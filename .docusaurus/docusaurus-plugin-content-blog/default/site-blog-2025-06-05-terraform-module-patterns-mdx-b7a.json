@@ -1,0 +1,80 @@
+{
+  "permalink": "/devops-blog/blog/terraform-module-patterns",
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/blog/2025-06-05-terraform-module-patterns.mdx",
+  "source": "@site/blog/2025-06-05-terraform-module-patterns.mdx",
+  "title": "Terraform Module Patterns for Production",
+  "description": "Reusable module design patterns used in real-world infrastructure with Terraform and Google Cloud.",
+  "date": "2025-06-05T14:00:00.000Z",
+  "tags": [
+    {
+      "inline": false,
+      "label": "Terraform",
+      "permalink": "/devops-blog/blog/tags/terraform",
+      "description": "Infrastructure as Code with Terraform"
+    },
+    {
+      "inline": false,
+      "label": "IaC",
+      "permalink": "/devops-blog/blog/tags/iac",
+      "description": "Infrastructure as Code"
+    },
+    {
+      "inline": false,
+      "label": "GCP",
+      "permalink": "/devops-blog/blog/tags/gcp",
+      "description": "Google Cloud Platform tutorials and tips"
+    },
+    {
+      "inline": false,
+      "label": "Modules",
+      "permalink": "/devops-blog/blog/tags/modules",
+      "description": "Modular code and reusable components"
+    },
+    {
+      "inline": false,
+      "label": "Best Practices",
+      "permalink": "/devops-blog/blog/tags/best-practices",
+      "description": "Industry best practices and patterns"
+    }
+  ],
+  "readingTime": 0.81,
+  "hasTruncateMarker": true,
+  "authors": [
+    {
+      "name": "SouravLobra",
+      "title": "DevOps Engineer",
+      "url": "https://github.com/souravlobra",
+      "page": {
+        "permalink": "/devops-blog/blog/authors/sourav"
+      },
+      "socials": {
+        "github": "https://github.com/souravlobra",
+        "linkedin": "https://www.linkedin.com/in/souravlobra/"
+      },
+      "imageURL": "https://github.com/souravlobra.png",
+      "key": "sourav"
+    }
+  ],
+  "frontMatter": {
+    "slug": "terraform-module-patterns",
+    "title": "Terraform Module Patterns for Production",
+    "description": "Reusable module design patterns used in real-world infrastructure with Terraform and Google Cloud.",
+    "date": "2025-06-05T14:00:00.000Z",
+    "authors": [
+      "sourav"
+    ],
+    "tags": [
+      "terraform",
+      "iac",
+      "gcp",
+      "modules",
+      "best-practices"
+    ],
+    "hide_table_of_contents": false
+  },
+  "unlisted": false,
+  "nextItem": {
+    "title": "How I Passed the GCP Associate Cloud Engineer Exam",
+    "permalink": "/devops-blog/blog/gcp-associate-exam-tips"
+  }
+}

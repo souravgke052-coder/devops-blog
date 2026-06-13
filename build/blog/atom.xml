@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?><?xml-stylesheet type="text/xsl" href="atom.xsl"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://souravgke052-coder.github.io/devops-blog/blog</id>
+    <title>DevOps Blog Blog</title>
+    <updated>2025-06-05T14:00:00.000Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://souravgke052-coder.github.io/devops-blog/blog"/>
+    <subtitle>DevOps Blog Blog</subtitle>
+    <icon>https://souravgke052-coder.github.io/devops-blog/img/favicon.ico</icon>
+    <entry>
+        <title type="html"><![CDATA[Terraform Module Patterns for Production]]></title>
+        <id>https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns</id>
+        <link href="https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns"/>
+        <updated>2025-06-05T14:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Reusable module design patterns used in real-world infrastructure with Terraform and Google Cloud.]]></summary>
+        <content type="html"><![CDATA[<p>After managing infrastructure across multiple projects, I’ve distilled some <strong>Terraform module patterns</strong> that keep code clean, reusable, and maintainable.</p>
+<!-- -->
+<hr>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="the-layout-pattern">The Layout Pattern<a href="https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns#the-layout-pattern" class="hash-link" aria-label="Direct link to The Layout Pattern" title="Direct link to The Layout Pattern" translate="no">​</a></h2>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-text codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">modules/</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  gce_instance/</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    main.tf</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    variables.tf</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    outputs.tf</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  vpc/</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    main.tf</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    variables.tf</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    outputs.tf</span><br></div></code></pre></div></div>
+<p>Each module:</p>
+<ul>
+<li class="">Has a <strong>single responsibility</strong></li>
+<li class="">Exposes only <strong>intentional inputs</strong> via <code>variables.tf</code></li>
+<li class="">Returns <strong>predictable outputs</strong> via <code>outputs.tf</code></li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="version-pinning">Version Pinning<a href="https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns#version-pinning" class="hash-link" aria-label="Direct link to Version Pinning" title="Direct link to Version Pinning" translate="no">​</a></h2>
+<p>Always pin provider and module versions in production.</p>
+<div class="language-hcl codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-hcl codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">terraform {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  required_providers {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    google = {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">      source  = "hashicorp/google"</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">      version = "~&gt; 5.0"</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    }</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  }</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">}</span><br></div></code></pre></div></div>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="using-for_each-over-count">Using <code>for_each</code> Over <code>count</code><a href="https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns#using-for_each-over-count" class="hash-link" aria-label="Direct link to using-for_each-over-count" title="Direct link to using-for_each-over-count" translate="no">​</a></h2>
+<p>Use <code>for_each</code> for named resources to avoid reordering issues.</p>
+<div class="language-hcl codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-hcl codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">variable "subnets" {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  type = map(object({</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    cidr = string</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    region = string</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  }))</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">}</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain" style="display:inline-block"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">resource "google_compute_subnetwork" "default" {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  for_each = var.subnets</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain" style="display:inline-block"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  name          = each.key</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  ip_cidr_range = each.value.cidr</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  region        = each.value.region</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  network       = google_compute_network.vpc.id</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">}</span><br></div></code></pre></div></div>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="remote-state-with-gcs">Remote State with GCS<a href="https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns#remote-state-with-gcs" class="hash-link" aria-label="Direct link to Remote State with GCS" title="Direct link to Remote State with GCS" translate="no">​</a></h2>
+<p>Store state remotely to enable team collaboration.</p>
+<div class="language-hcl codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-hcl codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">terraform {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  backend "gcs" {</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    bucket = "my-tf-state-bucket"</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">    prefix = "prod/infrastructure"</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  }</span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">}</span><br></div></code></pre></div></div>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="summary">Summary<a href="https://souravgke052-coder.github.io/devops-blog/blog/terraform-module-patterns#summary" class="hash-link" aria-label="Direct link to Summary" title="Direct link to Summary" translate="no">​</a></h2>
+<ul>
+<li class="">Use modules for reusable components</li>
+<li class="">Pin provider versions</li>
+<li class="">Prefer maps and <code>for_each</code> over lists and <code>count</code></li>
+<li class="">Always use remote state in production</li>
+</ul>
+<p>What patterns do you use? Let me know in the comments!</p>]]></content>
+        <author>
+            <name>SouravLobra</name>
+            <uri>https://github.com/souravlobra</uri>
+        </author>
+        <category label="Terraform" term="Terraform"/>
+        <category label="IaC" term="IaC"/>
+        <category label="GCP" term="GCP"/>
+        <category label="Modules" term="Modules"/>
+        <category label="Best Practices" term="Best Practices"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[How I Passed the GCP Associate Cloud Engineer Exam]]></title>
+        <id>https://souravgke052-coder.github.io/devops-blog/blog/gcp-associate-exam-tips</id>
+        <link href="https://souravgke052-coder.github.io/devops-blog/blog/gcp-associate-exam-tips"/>
+        <updated>2025-06-01T10:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Study tips, resources, and hands-on strategies for passing the GCP Associate Cloud Engineer certification.]]></summary>
+        <content type="html"><![CDATA[<p>Passing the <strong>Google Cloud Associate Cloud Engineer</strong> exam requires a mix of hands-on practice and focused study. Here are the strategies that worked for me.</p>
+<!-- -->
+<hr>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="study-resources">Study Resources<a href="https://souravgke052-coder.github.io/devops-blog/blog/gcp-associate-exam-tips#study-resources" class="hash-link" aria-label="Direct link to Study Resources" title="Direct link to Study Resources" translate="no">​</a></h2>
+<ul>
+<li class=""><strong>Official Google Cloud documentation</strong> — read it like a textbook</li>
+<li class=""><strong>Google Cloud Skills Boost</strong> — Quest: "Prepare for Your Associate Cloud Engineer Journey"</li>
+<li class=""><strong>Practice exams</strong> — Linux Academy / A Cloud Guru / Coursera</li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="key-focus-areas">Key Focus Areas<a href="https://souravgke052-coder.github.io/devops-blog/blog/gcp-associate-exam-tips#key-focus-areas" class="hash-link" aria-label="Direct link to Key Focus Areas" title="Direct link to Key Focus Areas" translate="no">​</a></h2>
+<ol>
+<li class="">
+<p><strong>IAM &amp; Identity</strong></p>
+<ul>
+<li class="">Understand the difference between primitive, predefined, and custom roles</li>
+<li class="">Know when to use Service Accounts vs User Accounts</li>
+</ul>
+</li>
+<li class="">
+<p><strong>Compute Engines</strong></p>
+<ul>
+<li class="">Know how to create and manage GCE instances</li>
+<li class="">Understand startup scripts and metadata</li>
+</ul>
+</li>
+<li class="">
+<p><strong>Kubernetes Engine (GKE)</strong></p>
+<ul>
+<li class="">Deploy clusters using Console and <code>gcloud</code></li>
+<li class="">Know basic <code>kubectl</code> commands</li>
+</ul>
+</li>
+<li class="">
+<p><strong>Storage &amp; Databases</strong></p>
+<ul>
+<li class="">Cloud Storage bucket classes and use cases</li>
+<li class="">When to use Cloud SQL vs Cloud Spanner vs BigQuery</li>
+</ul>
+</li>
+</ol>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="hands-on-practice">Hands-On Practice<a href="https://souravgke052-coder.github.io/devops-blog/blog/gcp-associate-exam-tips#hands-on-practice" class="hash-link" aria-label="Direct link to Hands-On Practice" title="Direct link to Hands-On Practice" translate="no">​</a></h2>
+<p>Create a mini project: deploy a VM, attach a persistent disk, configure a firewall rule, and host a simple app.</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style="--prism-color:#393A34;--prism-background-color:#f6f8fa"><div class="codeBlockContent_QJqH"><pre tabindex="0" class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style="color:#393A34;background-color:#f6f8fa"><code class="codeBlockLines_e6Vv"><div class="token-line" style="color:#393A34"><span class="token plain">gcloud compute instances create web-server </span><span class="token punctuation" style="color:#393A34">\</span><span class="token plain"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  --image-family</span><span class="token operator" style="color:#393A34">=</span><span class="token plain">debian-11 </span><span class="token punctuation" style="color:#393A34">\</span><span class="token plain"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  --image-project</span><span class="token operator" style="color:#393A34">=</span><span class="token plain">debian-cloud </span><span class="token punctuation" style="color:#393A34">\</span><span class="token plain"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  --machine-type</span><span class="token operator" style="color:#393A34">=</span><span class="token plain">e2-micro </span><span class="token punctuation" style="color:#393A34">\</span><span class="token plain"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  </span><span class="token parameter variable" style="color:#36acaa">--zone</span><span class="token operator" style="color:#393A34">=</span><span class="token plain">us-central1-a </span><span class="token punctuation" style="color:#393A34">\</span><span class="token plain"></span><br></div><div class="token-line" style="color:#393A34"><span class="token plain">  </span><span class="token parameter variable" style="color:#36acaa">--tags</span><span class="token operator" style="color:#393A34">=</span><span class="token plain">http-server</span><br></div></code></pre></div></div>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="exam-day-tips">Exam Day Tips<a href="https://souravgke052-coder.github.io/devops-blog/blog/gcp-associate-exam-tips#exam-day-tips" class="hash-link" aria-label="Direct link to Exam Day Tips" title="Direct link to Exam Day Tips" translate="no">​</a></h2>
+<ul>
+<li class="">Flag uncertain questions and return later</li>
+<li class="">Know the pricing model basics (sustained use discounts, committed use)</li>
+<li class="">Time management: 2 hours for 50 questions</li>
+</ul>
+<p>Good luck!</p>]]></content>
+        <author>
+            <name>SouravLobra</name>
+            <uri>https://github.com/souravlobra</uri>
+        </author>
+        <category label="GCP" term="GCP"/>
+        <category label="Certification" term="Certification"/>
+        <category label="Cloud" term="Cloud"/>
+        <category label="Tips" term="Tips"/>
+    </entry>
+</feed>

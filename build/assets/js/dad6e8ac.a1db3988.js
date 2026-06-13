@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkdevops_blog=self.webpackChunkdevops_blog||[]).push([["5276"],{5312(e){e.exports=JSON.parse('{"metadata":{"permalink":"/devops-blog/blog","page":1,"postsPerPage":10,"totalPages":1,"totalCount":2,"blogDescription":"Blog","blogTitle":"Blog"}}')}}]);

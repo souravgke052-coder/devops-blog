@@ -1,0 +1,24 @@
+{
+  "id": "getting-started",
+  "title": "Getting Started",
+  "description": "Welcome to DevOps Blog — your hub for Linux, Networking, GCP, Kubernetes, and Terraform.",
+  "source": "@site/docs/getting-started.md",
+  "sourceDirName": ".",
+  "slug": "/getting-started",
+  "permalink": "/devops-blog/docs/getting-started",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/getting-started.md",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 1,
+  "frontMatter": {
+    "sidebar_position": 1,
+    "description": "Welcome to DevOps Blog — your hub for Linux, Networking, GCP, Kubernetes, and Terraform."
+  },
+  "sidebar": "tutorialSidebar",
+  "next": {
+    "title": "Essential Linux Commands",
+    "permalink": "/devops-blog/docs/linux/commands"
+  }
+}

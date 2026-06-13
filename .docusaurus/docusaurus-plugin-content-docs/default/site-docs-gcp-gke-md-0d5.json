@@ -1,0 +1,28 @@
+{
+  "id": "gcp/gke",
+  "title": "GKE",
+  "description": "Google Kubernetes Engine (GKE) basics — cluster creation, node pools, and workloads.",
+  "source": "@site/docs/gcp/gke.md",
+  "sourceDirName": "gcp",
+  "slug": "/gcp/gke",
+  "permalink": "/devops-blog/docs/gcp/gke",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/gcp/gke.md",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 2,
+  "frontMatter": {
+    "sidebar_position": 2,
+    "description": "Google Kubernetes Engine (GKE) basics — cluster creation, node pools, and workloads."
+  },
+  "sidebar": "tutorialSidebar",
+  "previous": {
+    "title": "GCP Foundation",
+    "permalink": "/devops-blog/docs/gcp/foundation"
+  },
+  "next": {
+    "title": "Kubernetes Intro",
+    "permalink": "/devops-blog/docs/kubernetes/intro"
+  }
+}

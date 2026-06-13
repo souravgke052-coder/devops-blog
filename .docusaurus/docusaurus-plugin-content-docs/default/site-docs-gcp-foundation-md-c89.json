@@ -1,0 +1,28 @@
+{
+  "id": "gcp/foundation",
+  "title": "GCP Foundation",
+  "description": "Core GCP concepts including IAM, billing, resource hierarchy, and basic gcloud setup.",
+  "source": "@site/docs/gcp/foundation.md",
+  "sourceDirName": "gcp",
+  "slug": "/gcp/foundation",
+  "permalink": "/devops-blog/docs/gcp/foundation",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/gcp/foundation.md",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 1,
+  "frontMatter": {
+    "sidebar_position": 1,
+    "description": "Core GCP concepts including IAM, billing, resource hierarchy, and basic gcloud setup."
+  },
+  "sidebar": "tutorialSidebar",
+  "previous": {
+    "title": "Network Troubleshooting",
+    "permalink": "/devops-blog/docs/networking/troubleshooting"
+  },
+  "next": {
+    "title": "GKE",
+    "permalink": "/devops-blog/docs/gcp/gke"
+  }
+}

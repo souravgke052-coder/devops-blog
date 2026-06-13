@@ -1,0 +1,28 @@
+{
+  "id": "networking/troubleshooting",
+  "title": "Network Troubleshooting",
+  "description": "Practical network troubleshooting commands and workflows.",
+  "source": "@site/docs/networking/troubleshooting.md",
+  "sourceDirName": "networking",
+  "slug": "/networking/troubleshooting",
+  "permalink": "/devops-blog/docs/networking/troubleshooting",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/networking/troubleshooting.md",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 2,
+  "frontMatter": {
+    "sidebar_position": 2,
+    "description": "Practical network troubleshooting commands and workflows."
+  },
+  "sidebar": "tutorialSidebar",
+  "previous": {
+    "title": "Networking Fundamentals",
+    "permalink": "/devops-blog/docs/networking/fundamentals"
+  },
+  "next": {
+    "title": "GCP Foundation",
+    "permalink": "/devops-blog/docs/gcp/foundation"
+  }
+}

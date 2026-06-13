@@ -1,0 +1,28 @@
+{
+  "id": "networking/fundamentals",
+  "title": "Networking Fundamentals",
+  "description": "Core networking concepts for DevOps and cloud engineers.",
+  "source": "@site/docs/networking/fundamentals.md",
+  "sourceDirName": "networking",
+  "slug": "/networking/fundamentals",
+  "permalink": "/devops-blog/docs/networking/fundamentals",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/networking/fundamentals.md",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 1,
+  "frontMatter": {
+    "sidebar_position": 1,
+    "description": "Core networking concepts for DevOps and cloud engineers."
+  },
+  "sidebar": "tutorialSidebar",
+  "previous": {
+    "title": "Shell Scripting",
+    "permalink": "/devops-blog/docs/linux/scripting"
+  },
+  "next": {
+    "title": "Network Troubleshooting",
+    "permalink": "/devops-blog/docs/networking/troubleshooting"
+  }
+}

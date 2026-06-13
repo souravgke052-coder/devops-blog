@@ -1,0 +1,28 @@
+{
+  "id": "linux/commands",
+  "title": "Essential Linux Commands",
+  "description": "Essential Linux commands every DevOps engineer should know.",
+  "source": "@site/docs/linux/commands.md",
+  "sourceDirName": "linux",
+  "slug": "/linux/commands",
+  "permalink": "/devops-blog/docs/linux/commands",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/linux/commands.md",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 1,
+  "frontMatter": {
+    "sidebar_position": 1,
+    "description": "Essential Linux commands every DevOps engineer should know."
+  },
+  "sidebar": "tutorialSidebar",
+  "previous": {
+    "title": "Getting Started",
+    "permalink": "/devops-blog/docs/getting-started"
+  },
+  "next": {
+    "title": "Shell Scripting",
+    "permalink": "/devops-blog/docs/linux/scripting"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "intro",
+  "title": "Introduction",
+  "description": "Welcome to the DevOps Blog documentation section. Here you'll find guides and reference materials for Linux, Networking, GCP, Kubernetes, and Terraform.",
+  "source": "@site/docs/intro.mdx",
+  "sourceDirName": ".",
+  "slug": "/intro",
+  "permalink": "/devops-blog/docs/intro",
+  "draft": false,
+  "unlisted": false,
+  "editUrl": "https://github.com/souravgke052-coder/devops-blog/tree/main/docs/intro.mdx",
+  "tags": [],
+  "version": "current",
+  "sidebarPosition": 0,
+  "frontMatter": {
+    "sidebar_position": 0
+  }
+}
