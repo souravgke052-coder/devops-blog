@@ -1,0 +1,44 @@
+linux:
+  label: Linux
+  description: Linux administration, commands, and scripting
+  permalink: /linux
+networking:
+  label: Networking
+  description: Networking concepts, troubleshooting, and tools
+  permalink: /networking
+gcp:
+  label: GCP
+  description: Google Cloud Platform tutorials and tips
+  permalink: /gcp
+kubernetes:
+  label: Kubernetes
+  description: Kubernetes orchestration, deployments, and management
+  permalink: /kubernetes
+terraform:
+  label: Terraform
+  description: Infrastructure as Code with Terraform
+  permalink: /terraform
+best-practices:
+  label: Best Practices
+  description: Industry best practices and patterns
+  permalink: /best-practices
+certification:
+  label: Certification
+  description: Study guides and exam tips
+  permalink: /certification
+cloud:
+  label: Cloud
+  description: Cloud computing and platforms
+  permalink: /cloud
+tips:
+  label: Tips
+  description: Quick tips and tricks
+  permalink: /tips
+iac:
+  label: IaC
+  description: Infrastructure as Code
+  permalink: /iac
+modules:
+  label: Modules
+  description: Modular code and reusable components
+  permalink: /modules

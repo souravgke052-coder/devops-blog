@@ -1,0 +1,62 @@
+---
+slug: gcp-associate-exam-tips
+title: How I Passed the GCP Associate Cloud Engineer Exam
+description: Study tips, resources, and hands-on strategies for passing the GCP Associate Cloud Engineer certification.
+date: 2025-06-01T10:00:00Z
+authors: [sourav]
+tags: [gcp, certification, cloud, tips]
+hide_table_of_contents: false
+---
+
+# How I Passed the GCP Associate Cloud Engineer Exam
+
+Passing the **Google Cloud Associate Cloud Engineer** exam requires a mix of hands-on practice and focused study. Here are the strategies that worked for me.
+
+{/* truncate */}
+
+---
+
+## Study Resources
+
+- **Official Google Cloud documentation** — read it like a textbook
+- **Google Cloud Skills Boost** — Quest: "Prepare for Your Associate Cloud Engineer Journey"
+- **Practice exams** — Linux Academy / A Cloud Guru / Coursera
+
+## Key Focus Areas
+
+1. **IAM & Identity**
+   - Understand the difference between primitive, predefined, and custom roles
+   - Know when to use Service Accounts vs User Accounts
+
+2. **Compute Engines**
+   - Know how to create and manage GCE instances
+   - Understand startup scripts and metadata
+
+3. **Kubernetes Engine (GKE)**
+   - Deploy clusters using Console and `gcloud`
+   - Know basic `kubectl` commands
+
+4. **Storage & Databases**
+   - Cloud Storage bucket classes and use cases
+   - When to use Cloud SQL vs Cloud Spanner vs BigQuery
+
+## Hands-On Practice
+
+Create a mini project: deploy a VM, attach a persistent disk, configure a firewall rule, and host a simple app.
+
+```bash
+gcloud compute instances create web-server \
+  --image-family=debian-11 \
+  --image-project=debian-cloud \
+  --machine-type=e2-micro \
+  --zone=us-central1-a \
+  --tags=http-server
+```
+
+## Exam Day Tips
+
+- Flag uncertain questions and return later
+- Know the pricing model basics (sustained use discounts, committed use)
+- Time management: 2 hours for 50 questions
+
+Good luck!

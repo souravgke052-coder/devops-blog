@@ -1,0 +1,95 @@
+---
+slug: terraform-module-patterns
+title: Terraform Module Patterns for Production
+description: Reusable module design patterns used in real-world infrastructure with Terraform and Google Cloud.
+date: 2025-06-05T14:00:00Z
+authors: [sourav]
+tags: [terraform, iac, gcp, modules, best-practices]
+hide_table_of_contents: false
+---
+
+# Terraform Module Patterns for Production
+
+After managing infrastructure across multiple projects, I’ve distilled some **Terraform module patterns** that keep code clean, reusable, and maintainable.
+
+{/* truncate */}
+
+---
+
+## The Layout Pattern
+
+```
+modules/
+  gce_instance/
+    main.tf
+    variables.tf
+    outputs.tf
+  vpc/
+    main.tf
+    variables.tf
+    outputs.tf
+```
+
+Each module:
+- Has a **single responsibility**
+- Exposes only **intentional inputs** via `variables.tf`
+- Returns **predictable outputs** via `outputs.tf`
+
+## Version Pinning
+
+Always pin provider and module versions in production.
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+```
+
+## Using `for_each` Over `count`
+
+Use `for_each` for named resources to avoid reordering issues.
+
+```hcl
+variable "subnets" {
+  type = map(object({
+    cidr = string
+    region = string
+  }))
+}
+
+resource "google_compute_subnetwork" "default" {
+  for_each = var.subnets
+
+  name          = each.key
+  ip_cidr_range = each.value.cidr
+  region        = each.value.region
+  network       = google_compute_network.vpc.id
+}
+```
+
+## Remote State with GCS
+
+Store state remotely to enable team collaboration.
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "my-tf-state-bucket"
+    prefix = "prod/infrastructure"
+  }
+}
+```
+
+## Summary
+
+- Use modules for reusable components
+- Pin provider versions
+- Prefer maps and `for_each` over lists and `count`
+- Always use remote state in production
+
+What patterns do you use? Let me know in the comments!
