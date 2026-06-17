@@ -1,0 +1,311 @@
+# Routing
+
+## Overview
+
+Routing directs network traffic from source to destination. In cloud environments, routing is configured via route tables attached to subnets. Understanding routing is essential because misconfigured routes are a common cause of connectivity issues—traffic going to the wrong place, or not going anywhere at all.
+
+Linux routing uses the routing table to determine where to send packets. Cloud VPC routing follows similar logic but is managed at the VPC level. Dynamic routing protocols (BGP, OSPF) handle route exchange in larger or hybrid environments.
+
+## When To Use
+
+- **VPC design**: Configuring subnet route tables
+- **VPN setup**: Routing traffic through VPN tunnels
+- **Multi-VPC**: VPC peering, Transit Gateway
+- **Hybrid cloud**: On-prem to cloud connectivity
+
+## When NOT To Use
+
+- **Single subnet, no internet**: No routing needed
+- **Layer 2 only**: Switches handle this
+
+## Core Concepts
+
+### Linux Routing Table
+
+```bash
+# View routing table
+ip route show
+# default via 10.0.0.1 dev eth0 proto dhcp
+# 10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5
+
+# Default route (0.0.0.0/0)
+# All traffic not matching more specific routes goes here
+
+# Specific route
+# Traffic to 10.1.0.0/24 goes via 10.0.0.10
+ip route add 10.1.0.0/24 via 10.0.0.10 dev eth0
+
+# Check which route handles a destination
+ip route get 8.8.8.8
+# 8.8.8.8 via 10.0.0.1 dev eth0 src 10.0.0.5
+```
+
+### Route Table Structure
+
+```
+Destination     Gateway         Genmask         Flags Metric Ref  Use Iface
+0.0.0.0         10.0.0.1        0.0.0.0         UG    100    0      0 eth0
+10.0.0.0/24     0.0.0.0         255.255.255.0   U     100    0      0 eth0
+172.16.0.0/16   10.0.0.10       255.255.0.0     UG    100    0      0 eth0
+
+Legend:
+U = Route is up
+G = Gateway (indirect route)
+H = Host (specific route)
+```
+
+### Cloud Route Tables
+
+```bash
+# AWS route table for public subnet
+RouteTable:
+  Routes:
+    - DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: igw-xxx     # → Internet
+    - DestinationCidrBlock: 10.0.0.0/16
+      LocalGatewayId: local  # Local VPC
+
+# AWS route table for private subnet
+RouteTable:
+  Routes:
+    - DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: nat-xxx  # → NAT Gateway
+    - DestinationCidrBlock: 10.0.0.0/16
+      LocalGatewayId: local  # Local VPC
+```
+
+### Policy-Based Routing
+
+Linux supports multiple routing tables and policy routing (ip rule).
+
+```bash
+# Multiple routing tables
+echo "100 internal" >> /etc/iproute2/rt_tables
+echo "200 dmz" >> /etc/iproute2/rt_tables
+
+# Add routes to tables
+ip route add default via 10.0.1.1 dev eth1 table internal
+ip route add default via 10.0.2.1 dev eth2 table dmz
+
+# Policy routing rules
+ip rule add from 10.0.1.0/24 table internal
+ip rule add iif eth0 table dmz
+
+# Check rules
+ip rule show
+# 0:      from all lookup local
+# 32765:  from 10.0.1.0/24 lookup internal
+# 32766:  from all lookup main
+# 32767:  from all lookup default
+```
+
+## Real Production Example
+
+### AWS Transit Gateway Routing
+
+```bash
+# Create Transit Gateway
+aws ec2 create-transit-gateway \
+  --description "Hub" \
+  --amazon-side-asn 64512
+
+# Attach VPCs
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-xxx \
+  --vpc-id vpc-hub \
+  --subnet-ids subnet-xxx
+
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-xxx \
+  --vpc-id vpc-spoke-1 \
+  --subnet-ids subnet-yyy
+
+# Create route table
+aws ec2 create-transit-gateway-route-table \
+  --transit-gateway-id tgw-xxx
+
+# Associate attachments
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-id tgw-xxx \
+  --transit-gateway-attachment-id tgw-attach-xxx \
+  --transit-gateway-route-table-id tgw-rtb-xxx
+
+# Propagate routes from VPC (automatic)
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-id tgw-xxx \
+  --transit-gateway-route-table-id tgw-rtb-xxx \
+  --transit-gateway-attachment-id tgw-attach-xxx
+
+# Static route for VPN
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-xxx \
+  --destination-cidr-block 10.0.0.0/8 \
+  --transit-gateway-attachment-id tgw-attach-vpn
+
+# Propagated routes
+# Routes from VPC attachments automatically appear in TGW route table
+# Static routes for VPN override propagated routes
+```
+
+### BGP Routing
+
+```bash
+# Bird BGP configuration for router
+# /etc/bird/bird.conf
+
+protocol device {
+    scan time 60;
+}
+
+protocol direct {
+    interface "eth*";
+}
+
+protocol kernel kernel1 {
+    metric 100;
+    import none;
+    export all;
+    scan time 60;
+}
+
+protocol bgp bgp_cloud {
+    local as 65001;
+    neighbor 10.0.0.1 as 64512;
+    
+    import filter {
+        if source = RTS_BGP then accept;
+        reject;
+    };
+    
+    export filter {
+        if proto = "kernel1" then {
+            # Export local routes with MED
+            bgp_med = 100;
+            accept;
+        }
+        reject;
+    };
+}
+
+# Bird status
+birdc show protocols
+birdc show route
+birdc show route protocol bgp_cloud
+```
+
+## CLI Examples
+
+```bash
+# Linux routing
+ip route show
+ip route get 8.8.8.8
+ip route add 10.1.0.0/16 via 10.0.0.1
+ip route del 10.1.0.0/16 via 10.0.0.1
+
+# Routing tables
+ip route show table all
+ip rule show
+
+# AWS routing
+aws ec2 describe-route-tables --query 'RouteTables[].Routes'
+aws ec2 create-route --route-table-id rtb-xxx --destination-cidr-block 10.1.0.0/16 --nat-gateway-id nat-xxx
+
+# BGP
+birdc show protocols
+birdc show route
+
+# Quagga/Zebra
+vtysh
+show ip route
+show bgp summary
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `ip route` | Linux routing | `ip route show` |
+| `ip rule` | Policy routing | `ip rule show` |
+| `route -n` | Legacy routing | `route -n` |
+| `ip route get` | Find route for IP | `ip route get 8.8.8.8` |
+
+## Security
+
+### Routing Security
+
+```bash
+# Anti-spoofing: drop packets from wrong interface
+# /etc/sysctl.d/90-rp-filter.conf
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+
+# Disable ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+```
+
+## Troubleshooting
+
+### Routing Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Can't reach internet | Missing default route | Add route to IGW/NAT |
+| Cross-VPC fails | Missing route, no peering | Configure peering, add routes |
+| VPN not working | Route missing in route table | Add route via VPN gateway |
+| Traffic goes wrong way | More specific route | Adjust routes |
+
+```bash
+# Debug routing
+ping -c 1 8.8.8.8
+ip route get 8.8.8.8  # Which route handles this?
+
+# Trace path
+traceroute 8.8.8.8
+tracepath 8.8.8.8
+
+# Check for black holes
+tcpdump -i any icmp  # Watch for "Destination unreachable"
+```
+
+## Interview Questions
+
+**Q1: What happens when a packet arrives at a Linux router?**
+
+A: Packet arrives at NIC, kernel processes it. (1) PREROUTING netfilter hook runs (DNAT if any). (2) Routing decision: is packet for local delivery or forwarding? If forwarding, goes to FORWARD chain. If local, goes to INPUT chain. (3) Forward path: FORWARD chain (firewall), POSTROUTING (SNAT if any). (4) Local path: INPUT chain, deliver to socket. (5) Outgoing packets: OUTPUT chain, POSTROUTING. The routing table is consulted at steps 2 and when determining next hop for outgoing packets.
+
+**Q2: How does a default route work?**
+
+A: Default route (0.0.0.0/0 or ::/0) matches any destination that doesn't have a more specific route. When forwarding, kernel checks routes from most specific (longest prefix) to least specific. If no /8, /16, /24 matches, default is used. Default route's gateway receives the packet for further forwarding. If no default route and no matching route, packet is dropped and ICMP "Destination Unreachable" sent.
+
+## Cheat Sheet
+
+### Route Table Format
+
+```bash
+# Format: destination via gateway dev interface
+ip route add 10.0.0.0/24 via 10.0.0.1 dev eth0
+
+# Special destinations
+ip route add default via 10.0.0.1 dev eth0  # 0.0.0.0/0
+ip route add 10.0.0.0/8 dev eth0            # Connected network (no gateway)
+ip route add blackhole 10.0.0.0/8           # Drop traffic
+```
+
+### AWS Route Priority
+
+Routes are evaluated by specificity (longest prefix wins). For same prefix length:
+1. Black hole routes (drop)
+2. Propagated routes from BGP/VPN
+3. Static routes
+4. Local routes (VPC CIDR)
+
+## Related Topics
+
+- [VPC](./vpc) — Cloud routing
+- [Subnets](./subnets) — Subnet routing
+- [NAT](./nat) — NAT routing
+- [VPN](./vpn) — VPN routing

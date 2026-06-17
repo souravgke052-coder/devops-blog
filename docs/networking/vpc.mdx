@@ -1,0 +1,409 @@
+# VPC (Virtual Private Cloud)
+
+## Overview
+
+A VPC is an isolated virtual network in the cloud. It provides networking isolation, control over IP ranges, subnets, routing tables, internet gateways, NAT gateways, and security groups. Every cloud deployment starts with VPC design. Poor VPC design—wrong CIDR sizes, missing subnet isolation, insecure routing—causes security breaches and operational pain.
+
+In AWS, a VPC spans a single region but spans all availability zones. GCP VPCs are global (span regions automatically). Azure VNet is region-scoped. Understanding VPC peering, Transit Gateway, PrivateLink, and VPC endpoints is essential for cloud networking.
+
+## When To Use
+
+- **Any cloud deployment**: VPCs are foundational
+- **Multi-tier architecture**: Public/private subnets
+- **Multi-account**: Shared services VPC, peered VPCs
+- **Hybrid cloud**: Site-to-site VPN, Direct Connect
+
+## When NOT To Use
+
+- **Simple static sites**: Single instance, no VPC complexity needed
+- **Edge cases**: Lambda@Edge, Cloudflare Workers (different model)
+
+## Core Concepts
+
+### VPC Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        VPC (10.0.0.0/16)                    │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Public Subnets (10.0.0.0/24, 10.0.1.0/24)           │   │
+│  │ ALB, NAT Gateway, Bastion Host                      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Private Subnets (10.0.2.0/24, 10.0.3.0/24)          │   │
+│  │ Application servers (ASG)                           │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Isolated Subnets (10.0.4.0/24, 10.0.5.0/24)         │   │
+│  │ RDS, ElastiCache (no internet)                      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### AWS VPC Components
+
+**Internet Gateway (IGW)**: Provides internet access for VPC. Attached to VPC, routes 0.0.0.0/0 to IGW.
+
+**Virtual Private Gateway (VGW)**: Site-to-site VPN endpoint. Attached to VPC, routes traffic to on-prem.
+
+**NAT Gateway**: Enables private subnet instances to access internet (outbound only). Managed AWS service, not bastion.
+
+**Egress-Only Internet Gateway**: IPv6 equivalent of NAT Gateway.
+
+**VPC Endpoints**: Private access to AWS services (S3, DynamoDB). Gateway endpoint (free) vs Interface endpoint (ENI-based, $).
+
+**Peering Connection**: VPC-to-VPC connection. Not transitive (A→B and B→C ≠ A→C).
+
+**Transit Gateway**: Central hub connecting VPCs and on-prem. Replaces complex peering mesh.
+
+### AWS VPC Configuration
+
+```bash
+# Create VPC
+aws ec2 create-vpc --cidr-block 10.0.0.0/16
+
+# Enable DNS hostnames
+aws ec2 modify-vpc-attribute --vpc-id vpc-xxx --enable-dns-hostnames
+
+# Create subnets
+aws ec2 create-subnet --vpc-id vpc-xxx --cidr-block 10.0.0.0/24 --availability-zone us-east-1a
+aws ec2 create-subnet --vpc-id vpc-xxx --cidr-block 10.0.1.0/24 --availability-zone us-east-1b
+aws ec2 create-subnet --vpc-id vpc-xxx --cidr-block 10.0.2.0/24 --availability-zone us-east-1a
+
+# Create Internet Gateway
+aws ec2 create-internet-gateway
+aws ec2 attach-internet-gateway --internet-gateway-id igw-xxx --vpc-id vpc-xxx
+
+# Create route table for public subnet
+aws ec2 create-route-table --vpc-id vpc-xxx
+aws ec2 create-route --route-table-id rtb-xxx --destination-cidr-block 0.0.0.0/0 --gateway-id igw-xxx
+aws ec2 associate-route-table --route-table-id rtb-xxx --subnet-id subnet-xxx
+
+# Create NAT Gateway (in public subnet)
+aws ec2 allocate-address --domain vpc
+aws ec2 create-nat-gateway --subnet-id subnet-xxx --allocation-id eip-xxx
+
+# Create route table for private subnet (via NAT Gateway)
+aws ec2 create-route-table --vpc-id vpc-xxx
+aws ec2 create-route --route-table-id rtb-private --destination-cidr-block 0.0.0.0/0 --nat-gateway-id nat-xxx
+aws ec2 associate-route-table --route-table-id rtb-private --subnet-id subnet-private-xxx
+```
+
+### GCP VPC
+
+```bash
+# Create VPC
+gcloud compute networks create my-vpc --subnet-mode=custom
+
+# Create subnet
+gcloud compute networks subnets create my-subnet \
+  --network my-vpc \
+  --region us-central1 \
+  --range 10.0.0.0/24
+
+# Create firewall rules
+gcloud compute firewall-rules create allow-ssh \
+  --network my-vpc \
+  --allow tcp:22 \
+  --source-ranges 0.0.0.0/0
+
+# VPC is global by default (spans all regions)
+# No need for peering; resources in any region can communicate via RFC1918
+```
+
+## Real Production Example
+
+### Multi-Account VPC with Transit Gateway
+
+```bash
+# Network Account (Hub)
+aws ec2 create-transit-gateway \
+  --description "Central Transit Gateway" \
+  --amazon-side-asn 64512 \
+  --options "DnsSupport=enable,VpnEcmpSupport=enable,AutoAcceptSharedAttachments=enable"
+
+# Attach VPC in Network Account
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-xxx \
+  --vpc-id vpc-network \
+  --subnet-ids subnet-xxx
+
+# Shared Services VPC (in Shared Services Account)
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-xxx \
+  --vpc-id vpc-shared \
+  --subnet-ids subnet-yyy
+
+# Transit Gateway Route Table
+aws ec2 create-transit-gateway-route-table \
+  --transit-gateway-id tgw-xxx
+
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-id tgw-xxx \
+  --transit-gateway-route-table-id tgw-rtb-xxx \
+  --vpc-attachment attachment-xxx
+
+# Route to other VPCs
+aws ec2 create-transit-gateway-route \
+  --transit-gateway-route-table-id tgw-rtb-xxx \
+  --destination-cidr-block 10.1.0.0/16 \
+  --transit-gateway-attachment-id attachment-vpc1
+
+# Route from on-prem via VPN
+aws ec2 create-transit-gateway-vpn-attachment \
+  --transit-gateway-id tgw-xxx \
+  --vpn-connection-id vpn-xxx
+```
+
+### VPC Endpoint for Private S3 Access
+
+```bash
+# Gateway VPC Endpoint for S3
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --route-table-ids rtb-xxx
+
+# Now S3 traffic from this VPC uses private IP (10.0.0.x → s3.amazonaws.com)
+# No NAT Gateway needed, no egress charges for S3
+
+# Interface endpoint for Secrets Manager
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.secretsmanager \
+  --vpc-endpoint-type Interface \
+  --subnet-ids subnet-xxx subnet-yyy \
+  --security-group-ids sg-xxx
+
+# Creates ENIs in subnets with private IP (10.0.x.x)
+# Application accesses: https://secretsmanager.us-east-1.amazonaws.com
+# DNS resolves to VPC endpoint IP
+```
+
+## CLI Examples
+
+```bash
+# AWS VPC operations
+aws ec2 describe-vpcs
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxx"
+aws ec2 describe-route-tables --filters "Name=vpc-id,Values=vpc-xxx"
+aws ec2 describe-security-groups --filters "Name=vpc-id,Values=vpc-xxx"
+aws ec2 describe-vpc-peering-connections
+aws ec2 describe-transit-gateways
+
+# GCP VPC operations
+gcloud compute networks list
+gcloud compute networks subnets list
+gcloud compute routes list
+gcloud compute firewall-rules list
+```
+
+## Common Commands
+
+| Platform | Command | Purpose |
+|----------|---------|---------|
+| AWS | `aws ec2 describe-vpcs` | List VPCs |
+| AWS | `aws ec2 describe-subnets` | List subnets |
+| AWS | `aws ec2 describe-security-groups` | List SGs |
+| GCP | `gcloud compute networks list` | List VPCs |
+| GCP | `gcloud compute networks subnets list` | List subnets |
+
+## Monitoring
+
+### VPC Flow Logs
+
+```bash
+# Create Flow Log (AWS)
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids vpc-xxx \
+  --traffic-type ALL \
+  --log-destination-type cloud-watch-logs \
+  --log-group-name /aws/vpc/flow-logs \
+  --deliver-logs-permission-arn arn:aws:iam::xxx:role/FlowLogsRole
+
+# Flow Log format
+# version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
+
+# Example rejected connection
+# 2 123456789012 eni-xxx 10.0.0.5 203.0.113.1 54321 443 6 10 1500 1234567890 1234567895 REJECT OK
+
+# Query with Athena
+# SELECT * FROM vpc_flow_logs WHERE action = 'REJECT' AND dstport = 22
+# Find SSH attempts, port scans, etc.
+```
+
+### VPC Metrics
+
+```bash
+# AWS VPC metrics (CloudWatch)
+# NatGateway: BytesIn, BytesOut, PacketsIn, PacketsOut, ConnectionEstablished, PacketsDrop
+# VPN: TunnelState, TunnelDataIn, TunnelDataOut
+# Transit Gateway: BytesIn, PacketsIn, DropConnectionVertexCount
+
+# GCP VPC metrics (Cloud Monitoring)
+# compute.googleapis.com/instance/network/received_bytes_count
+# compute.googleapis.com/instance/network/sent_bytes_count
+# compute.googleapis.com/firewall/dropped_packets_count
+```
+
+## Security
+
+### VPC Security Best Practices
+
+```bash
+# 1. No public IPs on application servers
+# Instances should only have private IPs
+aws ec2 run-instances \
+  --image-id ami-xxx \
+  --subnet-id subnet-xxx \
+  --no-associate-public-ip-address \
+  --key-name my-key
+
+# 2. Security groups as firewall (stateful)
+aws ec2 create-security-group \
+  --group-name web-sg \
+  --description "Web tier security group" \
+  --vpc-id vpc-xxx
+
+# Allow from ALB only
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-xxx \
+  --protocol tcp --port 8080 \
+  --source-group sg-alb-xxx
+
+# 3. Network ACLs as subnet-level stateless firewall (optional)
+# Less commonly needed; security groups usually sufficient
+
+# 4. VPC endpoints for AWS services (no internet)
+# Use gateway endpoint for S3, DynamoDB
+
+# 5. Private subnets for databases
+# No internet access, accessed via application in private subnet
+```
+
+### VPC Security Groups
+
+```bash
+# Bastion host security group (only SSH from known IP)
+aws ec2 create-security-group \
+  --group-name bastion-sg \
+  --vpc-id vpc-xxx
+
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-bastion \
+  --protocol tcp --port 22 \
+  --cidr 203.0.113.0/24  # Office IP
+
+# Application security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-app \
+  --protocol tcp --port 8080 \
+  --source-group sg-alb  # Allow from ALB
+
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-app \
+  --protocol tcp --port 5432 \
+  --source-group sg-db  # Allow from database tier only
+
+# Database security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-db \
+  --protocol tcp --port 5432 \
+  --source-group sg-app  # Only from app tier
+```
+
+## Cost Optimization
+
+### VPC Cost Optimization
+
+| Component | Cost | Optimization |
+|-----------|------|--------------|
+| NAT Gateway | $0.045/GB | Use VPC endpoints, NAT instance |
+| VPC Peering | Free | Use instead of Transit Gateway for simple topologies |
+| Transit Gateway | $0.02/连接/hour | Simplifies multi-VPC topology |
+| Interface Endpoint | $0.01/ENI/hour + $0.01/GB | Use gateway for S3/DynamoDB |
+| Elastic IP | $0.005/hour (attached) | Release unused EIPs |
+
+```bash
+# NAT Gateway vs NAT Instance cost comparison
+# NAT Gateway: $0.045/GB processed
+# NAT Instance (t3.micro): $0.0104/hour + $0.01/GB for data transfer
+
+# For 100GB/month:
+# NAT Gateway: $4.50 + $4.50 = $9/month
+# NAT Instance: $7.50 + $1 = $8.50/month
+
+# For 1TB/month:
+# NAT Gateway: $45 + $45 = $90/month
+# NAT Instance (c5.xlarge): $0.17/hour * 730 = $124 + $10 = $134/month
+# NAT Gateway is cheaper for most cases
+```
+
+## Troubleshooting
+
+### Common VPC Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Can't reach internet from private subnet | No NAT Gateway, wrong route | Add NAT Gateway, update route table |
+| Can't access S3 from private subnet | No route, no VPC endpoint | Add gateway endpoint |
+| Cross-VPC connectivity fails | Peering not configured, no route | Configure peering, update routes |
+| Security group not working | Stateful—return traffic auto-allowed | Check SG rules, verify direction |
+| NAT Gateway not working | In wrong AZ, wrong route | Check NAT GW subnet, route table |
+
+## Interview Questions
+
+**Q1: What's the difference between a security group and a network ACL?**
+
+A: Security groups are stateful and attached to ENIs/instances. Allow rules only; implicit deny. Return traffic auto-allowed. Changes take effect immediately. Network ACLs are stateless and attached to subnets. Allow and deny rules; processed in order. Return traffic must be explicitly allowed. Best practice: use security groups for instance-level rules (layer of defense), NACLs for subnet-level perimeter (optional). For most cases, security groups alone are sufficient; NACLs add complexity without much benefit unless you need explicit deny rules at subnet boundary.
+
+**Q2: How do you allow private subnet instances to access the internet without public IPs?**
+
+A: Use NAT Gateway in public subnet. Route table of private subnet has 0.0.0.0/0 → NAT Gateway. NAT Gateway is in public subnet with route to IGW. Instances in private subnet send traffic to NAT Gateway, which SNATs and forwards to IGW. Return traffic goes back through NAT Gateway, which DNATs back to private IP. Alternatively, for S3/DynamoDB only, use Gateway VPC Endpoints (free, no NAT needed).
+
+**Q3: What's the difference between VPC Peering and Transit Gateway?**
+
+A: VPC Peering creates direct connection between two VPCs. Not transitive—if A peers with B and B peers with C, A cannot reach C directly. Scales poorly (n*(n-1)/2 peering connections for n VPCs). No central management. Transit Gateway acts as hub; attaches to many VPCs and VPN. Traffic between attached VPCs goes through TGW. Transitive—A→B and A→C works if both attached. Central route tables control routing. Scales better for many VPCs. Preferred for 3+ VPCs or hub-and-spoke topologies.
+
+## Cheat Sheet
+
+### AWS VPC Components
+
+| Component | Purpose | Cost |
+|-----------|---------|------|
+| VPC | Isolated network | Free |
+| Subnet | AZ-scoped network | Free |
+| Internet Gateway | VPC → Internet | Free |
+| NAT Gateway | Private → Internet | $0.045/GB |
+| VPC Endpoint (Gateway) | Private S3/DynamoDB | Free |
+| VPC Endpoint (Interface) | Private AWS service | $0.01/ENI-hour + $0.01/GB |
+| Peering | VPC ↔ VPC | Free |
+| Transit Gateway | Hub for VPCs/VPN | $0.02/attachment-hour |
+
+### VPC CIDR Best Practices
+
+```bash
+# Use RFC 1918 ranges
+10.0.0.0/8        # Large (16M addresses)
+172.16.0.0/12     # Medium (1M addresses)
+192.168.0.0/16    # Small (65K addresses)
+
+# Reserve space for future VPCs
+# AWS: /16 VPC, /24 per subnet = 256 subnets per VPC
+
+# Avoid overlapping CIDRs when peering multiple VPCs
+# Plan CIDR allocation across organization
+```
+
+## Related Topics
+
+- [Subnets](./subnets) — Subnet design
+- [CIDR](./cidr) — CIDR notation
+- [Routing](./routing) — Route tables
+- [NAT](./nat) — NAT Gateway
+- [Firewall](./firewall) — Security groups

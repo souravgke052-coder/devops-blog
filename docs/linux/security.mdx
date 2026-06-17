@@ -1,0 +1,684 @@
+---
+sidebar_position: 19
+description: Linux security hardening — SELinux, AppArmor, firewall (iptables/nftables), fail2ban, and production security practices.
+---
+
+# Linux Security
+
+## Overview
+
+Linux security is defense in depth — no single mechanism is sufficient, but layered controls make exploitation significantly harder. A hardened production system uses Mandatory Access Control (MAC) to confine services, a stateful firewall to limit network exposure, file integrity monitoring to detect tampering, and principle of least privilege to limit blast radius.
+
+Understanding the difference between Discretionary Access Control (DAC — traditional Unix permissions) and Mandatory Access Control (MAC — SELinux/AppArmor) is fundamental. DAC lets users set their own permissions; MAC is system-enforced and cannot be overridden by users. If a vulnerability allows privilege escalation, MAC is your last line of defense.
+
+The three tools in this guide address different layers:
+- **SELinux/AppArmor**: Application confinement — what can a compromised process do?
+- **iptables/nftables/firewalld**: Network filtering — who can connect and to where?
+- **fail2ban/auditd**: Intrusion detection and response
+
+## When To Use
+
+- Production servers with any network exposure
+- Multi-tenant environments where services must be isolated
+- Compliance requirements (PCI-DSS, SOC2, HIPAA)
+- Container hosts where namespace isolation is insufficient
+- Any system handling sensitive data
+
+## When NOT To Use
+
+- Development machines (overhead not worth it for local dev)
+- Single-purpose appliances with no network (but physical security still matters)
+- When the application fundamentally conflicts with MAC (some apps require disabled SELinux — understand the risk)
+- Systems with known incompatibilities — profile first, don't disable blindly
+
+## Core Concepts
+
+### SELinux
+
+SELinux (Security-Enhanced Linux) implements MAC in the Linux kernel. Every system object (files, processes, ports) has a security context. Policy rules define what contexts can access what other contexts.
+
+**Modes:**
+- **Enforcing**: Policy is enforced; violations are blocked and logged
+- **Permissive**: Policy violations are logged but NOT blocked (for testing)
+- **Disabled**: SELinux is completely off (not recommended)
+
+**Context format:** `user:role:type:level`
+- For files/processes: `user_u:object_r:httpd_sys_content_t:s0`
+- The type field is most important for type enforcement
+
+**Key commands:**
+```bash
+# Check status
+sestatus
+getenforce
+
+# View context of files/processes
+ls -Z /var/log/nginx/
+ps auxZ
+netstat -tulpnZ
+
+# Change context temporarily (doesn't survive restorecon)
+chcon -t httpd_sys_content_t /var/www/html/file.html
+
+# Restore default context (from policy)
+restorecon -Rv /var/www/html/
+
+# Change default context for paths (persistent)
+semanage fcontext -a -t httpd_sys_content_t "/srv/app(/.*)?"
+semanage fcontext -l | grep httpd
+
+# Boolean policies
+getsebool -a | grep httpd
+setsebool -P httpd_can_network_connect 1   # -P = persistent (survives reboot)
+
+# Check denials (audit log)
+ausearch -m AVC,USER_AVC -ts recent
+ausearch -m AVC -c httpd    # specific process
+
+# Generate policy from denials (training mode)
+audit2allow -a -M myapppolicy < /var/log/audit/audit.log
+semodule -i myapppolicy.pp
+
+# Troubleshoot: is it SELinux?
+semodule -B; getenforce   # If it works now, it was SELinux
+```
+
+**Common SELinux scenarios:**
+```bash
+# Allow HTTP to connect to remote ports
+setsebool -P httpd_can_network_connect 1
+
+# Allow HTTP to serve files in non-standard locations
+semanage fcontext -a -t httpd_sys_content_t "/opt/app(/.*)?"
+restorecon -Rv /opt/app
+
+# Allow nginx to bind to non-standard ports
+semanage port -a -t http_port_t -p tcp 8080
+
+# Allow SSH key-based auth (if custom home dirs)
+setsebool -P ssh_sysadm_login 1
+
+# Allow PostgreSQL to read config
+setsebool -P nis_enabled 1  # Generally avoid this
+```
+
+### AppArmor
+
+AppArmor is the Debian/Ubuntu alternative to SELinux, using path-based profiles rather than label-based. Easier to understand but less granular.
+
+```bash
+# Check status
+aa-status
+apparmor_status
+
+# Profile modes
+# enforce: blocks violations
+# complain: logs violations but doesn't block
+
+# Put a profile in complain mode for training
+aa-complain /etc/apparmor.d/usr.sbin/nginx
+
+# Load a profile
+apparmor_parser -r /etc/apparmor.d/usr.sbin/nginx
+
+# Edit profile (puts in complain mode automatically)
+aa-logprof
+
+# Disable a profile
+aa-disable /etc/apparmor.d/usr.sbin/nginx
+
+# View loaded profiles
+cat /sys/kernel/security/apparmor/profiles
+```
+
+**Profile example (for a simple script):**
+```
+# /etc/apparmor.d/usr.local.bin.myapp
+#include <tunables/global>
+
+/usr/local/bin/myapp {
+  #include <abstractions/base>
+  #include <abstractions/bash>
+
+  # Allow reading config
+  /etc/myapp/** r,
+  # Allow writing to data dir
+  /var/lib/myapp/** rw,
+  # Allow executing these binaries
+  /usr/bin/curl mr,
+  /usr/local/bin/my-helper cx,
+}
+```
+
+### iptables
+
+iptables is the legacy Linux firewall, using tables and chains. It is being replaced by nftables but remains widely used.
+
+```bash
+# Tables: filter (default), nat, mangle, raw
+# Chains: INPUT (incoming), OUTPUT (outgoing), FORWARD (routed)
+# Default policy: DROP or ACCEPT
+
+# Show current rules
+iptables -L -n -v --line-numbers
+iptables -t nat -L -n -v
+
+# Basic rules (in order — first match wins)
+iptables -A INPUT -i lo -j ACCEPT              # loopback
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT  # SSH
+iptables -A INPUT -p tcp --dport 80 -j ACCEPT  # HTTP
+iptables -A INPUT -p tcp --dport 443 -j ACCEPT # HTTPS
+iptables -A INPUT -j LOG --log-prefix "IPTables-DROP: " --log-uid
+iptables -A INPUT -j DROP                      # default: drop all
+
+# Connection tracking (stateful firewall)
+# ESTABLISHED: seen in both directions
+# RELATED: related to existing connection (e.g., FTP data)
+# NEW: new connection attempt
+# INVALID: not recognized
+
+# Rate limiting
+iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set
+iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 -j DROP
+
+# Save rules (Debian/Ubuntu)
+apt install iptables-persistent
+netfilter-persistent save
+
+# RHEL/CentOS
+service iptables save
+```
+
+### nftables
+
+nftables is the modern replacement for iptables (and ip6tables, arptables, ebtables). Uses a single command for all protocols, supports sets and maps, and is more performant.
+
+```bash
+# Show rules
+nft list ruleset
+
+# Create table and chain
+nft add table ip filter
+nft add chain ip filter input { type filter hook input priority 0 \; policy drop \; }
+
+# Add rules
+nft add rule ip filter input iif lo accept
+nft add rule ip filter input ct state established,related accept
+nft add rule ip filter input tcp dport ssh accept
+nft add rule ip filter input tcp dport {80, 443} accept
+
+# Using sets (block many IPs efficiently)
+nft add set ip filter blocked_ips { type ipv4_addr \; flags interval \; }
+nft add element ip filter blocked_ips { 192.0.2.1, 198.51.100.0/24 }
+
+# Using maps (port forwarding)
+nft add table ip nat
+nft add chain ip nat prerouting { type nat hook prerouting priority -100 \; }
+nft add rule ip nat prerouting iif eth0 tcp dport 80 dnat to 192.168.1.10:8080
+
+# Atomic replacement
+nft -f /etc/nftables.conf
+```
+
+### firewalld
+
+firewalld provides a D-Bus interface to nftables/iptables on RHEL/Fedora, using zones and services.
+
+```bash
+# Check status
+firewall-cmd --state
+firewall-cmd --list-all
+
+# Zones
+firewall-cmd --get-zones
+firewall-cmd --zone=public --list-all
+
+# Add service (opens port from /etc/services)
+firewall-cmd --zone=public --add-service=http --permanent
+firewall-cmd --zone=public --add-service=https --permanent
+
+# Add port
+firewall-cmd --zone=public --add-port=8080/tcp --permanent
+
+# Rich rules (complex filtering)
+firewall-cmd --zone=public --add-rich-rule='rule service name="ssh" log level="notice" accept limit value="5/minute"'
+firewall-cmd --zone=public --add-rich-rule='rule source address="192.0.2.0/24" service name="ssh" accept'
+
+# Remove
+firewall-cmd --zone=public --remove-service=http --permanent
+
+# Reload after changes
+firewall-cmd --reload
+```
+
+### fail2ban
+
+fail2ban monitors log files for failed authentication attempts and dynamically bans offending IPs via iptables or firewalld.
+
+```bash
+# Main config
+cat /etc/fail2ban/jail.conf
+
+# Override in jail.local (don't edit jail.conf)
+cat /etc/fail2ban/jail.local
+# [DEFAULT]
+# bantime = 3600
+# findtime = 600
+# maxretry = 5
+# destemail = admin@example.com
+# sender = fail2ban@example.com
+# action = %(action_mwl)s
+
+# [sshd]
+# enabled = true
+# port = ssh
+# filter = sshd
+# logpath = /var/log/auth.log
+# maxretry = 3
+
+# Test a filter
+fail2ban-regex /var/log/auth.log /etc/fail2ban/filter.d/sshd.conf
+
+# Commands
+fail2ban-client status
+fail2ban-client status sshd
+fail2ban-client set sshd unbanip 1.2.3.4
+fail2ban-client set sshd banip 1.2.3.4
+fail2ban-client reload nginx
+```
+
+### User Limits (ulimits)
+
+```bash
+# /etc/security/limits.conf
+# format: domain type item value
+# type: soft, hard, -
+# domain: username, @groupname, *, %groupname
+
+# Example limits
+* soft nofile 65536        # Soft limit: 65536 open files
+* hard nofile 65536        # Hard limit
+root soft nofile 65536     # Root needs separate entry
+@developers soft nproc 4096
+@developers hard nproc 8192
+
+# Verify current limits
+ulimit -n          # open files
+ulimit -u          # max processes
+cat /proc/<PID>/limits
+
+# For services started by systemd, add to unit:
+# [Service]
+# LimitNOFILE=65536
+# LimitNPROC=4096
+```
+
+## Real Production Example
+
+Complete security hardening for a web server (nginx + app):
+
+```bash
+# === SELINUX ===
+# Install SELinux tools
+yum install -y setroubleshoot selinux-policy-targeted policycoreutils
+
+# Set enforcing
+setenforce 1
+sed -i 's/SELINUX=disabled/SELINUX=enforcing/' /etc/selinux/config
+
+# Allow nginx to serve custom app directory
+semanage fcontext -a -t httpd_sys_content_t "/opt/myapp(/.*)?"
+restorecon -Rv /opt/myapp
+
+# Allow nginx to connect to backend (app server)
+setsebool -P httpd_can_network_connect 1
+setsebool -P httpd_can_network_relay 1
+
+# Allow nginx to read PHP files
+setsebool -P httpd_execmem 1
+
+# Verify
+getsebool -a | grep httpd
+
+# === FIREWALL ===
+systemctl enable firewalld
+systemctl start firewalld
+
+# Default zone: drop everything incoming, allow everything outgoing
+firewall-cmd --set-default-zone=drop
+
+# Allow specific services
+firewall-cmd --zone=drop --add-service=ssh --permanent
+firewall-cmd --zone=drop --add-service=http --permanent
+firewall-cmd --zone=drop --add-service=https --permanent
+
+# Allow from specific subnet
+firewall-cmd --zone=drop --add-source=10.0.0.0/8 --permanent
+
+# Allow SSH only from admin network (rate limit)
+firewall-cmd --zone=drop --add-rich-rule='rule service name="ssh" source address="10.0.1.0/24" accept limit value="5/m"'
+
+# Reload
+firewall-cmd --reload
+
+# === FAIL2BAN ===
+cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+destemail = security@example.com
+sender = fail2ban@example.com
+action = %(action_mwl)s
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/secure
+maxretry = 3
+bantime = 86400
+
+[nginx-http-auth]
+enabled = true
+port = http,https
+filter = nginx-http-auth
+logpath = /var/log/nginx/error.log
+maxretry = 5
+
+[nginx-noscript]
+enabled = true
+port = http,https
+filter = nginx-noscript
+logpath = /var/log/nginx/access.log
+maxretry = 3
+EOF
+
+systemctl enable fail2ban
+systemctl start fail2ban
+
+# === USER LIMITS ===
+cat >> /etc/security/limits.conf <<'EOF'
+
+# Application limits
+nginx soft nofile 65536
+nginx hard nofile 65536
+appuser soft nofile 65536
+appuser hard nofile 65536
+appuser soft nproc 2048
+appuser hard nproc 4096
+
+# Core dumps off
+* hard core 0
+EOF
+
+# === SYSCTL HARDENING ===
+cat >> /etc/sysctl.d/99-security.conf <<'EOF'
+# Kernel hardening
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+kernel.panic = 10
+kernel.panic_on_oops = 10
+
+# Network hardening
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+
+# File limits
+fs.file-max = 2097152
+fs.suid_dumpable = 0
+EOF
+
+sysctl -p /etc/sysctl.d/99-security.conf
+
+# === AUDITD ===
+yum install -y audit
+systemctl enable auditd
+
+# Add audit rules
+cat >> /etc/audit/rules.d/hardening.rules <<'EOF'
+# Audit successful file opens (find who accessed what)
+-a always,exit -F arch=b64 -S open -F success=1 -F auid>=1000 -F auid!=4294967295 -k file_access
+# Audit password changes
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+# Audit SSH config changes
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+EOF
+
+auditctl -R /etc/audit/rules.d/hardening.rules
+augenrules --load
+```
+
+## CLI Examples
+
+```bash
+# SELinux
+sestatus
+getenforce
+ls -Z /var/log/nginx/
+ps auxZ
+semanage port -l | grep http_port_t
+ausearch -m AVC -ts recent | tail -20
+
+# AppArmor
+aa-status
+aa-complain /path/to/profile
+apparmor_parser -r /etc/apparmor.d/*
+
+# iptables
+iptables -L -n -v
+iptables -t nat -L -n
+iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+iptables -I INPUT 1 -s 1.2.3.4 -j DROP
+iptables -D INPUT -p tcp --dport 80 -j ACCEPT
+
+# nftables
+nft list ruleset
+nft add rule ip filter input ct state established,related accept
+
+# firewalld
+firewall-cmd --list-all
+firewall-cmd --add-service=http --permanent
+firewall-cmd --list-rich-rules
+
+# fail2ban
+fail2ban-client status
+fail2ban-client set sshd unbanip 1.2.3.4
+fail2ban-regex /var/log/auth.log /etc/fail2ban/filter.d/sshd.conf
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `sestatus` | SELinux status |
+| `getenforce` | Current mode |
+| `semanage port -l` | Port to SELinux type mappings |
+| `setsebool -P` | Set boolean persistently |
+| `audit2allow` | Generate SELinux policy from denials |
+| `aa-status` | AppArmor profile status |
+| `iptables -L -n -v` | List all iptables rules |
+| `nft list ruleset` | List all nftables rules |
+| `firewall-cmd --list-all` | List firewalld config |
+| `fail2ban-client status` | Fail2ban jail status |
+| `ausearch` | Search audit logs |
+| `aureport` | Audit log summary |
+
+## Monitoring
+
+```bash
+# Monitor SELinux denials (watch for patterns)
+ausearch -m AVC -ts recent | aureport -a
+
+# Auditd: check login attempts
+aureport -l
+
+# Monitor failed SSH attempts (before fail2ban acts)
+grep "Failed password" /var/log/auth.log | awk '{print $11}' | sort | uniq -c | sort -rn | head -10
+
+# Audit log integrity check (AIDE)
+aide --check
+
+# Check firewall drops (iptables LOG before DROP)
+grep "IPTables-DROP" /var/log/kern.log | tail -50
+
+# Monitoring script:
+# if fail2ban-client status sshd | grep -q "0.0.0.0"; then
+#   echo "SSH ban list is empty — unusual"
+# fi
+```
+
+## Security
+
+**Defense in depth principle:**
+Never rely on a single control. Layers:
+1. Network firewall (only expose what's needed)
+2. Application-level authentication
+3. fail2ban (dynamic IP blocking)
+4. SELinux/AppArmor (confine the app)
+5. File permissions (least privilege)
+6. Audit logging (detect what happened)
+
+**Never disable SELinux permanently:**
+```bash
+# If you must disable for troubleshooting:
+# Temporarily: setenforce 0
+# After: setenforce 1
+# Then use audit2allow to build proper policy
+# NEVER leave it disabled in production
+```
+
+**Password policies:**
+```bash
+# /etc/login.defs
+PASS_MIN_LEN 12
+PASS_MAX_DAYS 90
+PASS_MIN_DAYS 1
+PASS_WARN_AGE 14
+
+# /etc/pam.d/password-auth or system-auth (RHEL)
+# password required pam_pwquality.so try_first_pass local_users_only retry=3
+# password requisite pam_pwhistory.so remember=5
+# password sufficient pam_unix.so sha512 shadow nullok try_first_pass use_authtok
+# password sufficient pam_permit.so
+```
+
+## Troubleshooting
+
+**SELinux blocking legitimate access:**
+1. Check for denial: `ausearch -m AVC -ts recent`
+2. See what was denied: `ausearch -m AVC -ts recent | audit2why`
+3. Create policy: `audit2allow -a -M myapp < /var/log/audit/audit.log`
+4. Load: `semodule -i myapp.pp`
+5. Test in permissive first: `semanage permissive -a myapp_t`
+
+**firewalld blocking expected traffic:**
+```bash
+# Check if it IS firewalld blocking
+firewall-cmd --query端口=8080/tcp
+
+# Check direct rules (bypass firewalld)
+iptables -L INPUT -n -v | grep 8080
+
+# Check if service is running
+systemctl status firewalld
+# Temporarily test (DANGEROUS in production):
+# firewall-cmd --panic-on  # ONLY if you have direct access
+```
+
+**fail2ban not banning:**
+```bash
+# Is fail2ban running?
+systemctl status fail2ban
+
+# Check jail status
+fail2ban-client status
+fail2ban-client status sshd
+
+# Test filter regex
+fail2ban-regex /var/log/auth.log /etc/fail2ban/filter.d/sshd.conf
+
+# Check iptables chains
+iptables -L f2b-sshd -n -v
+```
+
+## Interview Questions
+
+1. **What is the difference between SELinux and AppArmor, and when would you choose one over the other?**
+
+Both implement MAC, but SELinux uses security labels (type enforcement) on all objects, while AppArmor uses path-based profiles. SELinux is more granular and expressive but more complex to manage. AppArmor is simpler, easier to learn, but less powerful. SELinux is the default on RHEL/Fedora/Red Hat systems; AppArmor is the default on Debian/Ubuntu. Choose SELinux for high-security environments needing fine-grained control; choose AppArmor for environments needing easier onboarding.
+
+2. **How does connection tracking (conntrack) work, and what are its limitations?**
+
+Conntrack maintains a table of all TCP connections and their state (NEW, ESTABLISHED, RELATED, INVALID). When a packet arrives, the kernel checks the table. For ESTABLISHED/RELATED connections, the packet is allowed automatically without firewall rule evaluation — this is stateful inspection. Limitations: (1) Hardware limitations — high-throughput flows can saturate conntrack table; (2) NAT interactions — some NAT scenarios confuse conntrack; (3) Complex protocols like FTP, SIP, PPTP require helper modules; (4) Memory overhead — each entry consumes ~1KB; (5) Cannot track all protocols (ICMP is partially tracked).
+
+3. **What is the difference between iptables and nftables?**
+
+iptables operates on individual tables with separate rule sets for filter/nat/mangle, with up to 5 chains per table. Each rule is evaluated sequentially, and each table is independent. nftables uses a single command (`nft`) for all tables and protocols, with atomic rule replacement, named sets and maps for efficient bulk rule matching, better performance, and a cleaner syntax. nftables is a complete replacement that deprecates iptables, ip6tables, arptables, and ebtables. Use nftables for new deployments; iptables for existing infrastructure with well-understood configurations.
+
+4. **You discover a compromised server. What are your first 5 steps?**
+
+(1) Isolate: disconnect from network (`iptables -I INPUT -s 0/0 -j DROP` or unplug) to prevent lateral movement and further data exfiltration. (2) Preserve evidence: image the disk (`dd if=/dev/sda of=/backup/disk.img`), preserve memory if possible, snapshot VM. (3) Identify scope: check `ss -tunapl` for unusual connections, `ps aux` for suspicious processes, `last` and `w` for active sessions, `/proc/*/fd` for suspicious file activity, `ausearch` for privilege escalations. (4) Kill malicious processes: find by name/behavior, kill with `pkill -9`. (5) Begin incident response procedure: notify security team, do not wipe or reimage until forensics is complete, check logs for how attacker gained access, patch the vector.
+
+5. **What is a seccomp profile, and how does it differ from SELinux/AppArmor?**
+
+seccomp (secure computing) restricts the syscalls a process can make. A seccomp profile is a whitelist or blacklist of syscalls. Unlike SELinux/AppArmor which control access between objects (which file can nginx read), seccomp controls what kernel operations are available at all. seccomp-bpf (the extended version) allows fine-grained syscall filtering. Docker uses seccomp profiles to restrict syscalls inside containers (e.g., disallow `mount`). AppArmor/SELinux are broader — they can express relationships and types; seccomp is narrower but faster. A process could still use allowed syscalls to do harmful things within seccomp but AppArmor would restrict what those syscalls can operate on.
+
+## Cheat Sheet
+
+```bash
+# SELinux
+sestatus; getenforce
+ls -Z /path/to/file
+ps auxZ | grep nginx
+setsebool -P httpd_can_network_connect 1
+semanage port -a -t http_port_t -p tcp 8080
+ausearch -m AVC -ts recent
+
+# AppArmor
+aa-status
+aa-complain /path/to/profile
+apparmor_parser -r /etc/apparmor.d/profile
+
+# iptables
+iptables -L -n -v
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# nftables
+nft list ruleset
+nft add rule ip filter input ct state established,related accept
+
+# firewalld
+firewall-cmd --list-all
+firewall-cmd --add-service=http --permanent
+
+# fail2ban
+fail2ban-client status
+fail2ban-regex /var/log/auth.log /etc/fail2ban/filter.d/sshd.conf
+
+# auditd
+ausearch -m AVC -ts recent | audit2why
+aureport -l
+```
+
+## Related Topics
+
+- [Permissions](./permissions) — File permission basics
+- [Users and Groups](./users-and-groups) — User management and access control
+- [SSH](./ssh) — Secure remote access
+- [Containers](./containers) — Container security
+- [Monitoring](./monitoring) — Audit logging and alerting

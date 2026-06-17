@@ -1,0 +1,723 @@
+---
+sidebar_position: 3
+title: Networking Labs
+description: Hands-on networking configuration and troubleshooting labs
+---
+
+# Networking Labs
+
+## Overview
+
+Build practical networking skills through hands-on labs covering network configuration, troubleshooting, DNS, firewall management, and secure remote access.
+
+## Prerequisites
+
+- Basic Linux command line knowledge
+- Root/sudo access for network configuration
+- Access to multiple VMs or cloud instances (recommended for multi-host labs)
+
+### Required Tools
+
+```bash
+# Verify networking tools are available
+which ip ss nmcli systemctl
+ip link show
+ip addr show
+ss -tlnp
+```
+
+---
+
+## Lab 1: Network Interface Configuration
+
+**Objective**: Configure network interfaces, IP addressing, and routing
+**Estimated Time**: 25 minutes
+**Prerequisites**: Root/sudo access, Linux system with network interfaces
+
+### Step-by-Step
+
+#### 1. View Current Network Configuration
+
+```bash
+# List all network interfaces
+ip link show
+ip -br link show
+
+# Show IP addresses
+ip addr show
+ip -4 addr show
+
+# View routing table
+ip route show
+ip route show table all
+
+# Check DNS configuration
+cat /etc/resolv.conf
+
+# View hostname
+hostname
+cat /etc/hostname
+```
+
+#### 2. Configure Static IP Address
+
+```bash
+# Using ip commands (temporary - survives reboot on most systems)
+sudo ip addr add 192.168.1.100/24 dev eth0
+sudo ip addr del 192.168.1.100/24 dev eth0
+
+# View the change
+ip addr show eth0
+
+# Configure persistent static IP (Debian/Ubuntu)
+sudo tee /etc/network/interfaces.d/eth0.cfg << 'EOF'
+auto eth0
+iface eth0 inet static
+    address 192.168.1.100
+    netmask 255.255.255.0
+    gateway 192.168.1.1
+    dns-nameservers 8.8.8.8 8.8.4.4
+EOF
+
+sudo systemctl restart networking
+```
+
+#### 3. Configure via NetworkManager (RHEL/CentOS/Fedora)
+
+```bash
+# List connections
+nmcli connection show
+
+# Create static IP connection
+sudo nmcli connection add con-name "static-eth0" ifname eth0 type ethernet \
+    ip4 192.168.1.100/24 \
+    gw4 192.168.1.1
+
+# Set DNS servers
+sudo nmcli connection modify static-eth0 ipv4.dns "8.8.8.8,8.8.4.4"
+
+# Bring up the connection
+sudo nmcli connection up static-eth0
+
+# Verify
+ip addr show eth0
+nmcli device show eth0
+```
+
+### Validation
+
+```bash
+# Test connectivity
+ping -c 4 8.8.8.8
+ping -c 4 google.com
+
+# Check routing
+ip route show
+traceroute google.com  # or: mtr google.com
+
+# Verify DNS resolution
+nslookup google.com
+dig google.com
+```
+
+### Cleanup
+
+```bash
+# Remove static IP configuration
+sudo nmcli connection delete static-eth0
+sudo ip addr del 192.168.1.100/24 dev eth0 2>/dev/null
+
+# Restore DHCP (RHEL/CentOS)
+sudo nmcli connection add con-name "dhcp-eth0" ifname eth0 type ethernet
+sudo nmcli connection up dhcp-eth0
+```
+
+---
+
+## Lab 2: DNS Configuration and Troubleshooting
+
+**Objective**: Configure DNS, troubleshoot resolution issues, and understand DNS records
+**Estimated Time**: 30 minutes
+**Prerequisites**: sudo access, internet connectivity
+
+### Step-by-Step
+
+#### 1. DNS Resolution Commands
+
+```bash
+# Query DNS with dig
+dig +short google.com A
+dig +short google.com AAAA
+dig +short google.com MX
+dig +short google.com NS
+
+# Query specific DNS server
+dig @8.8.8.8 google.com A
+dig @1.1.1.1 google.com A
+
+# Reverse DNS lookup
+dig +short -x 8.8.8.8
+
+# Using nslookup
+nslookup google.com
+nslookup -type=MX google.com 8.8.8.8
+
+# Using host
+host google.com
+host -a google.com
+```
+
+#### 2. Configure Custom DNS Servers
+
+```bash
+# View current DNS configuration
+systemd-resolve --status
+cat /etc/resolv.conf
+
+# Add DNS server temporarily
+sudo tee -a /etc/resolv.conf << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+
+# Configure system-wide DNS (systemd-resolved)
+sudo tee /etc/systemd/resolved.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+DNSOverTLS=no
+Cache=yes
+EOF
+
+sudo systemctl restart systemd-resolved
+```
+
+#### 3. Configure /etc/hosts for Local Resolution
+
+```bash
+# Add local host entries
+sudo tee /etc/hosts << 'EOF'
+127.0.0.1 localhost
+127.0.1.1 myhostname
+
+# Application servers
+192.168.1.10 app-server.local
+192.168.1.11 db-server.local
+192.168.1.12 cache-server.local
+
+# Aliases
+app-server.local webapp
+EOF
+
+# Test local resolution
+ping -c 2 app-server.local
+getent hosts app-server.local
+```
+
+#### 4. Troubleshooting DNS Issues
+
+```bash
+# Check if DNS is responding
+dig +tcp google.com
+
+# Test with trace (shows full DNS resolution path)
+dig +trace google.com
+
+# Check negative caching
+dig +nocookie google.com
+dig +recurse google.com
+
+# Flush DNS cache (varies by system)
+# systemd-resolved:
+sudo systemd-resolve --flush-caches
+# nscd:
+sudo systemctl restart nscd
+# BIND:
+sudo rndc flush
+
+# Check DNS search domains
+echo $SEARCHDOMAIN
+ip route show | grep default
+```
+
+### Validation
+
+```bash
+# Comprehensive DNS test
+echo "=== System DNS ===" && cat /etc/resolv.conf
+echo "=== DNS Tests ===" && dig +short google.com && dig +short github.com
+echo "=== Local Hosts ===" && getent hosts app-server.local
+echo "=== Reverse DNS ===" && dig +short -x 8.8.8.8
+```
+
+### Cleanup
+
+```bash
+# Remove custom hosts entries (keep defaults)
+sudo sed -i '/app-server.local/d' /etc/hosts
+sudo sed -i '/db-server.local/d' /etc/hosts
+sudo sed -i '/cache-server.local/d' /etc/hosts
+sudo sed -i '/webapp/d' /etc/hosts
+
+# Restore original resolv.conf
+sudo rm /etc/resolv.conf
+sudo ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+```
+
+---
+
+## Lab 3: Firewall Configuration with iptables/nftables
+
+**Objective**: Configure firewall rules, implement port filtering, and secure services
+**Estimated Time**: 35 minutes
+**Prerequisites**: sudo access, SSH access (be careful not to lock yourself out)
+
+### Step-by-Step
+
+#### 1. Check Current Firewall Status
+
+```bash
+# Check if firewall is active
+sudo iptables -L -n -v
+sudo iptables -L INPUT -n -v
+
+# Check nftables
+sudo nft list ruleset
+
+# Check UFW status (Ubuntu)
+sudo ufw status verbose
+
+# Check firewalld status (RHEL/CentOS)
+sudo firewall-cmd --state
+sudo firewall-cmd --list-all
+```
+
+#### 2. Basic iptables Rules
+
+```bash
+# View current rules with line numbers
+sudo iptables -L INPUT --line-numbers -n
+
+# Allow established connections
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Allow loopback
+sudo iptables -A INPUT -i lo -j ACCEPT
+
+# Allow SSH (port 22)
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Allow HTTP/HTTPS
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+
+# Drop all other incoming traffic
+sudo iptables -A INPUT -j DROP
+
+# Save rules
+sudo iptables-save > /etc/iptables/rules.v4
+```
+
+#### 3. Common Firewall Scenarios
+
+```bash
+# Allow specific IP access to SSH
+sudo iptables -A INPUT -p tcp -s 10.0.0.0/24 --dport 22 -j ACCEPT
+
+# Allow port range (e.g., for FTP)
+sudo iptables -A INPUT -p tcp --dport 50000:51000 -j ACCEPT
+
+# Rate limit connections
+sudo iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set
+sudo iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 -j DROP
+
+# Log dropped packets (before the DROP rule)
+sudo iptables -A INPUT -j LOG --log-prefix "IPTABLES-DROP: " --log-level 4
+```
+
+#### 4. Using UFW (Ubuntu/Debian)
+
+```bash
+# Enable UFW
+sudo ufw enable
+
+# Allow SSH
+sudo ufw allow ssh
+sudo ufw allow 22/tcp
+
+# Allow specific application profiles
+sudo ufw app list
+sudo ufw allow 'Nginx Full'
+
+# Allow by IP address
+sudo ufw allow from 10.0.0.0/24
+
+# Allow port with specific source
+sudo ufw allow from 10.0.0.0/24 to any port 3306
+
+# Deny connections
+sudo ufw deny from 192.168.1.100
+
+# Delete rules
+sudo ufw status numbered
+sudo ufw delete 3
+
+# View logs
+sudo tail -f /var/log/ufw.log
+```
+
+### Validation
+
+```bash
+# Test firewall rules
+# From same machine:
+curl -I http://localhost
+ssh -o ConnectTimeout=5 127.0.0.1
+
+# From remote machine:
+nmap -sS -p 22,80,443 <your-server-ip>
+
+# Check connection tracking
+sudo conntrack -L
+sudo cat /proc/net/nf_conntrack
+```
+
+### Cleanup
+
+```bash
+# Flush all iptables rules
+sudo iptables -F
+sudo iptables -X
+sudo iptables -t nat -F
+sudo iptables -t nat -X
+
+# Set default policies
+sudo iptables -P INPUT ACCEPT
+sudo iptables -P FORWARD ACCEPT
+sudo iptables -P OUTPUT ACCEPT
+
+# Reset UFW
+sudo ufw disable
+sudo ufw reset
+```
+
+---
+
+## Lab 4: SSH Hardening and Key Management
+
+**Objective**: Configure secure SSH access, key-based authentication, and security hardening
+**Estimated Time**: 30 minutes
+**Prerequisites**: Two Linux systems or cloud instances, sudo access on server
+
+### Step-by-Step
+
+#### 1. SSH Key Generation and Deployment
+
+```bash
+# On CLIENT: Generate SSH key pair
+ssh-keygen -t ed25519 -C "devops-workstation"
+# Press Enter to accept default location
+# Enter passphrase (recommended for production)
+
+# Or generate RSA key
+ssh-keygen -t rsa -b 4096 -C "devops-workstation"
+
+# View generated keys
+ls -la ~/.ssh/
+cat ~/.ssh/id_ed25519.pub
+
+# Copy key to server
+ssh-copy-id -i ~/.ssh/id_ed25519.pub user@server-ip
+# Or manually:
+cat ~/.ssh/id_ed25519.pub | ssh user@server-ip "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+```
+
+#### 2. SSH Server Hardening
+
+```bash
+# On SERVER: Edit SSH config
+sudo tee /etc/ssh/sshd_config.d/hardening.conf << 'EOF'
+# Disable root login
+PermitRootLogin no
+
+# Disable password authentication (use keys only)
+PasswordAuthentication no
+PermitEmptyPasswords no
+
+# Use only strong ciphers
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+
+# Disable unused authentication methods
+ChallengeResponseAuthentication no
+KerberosAuthentication no
+GSSAPIAuthentication no
+
+# Connection settings
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 60
+
+# Limit connections (prevent brute force)
+MaxStartups 10:30:100
+
+# Log level
+LogLevel VERBOSE
+EOF
+
+# Test configuration
+sudo sshd -t
+
+# Restart SSH service
+sudo systemctl restart sshd
+```
+
+#### 3. SSH Config for Easy Access
+
+```bash
+# On CLIENT: Configure SSH config
+tee ~/.ssh/config << 'EOF'
+# Default settings for all hosts
+Host *
+    ServerAliveInterval 300
+    ServerAliveCountMax 2
+    AddKeysToAgent yes
+    IdentityFile ~/.ssh/id_ed25519
+
+# Production servers
+Host prod-*
+    User ubuntu
+    IdentityFile ~/.ssh/prod_key
+
+# Staging servers
+Host stage-*
+    User ubuntu
+    IdentityFile ~/.ssh/stage_key
+
+# Jump host configuration
+Host internal-app
+    User devops
+    ProxyJump bastion-host
+    ForwardAgent yes
+EOF
+
+chmod 600 ~/.ssh/config
+
+# Test connection
+ssh -v prod-server
+```
+
+#### 4. SSH Tunneling
+
+```bash
+# Local port forwarding (access remote service via local port)
+ssh -L 8080:localhost:80 user@webserver
+
+# Remote port forwarding (expose local service to remote)
+ssh -R 8080:localhost:80 user@bastion
+
+# Dynamic SOCKS proxy
+ssh -D 1080 user@bastion
+# Then configure browser to use SOCKS proxy localhost:1080
+
+# Jump through bastion host
+ssh -J bastion-user@bastion-ip internal-server-ip
+```
+
+### Validation
+
+```bash
+# Test key-based login (should NOT ask for password)
+ssh user@server-ip
+
+# Verify SSH config
+ssh -G user@server-ip | grep -E "passwordauthentication|pubkeyauthentication"
+
+# Check failed login attempts
+sudo grep "Failed password" /var/log/auth.log | tail -10
+
+# Check successful logins
+sudo lastlog | grep devops
+sudo grep "Accepted publickey" /var/log/auth.log | tail -10
+```
+
+### Cleanup
+
+```bash
+# On SERVER: Restore default SSH config
+sudo rm /etc/ssh/sshd_config.d/hardening.conf
+sudo systemctl restart sshd
+
+# On CLIENT: Remove SSH config entries
+# (edit ~/.ssh/config to remove entries)
+```
+
+---
+
+## Lab 5: Network Troubleshooting
+
+**Objective**: Diagnose and fix common network connectivity issues
+**Estimated Time**: 35 minutes
+**Prerequisites**: sudo access, network connectivity issues to diagnose
+
+### Step-by-Step
+
+#### 1. Basic Connectivity Tests
+
+```bash
+# Test reachability
+ping -c 4 8.8.8.8
+ping -c 4 google.com
+
+# Trace route to destination
+traceroute google.com     # Debian/Ubuntu
+traceroute -I google.com  # ICMP mode
+tracepath google.com
+
+# Use mtr for continuous trace
+mtr google.com
+mtr --report google.com  # one report then exit
+```
+
+#### 2. Port and Service Testing
+
+```bash
+# Test if port is open
+nc -zv google.com 443
+nc -zv example.com 80
+telnet google.com 443
+
+# Full port scan (install nmap)
+sudo apt-get install -y nmap  # Debian/Ubuntu
+sudo yum install -y nmap      # RHEL/CentOS
+
+# Scan common ports
+nmap -sT localhost
+nmap -sT -F server-ip
+
+# Service version detection
+nmap -sV localhost
+
+# Scan for open ports on remote server
+nmap -sT -p 22,80,443,3306,5432 server-ip
+```
+
+#### 3. Interface and Route Diagnostics
+
+```bash
+# Monitor network traffic
+watch -n 1 'ip -s link show'
+
+# Capture packets with tcpdump
+sudo tcpdump -i eth0 -c 10
+sudo tcpdump -i eth0 host 8.8.8.8 -n
+sudo tcpdump -i eth0 port 80 -v
+
+# Capture and save to file
+sudo tcpdump -i eth0 -w /tmp/capture.pcap
+# Stop with Ctrl+C
+
+# Read capture file
+sudo tcpdump -r /tmp/capture.pcap
+sudo tcpdump -r /tmp/capture.pcap | grep -i "http"
+
+# Analyze with tshark (CLI Wireshark)
+sudo tshark -r /tmp/capture.pcap -Y "http.request" -T fields -e http.request.uri
+```
+
+#### 4. DNS Troubleshooting
+
+```bash
+# Diagnose DNS resolution
+dig google.com +trace
+nslookup google.com 8.8.8.8
+
+# Check DNS propagation (for web domains)
+dig +short NS google.com
+dig +short +trace yourdomain.com
+
+# Test specific DNS server
+dig @8.8.8.8 google.com
+dig @1.1.1.1 google.com
+
+# Check for DNS leaks
+curl -s "https://dnsleaktest.com"
+```
+
+#### 5. Bandwidth and Speed Tests
+
+```bash
+# Test bandwidth (server-side)
+# Install iperf3
+sudo apt-get install -y iperf3
+
+# Start server
+iperf3 -s
+
+# Run client test (on another machine)
+iperf3 -c server-ip -R  # reverse mode (download test)
+iperf3 -c server-ip     # normal mode (upload test)
+
+# Use speedtest CLI
+sudo apt-get install -y speedtest-cli
+speedtest-cli
+```
+
+### Validation
+
+```bash
+# Create troubleshooting script
+cat > network_diag.sh << 'EOF'
+#!/bin/bash
+echo "=== Network Diagnostics ==="
+
+echo -e "\n--- Interfaces ---"
+ip addr show | grep -E "inet|state"
+
+echo -e "\n--- Routing ---"
+ip route show
+
+echo -e "\n--- DNS ---"
+cat /etc/resolv.conf
+
+echo -e "\n--- Connectivity ---"
+ping -c 2 8.8.8.8 && echo "Internet: OK" || echo "Internet: FAILED"
+
+echo -e "\n--- Open Ports ---"
+ss -tlnp | head -20
+EOF
+
+chmod +x network_diag.sh
+./network_diag.sh
+```
+
+### Cleanup
+
+```bash
+# Remove temporary files
+rm -f /tmp/capture.pcap
+rm -f network_diag.sh
+
+# Stop iperf3 server (if started)
+pkill iperf3
+```
+
+---
+
+## Interview Prep Connections
+
+Review these common networking interview topics:
+
+- [DNS Explained](/docs/networking/dns)
+- [TCP/IP Fundamentals](/docs/networking/tcp-ip)
+- [Firewall Configuration](/docs/security/firewalls)
+
+Common interview questions:
+- "How would you troubleshoot a server that can't reach the internet?"
+- "Explain the difference between TCP and UDP"
+- "How does DNS resolution work?"
+- "Walk me through configuring a firewall for a web server"
+
+## Related Topics
+
+- [SSL/TLS Certificates](/docs/security/tls)
+- [VPN Configuration](/docs/networking/vpn)
+- [Load Balancing](/docs/networking/load-balancing)

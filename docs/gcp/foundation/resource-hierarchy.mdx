@@ -1,0 +1,822 @@
+# Resource Hierarchy
+
+## Overview
+
+GCP's Resource Hierarchy is the logical structure that organizes all cloud resources from the Organization node down to individual resources. Understanding this hierarchy is fundamental to GCP architecture because it determines how IAM policies, organization policies, and billing are inherited and applied. The hierarchy follows a strict parent-child relationship where resources at higher levels can impose policies on resources below them, but not vice versa.
+
+The hierarchy has four main levels: Organization, Folders, Projects, and Resources. Each GCP resource must belong to exactly one parent at the level immediately above it—resources belong to projects, projects belong to folders (or directly to the organization), and folders can belong to the organization or other folders. This structure mirrors how organizations are typically structured and enables effective governance at scale.
+
+The Resource Hierarchy is the foundation for Google Cloud's "context-aware" access control model. Rather than managing permissions on every individual resource, you can apply policies at higher levels and have them cascade down. This reduces administrative overhead while ensuring consistent security postures across your entire GCP environment.
+
+## When To Use
+
+- **Planning GCP organization structure**: Before creating projects and resources
+- **Designing IAM strategy**: Understanding how policies inherit
+- **Applying organization policies**: Knowing where to set constraints
+- **Planning billing structure**: Understanding cost allocation through the hierarchy
+- **Auditing access**: Understanding who has access to what and where
+- **Designing Shared VPC**: Planning host and service project relationships
+
+## When NOT To Use
+
+- **Single-project simple deployments**: The hierarchy exists but you don't need to leverage it fully
+- **Personal projects**: Personal projects don't need organizational hierarchy
+- **Learning/experimentation**: Focus on individual service features first
+
+## Architecture
+
+**Hierarchy Diagram:**
+```
+Google Cloud Organization (organization)
+├── Organization Policies (org-wide constraints)
+├── Folders (logical grouping containers)
+│   ├── Production Folder
+│   │   ├── Project: App Production
+│   │   │   ├── GKE Cluster (resource)
+│   │   │   ├── Cloud SQL (resource)
+│   │   │   └── Cloud Storage Bucket (resource)
+│   │   └── Project: API Production
+│   │       └── Compute Instances (resource)
+│   ├── Staging Folder
+│   │   └── Project: App Staging
+│   └── Development Folder
+│       └── Project: App Dev
+└── Direct Projects (optional, not under folders)
+```
+
+**Hierarchy Levels:**
+
+| Level | Purpose | Examples |
+|-------|---------|----------|
+| Organization | Root entity representing company | google.com org |
+| Folders | Logical grouping by team/environment | Production, Teams |
+| Projects | Billing/IAM boundary, resource container | app-prod, api-staging |
+| Resources | Actual compute/storage/network resources | VMs, buckets, databases |
+
+**Policy Inheritance Flow:**
+
+```
+Organization Policy: Deny serial ports everywhere
+        ↓ (inherits)
+Folder Policy: Allow serial ports in Development
+        ↓ (inherits to children)
+Project: Inherits from Folder (allows serial ports)
+        ↓ (applies to)
+Resources: Can use serial ports
+```
+
+**Key Principles:**
+1. **Top-down inheritance**: Policies flow from parent to child
+2. **Child restriction only**: Lower levels can only restrict further, not expand
+3. **Union of permissions**: Effective permissions are the union of all granting policies
+4. **Explicit deny wins**: Deny policies override allow policies
+5. **Least privilege**: Grant minimum necessary permissions at appropriate level
+
+## Core Concepts
+
+### Resource Types
+
+**Organization Resource:**
+```bash
+# Get organization info
+gcloud organizations list
+gcloud organizations describe 123456789012
+```
+
+**Folder Resource:**
+```bash
+# List folders
+gcloud resource-manager folders list --organization=123456789012
+# Create folders
+gcloud resource-manager folders create "folders/team-name" \
+    --organization=123456789012 \
+    --display-name="Team Name"
+```
+
+**Project Resource:**
+```bash
+# List projects
+gcloud projects list
+# Create project
+gcloud projects create my-project --name="My Project"
+# Move project between folders
+gcloud projects move my-project --folder=folders/FOLDER_ID
+```
+
+**Regional/Zonal Resources:**
+```bash
+# Instance in us-central1-a zone
+gcloud compute instances list --zone=us-central1-a
+# Cloud SQL in us-central1 region
+gcloud sql instances list --region=us-central1
+```
+
+### IAM Policy Inheritance
+
+**At Organization Level:**
+```bash
+gcloud organizations get-iam-policy 123456789012
+```
+
+**At Folder Level:**
+```bash
+gcloud resource-manager folders get-iam-policy folders/FOLDER_ID
+```
+
+**At Project Level:**
+```bash
+gcloud projects get-iam-policy my-project
+```
+
+**At Resource Level:**
+```bash
+gcloud compute instances get-iam-policy instance-id --zone=us-central1-a
+```
+
+### Effective Permissions
+
+```bash
+# Test effective permissions
+gcloud alpha iap test-iam-permissions \
+    --resource=//compute.googleapis.com/projects/my-project/zones/us-central1-a/instances/instance-id \
+    --permissions=compute.instances.start,compute.instances.stop
+
+# Get effective policy
+gcloud resource-manager folders get-iam-policy folders/FOLDER_ID --effective-policy
+```
+
+### Resource Manager API
+
+```bash
+# Search resources across hierarchy
+gcloud asset search-all-resources \
+    --scope=organizations/123456789012 \
+    --asset-types=compute.googleapis.com.Instance
+
+# Search IAM policies
+gcloud asset search-all-iam-policies \
+    --scope=organizations/123456789012 \
+    --query="policy:specific-role"
+```
+
+### Quotas in Hierarchy
+
+| Level | Quota Scope | Examples |
+|-------|-------------|----------|
+| Organization | Global, shared across org | Max folders, custom roles |
+| Folder | Aggregated from children | Folder admin access |
+| Project | Per-project limits | CPUs, IPs, instances |
+| Resource | Per-resource limits | Instance sizes, disk sizes |
+
+### Key Gotchas
+
+- **Organization node requires Google Workspace or Cloud Identity**—not available for personal Gmail accounts
+- **IAM policies are a union, not intersection**—if any policy grants access, access is allowed (unless denied)
+- **Org policies cascade down** but can only restrict, not expand permissions
+- **Deleting a parent resource requires deleting/moving all children first**
+- **Project can't be moved to folder in different organization**—organizations are top-level
+- **Folder moves affect ALL children**—can take 30+ minutes for large hierarchies
+- **Default VPC exists at project level** but subnets are regional
+
+## Real Production Example
+
+Complete resource hierarchy setup:
+
+```bash
+# 1. Create organization structure
+# Organization already exists; get the ID
+ORG_ID=$(gcloud organizations list --format="value(name)" | head -1)
+echo "Organization ID: $ORG_ID"
+
+# 2. Create folder hierarchy
+# Environment folders
+gcloud resource-manager folders create "folders/environments" \
+    --organization=$ORG_ID --display-name="Environments"
+
+ENV_ID=$(gcloud resource-manager folders list \
+    --organization=$ORG_ID --format="value(name)" | grep environments | head -1)
+
+gcloud resource-manager folders create "folders/environments/production" \
+    --organization=$ORG_ID --display-name="Production"
+
+gcloud resource-manager folders create "folders/environments/staging" \
+    --organization=$ORG_ID --display-name="Staging"
+
+gcloud resource-manager folders create "folders/environments/development" \
+    --organization=$ORG_ID --display-name="Development"
+
+# Team folders
+gcloud resource-manager folders create "folders/teams" \
+    --organization=$ORG_ID --display-name="Teams"
+
+TEAMS_ID=$(gcloud resource-manager folders list \
+    --organization=$ORG_ID --format="value(name)" | grep teams | head -1)
+
+gcloud resource-manager folders create "folders/teams/platform" \
+    --organization=$ORG_ID --display-name="Platform Team"
+
+gcloud resource-manager folders create "folders/teams/data" \
+    --organization=$ORG_ID --display-name="Data Team"
+
+# 3. Apply organization-level policies
+# Disable serial port access org-wide
+cat > disable-serial-port.yaml << 'EOF'
+name: organizations/$ORG_ID/policies/compute.disableSerialPortAccess
+spec:
+  rules:
+  - enforce: false
+EOF
+gcloud org-policies set-policy disable-serial-port.yaml \
+    --organization=$ORG_ID
+
+# Require OS Login
+cat > require-os-login.yaml << 'EOF'
+name: organizations/$ORG_ID/policies/compute.requireOsLogin
+spec:
+  rules:
+  - enforce: true
+EOF
+gcloud org-policies set-policy require-os-login.yaml \
+    --organization=$ORG_ID
+
+# 4. Set folder-level IAM
+PLATFORM_ID=$(gcloud resource-manager folders list \
+    --organization=$ORG_ID --format="value(name)" | grep platform | head -1)
+
+gcloud resource-manager folders add-iam-policy-binding $PLATFORM_ID \
+    --member="group:platform@company.com" \
+    --role="roles/resourcemanager.folderAdmin"
+
+# 5. Create projects in folders
+PROD_ID=$(gcloud resource-manager folders list \
+    --organization=$ORG_ID --format="value(name)" | grep "environments/production\"" | head -1)
+
+gcloud projects create my-app-prod \
+    --name="My App Production" \
+    --folder=$PROD_ID
+
+gcloud projects create my-api-prod \
+    --name="API Production" \
+    --folder=$PROD_ID
+
+# 6. Apply project-level IAM
+gcloud projects add-iam-policy-binding my-app-prod \
+    --member="group:app-team@company.com" \
+    --role="roles/editor"
+
+gcloud projects add-iam-policy-binding my-app-prod \
+    --member="serviceAccount:ci@my-project.iam.gserviceaccount.com" \
+    --role="roles/container.developer"
+```
+
+```hcl
+# Terraform: Complete resource hierarchy
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "organization_id" {
+  type = string
+}
+
+variable "billing_account" {
+  type = string
+}
+
+# ========== ORGANIZATION POLICIES ==========
+resource "google_org_policy_policy" "disable_serial_port" {
+  org_id = var.organization_id
+  name   = "organizations/${var.organization_id}/policies/compute.disableSerialPortAccess"
+  policy {
+    boolean_policy {
+      enforced = false
+    }
+  }
+}
+
+resource "google_org_policy_policy" "require_os_login" {
+  org_id = var.organization_id
+  name   = "organizations/${var.organization_id}/policies/compute.requireOsLogin"
+  policy {
+    enforce = true
+  }
+}
+
+# ========== FOLDERS ==========
+resource "google_folder" "environments" {
+  display_name = "Environments"
+  parent       = "organizations/${var.organization_id}"
+}
+
+resource "google_folder" "production" {
+  display_name = "Production"
+  parent       = google_folder.environments.id
+}
+
+resource "google_folder" "staging" {
+  display_name = "Staging"
+  parent       = google_folder.environments.id
+}
+
+resource "google_folder" "development" {
+  display_name = "Development"
+  parent       = google_folder.environments.id
+}
+
+resource "google_folder" "teams" {
+  display_name = "Teams"
+  parent       = "organizations/${var.organization_id}"
+}
+
+resource "google_folder" "platform_team" {
+  display_name = "Platform Team"
+  parent       = google_folder.teams.id
+}
+
+# ========== FOLDER IAM ==========
+resource "google_folder_iam_member" "platform_admin" {
+  folder = google_folder.platform_team.id
+  role   = "roles/resourcemanager.folderAdmin"
+  member = "group:platform@company.com"
+}
+
+resource "google_folder_iam_member" "all_viewer" {
+  folder = google_folder.environments.id
+  role   = "roles/viewer"
+  member = "group:all-employees@company.com"
+}
+
+# ========== PROJECTS ==========
+resource "google_project" "app_production" {
+  name            = "Application Production"
+  project_id      = "my-app-prod"
+  folder_id       = google_folder.production.id
+  billing_account = var.billing_account
+
+  labels = {
+    environment = "production"
+    application = "my-app"
+  }
+}
+
+resource "google_project" "api_production" {
+  name            = "API Production"
+  project_id      = "my-api-prod"
+  folder_id       = google_folder.production.id
+  billing_account = var.billing_account
+
+  labels = {
+    environment = "production"
+    application = "api"
+  }
+}
+
+resource "google_project" "app_staging" {
+  name            = "Application Staging"
+  project_id      = "my-app-staging"
+  folder_id       = google_folder.staging.id
+  billing_account = var.billing_account
+
+  labels = {
+    environment = "staging"
+    application = "my-app"
+  }
+}
+
+# ========== PROJECT IAM ==========
+resource "google_project_iam_member" "app_prod_devs" {
+  project = google_project.app_production.id
+  role    = "roles/editor"
+  member  = "group:app-developers@company.com"
+}
+
+resource "google_project_iam_member" "app_prod_sa" {
+  project = google_project.app_production.id
+  role    = "roles/container.developer"
+  member  = "serviceAccount:ci@my-ci-project.iam.gserviceaccount.com"
+}
+```
+
+## CLI Examples
+
+```bash
+# Get organization
+gcloud organizations list
+gcloud organizations describe ORG_ID
+
+# List folders
+gcloud resource-manager folders list --organization=ORG_ID
+
+# Create folder
+gcloud resource-manager folders create PATH \
+    --organization=ORG_ID \
+    --display-name=NAME
+
+# List projects
+gcloud projects list
+
+# Create project
+gcloud projects create PROJECT_ID --name=NAME --folder=FOLDER_ID
+
+# Move project
+gcloud projects move PROJECT --folder=FOLDER_ID
+
+# Get IAM policy at each level
+gcloud organizations get-iam-policy ORG_ID
+gcloud resource-manager folders get-iam-policy FOLDER_ID
+gcloud projects get-iam-policy PROJECT
+
+# Set IAM policy
+gcloud organizations set-iam-policy ORG_ID policy.json
+gcloud resource-manager folders set-iam-policy FOLDER_ID policy.json
+gcloud projects set-iam-policy PROJECT policy.json
+
+# List org policies
+gcloud org-policies list --organization=ORG_ID
+gcloud org-policies list --folder=FOLDER_ID
+
+# Set org policy
+gcloud org-policies set-policy policy.yaml --organization=ORG_ID
+gcloud org-policies set-policy policy.yaml --folder=FOLDER_ID
+```
+
+## Terraform Example
+
+```hcl
+# Complete GCP hierarchy with all components
+provider "google" {
+  organization = "123456789012"
+}
+
+# ============================================
+# ORGANIZATION POLICIES
+# ============================================
+resource "google_org_policy_policy" "org_policy_example" {
+  org_id = "123456789012"
+  name   = "organizations/123456789012/policies/constraint.example"
+  policy {
+    constraint {
+      constraint = "constraints/constraint.example"
+    }
+    boolean_policy {
+      enforced = true
+    }
+  }
+}
+
+# ============================================
+# FOLDERS - Environment Structure
+# ============================================
+resource "google_folder" "env_root" {
+  display_name = "Environments"
+  parent       = "organizations/123456789012"
+}
+
+resource "google_folder" "production" {
+  display_name = "Production"
+  parent       = google_folder.env_root.id
+}
+
+resource "google_folder" "staging" {
+  display_name = "Staging"
+  parent       = google_folder.env_root.id
+}
+
+resource "google_folder" "development" {
+  display_name = "Development"
+  parent       = google_folder.env_root.id
+}
+
+# ============================================
+# FOLDERS - Team Structure
+# ============================================
+resource "google_folder" "teams_root" {
+  display_name = "Teams"
+  parent       = "organizations/123456789012"
+}
+
+resource "google_folder" "platform" {
+  display_name = "Platform"
+  parent       = google_folder.teams_root.id
+}
+
+resource "google_folder" "data" {
+  display_name = "Data"
+  parent       = google_folder.teams_root.id
+}
+
+# ============================================
+# FOLDER IAM
+# ============================================
+resource "google_folder_iam_member" "platform_team_admin" {
+  folder = google_folder.platform.id
+  role   = "roles/resourcemanager.folderAdmin"
+  member = "group:platform@company.com"
+}
+
+resource "google_folder_iam_member" "all_org_viewer" {
+  folder = "organizations/123456789012"
+  role   = "roles/viewer"
+  member = "group:all-employees@company.com"
+}
+
+# ============================================
+# FOLDER ORG POLICIES
+# ============================================
+resource "google_org_policy_policy" "prod_restrictive" {
+  folder = google_folder.production.id
+  name   = "folders/${google_folder.production.id}/policies/compute.vmExternalIp"
+  policy {
+    boolean_policy {
+      enforced = false  # No external IPs in prod
+    }
+  }
+}
+
+# ============================================
+# PROJECTS
+# ============================================
+resource "google_project" "app_prod" {
+  name       = "App Production"
+  project_id = "my-app-prod"
+  folder_id  = google_folder.production.id
+  billing_account = "XXXXXX-XXXXXX-XXXXXX"
+
+  labels = {
+    environment = "production"
+    team        = "platform"
+  }
+}
+
+resource "google_project" "data_warehouse" {
+  name       = "Data Warehouse"
+  project_id = "my-data-warehouse"
+  folder_id  = google_folder.production.id
+  billing_account = "XXXXXX-XXXXXX-XXXXXX"
+
+  labels = {
+    environment = "production"
+    team        = "data"
+  }
+}
+
+# ============================================
+# PROJECT IAM
+# ============================================
+resource "google_project_iam_member" "prod_developers" {
+  project = google_project.app_prod.id
+  role    = "roles/editor"
+  member  = "group:developers@company.com"
+}
+
+resource "google_project_iam_member" "data_viewer" {
+  project = google_project.data_warehouse.id
+  role    = "roles/bigquery.dataViewer"
+  member  = "group:analytics@company.com"
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List organizations | `gcloud organizations list` |
+| Get org policy | `gcloud organizations get-iam-policy ORG_ID` |
+| List folders | `gcloud resource-manager folders list --organization=ORG_ID` |
+| Create folder | `gcloud resource-manager folders create PATH --organization=ORG_ID` |
+| Get folder IAM | `gcloud resource-manager folders get-iam-policy FOLDER_ID` |
+| List projects | `gcloud projects list` |
+| Move project | `gcloud projects move PROJECT --folder=FOLDER_ID` |
+| Get project IAM | `gcloud projects get-iam-policy PROJECT` |
+| List org policies | `gcloud org-policies list --organization=ORG_ID` |
+| Set org policy | `gcloud org-policies set-policy POLICY.yaml --organization=ORG_ID` |
+| Search resources | `gcloud asset search-all-resources --scope=ORG_ID` |
+
+## Monitoring
+
+**Hierarchy Monitoring:**
+
+1. **Track hierarchy changes**
+   ```bash
+   # Log all hierarchy changes
+   gcloud logging read 'protoPayload.methodName=~"CreateFolder\|DeleteFolder\|MoveFolder\|CreateProject\|MoveProject"' \
+       --organization=ORG_ID
+   
+   # Alert on hierarchy changes
+   gcloud alpha monitoring policies create \
+       --display-name="Hierarchy Change Alert" \
+       --condition-display-name="Folder or Project change"
+   ```
+
+2. **Resource inventory**
+   ```bash
+   # List all resources in organization
+   gcloud asset search-all-resources \
+       --scope=organizations/ORG_ID \
+       --asset-types=compute.googleapis.com.Instance,storage.googleapis.com.Bucket
+   
+   # Export to BigQuery for analysis
+   gcloud asset export \
+       --dest=gs://my-bucket/asset-inventory.json \
+       --content-type=resource \
+       --scope=organizations/ORG_ID
+   ```
+
+3. **IAM audit**
+   ```bash
+   # Find overly permissive IAM
+   gcloud asset search-all-iam-policies \
+       --scope=organizations/ORG_ID \
+       --query="policy:roles/owner"
+   ```
+
+## Security
+
+**Hierarchy Security Best Practices:**
+
+1. **Use least privilege at each level**
+   ```bash
+   # Org level: security team only
+   gcloud organizations add-iam-policy-binding ORG_ID \
+       --member="group:security@company.com" \
+       --role="roles/organization.admin"
+   
+   # Folder level: team leads
+   gcloud resource-manager folders add-iam-policy-binding FOLDER_ID \
+       --member="group:team-lead@company.com" \
+       --role="roles/resourcemanager.folderAdmin"
+   ```
+
+2. **Apply restrictive org policies at top level**
+   - Require OS Login for SSH
+   - Disable serial port access
+   - Restrict allowed VM disk images
+   - Require secure boot for Shielded VMs
+
+3. **Separate production from non-production at folder level**
+   ```bash
+   # More restrictive policies for production
+   gcloud org-policies set-policy prod-restrictions.yaml --folder=folders/PROD_ID
+   ```
+
+4. **Use folders for sensitive data isolation**
+   ```bash
+   # Create compliance folder with strict policies
+   gcloud org-policies set-policy compliance-policy.yaml --folder=folders/COMPLIANCE_ID
+   ```
+
+5. **Audit hierarchy access regularly**
+   ```bash
+   # Find all users with admin access
+   gcloud asset search-all-iam-policies \
+       --scope=organizations/ORG_ID \
+       --query="policy:admin"
+   ```
+
+## Cost Optimization
+
+**Hierarchy-Based Cost Management:**
+
+1. **Create budgets at folder level**
+   ```bash
+   gcloud billing budgets create \
+       --billing-account=XXXXXX \
+       --display-name="Production Folder Budget" \
+       --amount=100000USD \
+       --filter-projects=projects/proj-1,projects/proj-2
+   ```
+
+2. **Use labels for granular cost allocation**
+   - Each project should have environment, team, application labels
+   - Enable billing export with folder context
+
+3. **Clean up folders regularly**
+   ```bash
+   # Find projects with no resources
+   gcloud asset search-all-resources \
+       --scope=folders/FOLDER_ID \
+       --asset-types=compute.googleapis.com.Instance
+   
+   # Identify idle projects for cleanup
+   ```
+
+4. **Set regional restrictions at folder level**
+   ```bash
+   # Restrict dev folder to cheaper regions
+   gcloud org-policies set-policy restrict-regions.yaml --folder=folders/DEV_ID
+   ```
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Can't access resource due to hierarchy**
+   ```bash
+   # Check effective permissions at each level
+   gcloud organizations get-iam-policy ORG_ID
+   gcloud resource-manager folders get-iam-policy FOLDER_ID
+   gcloud projects get-iam-policy PROJECT
+   
+   # Check org policies that might be restricting
+   gcloud org-policies list --organization=ORG_ID
+   gcloud org-policies list --folder=FOLDER_ID
+   ```
+
+2. **Project won't move to new folder**
+   ```bash
+   # Check permissions (need folder admin on both source and target)
+   # Check if target is child of source (not allowed)
+   # Check folder depth limit (10 levels)
+   ```
+
+3. **Org policy not applying**
+   ```bash
+   # Verify policy is set
+   gcloud org-policies describe CONSTRAINT --organization=ORG_ID
+   
+   # Check if inheritance is working
+   gcloud org-policies describe CONSTRAINT --folder=FOLDER_ID
+   
+   # Note: Some policies only affect new resources
+   ```
+
+4. **IAM change not taking effect**
+   ```bash
+   # IAM can take up to 7 minutes to propagate
+   # Check if there's a conflicting binding
+   # Verify the correct level is being checked
+   ```
+
+5. **Finding resources in hierarchy**
+   ```bash
+   # Search all resources in org
+   gcloud asset search-all-resources \
+       --scope=organizations/ORG_ID
+   
+   # Search by resource type
+   gcloud asset search-all-resources \
+       --scope=folders/FOLDER_ID \
+       --asset-types=compute.googleapis.com.Instance
+   ```
+
+## Interview Questions
+
+1. **Draw and explain GCP's resource hierarchy. How do IAM policies flow through it?**
+
+2. **What's the difference between organization policies and IAM policies? When would you use each?**
+
+3. **How do you design a resource hierarchy for a company with 10 teams and 3 environments each?**
+
+4. **Explain how organization policies cascade. Can a folder policy be more permissive than an org-level policy?**
+
+5. **What happens when you move a project from one folder to another? What are the implications for IAM and billing?**
+
+## Cheat Sheet
+
+```
+# Hierarchy Levels (top to bottom)
+Organization (org-123456789012)
+├── Folders (folders/123456789012)
+│   └── Folders (nested, max 10 levels)
+│       └── Projects (my-project)
+│           └── Resources (instances, buckets, etc.)
+
+# Commands by Level
+gcloud organizations list/get-iam-policy/set-iam-policy
+gcloud resource-manager folders create/list/describe/get-iam-policy
+gcloud projects list/create/move/describe/get-iam-policy
+gcloud org-policies list/set-policy/reset
+
+# IAM Inheritance
+- Organization → Folders → Projects → Resources
+- Child policies can RESTRICT but not EXPAND parent policies
+- All IAM grants are additive (union)
+
+# Policy Evaluation
+1. Check Organization policies
+2. Check Folder policies (may add restrictions)
+3. Check Project policies
+4. Check Resource-level policies (may add restrictions)
+5. Deny wins over allow
+```
+
+## Labs
+
+1. **Hierarchy Design**: Design a folder structure for a multi-team organization
+2. **Policy Inheritance**: Set org policies, verify they cascade to folders and projects
+3. **IAM Across Levels**: Grant permissions at different levels, test effective access
+4. **Project Organization**: Create projects, move them between folders, verify IAM changes
+5. **Hierarchy Monitoring**: Set up audit logging for hierarchy changes, create alerts
+
+## Related Services
+
+- [Organization Node](./organization)
+- [Folders](./folders)
+- [Projects](./projects)
+- [IAM](./iam)
+- [Billing](./billing)

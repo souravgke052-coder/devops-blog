@@ -1,0 +1,321 @@
+# CIDR (Classless Inter-Domain Routing)
+
+## Overview
+
+CIDR (pronounced "cider") is the method for allocating IP addresses and routing prefix aggregation. It replaced the older classful addressing (Class A/B/C) which wasted millions of addresses. Understanding CIDR is essential for VPC design, Kubernetes networking, firewall rules, and any situation involving IP address ranges.
+
+CIDR notation (e.g., 10.0.0.0/24) combines an IP address with a prefix length indicating network bits. The /24 means the first 24 bits (3 octets) define the network; the remaining 8 bits (1 octet) are for hosts. This gives 256 addresses, of which 254 are typically usable.
+
+## When To Use
+
+- **VPC design**: Determining VPC and subnet sizes
+- **Firewall rules**: Defining allowed IP ranges
+- **Routing**: Route aggregation and summarization
+- **Kubernetes**: Pod and service CIDRs
+- **Cloud networking**: Security groups, NACLs
+
+## When NOT To Use
+
+- **IPv6**: Different notation (though similar concepts)
+- **Simple single-device config**: Doesn't apply
+
+## Core Concepts
+
+### CIDR Notation
+
+```
+10.0.0.0/24
+│    │     │
+│    │     └── Prefix length (network bits)
+│    └──────── Base IP address
+└────────────── Network starts at 10.0.0
+
+/24 = 24 network bits = 8 host bits = 2^8 = 256 addresses
+/16 = 16 network bits = 16 host bits = 2^16 = 65,536 addresses
+/8  = 8 network bits  = 24 host bits = 2^24 = 16,777,216 addresses
+```
+
+### CIDR to Subnet Mask
+
+```bash
+# /24 = 255.255.255.0
+# Binary: 11111111.11111111.11111111.00000000
+
+# /16 = 255.255.0.0
+# Binary: 11111111.11111111.00000000.00000000
+
+# /20 = 255.255.240.0
+# Binary: 11111111.11111111.11110000.00000000
+
+# /28 = 255.255.255.240
+# Binary: 11111111.11111111.11111111.11110000
+
+# Convert with ipcalc
+ipcalc 10.0.0.0/24
+# Address:   10.0.0.0
+# Netmask:   255.255.255.0 = 24
+# Wildcard:  0.0.0.255
+# Network:   10.0.0.0/24
+# HostMin:   10.0.0.1
+# HostMax:   10.0.0.254
+# Broadcast: 10.0.0.255
+# Hosts/Net: 254
+```
+
+### Common CIDR Blocks
+
+| CIDR | Netmask | Usable IPs | Description |
+|------|---------|------------|-------------|
+| /32 | 255.255.255.255 | 1 | Single host |
+| /31 | 255.255.255.254 | 2 | Point-to-point link |
+| /30 | 255.255.255.252 | 2 | Point-to-point (legacy) |
+| /29 | 255.255.255.248 | 6 | Small subnet |
+| /28 | 255.255.255.240 | 14 | Small group |
+| /27 | 255.255.255.224 | 30 | Medium-small |
+| /26 | 255.255.255.192 | 62 | Medium |
+| /25 | 255.255.255.128 | 126 | Medium-large |
+| /24 | 255.255.255.0 | 254 | Standard (legacy Class C) |
+| /20 | 255.255.240.0 | 4094 | Large |
+| /16 | 255.255.0.0 | 65,534 | Large (legacy Class B) |
+| /8 | 255.0.0.0 | 16,777,214 | Very large (legacy Class A) |
+
+### CIDR Arithmetic
+
+```bash
+# Split /24 into /26 subnets (4 subnets)
+10.0.0.0/24 can be divided into:
+  10.0.0.0/26   → 10.0.0.0 - 10.0.0.63 (64 addresses)
+  10.0.0.64/26  → 10.0.0.64 - 10.0.0.127
+  10.0.0.128/26 → 10.0.0.128 - 10.0.0.191
+  10.0.0.192/26 → 10.0.0.192 - 10.0.0.255
+
+# Merge /26 into /24
+4 consecutive /26 subnets = 1 /24
+
+# Calculate network address from IP + CIDR
+IP: 10.0.1.23/24
+# 24 bits = 3 octets fixed
+# Network: 10.0.1.0
+# Host bits: 23 → this is host .23
+# First IP: 10.0.1.1
+# Last IP: 10.0.1.254
+# Broadcast: 10.0.1.255
+```
+
+### Supernetting (Route Aggregation)
+
+Supernetting combines multiple smaller networks into a larger one, used for route summarization.
+
+```bash
+# Aggregate these /24 networks into single /22:
+# 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24
+# All share first 22 bits: 10.0.0.0/22
+
+# Check: 10.0.0.0/22
+# Netmask: 255.255.252.0
+# First IP: 10.0.0.1
+# Last IP: 10.0.3.254
+# Broadcast: 10.0.3.255
+
+# Route summary in AWS
+# Instead of routes for /24 each, one route for /22
+aws ec2 create-route --route-table-id rtb-xxx \
+  --destination-cidr-block 10.0.0.0/22 \
+  --instance-id i-xxx
+```
+
+## Real Production Example
+
+### AWS VPC CIDR Planning
+
+```bash
+# Plan a multi-account, multi-VPC architecture
+# Organization: 10.0.0.0/8 (RFC 1918 Class A)
+# Each VPC gets /16
+
+# Network Account
+Network VPC:        10.0.0.0/16   # Central services
+  Public:           10.0.0.0/24
+  VPN:              10.0.1.0/24
+  Transit Gateway:  10.0.2.0/24
+
+# Shared Services
+SharedServices VPC: 10.1.0.0/16  # Monitoring, CI/CD
+  App:              10.1.0.0/20
+  Data:             10.1.16.0/20
+
+# Production VPCs
+Prod-VPC-1:         10.2.0.0/16  # Production us-east-1
+Prod-VPC-2:         10.3.0.0/16  # Production us-west-2
+
+# Development
+Dev-VPC:            10.254.0.0/16
+
+# These don't overlap! 10.0, 10.1, 10.2, 10.3, 10.254 are distinct /16s
+```
+
+### Kubernetes CIDR Design
+
+```bash
+# EKS VPC: 10.0.0.0/16
+# Node subnets: /20 per AZ (4094 hosts each)
+# Pod subnets: /17 per AZ (32766 pods each)
+# Service CIDR: 172.20.0.0/16
+
+# Subnet allocation (3 AZs):
+# Nodes: 10.0.0.0/20, 10.0.16.0/20, 10.0.32.0/20
+# Pods: 10.0.128.0/17, 10.0.128.0/17, 10.0.128.0/17 (same range, different AZs)
+
+# VPC CNI allocates pod IPs from these ranges
+# Ensure no overlap with:
+# - VPC CIDR (used for ENIs, nodes)
+# - Service CIDR (used for ClusterIP)
+# - Node local ranges (169.254.169.254, etc.)
+```
+
+### Firewall CIDR Rules
+
+```bash
+# Allow access from corporate network (RFC 1918)
+iptables -A INPUT -s 10.0.0.0/8 -j ACCEPT
+
+# Allow from specific /24
+iptables -A INPUT -s 10.0.1.0/24 -j ACCEPT
+
+# Deny specific /28 but allow rest of /24
+iptables -A INPUT -s 10.0.0.16/28 -j DROP
+iptables -A INPUT -s 10.0.0.0/24 -j ACCEPT
+
+# AWS Security Group: allow from VPN
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-xxx \
+  --protocol tcp \
+  --port 22 \
+  --cidr 10.0.1.0/24
+
+# Deny list using ipset (efficient for many CIDRs)
+ipset create allowlist hash:net
+ipset add allowlist 10.0.0.0/8
+ipset add allowlist 192.168.0.0/16
+
+iptables -A INPUT -m set --match-set allowlist src -j ACCEPT
+```
+
+## CLI Examples
+
+```bash
+# Calculate CIDR info
+ipcalc 10.0.0.0/24
+sipcalc 10.0.0.0/24
+
+# Check if IP is in CIDR
+python3 -c "import ipaddress; print('in' if ipaddress.ip_address('10.0.0.50') in ipaddress.ip_network('10.0.0.0/24') else 'out')"
+
+# Find CIDR for IP
+ip route get 10.0.0.50
+
+# List network ranges
+aws ec2 describe-vpcs | jq '.Vpcs[].CidrBlock'
+
+# CIDR overlap detection
+python3 << 'EOF'
+import ipaddress
+
+def cidrs_overlap(cidr1, cidr2):
+    n1 = ipaddress.ip_network(cidr1)
+    n2 = ipaddress.ip_network(cidr2)
+    return n1.overlaps(n2)
+
+print(cidrs_overlap('10.0.0.0/24', '10.0.0.128/25'))  # True
+print(cidrs_overlap('10.0.0.0/24', '10.0.1.0/24'))    # False
+EOF
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `ipcalc` | Calculate CIDR | `ipcalc 10.0.0.0/24` |
+| `sipcalc` | Advanced CIDR calc | `sipcalc -r 10.0.0.0/24` |
+| `ip addr` | View IP with CIDR | `ip addr show` |
+| `ip route` | View routes with CIDR | `ip route show` |
+
+## Monitoring
+
+CIDR is configuration, not monitored. Ensure CIDR planning is documented.
+
+## Security
+
+### CIDR Security Considerations
+
+```bash
+# Never expose 0.0.0.0/0 unless necessary
+# Block external access to management ports
+iptables -A INPUT -s 0.0.0.0/0 -p tcp --dport 22 -j DROP
+iptables -A INPUT -s 0.0.0.0/0 -p tcp --dport 3389 -j DROP
+
+# Allow only specific ranges
+iptables -A INPUT -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT
+
+# Watch for scans from hostile CIDRs
+fail2ban
+# Add static routes for known hostile networks
+ip route add blackhole 192.0.2.0/24
+```
+
+## Troubleshooting
+
+### Common CIDR Issues
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| VPC creation fails | CIDR already in use | Use different CIDR |
+| Overlapping CIDRs | Poor planning | Re-address, use VPC peering carefully |
+| Can't assign IP | Subnet too small | Use larger subnet |
+| Route conflict | Specific route vs summary | Specific routes override |
+
+## Interview Questions
+
+**Q1: What does /24 mean in CIDR notation?**
+
+A: /24 means the first 24 bits of the 32-bit IPv4 address define the network. The remaining 8 bits are for hosts. In dotted notation, /24 = 255.255.255.0. For 10.0.0.0/24: network is 10.0.0 (first 3 octets fixed), hosts are 10.0.0.1-10.0.0.254 (254 usable, minus 5 AWS-reserved = 251). The /24 is a network prefix that can be routed as a single entity—routers need only one entry for 10.0.0.0/24 instead of 254 individual routes.
+
+**Q2: How do you calculate how many hosts are in a /22?**
+
+A: 32 - prefix = host bits. 32 - 22 = 10 host bits. 2^10 = 1024 total addresses. Subtract 2 (network and broadcast) = 1022 usable. In AWS, subtract 5 (AWS reserves 5) = 1017 usable. The /22 covers a /24 range of 4 consecutive /24s: 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24.
+
+**Q3: What is route summarization and why use it?**
+
+A: Route summarization (supernetting) combines multiple specific routes into a single, shorter prefix. For example, 4 /24s (10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24) can be announced as 10.0.0.0/22. Benefits: (1) Smaller routing tables—fewer entries in router; (2) Reduced convergence time—less work when routes change; (3) Isolation—changes within summarized range don't affect external routers. Tradeoff: less specific routing (traffic to 10.0.0.100 and 10.0.1.200 both go to same next hop, even if one is down).
+
+## Cheat Sheet
+
+### CIDR Quick Reference
+
+| CIDR | Mask | Usable Hosts | AWS Usable |
+|------|------|--------------|------------|
+| /30 | 255.255.255.252 | 2 | 0 |
+| /29 | 255.255.255.248 | 6 | 3 |
+| /28 | 255.255.255.240 | 14 | 11 |
+| /27 | 255.255.255.224 | 30 | 27 |
+| /26 | 255.255.255.192 | 62 | 59 |
+| /25 | 255.255.255.128 | 126 | 123 |
+| /24 | 255.255.255.0 | 254 | 251 |
+| /20 | 255.255.240.0 | 4094 | 4091 |
+| /16 | 255.255.0.0 | 65,534 | 65,531 |
+| /8 | 255.0.0.0 | 16,777,214 | - |
+
+### RFC 1918 Private Ranges
+
+| Range | CIDR | Size |
+|-------|------|------|
+| 10.0.0.0 - 10.255.255.255 | 10.0.0.0/8 | 16M |
+| 172.16.0.0 - 172.31.255.255 | 172.16.0.0/12 | 1M |
+| 192.168.0.0 - 192.168.255.255 | 192.168.0.0/16 | 65K |
+
+## Related Topics
+
+- [Subnets](./subnets) — Subnet design
+- [VPC](./vpc) — VPC architecture
+- [Routing](./routing) — Route tables
+- [Firewall](./firewall) — CIDR in firewall rules

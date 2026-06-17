@@ -1,0 +1,896 @@
+---
+id: automation
+title: GitOps & Automation
+description: GitOps with ArgoCD/Flux, event-driven automation, Slack integration, and ChatOps
+sidebar_position: 11
+---
+
+# GitOps & Automation
+
+## Overview
+
+GitOps extends CI/CD by using Git as the single source of truth for infrastructure and application configuration. Combined with event-driven automation, it enables declarative, auditable, and self-healing deployments. This guide covers GitOps implementation, event-driven workflows, and ChatOps practices.
+
+## When To Use
+
+- Kubernetes deployments requiring declarative management
+- Multi-environment configuration consistency
+- Compliance requiring full audit trails
+- Self-healing infrastructure requirements
+- Git-centric workflow teams
+
+## When NOT To Use
+
+- Infrastructure requiring imperative management
+- Rapid prototyping without established patterns
+- Single developer projects without deployment automation
+- Non-Git configuration stores
+
+## Core Concepts
+
+### GitOps Principles
+
+| Principle | Description |
+|-----------|-------------|
+| **Declarative** | All infrastructure and apps defined as code |
+| **Versioned** | Git as source of truth with full history |
+| **Pull-based** | Controllers pull desired state from Git |
+| **Self-healing** | Automatic reconciliation on drift |
+
+### Automation Patterns
+
+```
+┌──────────────┐    Event    ┌──────────────┐    Action    ┌──────────────┐
+│   Git Push   │────────────▶│  Webhook /   │────────────▶│    CI/CD     │
+│              │             │  Event Bus   │             │   Pipeline   │
+└──────────────┘             └──────────────┘             └──────────────┘
+                                    │                           │
+                                    │                           │
+                              ┌─────▼─────┐               ┌─────▼─────┐
+                              │  Slack /  │               │  ArgoCD / │
+                              │  Teams    │               │   Flux    │
+                              └───────────┘               └───────────┘
+```
+
+## Real Production Example
+
+### ArgoCD with GitOps
+
+```yaml
+# argocd-application.yaml - Main Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-production
+  namespace: argocd
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io
+  labels:
+    app: api
+    env: production
+spec:
+  project: production
+  source:
+    repoURL: https://github.com/myorg/k8s-config
+    targetRevision: HEAD
+    path: production/api
+    kustomize:
+      images:
+      - gcr.io/myproject/api:v1.2.3
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+    - CreateNamespace=true
+    - PruneLast=true
+    - serverSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### Kustomize Configuration
+
+```yaml
+# kustomization.yaml - Base
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- deployment.yaml
+- service.yaml
+- hpa.yaml
+- configmap.yaml
+
+commonLabels:
+  app: api
+
+images:
+- name: gcr.io/myproject/api
+  newTag: v1.0.0
+
+configMapGenerator:
+- name: api-config
+  literals:
+  - ENVIRONMENT=production
+```
+
+```yaml
+# production/kustomization.yaml - Production overlay
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../base
+
+namespace: production
+
+replicas:
+- name: api
+  count: 5
+
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/resources/limits/memory
+      value: "1Gi"
+  target:
+    kind: Deployment
+
+patchesStrategicMerge:
+- production-patch.yaml
+
+commonLabels:
+  env: production
+```
+
+### Complete GitOps Pipeline
+
+```yaml
+# .github/workflows/gitops.yml
+name: GitOps Sync
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      sync_env:
+        description: 'Environment to sync'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+
+concurrency:
+  group: gitops-${{ inputs.sync_env || 'staging' }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================
+  # UPDATE MANIFESTS
+  # ============================================
+  update-manifests:
+    name: Update Manifests
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITOPS_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config user.name "GitOps Bot"
+          git config user.email "gitops@myorg.com"
+      
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "tag" ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=sha-${{ github.sha }}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Update kustomization
+        run: |
+          # Update image tag in kustomization
+          cd production/api
+          
+          # Using yq for YAML editing
+          yq e '.images[0].newTag = "${{ steps.version.outputs.version }}"' \
+            -i kustomization.yaml
+          
+          git add .
+          git diff --cached --stat
+      
+      - name: Create commit and PR
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          BRANCH="update/api-${{ steps.version.outputs.version }}"
+          
+          git checkout -b $BRANCH
+          git commit -m "chore: Update api to ${{ steps.version.outputs.version }}"
+          git push origin $BRANCH
+          
+          # Create PR
+          gh pr create \
+            --title "Release: api ${{ steps.version.outputs.version }}" \
+            --body "Automated release PR" \
+            --base main \
+            --head $BRANCH
+          
+          # Auto-merge
+          gh pr merge $BRANCH --squash --delete-branch
+      
+      - name: Push directly
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git add .
+          git commit -m "chore: Update api to ${{ steps.version.outputs.version }} [manual]"
+          git push origin main
+
+  # ============================================
+  # SYNC WITH ARGOCD
+  # ============================================
+  argocd-sync:
+    name: ArgoCD Sync
+    runs-on: ubuntu-latest
+    needs: update-manifests
+    if: github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: ArgoCD Login
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          version: 'v2.8.0'
+          command: |
+            argocd login ${{ vars.ARGOCD_SERVER }} \
+              --username ${{ secrets.ARGOCD_USER }} \
+              --password ${{ secrets.ARGOCD_PASSWORD }} \
+              --grpc-web
+      
+      - name: Sync application
+        run: |
+          argocd app sync api-${{ inputs.sync_env }} \
+            --revision ${{ needs.update-manifests.outputs.version }} \
+            --force \
+            --prune
+      
+      - name: Wait for rollout
+        run: |
+          argocd app wait api-${{ inputs.sync_env }} \
+            --timeout 600 \
+            --health
+
+  # ============================================
+  # NOTIFY
+  # ============================================
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [update-manifests, argocd-sync]
+    if: always()
+    
+    steps:
+      - name: Slack Notification
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ needs.argocd-sync.result == 'success' && ':white_check_mark:' || ':x:' }} GitOps Sync",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*GitOps Sync ${{ inputs.sync_env }}*\nVersion: ${{ needs.update-manifests.outputs.version }}\nStatus: ${{ needs.argocd-sync.result }}\nActor: ${{ github.actor }}"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### Flux Configuration
+
+```yaml
+# flux-gitrepo.yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: api
+  namespace: production
+spec:
+  interval: 1m
+  url: https://github.com/myorg/k8s-config
+  ref:
+    branch: main
+  secretRef:
+    name: git-auth
+  ignore: |
+    # Ignore docs
+    /**/docs/**
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: api
+  namespace: production
+spec:
+  interval: 5m
+  path: ./production/api
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: api
+  targetNamespace: production
+  postBuild:
+    substitute:
+      IMAGE_TAG: "v1.2.3"
+      ENVIRONMENT: production
+```
+
+## Event-Driven Automation
+
+### Event-Driven Deployment
+
+```yaml
+# Cloud Events consumer for deployment automation
+name: Event-Driven Deployment
+
+on:
+  repository_dispatch:
+    types: [deploy-request]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Parse event payload
+        run: |
+          SERVICE=${{ github.event.client_payload.service }}
+          VERSION=${{ github.event.client_payload.version }}
+          ENVIRONMENT=${{ github.event.client_payload.environment }}
+          
+          echo "Deploying $SERVICE:$VERSION to $ENVIRONMENT"
+      
+      - name: Deploy
+        run: |
+          kubectl set image deployment/$SERVICE \
+            $SERVICE=gcr.io/myproject/$SERVICE:$VERSION \
+            -n $ENVIRONMENT
+```
+
+### GitHub Webhook Events
+
+```yaml
+# webhook-trigger.yaml - Process webhook events
+name: Webhook Handler
+
+on:
+  repository_dispatch:
+    types:
+    - deploy-staging
+    - deploy-production
+  
+  push:
+    branches: [main]
+
+jobs:
+  handle-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Handle deployment
+        run: |
+          EVENT_TYPE=${{ github.event_name }}
+          
+          case $EVENT_TYPE in
+            repository_dispatch)
+              ENV=${{ github.event.client_payload.environment }}
+              SERVICE=${{ github.event.client_payload.service }}
+              ;;
+            push)
+              ENV="staging"
+              SERVICE="api"
+              ;;
+          esac
+          
+          echo "Deploying to $ENV"
+```
+
+### Scheduled Automation
+
+```yaml
+# Scheduled tasks
+name: Scheduled Maintenance
+
+on:
+  schedule:
+    # Run health check every 5 minutes
+    - cron: '*/5 * * * *'
+    # Run cleanup daily at 3 AM
+    - cron: '0 3 * * *'
+    # Run security scan weekly
+    - cron: '0 0 * * 0'
+
+jobs:
+  health-check:
+    if: github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check
+        run: |
+          curl -f https://myapp.com/health || echo "UNHEALTHY"
+      
+  cleanup:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 3 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup old pods
+        run: |
+          kubectl delete pods --field-selector='status.phase!=Running' -A
+      
+  security-scan:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 0 * * 0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Full security scan
+        run: trivy image --severity CRITICAL gcr.io/myproject/api:latest
+```
+
+## ChatOps Integration
+
+### Slack Deployment Commands
+
+```yaml
+# slack-commands.yml
+name: Slack Commands
+
+on:
+  repository_dispatch:
+    types: [slack-command]
+
+jobs:
+  handle-command:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse slash command
+        id: command
+        run: |
+          COMMAND=${{ github.event.client_payload.text }}
+          echo "command=$COMMAND" >> $GITHUB_OUTPUT
+          
+          # Parse command
+          # /deploy api v1.2.3 production
+          IFS=' ' read -ra PARTS <<< "$COMMAND"
+          echo "service=${PARTS[0]}" >> $GITHUB_OUTPUT
+          echo "version=${PARTS[1]}" >> $GITHUB_OUTPUT
+          echo "environment=${PARTS[2]}" >> $GITHUB_OUTPUT
+      
+      - name: Execute command
+        run: |
+          kubectl set image deployment/${{ steps.command.outputs.service }} \
+            ${{ steps.command.outputs.service }}=gcr.io/myproject/${{ steps.command.outputs.service }}:${{ steps.command.outputs.version }} \
+            -n ${{ steps.command.outputs.environment }}
+```
+
+### Notification Templates
+
+```yaml
+# Slack notification workflow
+- name: Rich Notification
+  uses: slackapi/slack-github-action@v1.25.0
+  with:
+    payload: |
+      {
+        "text": ":rocket: Deployment Notification",
+        "blocks": [
+          {
+            "type": "header",
+            "text": {
+              "type": "plain_text",
+              "text": "Production Deployment"
+            }
+          },
+          {
+            "type": "section",
+            "fields": [
+              {
+                "type": "mrkdwn",
+                "text": "*Service:*\napi-service"
+              },
+              {
+                "type": "mrkdwn",
+                "text": "*Version:*\nv1.2.3"
+              },
+              {
+                "type": "mrkdwn",
+                "text": "*Environment:*\nproduction"
+              },
+              {
+                "type": "mrkdwn",
+                "text": "*Status:*\n:white_check_mark: Success"
+              }
+            ]
+          },
+          {
+            "type": "actions",
+            "elements": [
+              {
+                "type": "button",
+                "text": {
+                  "type": "plain_text",
+                  "text": "View in ArgoCD"
+                },
+                "url": "https://argocd.myorg.com/applications/api-production"
+              },
+              {
+                "type": "button",
+                "text": {
+                  "type": "plain_text",
+                  "text": "Rollback"
+                },
+                "action_id": "rollback"
+              }
+            ]
+          }
+        ]
+      }
+```
+
+## Configuration / Pipeline Examples
+
+### Multi-Environment Promotion
+
+```yaml
+# promotion-pipeline.yml
+name: Environment Promotion
+
+on:
+  workflow_run:
+    workflows: [Build & Test]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  promote:
+    name: Promote through environments
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, staging, qa, production]
+        include:
+          - env: production
+            requires_approval: true
+    
+    environment: ${{ matrix.env }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Update environment
+        run: |
+          # Update kustomize image
+          yq e ".images[0].newTag = \"${{ github.event.workflow_run.conclusion == 'success' && 'latest' || 'rollback' }}\"" \
+            -i ${{ matrix.env }}/api/kustomization.yaml
+          
+          git add .
+          git commit -m "chore: Promote to ${{ matrix.env }}"
+          git push
+```
+
+### ArgoCD App-of-Apps
+
+```yaml
+# app-of-apps.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: apps
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/myorg/k8s-config
+    path: apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      selfHeal: true
+```
+
+```yaml
+# apps/ Chart.yaml
+apiVersion: v2
+name: apps
+version: 1.0.0
+
+dependencies:
+- name: api
+  version: ">=1.0.0"
+  condition: api.enabled
+```
+
+## Common Commands / Steps
+
+### ArgoCD Commands
+
+```bash
+# Login
+argocd login argocd.myorg.com --username user
+
+# List apps
+argocd app list
+argocd app list -l app=api
+
+# Get app status
+argocd app get api-production
+argocd app get api-production -o wide
+
+# Sync (deploy)
+argocd app sync api-production
+argocd app sync api-production --revision v1.2.3 --force
+
+# Watch sync
+argocd app sync api-production --watch
+
+# Rollback
+argocd app rollback api-production
+
+# Set image
+argocd app set api-production --kustomize-image gcr.io/myproject/api=sha-abc123
+
+# Refresh
+argocd app refresh api-production
+argocd app sync api-production
+
+# Delete
+argocd app delete api-production --cascade
+```
+
+### Flux Commands
+
+```bash
+# Install Flux
+flux install --namespace=flux-system
+
+# Create source
+flux create source git api \
+  --url=https://github.com/myorg/k8s-config \
+  --branch=main \
+  --interval=1m
+
+# Create kustomization
+flux create kustomization api \
+  --source=GitRepository/api \
+  --path=./production/api \
+  --prune=true \
+  --wait=true
+
+# Reconcile
+flux reconcile kustomization api
+flux reconcile source git api
+
+# Check status
+flux get kustomizations
+flux get sources git
+```
+
+### GitOps Verification
+
+```bash
+# Check cluster state
+kubectl get all -n production -l app=api
+
+# Check drift
+argocd app diff api-production
+
+# Check reconciliation
+kubectl get application api-production -n argocd -o jsonpath='{.status.health.status}'
+```
+
+## Monitoring
+
+### GitOps Metrics
+
+| Metric | Description | Target |
+|--------|-------------|--------|
+| Sync frequency | How often apps sync | Every 1-5 min |
+| Drift duration | Time between drift and fix | < 5 min |
+| Sync success rate | Successful syncs | > 99% |
+| Auto-heal success | Automatic fixes | > 95% |
+
+### Prometheus Queries
+
+```promql
+# ArgoCD sync latency
+histogram_quantile(0.95,
+  rate(argocd_app_sync_seconds_bucket[5m])
+)
+
+# Application health
+argocd_app_info{health_status="Healthy"}
+
+# Sync frequency
+sum(rate(argocd_app_sync_total[5m])) by (name)
+
+# Flux reconciliation
+flux_source_refresh_total{result="Success"}
+```
+
+## Security
+
+### GitOps Security Best Practices
+
+| Practice | Implementation |
+|----------|----------------|
+| Branch protection | Require PRs for manifest changes |
+| Signed commits | Enforce GPG signing |
+| Secret management | Use Sealed Secrets, Vault |
+| Least privilege | Service accounts with minimal permissions |
+| Audit logging | Enable ArgoCD/Fux audit logs |
+
+```yaml
+# ArgoCD RBAC
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+data:
+  policy.csv: |
+    p, role:deployer, applications, *, */*, allow
+    p, role:deployer, applications, sync, production/*, allow
+    g, team-leads, role:deployer
+```
+
+### Secret Management with Sealed Secrets
+
+```yaml
+# sealed-secret.yaml
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  name: api-secret
+  namespace: production
+spec:
+  encryptedData:
+    DATABASE_URL: AgA...
+    API_KEY: AgB...
+```
+
+## Cost Optimization
+
+### Automation Efficiency
+
+| Optimization | Benefit | Implementation |
+|-------------|---------|----------------|
+| Sync interval tuning | Reduce API calls | 5min for stable, 1min for critical |
+| Batch changes | Fewer syncs | Combine multiple changes |
+| Selective sync | Faster convergence | Sync only changed apps |
+| Resource limits | Cost control | Set CPU/memory limits |
+
+```bash
+# Optimize sync interval
+flux create kustomization api \
+  --interval=5m \  # Less frequent for stable environments
+  --source=GitRepository/api
+
+# Batch environment updates
+git commit -m "chore: Update all services to v1.2.3" \
+  staging/ \
+  production/
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Sync stuck | Conflicts, network | Force sync with --force |
+| Drift not detected | Sync interval too long | Reduce interval |
+| Permission denied | RBAC misconfigured | Check service account |
+| Image not found | Wrong tag | Update manifest with valid tag |
+| Hooks failing | Pre-sync hook error | Check hook logs |
+
+### Debug Commands
+
+```bash
+# ArgoCD debug
+argocd app get api-production --show-operations
+argocd app history api-production
+argocd app resource api-production -n production
+
+# Flux debug
+flux logs --kind=GitRepository
+flux logs --kind=Kustomization
+
+# Check reconciliation
+kubectl get kustomizations -n flux-system
+kubectl describe kustomization api -n production
+
+# Force reconcile
+argocd app sync api-production --force
+flux reconcile kustomization api -n production --with-source
+```
+
+## Interview Questions
+
+### Q1: What is GitOps and how does it differ from traditional CI/CD?
+
+**Answer:** GitOps uses Git as single source of truth for infrastructure and application configuration. Unlike traditional CI/CD where pipeline pushes to environments, GitOps uses a pull-based model where controllers (ArgoCD, Flux) continuously monitor Git and sync changes to clusters. Benefits: full audit trail, easy rollback, self-healing, drift detection.
+
+### Q2: How do you handle secrets in GitOps?
+
+**Answer:** Secrets cannot be stored in plain text in Git. Options: 1) Sealed Secrets (encrypt with cluster's public key), 2) Vault integration (external secrets operator), 3) SOPS with age encryption, 4) AWS/GCP secret manager with CSI driver. Never commit raw secrets; use external secret management with controller syncing.
+
+### Q3: What is the difference between ArgoCD and Flux?
+
+**Answer:** ArgoCD is a declarative, Kubernetes-native CI/CD tool with strong UI and multi-cluster support. Flux is more Git-native, composable, and integrates well with Flux CD ecosystem (Flux 2 = Flux + Helm + Notification). ArgoCD has better visualization; Flux is more flexible and GitOps-native. Both follow GitOps principles.
+
+### Q4: How do you implement progressive delivery with GitOps?
+
+**Answer:** Use Argo Rollouts or Flagger (for Flux). Define progressive delivery strategy (canary, blue-green) in Rollout CRD. Integrate with metrics (Prometheus) for automated analysis. GitOps updates Rollout spec in Git, Rollout controller manages traffic shifting. Enables GitOps + progressive delivery for safe deployments.
+
+### Q5: How do you handle multi-environment GitOps?
+
+**Answer:** 1) Separate directories per environment (dev/, staging/, prod/), 2) Use Kustomize overlays for environment-specific config, 3) ArgoCD Application per environment, or App-of-Apps pattern, 4) Promotion through environments (dev → staging → prod), 5) Git branch per environment (less preferred). Central config repo with clear structure.
+
+## Cheat Sheet
+
+```bash
+# ArgoCD
+argocd app list
+argocd app get api-production
+argocd app sync api-production
+argocd app diff api-production
+argocd app set api-production --kustomize-image api:v1.2.3
+argocd app rollback api-production
+
+# Flux
+flux get kustomizations
+flux reconcile kustomization api
+flux create source git api --url=https://github.com/org/repo
+flux create kustomization api --source=GitRepository/api
+
+# Kustomize
+kubectl kustomize ./production/api
+kustomize build ./production/api
+
+# General
+kubectl get all -n production -l app=api
+kubectl describe deployment api -n production
+```
+
+## Related Topics
+
+- [CI/CD Overview](./overview.mdx)
+- [GitHub Actions](./github.mdx)
+- [Deployment Strategies](./deploy.mdx)
+- [Blue-Green Deployments](./blue-green.mdx)
+- [Canary Deployments](./canary.mdx)
+- [Rollback Procedures](./rollback.mdx)

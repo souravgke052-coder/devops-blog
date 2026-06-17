@@ -1,0 +1,625 @@
+---
+title: "Kubernetes ConfigMaps"
+description: "Complete guide to Kubernetes ConfigMaps - configuration management and container configuration"
+sidebar_position: 10
+---
+
+# Kubernetes ConfigMaps
+
+## Overview
+
+A **ConfigMap** is a Kubernetes resource used to store non-sensitive configuration data in key-value pairs. ConfigMaps decouple configuration from application code, allowing the same container image to be used with different configurations across environments. They can be consumed as environment variables, command-line arguments, or mounted files.
+
+## When to Use
+
+- **Configuration data** that doesn't contain secrets
+- **Application configuration** (JSON, YAML, properties files)
+- **Environment-specific settings** (dev, staging, prod)
+- **Feature flags** and feature toggles
+- **Certificates and keys** for trusted CAs
+- **Command-line arguments** for containers
+
+## When NOT to Use
+
+- **Sensitive data** - use Secrets instead
+- **Binary data over 1MB** - use external storage
+- **Database credentials** - use Secrets
+- **API keys or tokens** - use Secrets
+
+## Core Concepts
+
+### ConfigMap Usage Patterns
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         ConfigMap Usage                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Environment Variables                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  env:                                                                 │   │
+│  │  - name: LOG_LEVEL                                                  │   │
+│  │    valueFrom:                                                        │   │
+│  │      configMapKeyRef:                                                │   │
+│  │        name: app-config                                             │   │
+│  │        key: log_level                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  2. Volume Mount                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  volumeMounts:                                                       │   │
+│  │  - name: config                                                      │   │
+│  │    mountPath: /etc/config                                           │   │
+│  │                                                                      │   │
+│  │  volumes:                                                            │   │
+│  │  - name: config                                                      │   │
+│  │    configMap:                                                        │   │
+│  │      name: app-config                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  3. Command-line Arguments                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  env:                                                                 │   │
+│  │  - name: APP_CONFIG                                                  │   │
+│  │    valueFrom:                                                        │   │
+│  │      configMapKeyRef:                                                │   │
+│  │        name: app-config                                             │   │
+│  │        key: config_path                                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production API ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-service-config
+  namespace: production
+  labels:
+    app: api-service
+    environment: production
+  annotations:
+    description: "Configuration for API service"
+data:
+  # Application settings
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  APP_PORT: "8080"
+  
+  # Feature flags
+  FEATURE_NEW_SEARCH: "true"
+  FEATURE_ANALYTICS: "true"
+  FEATURE_BETA_UI: "false"
+  
+  # Database pool settings
+  DB_POOL_SIZE: "20"
+  DB_POOL_MIN: "5"
+  DB_POOL_MAX: "50"
+  DB_IDLE_TIMEOUT: "300s"
+  
+  # Cache settings
+  CACHE_ENABLED: "true"
+  CACHE_TTL: "3600"
+  CACHE_MAX_SIZE: "10000"
+  
+  # Rate limiting
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_REQUESTS_PER_MINUTE: "1000"
+  RATE_LIMIT_BURST: "100"
+  
+  # CORS settings
+  CORS_ALLOWED_ORIGINS: "https://app.example.com,https://admin.example.com"
+  CORS_ALLOWED_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
+  CORS_MAX_AGE: "86400"
+
+---
+# Environment file format
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-service-env
+  namespace: production
+binaryData:
+  # For binary data, use binaryData instead of data
+  # key: base64encodedvalue
+data:
+  .env.file: |
+    APP_ENV=production
+    LOG_LEVEL=info
+    APP_PORT=8080
+  nginx.conf: |
+    server {
+      listen 8080;
+      server_name _;
+      
+      location / {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+      }
+      
+      location /health {
+        access_log off;
+        return 200 "OK";
+      }
+    }
+```
+
+### Multi-File ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config-files
+  namespace: production
+data:
+  config.yaml: |
+    application:
+      name: api-service
+      version: v2.3.1
+    
+    database:
+      host: ${DB_HOST}
+      port: ${DB_PORT}
+      name: ${DB_NAME}
+      pool_size: 20
+    
+    redis:
+      host: ${REDIS_HOST}
+      port: 6379
+      db: 0
+    
+    monitoring:
+      enabled: true
+      metrics_path: /metrics
+      health_check_path: /healthz
+  
+  logging.yaml: |
+    version: 1
+    formatters:
+      json:
+        class: pythonjsonlogger.jsonlogger.JsonFormatter
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: json
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+  
+  prometheus.yaml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    scrape_configs:
+    - job_name: 'api-service'
+      static_configs:
+      - targets: ['localhost:8080']
+```
+
+### ConfigMap for Multiple Environments
+
+```yaml
+# Production ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config-prod
+  namespace: production
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "warn"
+  DB_HOST: "postgres-prod.database.svc.cluster.local"
+  REDIS_HOST: "redis-prod.cache.svc.cluster.local"
+
+---
+# Staging ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config-staging
+  namespace: staging
+data:
+  APP_ENV: "staging"
+  LOG_LEVEL: "debug"
+  DB_HOST: "postgres-staging.database.svc.cluster.local"
+  REDIS_HOST: "redis-staging.cache.svc.cluster.local"
+```
+
+## YAML Examples
+
+### ConfigMap from Literal Values
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simple-config
+data:
+  # Simple key-value
+  DATABASE_HOST: "localhost"
+  DATABASE_PORT: "5432"
+  
+  # Multi-line value
+  CONFIG: |
+    {
+      "key": "value",
+      "nested": {
+        "key": "value"
+      }
+    }
+```
+
+### ConfigMap with Keys from Files
+
+```bash
+# Create from file
+kubectl create configmap app-config \
+  --from-file=config.yaml \
+  --from-file=logging.yaml \
+  -n production
+
+# Create from literal
+kubectl create configmap env-config \
+  --from-literal=APP_ENV=production \
+  --from-literal=LOG_LEVEL=info \
+  -n production
+
+# Create from env file
+kubectl create configmap env-file-config \
+  --from-env-file=./config.env \
+  -n production
+
+# Create from directory
+kubectl create configmap dir-config \
+  --from-file=/path/to/config/directory \
+  -n production
+```
+
+### ConfigMap with Subpaths
+
+```yaml
+volumeMounts:
+- name: config
+  mountPath: /etc/config
+  readOnly: true
+
+volumes:
+- name: config
+  configMap:
+    name: app-config
+    items:
+    - key: config.yaml
+      path: app.yaml  # Renames key to path
+    - key: logging.yaml
+      path: logging.yaml
+    defaultMode: 0644
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create ConfigMap
+kubectl create configmap my-config \
+  --from-literal=key1=value1 \
+  --from-literal=key2=value2
+
+# Create from file
+kubectl create configmap my-config \
+  --from-file=config.yaml
+
+# Create from directory
+kubectl create configmap my-config \
+  --from-file=./config/
+
+# Create from env file
+kubectl create configmap my-config \
+  --from-env-file=./config.env
+
+# Apply from YAML
+kubectl apply -f configmap.yaml
+
+# List ConfigMaps
+kubectl get configmaps
+kubectl get cm
+kubectl get cm -n production
+
+# Describe ConfigMap
+kubectl describe configmap my-config -n production
+
+# Get ConfigMap YAML
+kubectl get configmap my-config -n production -o yaml
+
+# Delete ConfigMap
+kubectl delete configmap my-config -n production
+```
+
+### Inspecting ConfigMaps
+
+```bash
+# Get specific key
+kubectl get configmap my-config -n production -o jsonpath='{.data.key1}'
+
+# Get all keys
+kubectl get configmap my-config -n production -o jsonpath='{.data}' | jq 'keys'
+
+# List ConfigMaps with labels
+kubectl get cm -l app=api-service -n production
+
+# Watch ConfigMap changes
+kubectl get cm my-config -n production -w
+```
+
+### Updating ConfigMaps
+
+```bash
+# Edit ConfigMap
+kubectl edit configmap my-config -n production
+
+# Patch ConfigMap
+kubectl patch configmap my-config -n production -p '{"data":{"NEW_KEY":"NEW_VALUE"}}'
+
+# Force replace (update all data)
+kubectl replace -f updated-configmap.yaml
+
+# Update from file
+kubectl apply -f configmap.yaml
+```
+
+## Common Commands
+
+```bash
+# Generate ConfigMap from deployment
+kubectl create configmap my-config --from-literal=KEY=VALUE --dry-run=client -o yaml > configmap.yaml
+
+# Create ConfigMap from multiple sources
+kubectl create configmap my-config \
+  --from-file=config.yaml \
+  --from-file=secrets.encrypted \
+  --from-literal=API_KEY=VALUE \
+  -n production -o yaml
+
+# Check which pods use a ConfigMap
+kubectl get pods -n production -o json | jq '.items[] | select(.spec.containers[].envFrom[] | select(.configMapRef.name=="my-config")) | .metadata.name'
+```
+
+## Monitoring
+
+### ConfigMap Version Tracking
+
+```bash
+# Check ConfigMap age
+kubectl get configmaps -n production -o custom-columns='NAME:{metadata.name},AGE:{metadata.creationTimestamp}'
+
+# Check for recent updates
+kubectl get configmaps -n production -o json | jq '.items[] | {name: .metadata.name, resourceVersion: .metadata.resourceVersion}'
+```
+
+### Kubernetes Events
+
+```bash
+# Watch for ConfigMap changes
+kubectl get events --field-selector involvedObject.kind=ConfigMap
+
+# Get events for specific ConfigMap
+kubectl get events --field-selector involvedObject.name=my-config
+```
+
+## Security
+
+### RBAC for ConfigMap Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: configmap-reader
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: configmap-manager
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+### ConfigMap Security Considerations
+
+```bash
+# ConfigMaps are not encrypted by default
+# For sensitive data, use Secrets instead
+
+# Limit who can read ConfigMaps
+kubectl auth can-i get configmaps --namespace=production
+
+# Check ConfigMap access
+kubectl auth can-i get configmaps/my-config --namespace=production
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| ConfigMap not updating in pod | Volume not using subPath | Remove subPath or restart pod |
+| ConfigMap key not found | Key doesn't exist | Check ConfigMap contents |
+| Pod not reading ConfigMap | Environment variable name mismatch | Verify env var names |
+| Permission denied | defaultMode not set | Set appropriate file permissions |
+
+### Diagnostic Commands
+
+```bash
+# Check ConfigMap exists
+kubectl get configmap my-config -n production
+
+# View ConfigMap contents
+kubectl describe configmap my-config -n production
+kubectl get configmap my-config -n production -o yaml
+
+# Check if pod has ConfigMap mounted
+kubectl describe pod my-pod -n production | grep -A 5 "Volumes"
+
+# Check mounted files
+kubectl exec my-pod -n production -- ls -la /etc/config/
+
+# Check environment variables
+kubectl exec my-pod -n production -- env | grep -E "KEY1|KEY2"
+
+# Verify ConfigMap key values
+kubectl get configmap my-config -n production -o jsonpath='{.data.KEY1}'
+```
+
+### Restart Considerations
+
+```bash
+# Rolling restart to pick up ConfigMap changes
+kubectl rollout restart deployment api-service -n production
+
+# If using volumes without subPath, changes are automatic
+# Check with:
+kubectl exec my-pod -n production -- cat /etc/config/config.yaml
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a ConfigMap in Kubernetes?**
+A: A ConfigMap is a Kubernetes resource that stores non-sensitive configuration data in key-value pairs. It's used to decouple configuration from application code and can be consumed as environment variables, command-line arguments, or mounted files.
+
+**Q: What are the ways to use a ConfigMap in a Pod?**
+A: ConfigMaps can be used as: 1) Environment variables (env or envFrom), 2) Command-line arguments (via env), 3) Volume mounts (files), or 4) Environment variables from specific keys (configMapKeyRef).
+
+**Q: What is the difference between ConfigMap and Secret?**
+A: ConfigMaps store non-sensitive configuration data in plain text. Secrets store sensitive data (like passwords, tokens, keys) and can have values base64-encoded. Both are base64 when stored, but Secrets have additional security considerations.
+
+### Intermediate Questions
+
+**Q: How do ConfigMap changes propagate to running pods?**
+A: When a ConfigMap is mounted as a volume without subPath, changes automatically propagate to mounted files. If using subPath or environment variables, the pod must be restarted to pick up changes.
+
+**Q: What is subPath and when should you use it?**
+A: subPath allows mounting a specific key from a ConfigMap to a specific path. However, changes to the ConfigMap won't propagate when using subPath. Only use subPath when you need to avoid overwriting the entire directory.
+
+**Q: How do you manage ConfigMaps across environments?**
+A: Use separate ConfigMaps per environment (production, staging, dev) with the same keys but different values. Reference the environment-specific ConfigMap in each namespace.
+
+### Advanced Questions
+
+**Q: How would you update application configuration without restarting pods?**
+A: For file-based configuration, mount ConfigMap as volume (without subPath). For environment variables, use an operator (like Reloader) that watches ConfigMaps and triggers pod restarts when they change.
+
+**Q: What are the limitations of ConfigMaps?**
+A: ConfigMaps are limited to 1MB in size. They are not encrypted by default (use RBAC to restrict access). Changes require pod restart for environment variables.
+
+## Cheat Sheet
+
+### ConfigMap YAML Template
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+  namespace: default
+data:
+  # Simple key-value pairs
+  KEY1: value1
+  KEY2: value2
+  
+  # Multi-line with |
+  CONFIG: |
+    {
+      "key": "value"
+    }
+  
+  # Simple config with >
+  CONFIG2: >
+    line1
+    line2
+
+binaryData:
+  # Base64 encoded binary data
+  BINARY_KEY: base64encodedvalue
+```
+
+### Consuming ConfigMap in Pod
+
+```yaml
+spec:
+  containers:
+  - name: app
+    env:
+    # Single value
+    - name: KEY1
+      valueFrom:
+        configMapKeyRef:
+          name: my-config
+          key: KEY1
+    # All values as env
+    envFrom:
+    - configMapRef:
+        name: my-config
+    
+    volumeMounts:
+    - name: config
+      mountPath: /etc/config
+      readOnly: true
+  
+  volumes:
+  - name: config
+    configMap:
+      name: my-config
+      items:
+      - key: config.yaml
+        path: config.yaml
+      defaultMode: 0644
+```
+
+### Essential Commands
+
+```bash
+# Create
+kubectl create configmap my-config --from-literal=key=value
+kubectl create configmap my-config --from-file=config.yaml
+
+# Get
+kubectl get configmap my-config -o yaml
+kubectl get configmap my-config -o jsonpath='{.data.key}'
+
+# Update
+kubectl apply -f configmap.yaml
+kubectl edit configmap my-config
+
+# Delete
+kubectl delete configmap my-config
+```
+
+## Related Topics
+
+- [Secrets](./secrets) - Sensitive data storage
+- [Deployments](./deployments) - Using ConfigMaps in deployments
+- [Pods](./pods) - Volume mounting in Pods
+- [Security](./security) - ConfigMap access control

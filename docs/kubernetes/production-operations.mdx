@@ -1,0 +1,776 @@
+---
+title: "Kubernetes Production Operations"
+description: "Complete guide to Kubernetes production operations - upgrades, backup, disaster recovery, and operational best practices"
+sidebar_position: 20
+---
+
+# Kubernetes Production Operations
+
+## Overview
+
+Production Kubernetes operations encompass cluster lifecycle management, workload reliability, disaster recovery, cost optimization, and incident response. These practices ensure high availability, performance, and security in production environments.
+
+## When to Use
+
+- **Production cluster management** - upgrades, scaling, maintenance
+- **Disaster recovery planning** - backups, failovers
+- **Cost optimization** - right-sizing, scheduling
+- **Incident response** - debugging, mitigation
+- **Change management** - deployments, rollbacks
+
+## When NOT to Use
+
+- **Development clusters** - full operational suite overkill
+- **Simple applications** - basic monitoring sufficient
+
+## Core Concepts
+
+### Production Requirements
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Production Kubernetes Checklist                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  High Availability                                                    │   │
+│  │  - Multi-zone node pools                                             │   │
+│  │  - Multiple replicas for critical workloads                           │   │
+│  │  - PodDisruptionBudgets                                               │   │
+│  │  - Control plane redundancy                                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Security                                                             │   │
+│  │  - RBAC with least privilege                                         │   │
+│  │  - NetworkPolicies                                                   │   │
+│  │  - PodSecurity Standards                                              │   │
+│  │  - Secrets encryption                                                │   │
+│  │  - Audit logging                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Observability                                                       │   │
+│  │  - Metrics (Prometheus)                                              │   │
+│  │  - Logs (Loki/ELK)                                                   │   │
+│  │  - Traces (Jaeger)                                                   │   │
+│  │  - Alerting                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Disaster Recovery                                                   │   │
+│  │  - Regular etcd backups                                               │   │
+│  │  - Application data backups                                          │   │
+│  │  - Runbook documentation                                             │   │
+│  │  - Recovery testing                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### Cluster Upgrade Process
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Cluster Upgrade Flow                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Control Plane Upgrade                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Upgrade control plane components                                  │   │
+│  │  - Verify API server availability                                    │   │
+│  │  - Run smoke tests                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              ▼                                               │
+│  2. Node Pool Upgrade (one at a time)                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Cordon node                                                       │   │
+│  │  - Drain pods (respects PDBs)                                        │   │
+│  │  - Upgrade node (recreate or in-place)                               │   │
+│  │  - Uncordon node                                                     │   │
+│  │  - Verify workload running                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              ▼                                               │
+│  3. Verification                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Check all pods running                                            │   │
+│  │  - Run integration tests                                             │   │
+│  │  - Verify metrics and logs                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Cluster Lifecycle Management
+
+```yaml
+# GKE Cluster upgrade configuration
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: production-cluster
+  namespace: config-management
+spec:
+  # Network configuration
+  networkRef:
+    name: production-vpc
+  subnetworkRef:
+    name: production-subnet
+  
+  # Release channel (Stable, Regular, Rapid)
+  releaseChannel:
+    channel: Stable
+  
+  # Node management
+  nodePools:
+  - name: system-pool
+    locations:
+    - us-central1-a
+    - us-central1-b
+    - us-central1-c
+    config:
+      machineType: n2-standard-4
+      diskSizeGb: 100
+      diskType: pd-standard
+      preemptible: false
+      shieldedInstanceConfig:
+        enableSecureBoot: true
+        enableIntegrityMonitoring: true
+    management:
+      autoUpgrade: true
+      autoRepair: true
+      upgradeSettings:
+        maxSurge: 1
+        maxUnavailable: 0
+    version: 1.28
+  
+  - name: workload-pool
+    locations:
+    - us-central1-a
+    - us-central1-b
+    - us-central1-c
+    config:
+      machineType: n2-standard-8
+      diskSizeGb: 100
+      diskType: pd-standard
+      preemptible: false
+      spot: false
+    management:
+      autoUpgrade: true
+      autoRepair: true
+      upgradeSettings:
+        maxSurge: 2
+        maxUnavailable: 0
+    version: 1.28
+   Autoscaling:
+      autoscalingProfile: BALANCED
+  
+  - name: spot-pool
+    config:
+      machineType: n2-standard-8
+      preemptible: true
+      spot: true
+      nodeLocations:
+      - us-central1-a
+      - us-central1-b
+    Autoscaling:
+      enableAutoscaling: true
+      minNodeCount: 0
+      maxNodeCount: 20
+  
+  # Security
+  enablePrivateNodes: true
+  masterAuth:
+    clusterCaCertificate: <base64-encoded-cert>
+    privateEndpoint: <private-endpoint>
+    publicEndpoint: <public-endpoint>
+  
+  # Network policy
+  networkPolicy:
+    enabled: true
+    provider: CALICO
+  
+  # Workload identity
+  workloadIdentity:
+    enabled: true
+  
+  # Vertical Pod Autoscaling
+  verticalPodAutoscaling:
+    enabled: true
+  
+  # Maintenance window
+  maintenanceWindow:
+    startTime: "2024-01-01T02:00:00Z"
+    recurrence: FREQ=WEEKLY;BYDAY=SU
+  
+  # Binary authorization
+  binaryAuthorization:
+    enabled: true
+    defaultAdmissionRule:
+      enforcementMode: ENFORCED_BLOCK_AND_AUDIT_LOG
+
+---
+# Node pool upgrade automation
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-pool-upgrade
+  namespace: production
+spec:
+  schedule: "0 2 * * 0"  # Weekly Sunday 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: node-upgrade-sa
+          containers:
+          - name: upgrade
+            image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+            command:
+            - bash
+            - -c
+            - |
+              # Get current versions
+              CURRENT_VERSION=$(gcloud container clusters describe production-cluster --region=us-central1 --format='value(currentMasterVersion)')
+              
+              # Check for available upgrades
+              AVAILABLE=$(gcloud container get-server-config --region=us-central1 --format='value(validMasterVersions[0])')
+              
+              echo "Current: $CURRENT_VERSION, Latest: $AVAILABLE"
+              
+              # Only upgrade if there are security patches
+              if [ "$CURRENT_VERSION" != "$AVAILABLE" ]; then
+                echo "Upgrading cluster to $AVAILABLE"
+                # In production, this would be a controlled upgrade process
+                # gcloud container clusters upgrade production-cluster --region=us-central1
+              fi
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          restartPolicy: OnFailure
+
+---
+# PodDisruptionBudget for critical services
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-service-pdb
+  namespace: production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api-service
+      tier: backend
+
+---
+# Backup schedule for etcd
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: kube-system
+spec:
+  schedule: "0 */4 * * *"  # Every 4 hours
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: etcd-backup-sa
+          containers:
+          - name: backup
+            image: k8s.gcr.io/etcd:3.5.9
+            command:
+            - /bin/sh
+            - -c
+            - |
+              ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snapshot-$(date +%Y%m%d-%H%M%S).db \
+                --endpoints=https://127.0.0.1:2379 \
+                --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                --cert=/etc/kubernetes/pki/etcd/server.crt \
+                --key=/etc/kubernetes/pki/etcd/server.key
+              
+              # Upload to GCS
+              gsutil cp /backup/etcd-snapshot-*.db gs://my-bucket/etcd-backups/
+              
+              # Clean old backups (keep last 7 days)
+              find /backup -name "etcd-snapshot-*.db" -mtime +7 -delete
+            volumeMounts:
+            - name: etcd-data
+              mountPath: /var/lib/etcd
+            - name: backup
+              mountPath: /backup
+          volumes:
+          - name: etcd-data
+            hostPath:
+              path: /var/lib/etcd
+          - name: backup
+            emptyDir: {}
+          hostNetwork: true
+          securityContext:
+            runAsUser: 0
+          tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+          restartPolicy: OnFailure
+```
+
+### Disaster Recovery Runbook
+
+```yaml
+# Application backup cronjob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: app-backup
+  namespace: production
+spec:
+  schedule: "0 3 * * *"  # Daily at 3 AM
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          serviceAccountName: backup-sa
+          containers:
+          - name: backup
+            image: gcr.io/myproject/backup-tool:v1.0
+            env:
+            - name: BACKUP_DEST
+              value: gs://my-bucket/app-backups
+            - name: DB_HOST
+              value: postgres.production.svc.cluster.local
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: backup-config
+                  key: db-name
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Backup database
+              PGPASSWORD=$DB_PASSWORD pg_dump -h $DB_HOST -U $DB_USER -d $DB_NAME > /backup/db-$(date +%Y%m%d-%H%M%S).sql
+              
+              # Upload to GCS
+              gsutil rsync -r /backup gs://$BACKUP_DEST/
+              
+              # Upload to Cloud Storage with lifecycle
+              gsutil defstorageclass set NEARLINE gs://$BACKUP_DEST/
+            resources:
+              requests:
+                cpu: 500m
+                memory: 512Mi
+              limits:
+                cpu: 1000m
+                memory: 1Gi
+          restartPolicy: OnFailure
+```
+
+### Cost Optimization Automation
+
+```yaml
+# Resource usage optimization cronjob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: resource-optimizer
+  namespace: production
+spec:
+  schedule: "0 6 * * 1"  # Weekly Monday 6 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cost-optimizer-sa
+          containers:
+          - name: optimizer
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Get pods without resource requests
+              echo "=== Pods without resource requests ==="
+              kubectl get pods -A -o json | jq -r '.items[] | select(.spec.containers[].resources.requests == null) | "\(.metadata.namespace)/\(.metadata.name)"'
+              
+              # Get oversized PVCs (> 80% unused)
+              echo "=== Oversized PVCs ==="
+              kubectl get pvc -A -o json | jq -r '.items[] | select(.status.capacity != null) | {name: .metadata.name, requested: .spec.resources.requests.storage, used: .status.capacity}'
+              
+              # Check for idle deployments
+              echo "=== Idle deployments (0 replicas) ==="
+              kubectl get deployments -A -o json | jq -r '.items[] | select(.spec.replicas == 0) | "\(.metadata.namespace)/\(.metadata.name)"'
+          restartPolicy: OnFailure
+```
+
+## YAML Examples
+
+### PodDisruptionBudget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+spec:
+  minAvailable: 2  # OR maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: api
+```
+
+### CronJob for Operations
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup-job
+spec:
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cleanup
+            image: bitnami/kubectl:latest
+            command: ["kubectl", "delete", "pods", "--field-selector=status.phase==Succeeded", "-n", "default"]
+          restartPolicy: OnFailure
+```
+
+## CLI Examples (kubectl)
+
+### Cluster Operations
+
+```bash
+# Check cluster version
+kubectl version --short
+gcloud container clusters describe production-cluster --region=us-central1
+
+# Drain node for maintenance
+kubectl drain node-name --ignore-daemonsets --delete-emptydir-data --force
+
+# Cordon/unCordon node
+kubectl cordon node-name
+kubectl uncordon node-name
+
+# Check node status
+kubectl get nodes -o wide
+kubectl describe node node-name
+
+# Check component status
+kubectl get componentstatuses
+kubectl get cs
+```
+
+### Backup and Restore
+
+```bash
+# etcd backup
+ETCDCTL_API=3 etcdctl snapshot save /tmp/etcd.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# etcd restore
+ETCDCTL_API=3 etcdctl snapshot restore /tmp/etcd.db \
+  --data-dir=/var/lib/etcd/restore
+
+# Check etcd health
+ETCDCTL_API=3 etcdctl endpoint health --cluster
+```
+
+### Node Operations
+
+```bash
+# Rolling update node pool (GKE)
+gcloud container node-pools upgrade my-pool \
+  --cluster=my-cluster \
+  --region=us-central1
+
+# Create node pool
+gcloud container node-pools create new-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --node-version=1.28
+
+# Delete node pool
+gcloud container node-pools delete old-pool \
+  --cluster=my-cluster \
+  --region=us-central1
+```
+
+### Workload Operations
+
+```bash
+# Check pod distribution
+kubectl get pods -o wide | awk '{print $1, $3, $7}' | head -20
+
+# Check deployment status
+kubectl rollout status deployment/api -n production
+
+# Scale deployment
+kubectl scale deployment api --replicas=10 -n production
+
+# Restart deployment
+kubectl rollout restart deployment/api -n production
+
+# Check resource usage
+kubectl top nodes
+kubectl top pods -A | sort -k3 -rn | head -20
+```
+
+## Common Commands
+
+```bash
+# Check cluster health
+kubectl get nodes
+kubectl get cs
+kubectl get events --sort-by='.lastTimestamp' | tail -20
+
+# Check pod health
+kubectl get pods -A | grep -E "Pending|ContainerCreating|Error|ImagePullBackOff"
+
+# Check resource quotas
+kubectl get resourcequotas -n production
+kubectl describe resourcequotas -n production
+
+# Check limit ranges
+kubectl get limitranges -n production
+```
+
+## Monitoring
+
+### Key Production Metrics
+
+| Metric | Description | Alert Threshold |
+|--------|-------------|-----------------|
+| API server latency | P99 < 1s | > 1s |
+| Node conditions | Ready = true | Ready = false |
+| Pod restart count | < 5 per hour | > 10 per hour |
+| etcd latency | < 10ms | > 50ms |
+| Scheduler latency | < 5s | > 10s |
+
+### Operational Dashboards
+
+```bash
+# Cluster overview dashboard
+# - Node count, condition status
+# - Pod count by phase
+# - API server request rate
+# - etcd disk usage
+# - Control plane CPU/memory
+```
+
+## Security
+
+### Operational Security Checklist
+
+```yaml
+# Regular security tasks:
+# - Review RBAC bindings monthly
+# - Rotate service account tokens
+# - Update PodSecurityStandards
+# - Review audit logs
+# - Rotate Secrets and Certificates
+# - Update node images
+```
+
+### RBAC for Operations
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-operator
+rules:
+# Nodes
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "patch"]
+# Pods (for debugging)
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+# Deployments
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "scale"]
+# Namespaces
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+```
+
+## Cost Optimization
+
+### Cost Management Strategies
+
+```bash
+# Right-sizing
+kubectl top pods -A | sort -k3 -rn | head -10
+
+# Scale down non-production
+kubectl scale deployment -l environment=dev --replicas=1
+
+# Use spot instances for batch
+gcloud container node-pools create spot-pool \
+  --cluster=my-cluster \
+  --spot \
+  --enable-autoscaling \
+  --min-nodes=0 \
+  --max-nodes=50
+
+# Set resource requests
+kubectl set resources deployment/api \
+  --requests=cpu=500m,memory=512Mi \
+  --limits=cpu=1000m,memory=1Gi \
+  -n production
+```
+
+## Troubleshooting
+
+### Common Production Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Node NotReady | Kubelet issue, resource exhaustion | Check kubelet, SSH node |
+| Pod stuck terminating | Finalizers, volume mounts | Check mounts, force delete |
+| API server slow | etcd issues, resource limits | Check etcd, scale up |
+| High pod restart | OOMKilled, crash loops | Check logs, limits |
+| Service unreachable | Endpoint issues | Check pods, selectors |
+
+### Diagnostic Procedures
+
+```bash
+# Node troubleshooting
+kubectl describe node node-name
+ssh node-name "journalctl -u kubelet"
+ssh node-name "crictl ps | head -10"
+
+# Pod troubleshooting
+kubectl describe pod my-pod -n production
+kubectl logs my-pod -n production --previous
+kubectl exec my-pod -n production -- /bin/sh
+
+# API server troubleshooting
+kubectl get events --field-selector reason=FailedCreate
+kubectl auth can-i --list
+
+# etcd troubleshooting
+ETCDCTL_API=3 etcdctl endpoint status --cluster -w table
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: How do you upgrade a Kubernetes cluster?**
+A: Control plane first (managed service handles this for GKE/EKS), then node pools. For node upgrades, cordon/drain nodes, upgrade, then uncordon. Use rolling update strategy with PDBs.
+
+**Q: What is a PodDisruptionBudget?**
+A: A PDB ensures minimum number of pods available during voluntary disruptions (drains, upgrades). It prevents too many pods being evicted simultaneously.
+
+**Q: How do you handle etcd backup?**
+A: Use etcdctl snapshot save regularly (every few hours). Store in multiple locations. Test restore periodically. In GKE, managed etcd handles backups.
+
+### Intermediate Questions
+
+**Q: How would you implement zero-downtime deployment?**
+A: Use RollingUpdate with maxUnavailable: 0 and maxSurge: 1. Ensure proper readiness probes. Use PDBs for critical services. Test with canary before full rollout.
+
+**Q: What is the difference between on-demand and maintenance windows?**
+A: On-demand upgrades happen immediately. Maintenance windows schedule upgrades during low-traffic periods. Use maintenance windows for production clusters.
+
+### Advanced Questions
+
+**Q: How would you recover from a failed cluster upgrade?**
+A: Roll back to previous version (if available), restore etcd from backup, redeploy workloads from manifests in git, verify state.
+
+## Cheat Sheet
+
+### Operational Commands
+
+```bash
+# Node management
+kubectl cordon node
+kubectl drain node --ignore-daemonsets
+kubectl uncordon node
+
+# Pod management
+kubectl rollout status deployment/app
+kubectl rollout undo deployment/app
+kubectl rollout restart deployment/app
+
+# Resource management
+kubectl top nodes
+kubectl top pods -A
+
+# Events
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+### Checklist for Production
+
+```yaml
+# High Availability
+- Multi-zone node pools
+- PDBs for critical services
+- Replica count >= 2
+- Anti-affinity rules
+
+# Security
+- RBAC configured
+- NetworkPolicies
+- PodSecurityStandards
+- Secrets encrypted
+
+# Observability
+- Metrics collection
+- Log aggregation
+- Alert configuration
+- Dashboards
+
+# Disaster Recovery
+- Regular backups
+- Tested recovery
+- Runbooks documented
+- Contact information
+```
+
+### Upgrade Process
+
+```bash
+# 1. Check current version
+kubectl version
+
+# 2. Drain node
+kubectl drain node-name --ignore-daemonsets
+
+# 3. Upgrade node (GKE)
+gcloud container node-pools upgrade my-pool
+
+# 4. Verify
+kubectl get nodes
+kubectl rollout status deployment/myapp
+
+# 5. Uncordon
+kubectl uncordon node-name
+```
+
+## Related Topics
+
+- [Deployments](./deployments) - Deployment strategies
+- [Architecture](./architecture) - Cluster components
+- [Security](./security) - Security hardening
+- [Observability](./observability) - Monitoring stack

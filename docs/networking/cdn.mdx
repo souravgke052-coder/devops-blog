@@ -1,0 +1,504 @@
+# CDN (Content Delivery Network)
+
+## Overview
+
+CDNs cache and deliver content from edge locations closer to users, dramatically reducing latency and offloading origin traffic. A well-configured CDN can reduce latency from 200ms+ to 20ms, reduce origin load by 90%+, and provide DDoS protection as a side effect. Understanding CDN caching strategies, invalidation, and security configurations is essential for any public-facing application.
+
+Modern CDNs do far more than caching: TLS termination, image optimization, bot protection, edge computing (Workers/Lambda@Edge), and real-time logs. Cloudflare, Fastly, AWS CloudFront, and Akamai each have unique features, but caching fundamentals apply across all.
+
+This page covers CDN architecture, caching strategies, and production configurations.
+
+## When To Use
+
+- **Static content delivery**: JS, CSS, images, fonts
+- **Global latency reduction**: Multi-region user base
+- **Origin protection**: Offload traffic, DDoS mitigation
+- **API response caching**: GET request caching with appropriate TTLs
+- **Video streaming**: HLS/DASH with edge caching
+
+## When NOT To Use
+
+- **Real-time data**: Stock prices, live sports scores
+- **User-specific content**: Authenticated API responses
+- **Frequently changing data**: &lt;1 minute cache TTL needed
+- **High-security data**: Should not proxy sensitive data without controls
+
+## Core Concepts
+
+### CDN Architecture
+
+**PoP (Point of Presence)**: Edge locations where CDN has servers. Users connect to nearest PoP (anycast routing).
+
+**Origin Shield**: Intermediate caching layer between edge and origin. Reduces origin load for cache misses.
+
+**Anycast**: Multiple PoPs share same IP. Traffic automatically routes to nearest PoP. DNS determines nearest.
+
+```
+User (New York) → CloudFront Edge (NYC) → CloudFront Origin Shield (us-east-1) → Origin
+User (London) → CloudFront Edge (London) → CloudFront Origin Shield (eu-west-1) → Origin
+
+Without Origin Shield:
+Edge cache miss → Direct to origin (many edges = many origin requests)
+
+With Origin Shield:
+Edge cache miss → Origin Shield → Origin (single request per content per region)
+```
+
+### Caching Fundamentals
+
+**Cache-Control Headers**: Control how CDN caches content.
+
+```
+Cache-Control: public, max-age=31536000, immutable
+# public: cacheable by CDN and browsers
+# max-age: cache duration in seconds (1 year)
+# immutable: content won't change, no revalidation needed
+
+Cache-Control: private, no-cache, must-revalidate
+# private: only browser caches, not CDN
+# no-cache: revalidate before serving
+# must-revalidate: serve stale if origin unavailable
+
+Cache-Control: no-store
+# Don't cache anywhere
+```
+
+**Edge Caching**:
+- CDN respects Cache-Control from origin (unless CDN overrides)
+- `s-maxage` overrides `max-age` for shared caches (CDN)
+- `stale-while-revalidate`: serve stale while revalidating in background
+
+```bash
+# Origin response with caching headers
+HTTP/1.1 200 OK
+Content-Type: text/javascript
+Cache-Control: public, max-age=31536000, s-maxage=86400
+ETag: "abc123"
+Vary: Accept-Encoding
+
+# CDN behavior:
+# - Stores response at edge
+# - Serves from edge for 86400 seconds (1 day)
+# - After 86400, revalidates with origin (but serves stale)
+# - Browser caches for 1 year
+```
+
+### Cache Keys and Normalization
+
+CDNs normalize cache keys to maximize cache hits:
+
+- Strip query params (configurable)
+- Normalize Accept-Encoding (gzip/brotli treated same)
+- Normalize Accept-Language
+
+```bash
+# CloudFront cache policy (CacheKeyPolicy)
+# By default: include query strings, headers (Host, Authorization)
+# Optimized: whitelist query params
+CachePolicy:
+  QueryStrings:
+    Items:
+      - "version"
+      - "token"
+  Headers:
+    Items:
+      - "Host"
+      - "Origin"
+  Cookies:
+    Items:
+      - "session_id"
+
+# If you have multiple URLs for same content:
+# /api/users?v=1 → /api/users
+# CloudFront normalizes, same cache hit
+```
+
+### Vary Header
+
+The `Vary` header tells CDN to cache multiple versions based on request headers.
+
+```bash
+# Response varies by Accept-Encoding
+Vary: Accept-Encoding
+# Cache: gzip version and brotli version separately
+
+# Response varies by Accept-Language (for content negotiation)
+Vary: Accept-Language, Accept-Encoding
+# Cache: en-us/gzip, fr-fr/gzip, en-us/brotli
+
+# Warning: Too many Vary values = cache fragmentation
+# Only vary on headers that genuinely affect response
+```
+
+### Cache Invalidation
+
+Invalidating cached content before TTL expires:
+
+```bash
+# CloudFront invalidation
+aws cloudfront create-invalidation \
+  --distribution-id XXX \
+  --paths "/images/*" "/api/v1/static/*"
+
+# Cloudflare purge
+curl -X POST "https://api.cloudflare.com/client/v4/zones/ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"files":["https://example.com/style.css"]}'
+
+# Fastly purge
+curl -X POST "https://api.fastly.com/purge/example.com/path" \
+  -H "Fastly-Key: API_KEY"
+
+# Cache tags (CloudFront)
+# Tag objects at origin
+# X-Amz-Cdn-Introspection-Tag: product-page, dynamic-content
+# Invalidate by tag
+aws cloudfront create-invalidation \
+  --distribution-id XXX \
+  --invalidation-batch Files=/* \
+  --tagging QueryString=tag=product-page
+```
+
+## Real Production Example
+
+### CloudFront Configuration
+
+```bash
+# Create distribution
+aws cloudfront create-distribution \
+  --origin-domain-name api.example.com \
+  --origin-protocol-policy https-only \
+  --enabled \
+  --price-class PriceClass_All \
+  --default-root-object index.html
+
+# Create cache policy for static assets
+aws cloudfront create-cache-policy \
+  --cache-policy-config '{
+    "Name": "StaticAssetsCache",
+    "MinTTL": 60,
+    "MaxTTL": 31536000,
+    "DefaultTTL": 86400,
+    "ParametersInCacheKeyAndForwardedToOrigin": {
+      "QueryStrings": {"Items": ["v"], "Quantity": 1, "Action": "WHITELIST"},
+      "Headers": {"Items": [], "Quantity": 0, "Action": "NONE"},
+      "Cookies": {"Items": [], "Quantity": 0, "Action": "NONE"},
+      "EnableAcceptEncodingGzip": true,
+      "EnableAcceptEncodingBrotli": true
+    }
+  }'
+
+# Create response headers policy (security headers)
+aws cloudfront create-response-headers-policy \
+  --response-headers-policy-config '{
+    "Name": "SecurityHeaders",
+    "securityHeadersConfig": {
+      "XSSProtection": {"Status": "ENABLED", "ModeBlock": "MODE_BLOCK"},
+      "FrameOptions": {"Status": "ENABLED", "Value": "DENY"},
+      "StrictTransportSecurity": {"Status": "ENABLED", "MaxAge": 31536000, "IncludeSubdomains": true},
+      "ContentTypeOptions": {"Status": "ENABLED"}
+    }
+  }'
+
+# Associate cache policy with behavior
+aws cloudfront update-distribution \
+  --id DIST_ID \
+  --default-cache-behavior-target-origin-id ORIGIN_ID \
+  --cache-behaviors '[{"PathPattern": "*.js", "TargetOriginId": "origin", "ViewerProtocolPolicy": "redirect-to-https", "CachePolicyId": "CACHE_POLICY_ID"}]'
+```
+
+### Cloudflare Configuration
+
+```bash
+# Page Rules (Cache everything, edge cache TTL)
+# URL pattern: example.com/static/*
+# Settings:
+#   - Cache Level: Cache Everything
+#   - Edge Cache TTL: 1 month
+#   - Browser Cache TTL: 1 year
+#   - Chunked encoding: On
+
+# Cache Rules API
+curl -X POST "https://api.cloudflare.com/client/v4/zones/ZONE_ID/cache/rules" \
+  -H "Authorization: Bearer API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "rules": [{
+      "actions": [{
+        "action": "set_cache_level",
+        "value": "cache_everything"
+      }],
+      "filters": {
+        "url_pattern": "example.com/static/*"
+      }
+    }]
+  }'
+
+# Argo Smart Routing (faster routing)
+# Paid feature: Cloudflare optimizes routing between PoPs
+curl -X PATCH "https://api.cloudflare.com/client/v4/zones/ZONE_ID/settings/argo" \
+  -H "Authorization: Bearer API_TOKEN" \
+  --data '{"value": "on"}'
+```
+
+### Cache-Control Configuration Examples
+
+```bash
+# Static assets (immutable)
+Cache-Control: public, max-age=31536000, immutable
+
+# API responses (short cache, revalidate)
+Cache-Control: no-cache, private
+
+# User-specific but cacheable (CDN can cache, browser can't)
+Cache-Control: private, max-age=300, s-maxage=300
+
+# Stale-while-revalidate (serve stale while fetching new)
+Cache-Control: public, max-age=60, stale-while-revalidate=300
+
+# Force revalidation
+Cache-Control: public, max-age=0, s-maxage=0, must-revalidate
+```
+
+## CLI Examples
+
+```bash
+# Test CDN hit
+curl -I https://cdn.example.com/assets/app.js | grep -E "X-Cache|Server|Cache-Control|age"
+
+# CloudFront cache stats
+aws cloudfront get-stats \
+  --distribution-id XXX \
+  --start-time 2024-01-01 \
+  --end-time 2024-01-02
+
+# Cloudflare analytics
+curl "https://api.cloudflare.com/client/v4/zones/ZONE_ID/analytics/dashboard" \
+  -H "Authorization: Bearer API_TOKEN" | jq '.result.totals'
+
+# Purge single file
+curl -X DELETE "https://api.cloudflare.com/client/v4/zones/ZONE_ID/cache/purge" \
+  -H "Authorization: Bearer API_TOKEN" \
+  --data '{"files":["https://example.com/style.css"]}'
+```
+
+## Common Commands
+
+| Tool | Purpose | Example |
+|------|---------|---------|
+| `curl -I` | Check cache headers | `curl -I https://cdn.example.com` |
+| `aws cloudfront` | CloudFront management | `create-invalidation` |
+| `cf-cli` | Cloudflare management | `cf purge-cache` |
+| `fastly-cli` | Fastly management | `fastly purge` |
+
+## Monitoring
+
+### CDN Metrics
+
+```bash
+# CloudFront metrics (CloudWatch)
+# CacheHitRate: percentage of requests served from cache
+# 4xxErrorRate, 5xxErrorRate: error rates
+# Requests: total requests
+# BytesUploaded, BytesDownloaded: bandwidth
+
+# Cloudflare analytics (API)
+# requests.all: total requests
+# bandwidth.total: GB transferred
+# cache.ratio: cache hit ratio
+# visits.jsrequests.total: JavaScript errors
+```
+
+### Prometheus Origin Metrics
+
+```promql
+# Origin request rate (vs CDN served)
+rate(origin_requests_total[5m])
+# Should be much lower than total CDN requests
+
+# Cache hit ratio
+# From CDN logs or metrics
+rate(cdn_cache_hits[5m]) / rate(cdn_requests[5m])
+
+# Origin error rate (if CDN is caching errors)
+rate(cdn_origin_errors[5m]) / rate(cdn_origin_requests[5m])
+```
+
+## Security
+
+### CDN Security Configuration
+
+```bash
+# WAF rules (CloudFlare)
+# Block SQL injection
+curl -X POST "https://api.cloudflare.com/client/v4/zones/ZONE_ID/firewall/rules" \
+  -H "Authorization: Bearer API_TOKEN" \
+  --data '{
+    "rules": [{
+      "action": "block",
+      "expression": "(ip.src.country in {\"XX\"})"
+    }]
+  }'
+
+# CloudFront Origin Access Identity (OAI)
+# Restrict S3 origin to CloudFront only
+aws cloudfront create-cloud-front-origin-access-identity \
+  --cloud-front-origin-access-identity-config \
+    '{"CallerReference":"example","Comment":"OAI for S3"}'
+
+# CloudFront custom SSL (free with AWS ACM)
+# Minimum TLS 1.2
+aws cloudfront update-distribution \
+  --id DIST_ID \
+  --viewer-custom-ssl-behavior {"MinimumProtocolVersion":"TLSv1.2_2021"}
+```
+
+### DDoS Protection
+
+CDNs provide automatic DDoS protection by:
+- Absorbing volumetric attacks at edge
+- Anycast distribution across many PoPs
+- Rate limiting and challenge pages
+
+```bash
+# Cloudflare DDoS protection (always-on for Enterprise)
+# Lower tiers: enable "Under Attack Mode" during attack
+curl -X PATCH "https://api.cloudflare.com/client/v4/zones/ZONE_ID/settings/security_level" \
+  -H "Authorization: Bearer API_TOKEN" \
+  --data '{"value": "attack_challenge_mode"}'
+```
+
+## Cost Optimization
+
+### CDN Cost Structure
+
+```bash
+# CloudFront pricing (us-east-1)
+# Data transfer:
+# - First 10TB/month: $0.085/GB
+# - 10-50TB: $0.080/GB
+# - 50TB+: decreasing
+
+# Requests:
+# - HTTP: $0.0075 per 10,000 requests
+# - HTTPS: $0.01 per 10,000 requests
+
+# Example cost calculation:
+# 100 million page views/month
+# 500KB average page size
+# 50% cached, 50% origin fetched
+# Data: 50M pages * 500KB = 25TB (cached at edge), 12.5TB from origin
+# $25TB * $0.085 = $2,125 (cached)
+# $12.5TB * $0.085 = $1,062 (origin)
+# Plus requests: 100M * $0.01/10000 = $100
+# Total: ~$3,287/month
+```
+
+### Cost Optimization Strategies
+
+```bash
+# 1. Longer cache TTLs = more edge hits
+Cache-Control: public, max-age=31536000
+
+# 2. Use compression (gzip/brotli)
+# Reduces data transfer by 70%
+
+# 3. Image optimization
+# Use WebP/AVIF instead of JPEG/PNG
+# Cloudflare Polish, CloudFront Image Optimization
+
+# 4. Minimize origin requests
+# Use origin shield (CloudFront: $0.01/1000 requests)
+# Worth it if origin compute cost > $0.01/1000 requests
+
+# 5. Cache API GET responses
+# GET /api/users?page=1 → cache 60 seconds
+# Reduces origin load significantly
+```
+
+## Troubleshooting
+
+### Common CDN Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Stale content | TTL not expired | Purge cache, reduce TTL |
+| High origin load | Low cache hit ratio | Increase TTL, improve Vary |
+| Different response in different regions | Regional PoP caching | Check Vary headers, purge |
+| 503 errors | Origin overloaded | Scale origin, rate limit |
+| Cache bypassed | Cache-Control: no-store | Use cacheable headers |
+
+```bash
+# Check which edge served request
+curl -I https://cdn.example.com/file.js | grep -i server
+# Server: CloudFront
+# X-Cache: Hit from cloudfront or Miss from cloudfront
+
+# Verify cache status
+# If X-Cache: Miss, origin was hit
+# If X-Cache: Hit from cloudfront, served from edge cache
+
+# Debug with cf_trace (Cloudflare)
+curl -s https://cdn.example.com/ -H "cf-check-cache-status: true"
+
+# Check origin shield (CloudFront)
+# X-Cache: Miss from cloudfront, Hit from cloudfront
+# If second hit says "Miss from cloudfront", not using origin shield
+```
+
+## Interview Questions
+
+**Q1: How does a CDN improve performance?**
+
+A: CDNs improve performance through: (1) Geographic proximity—users connect to nearby PoP, reducing network latency (200ms → 20ms typical); (2) Caching—frequently requested content served from edge, avoiding origin round-trip entirely; (3) Connection reuse—CDN maintains persistent connections to origin, eliminating TCP handshake; (4) Compression and optimization—on-the-fly gzip, image optimization; (5) Anycast routing—traffic automatically routes to least-loaded, nearest PoP; (6) Origin protection—offloads traffic during flash crowds, preventing origin overload. The effectiveness depends on cache hit ratio—higher hit ratio = better performance.
+
+**Q2: What is origin shield and when should you use it?**
+
+A: Origin Shield is a single caching layer (typically in the same region as origin) that sits between CDN edge locations and the origin server. Without origin shield, every cache miss at every edge hits the origin directly—a popular object fetched from 10 edge locations means 10 origin requests. With origin shield, only the first edge triggers an origin fetch; other edges get from origin shield. Use origin shield when: you have many edge locations, origin is expensive/limited, you want consistent cache TTLs, or you're seeing origin overload during cache stampedes. CloudFront calls this "Origin Shield." Cost: ~$0.01/1000 requests but saves on origin compute.
+
+**Q3: How do you handle cache invalidation in production?**
+
+A: Cache invalidation strategies: (1) Purge by URL—delete specific objects. Fast for single files, slow for many. (2) Purge by tag—CloudFlare Cache Tags, CloudFront Cache Policies. Purge all objects with a tag in one call. (3) Versioned URLs—append version to path (/v1/app.js). Browser cache handles versioning. No invalidation needed, just update link. (4) Short TTL + stale-while-revalidate—serve stale while revalidating. Transparent to users. (5) Cache-Control: no-cache for critical content. For most cases: versioned URLs for static assets (JS, CSS), short TTL with fallback for API, tag-based invalidation for content updates.
+
+## Cheat Sheet
+
+### Cache-Control Directives
+
+| Directive | Effect |
+|-----------|--------|
+| public | CDN and browser can cache |
+| private | Only browser can cache |
+| no-store | Don't cache anywhere |
+| no-cache | Must revalidate before use |
+| max-age=N | Cache for N seconds |
+| s-maxage=N | CDN cache for N seconds |
+| immutable | Never changes (no revalidate) |
+| stale-while-revalidate=N | Serve stale for N seconds while revalidating |
+
+### CDN Headers
+
+| Header | Purpose |
+|--------|---------|
+| X-Cache | Hit/Miss status |
+| Age | Time in cache |
+| Cache-Control | Caching directives |
+| ETag | Version identifier |
+| Vary | What affects caching |
+| Cdn-Cache-Control | CDN-specific (CloudFront) |
+
+### CloudFront Cache Policies
+
+| Policy | Use |
+|--------|-----|
+| CachingOptimized | Static assets (1 day TTL) |
+| CachingDisabled | Dynamic content |
+| Elemental-MediaPackage | Video |
+| CachingOptimizedUncompressed | Uncompressed origins |
+
+## Related Topics
+
+- [HTTP](./http) — Cache-Control headers
+- [HTTPS](./https) — CDN TLS termination
+- [Load Balancing](./load-balancing) — CDN as frontend
+- [Observability](./observability) — CDN metrics

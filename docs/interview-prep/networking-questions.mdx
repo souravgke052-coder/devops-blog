@@ -1,0 +1,861 @@
+---
+sidebar_position: 3
+title: "Networking Interview Questions"
+description: "Advanced networking interview questions for DevOps and SRE roles covering TCP/IP, DNS, load balancing, and network troubleshooting"
+---
+
+# Networking Interview Questions
+
+## Overview
+
+Networking is the circulatory system of modern distributed systems. Senior engineers must understand not just how to configure networking, but why networks behave the way they do under load, failure, and misconfiguration.
+
+These questions probe your understanding of protocol internals, your ability to diagnose connectivity issues at scale, and your knowledge of modern networking architectures including service meshes, CNI, and cloud networking patterns.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Explain the TCP three-way handshake and why it's necessary. What happens during connection termination?**
+
+A: **Three-way handshake purpose**: Establish a reliable connection before data transfer. Both parties must confirm:
+1. The sender can reach the receiver
+2. The receiver can reach the sender
+3. Both agree on initial sequence numbers
+
+**The handshake**:
+```
+Client                         Server
+   │                              │
+   │ ──── SYN (seq=x) ──────────▶│  Client: "I want to talk, my ISN is x"
+   │                              │
+   │ ◀──── SYN-ACK (seq=y, ack=x+1)│  Server: "Ack, here's my ISN y"
+   │                              │
+   │ ──── ACK (ack=y+1) ─────────▶│  Client: "Ack confirmed"
+   │                              │
+   │ ◀──── Data flows ───────────▶│
+```
+
+**Why sequence numbers matter**: They handle:
+- Reordering (use sequence to reassemble)
+- Duplicates (ignore already-seen sequence numbers)
+- Reliability (ACK confirms receipt)
+
+**Connection termination (四次挥手)**:
+```
+Client                         Server
+   │                              │
+   │ ──── FIN (seq=u) ──────────▶│  Client: "I'm done sending"
+   │ ◀──── ACK (ack=u+1) ─────────│  Server: "Got it"
+   │                              │
+   │ ◀──── FIN (seq=v) ───────────│  Server: "I'm done too"
+   │ ──── ACK (ack=v+1) ─────────▶│  Client: "Acknowledged"
+   │                              │
+   │  (Client waits 2MSL before   │
+   │   closing, prevents late     │
+   │   packets from being sent    │
+   │   to new connection)         │
+```
+
+**Why TIME_WAIT lasts 2MSL**: MSL (Maximum Segment Lifetime) is typically 60 seconds. The 2MSL wait ensures:
+1. Delayed packets from the terminating connection don't arrive at a new connection with the same 4-tuple
+2. The final ACK is acknowledged (if lost, server will retransmit FIN and client will retransmit ACK)
+
+**Trap**: Many candidates think FINs just close the connection. The sequence number accounting and TIME_WAIT are critical for correctness.
+
+---
+
+**Q: What is TCP slow start and congestion avoidance? How does it affect throughput?**
+
+A: **The problem**: A sender can't know the available bandwidth or receiver's buffer capacity. Sending at full speed initially would cause massive packet loss on congestion.
+
+**Slow start algorithm**:
+- Start with `cwnd` (congestion window) = 1-4 MSS (Maximum Segment Size)
+- For each ACK received, increase cwnd by 1 MSS
+- Exponential growth: 1 → 2 → 4 → 8 → 16...
+- When cwnd reaches `ssthresh` (slow start threshold), switch to congestion avoidance
+
+**Congestion avoidance**:
+- Linear growth: cwnd increases by 1 MSS per RTT (roughly 1/cwnd per ACK)
+- 16 → 17 → 18 → 19...
+
+**Practical implications**:
+- Short-lived connections never reach full bandwidth (bandwidth-delay product problem)
+- For HTTP/1.1 with multiple requests, connection reuse is critical
+- For bulk transfers, BDP = bandwidth * RTT determines optimal window size
+
+**Modern TCP improvements**:
+- **CUBIC** (default in Linux): Uses cubic function for faster recovery
+- **BBR** (Google): Models bandwidth and RTT to find optimal rate
+- **Compound TCP** (Windows): Combines delay-based and loss-based approaches
+
+**Debugging hint**: `ss -i` shows cwnd and pacing_rate for connections.
+
+---
+
+**Q: Explain DNS resolution and the different record types. Why can DNS be a single point of failure?**
+
+A: **DNS resolution chain**:
+
+```
+┌─────────┐     ┌─────────┐     ┌──────────┐     ┌─────────┐     ┌─────────┐
+│  Client │────▶│ Resolver│────▶│Root NS   │────▶│  TLD    │────▶│Auth NS  │
+│ (stub)  │◀────│(8.8.8.8)│◀────│ (.com)   │◀────│(google) │◀────│(google) │
+└─────────┘     └─────────┘     └──────────┘     └─────────┘     └─────────┘
+                                  
+Client asks resolver → Resolver asks root → Root points to TLD → TLD points to authoritative → Auth returns A/AAAA
+```
+
+**Key record types**:
+- **A**: IPv4 address mapping
+- **AAAA**: IPv6 address mapping
+- **CNAME**: Canonical name (alias) — forces DNS lookup chain
+- **MX**: Mail exchange (priority + mail server)
+- **TXT**: SPF, DKIM, verification records
+- **NS**: Nameserver delegation
+- **PTR**: Reverse DNS (IP → name)
+- **SOA**: Start of authority (zone info: serial, refresh, retry, expire, minimum)
+- **SRV**: Service locator (protocol, priority, weight, port, target)
+
+**Single point of failure issues**:
+1. If your NS is unavailable, your domain is unreachable
+2. If resolver is unavailable, all lookups for your domain fail
+3. DNS amplification attacks exploit open resolvers
+
+**Mitigations**:
+- Multiple authoritative nameservers in different ASNs
+- Anycast (same IP, BGP routes to nearest NS)
+- DNSSEC for authenticity
+- Multiple resolver options (client-side)
+
+---
+
+**Q: What is the difference between iptables and nftables? When would you use each?**
+
+A: **iptables**:
+- Legacy packet filtering (since Linux 2.4)
+- Tables: filter, nat, mangle, raw, security
+- Chains: INPUT, OUTPUT, FORWARD, PREROUTING, POSTROUTING
+- Matches targets (ACCEPT, DROP, REJECT, LOG, MASQUERADE, etc.)
+
+**nftables** (modern replacement):
+- Single table with multiple families (ip, ip6, inet, arp, bridge, netdev)
+- Better performance (single hooks vs multiple)
+- Native support for sets and maps (dynamic rules)
+- Replaces iptables, ip6tables, ebtables, arptables
+
+**Comparison**:
+```bash
+# iptables (verbose, hard to script)
+iptables -A INPUT -p tcp --dport 443 -m state --state NEW -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# nftables (more concise, programmable)
+nft add rule ip filter input tcp dport 443 ct state new accept
+nft add rule ip filter input ct state established,related accept
+```
+
+**nftables advantages**:
+- Sets: `nft add rule ip filter input ip saddr @allowed_ips accept`
+- Maps: NAT with dynamic translation
+- Atomic rule replacement (no race conditions)
+- Better performance at high rule count
+
+**When to use iptables**: Legacy systems, existing infrastructure with established patterns, or when you need specific iptables-only features.
+
+---
+
+**Q: Explain BGP and how it enables internet routing. What happens during a BGP route flap?**
+
+A: **BGP (Border Gateway Protocol)** is the protocol that makes the internet work — it exchanges routing information between Autonomous Systems (AS).
+
+**Key BGP concepts**:
+- **AS**: Collection of routers under single administrative control
+- **eBGP**: BGP between different ASes (typically via direct peering)
+- **iBGP**: BGP within same AS (to propagate external routes internally)
+- **AS-Path**: The path of AS numbers a route has traversed
+- **MED, Local Preference, Origin**: Path attributes for routing decisions
+
+**Route selection order** (simplified):
+1. Highest Local Preference
+2. Shortest AS-Path
+3. Lowest Origin type (IGP < EGP < Incomplete)
+4. Lowest MED
+5. eBGP over iBGP
+6. Lowest IGP cost to NEXT_HOP
+7. Lowest router ID
+
+**BGP route flap**:
+When a BGP route becomes unavailable and recovers repeatedly:
+```
+Unstable route:   UP ──────── DOWN ──────── UP ──────── DOWN
+                 announcement  withdrawal  announcement  withdrawal
+```
+
+**Why flaps are bad**:
+- Every flap triggers routing table updates across internet
+- Causes CPU load on routers
+- Can propagate instability globally (route oscillation)
+- Triggers damping (suppression of further changes)
+
+**Route flap damping**:
+- Penalizes unstable prefixes
+- After threshold, route is suppressed for a time
+- Exponential decay reduces penalty over time
+- Prevents transient instability from affecting entire internet
+
+**Trap**: Many candidates confuse BGP with OSPF/IS-IS. BGP is policy-based inter-AS routing, not IGP for intra-AS.
+
+---
+
+**Q: What is the difference between HTTP/1.1, HTTP/2, and HTTP/3? When would you choose each?**
+
+A: **HTTP/1.1**:
+- Persistent connections (keep-alive)
+- Pipelining (theoretical, rarely implemented correctly)
+- Header compression not standardized (except gzip)
+- Head-of-line blocking: if request 1 is slow, request 2 waits
+
+**HTTP/2**:
+- Multiplexing: Multiple streams over single TCP connection
+- Header compression (HPACK)
+- Server push (server can send resources without request)
+- Stream prioritization
+- **Problem**: TCP head-of-line blocking still exists — packet loss stalls all streams
+
+**HTTP/3 (QUIC)**:
+- Built on UDP, not TCP
+- Independent streams within QUIC connection — no head-of-line blocking
+- 0-RTT connection establishment (with security)
+- Connection migration (IP changes don't break connection)
+- Built-in TLS 1.3
+
+**When to choose**:
+| Scenario | Best Choice | Reason |
+|----------|-------------|--------|
+| High packet loss network | HTTP/3 | No TCP HOL blocking |
+| Low-latency short connections | HTTP/3 | 0-RTT, connection migration |
+| Simple infrastructure | HTTP/1.1 or HTTP/2 | QUIC requires UDP load balancing |
+| High bandwidth, low loss | HTTP/2 or HTTP/3 | Similar performance |
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: A service on port 8080 is unreachable. Walk me through the troubleshooting steps.**
+
+A: **Step 1: Verify local reachability**
+```bash
+# Is the service listening?
+ss -tulpn | grep 8080
+# or netstat -tulpn | grep 8080
+
+# Check if process is bound to specific interface
+cat /proc/net/tcp | grep 1F90  # 1F90 = 8080 in hex
+```
+
+**Step 2: Local connectivity test**
+```bash
+# Can you connect locally?
+curl -v http://127.0.0.1:8080/health
+telnet 127.0.0.1 8080
+
+# Is firewall blocking?
+iptables -L INPUT -n | grep 8080
+firewall-cmd --list-ports  # RHEL/CentOS
+ufw status  # Ubuntu/Debian
+```
+
+**Step 3: Network path test**
+```bash
+# Layer 3: Can you reach the host?
+ping -c 5 <target-ip>
+
+# Layer 4: Can you reach the port?
+nc -zv <target-ip> 8080
+nmap -p 8080 <target-ip>
+
+# Is something else using the port (reuse)?
+ss -tulpn sport :8080
+```
+
+**Step 4: Deeper diagnostics**
+```bash
+# Trace the packet path
+traceroute -T -p 8080 <target-ip>
+# or mtr -T -P 8080 <target-ip>
+
+# Capture packets
+tcpdump -i any -nn port 8080 -w /tmp/capture.pcap
+# then: tcpdump -r /tmp/capture.pcap -n
+```
+
+**Step 5: Service configuration check**
+```bash
+# Is service bound to specific IP?
+# Check application config, look for:
+# bind_address, host, listen, interface settings
+
+# Check if SELinux/AppArmor blocking
+getenforce
+sestatus
+# or aa-status
+```
+
+---
+
+**Q: How do you capture and analyze TLS traffic for debugging?**
+
+A: **For debugging your own services**:
+```bash
+# Method 1: Use openssl s_client
+openssl s_client -connect host:443 -debug
+openssl s_client -connect host:443 -tls1_2 -cipher 'ECDHE-RSA-AES256-GCM-SHA384'
+
+# Show certificate chain
+openssl s_client -connect host:443 -showcerts </dev/null 2>/dev/null | \
+  openssl x509 -noout -subject -issuer -dates
+
+# Check TLS version and cipher suite
+echo | openssl s_client -connect host:443 2>&1 | grep -E "Protocol|Cipher"
+```
+
+**Method 2: Wireshark with SSLKEYLOGFILE**
+```bash
+# Configure browser or curl to log session keys
+export SSLKEYLOGFILE=/tmp/ssl-keys.log
+
+# Then capture
+tcpdump -i any -w /tmp/https.pcap port 443
+
+# Open in Wireshark with key file: Edit → Preferences → TLS → (SSLKEYLOGFILE)
+```
+
+**Method 3: Re-encrypt traffic using socat**
+```bash
+# Forward HTTPS to plaintext
+socat -v SSL-LISTEN:8443,fork,reuseaddr,cert=/tmp/cert.pem,verify=0 TCP:localhost:8080
+# Now curl http://localhost:8080/ via localhost:8443
+```
+
+**Method 4: Using mitmproxy**
+```bash
+mitmproxy --listen-port 8080 --mode regular
+# Then set proxy in environment or application
+export HTTPS_PROXY=http://localhost:8080
+```
+
+---
+
+**Q: How would you debug high connection latency using ss and tcpdump?**
+
+A: **Using ss for connection analysis**:
+```bash
+# Check all TCP connections with timer info
+ss -ti state established
+
+# Look for connections with high latency
+ss -ti 'dst 10.0.0.0/8'
+# -u: uRTO (smoothed RTT)
+# -b: bbr information
+# -p: process info
+
+# Socket memory usage
+ss -m
+
+# TCP metrics per connection
+ss -ti -e 'dst 172.16.0.0/12'
+# Shows: snd_cwnd, pacing_rate, retrans, rtt, rttvar, delivery_rate
+```
+
+**tcpdump for packet-level analysis**:
+```bash
+# Capture with timing (relative timestamps)
+tcpdump -i any 'port 8080' -tttt
+
+# Capture with expanded packets (full headers)
+tcpdump -i any 'port 8080' -v
+
+# Specific filter: SYN retransmissions
+tcpdump -i any 'tcp[tcpflags] == tcp-syn and tcp[tcp13] & 4 != 0'
+
+# Capture and analyze round-trip times
+tcpdump -i any 'port 8080' -w /tmp/latency.pcap
+# Then use tshark:
+tshark -r /tmp/latency.pcap -Y "tcp.analysis.ack_rtt" -T fields -e frame.time_relative -e tcp.analysis.ack_rtt > rtt.csv
+```
+
+**Bottleneck identification**:
+```bash
+# High rtt on localhost? Network namespace issues?
+# High rtt on WAN? ISP or distance problem?
+# Variable rtt? Congestion or jitter?
+# Retransmissions? Packet loss on network path?
+
+# Check network interface errors
+netstat -i
+ip -s link show eth0
+```
+
+---
+
+**Q: Explain how you'd set up a site-to-site VPN using WireGuard.**
+
+A: **WireGuard advantages**: Simpler than OpenVPN/IPSec, kernel-level performance, modern crypto, minimal attack surface.
+
+**Server side (firewall/gateway)**:
+```bash
+# Install wireguard
+apt install wireguard
+
+# Generate keys
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private-key>
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Enable IP forwarding
+# Add to /etc/sysctl.conf: net.ipv4.ip_forward = 1
+
+[Peer]
+PublicKey = <client-public-key>
+AllowedIPs = 10.0.0.2/32  # Can also use 0.0.0.0/0 for full tunnel
+PersistentKeepalive = 25  # For NAT traversal
+```
+
+**Client side (office network)**:
+```bash
+# /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <client-private-key>
+
+[Peer]
+PublicKey = <server-public-key>
+Endpoint = <server-public-ip>:51820
+AllowedIPs = 192.168.0.0/24  # Office network routes
+PersistentKeepalive = 25
+```
+
+**Start and verify**:
+```bash
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+
+# Check status
+wg show
+ip addr show wg0
+```
+
+---
+
+### Troubleshooting Questions
+
+**Q: Users report intermittent timeouts accessing your service. The service is healthy. What's likely wrong?**
+
+A: **Diagnosis approach**:
+
+1. **Check for packet loss**:
+```bash
+# On client
+ping -c 100 target | grep -E "loss|rtt"
+# Look for: 5% loss = likely congestion, 100% = unreachable
+
+# Using mtr for continuous assessment
+mtr -r -c 100 target
+# Look for: high packet loss at specific hop = problem there
+```
+
+2. **Check MTU/fragmentation issues**:
+```bash
+# Path MTU discovery failures cause ICMP "packet too big" drops
+ping -M do -s 1400 target  # smaller packet
+ping -M do -s 1472 target  # typical MTU for VPN
+ping -M do -s 1500 target  # may fail if MTU issues
+
+# Check for ICMP filtering
+tcpdump -i any 'icmp[icmptype] == 3'  # destination unreachable
+```
+
+3. **Check connection tracking table exhaustion**:
+```bash
+# Linux nf_conntrack
+cat /proc/sys/net/netfilter/nf_conntrack_max
+cat /proc/net/nf_conntrack | wc -l
+# If close to max, new connections wait/retry
+
+# Check for long-lived connections filling table
+cat /proc/net/nf_conntrack | awk '{print $4}' | sort | uniq -c | sort -rn | head
+```
+
+4. **Check for TCP exhaustion**:
+```bash
+# Port exhaustion (client side)
+ss -s | grep TCP
+# or netstat -an | awk '/^tcp/ {s[$5]++} END {for(k in s) print s[k],k}' | sort -rn | head
+
+# Ephemeral port range
+cat /proc/sys/net/ipv4/ip_local_port_range  # typically 32768-60999
+```
+
+5. **Check DNS resolution delays**:
+```bash
+# DNS timeout causing apparent timeouts
+time nslookup service.local
+# or use strace to see DNS timing
+```
+
+---
+
+**Q: An application connects to a database successfully but queries timeout intermittently. How do you diagnose?**
+
+A: **Network path to database**:
+```bash
+# Is the database reachable?
+ping -c 10 database-host
+nc -zv database-host 5432  # or 3306, 27017, etc.
+
+# Check for latency spikes
+mtr database-host | head -20
+
+# Check firewall rules (maybe only certain ports blocked?)
+```
+
+**Database connection issues**:
+```bash
+# Connection pool exhaustion (application side)
+# Check connection pool metrics (varies by app)
+# But also check:
+
+# Number of connections from app server
+ss -tn | grep :5432 | wc -l  # PostgreSQL
+
+# Database max connections
+psql -c "SHOW max_connections;"
+psql -c "SELECT count(*) FROM pg_stat_activity;"
+```
+
+**Application query timeouts**:
+```bash
+# Check slow query log
+# PostgreSQL: log_min_duration_statement
+# MySQL: slow_query_log
+
+# Check if query is waiting on locks
+psql -c "SELECT * FROM pg_stat_activity WHERE wait_event IS NOT NULL;"
+```
+
+**TCP retransmissions**:
+```bash
+# Capture traffic during timeout
+tcpdump -i any 'port 5432' -w /tmp/db.pcap &
+
+# Then analyze
+tcpdump -r /tmp/db.pcap | grep -E "retrans|timeout|drop"
+
+# Check for packet loss
+ss -ti 'dst database-host and dst port 5432'
+```
+
+**MTU issues with large result sets**:
+```bash
+# If large queries fail but small succeed, MTU might be the issue
+ping -M do -s 8000 database-host
+# If this fails: path MTU discovery broken or VPN encapsulation
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: Design a multi-region active-active deployment with global traffic routing.**
+
+A: **Architecture components**:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │              Cloudflare /              │
+                    │            AWS Global Accelerator       │
+                    └──────────────────┬──────────────────────┘
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              │                        │                        │
+              ▼                        ▼                        ▼
+       ┌──────────┐            ┌──────────┐            ┌──────────┐
+       │  us-east │            │ eu-west  │            │ ap-south │
+       │          │            │          │            │          │
+       │ ┌──────┐ │            │ ┌──────┐ │            │ ┌──────┐ │
+       │ │App T.│ │◀───────────▶│ │App T.│ │◀──────────▶│ │App T.│ │
+       │ └──┬───┘ │   Replication │ └──┬───┘ │            │ └──┬───┘ │
+       │    │     │            │    │     │            │    │     │
+       │ ┌──┴───┐ │            │ ┌──┴───┐ │            │ ┌──┴───┐ │
+       │ │ DB   │ │            │ │ DB   │ │            │ │ DB   │ │
+       │ │      │ │            │ │      │ │            │ │      │ │
+       │ └──────┘ │            │ └──────┘ │            │ └──────┘ │
+       └──────────┘            └──────────┘            └──────────┘
+              │                        │                        │
+              └────────────────────────┴────────────────────────┘
+                                   │
+                            ┌──────┴──────┐
+                            │   Global    │
+                            │  Database   │
+                            │(CockroachDB/│
+                            │  Spanner)   │
+                            └─────────────┘
+```
+
+**Traffic routing options**:
+1. **GeoDNS**: Route based on user's DNS resolver location (low latency, not perfect)
+2. **Anycast**: Single IP, BGP routes to nearest region
+3. **Global Load Balancer**: Health-check aware routing with failover
+
+**Database considerations**:
+- **Strong consistency across regions**: Use distributed database (CockroachDB, Google Spanner, Aurora Global)
+- **Eventual consistency acceptable**: Master in one region, read replicas elsewhere
+- **Async replication**: Write to master region, replicate to others
+
+**Key design decisions**:
+| Requirement | Approach |
+|------------|----------|
+| Write latency | Single master region, or async multi-master |
+| Read latency | Local read replicas |
+| Failover | Automated DNS failover or load balancer health checks |
+| Conflict resolution | Last-writer-wins, or application-level |
+| Data residency | Route writes to allowed regions |
+
+**Monitoring**:
+- Latency per region (synthetic monitoring)
+- Replication lag
+- Health check status
+- Traffic distribution
+
+---
+
+**Q: How would you design a CDN for a global application with cache invalidation?**
+
+A: **CDN architecture**:
+
+```
+┌─────────┐     ┌─────────┐     ┌─────────┐
+│  User   │────▶│  PoP    │────▶│  Origin │
+│ Request │◀────│ (Edge)  │◀────│ Server  │
+└─────────┘     └─────────┘     └─────────┘
+                      │
+                      ▼
+              ┌───────────────┐
+              │ Cache Storage │
+              │ (SSD/RAM)     │
+              └───────────────┘
+```
+
+**Origin architecture**:
+```bash
+# Cloudflare Workers for edge compute
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request))
+})
+
+# Cache-Control headers from origin
+Cache-Control: public, max-age=86400, stale-while-revalidate=3600
+# - public: can be cached
+# - max-age: TTL
+# - stale-while-revalidate: serve stale while fetching update
+```
+
+**Cache invalidation strategies**:
+
+1. **URL-based invalidation (purge)**:
+```bash
+# Cloudflare
+curl -X POST "https://api.cloudflare.com/client/v4/zones/{zone}/purge_cache" \
+  -H "Authorization: Bearer {token}" \
+  -H "Content-Type: application/json" \
+  --data '{"files":["https://example.com/assets/*"]}'
+
+# AWS CloudFront
+aws cloudfront create-invalidation --distribution-id XXX --paths "/assets/*"
+```
+
+2. **Tag-based invalidation**:
+```bash
+# Cache by content tag (e.g., "version-abc123")
+# Invalidate all objects with tag without listing them
+```
+
+3. **Surrogate keys**:
+```bash
+# Add Surrogate-Key header from origin
+# e.g., Surrogate-Key: product-123 category-electronics
+# Purge by key
+```
+
+**Architecture decisions**:
+- **Cache hit ratio vs freshness**: Aggressive caching = faster, but harder to invalidate
+- **Cache key normalization**: Strip query params or normalize them (e.g., `/img.jpg?v=abc123`)
+- **Stale content handling**: `stale-while-revalidate` reduces origin load during invalidation
+- **Grace mode**: Serve stale content when origin is down (better than 503)
+
+---
+
+### Security Questions
+
+**Q: A container needs to make outbound HTTPS calls but should have no inbound network access. How do you configure this?**
+
+A: **Kubernetes network policy**:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-https-only
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  policyTypes:
+    - Egress
+  egress:
+    # Allow DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    # Allow HTTPS to specific destinations
+    - ports:
+        - port: 443
+      to:
+        - podSelector: {}
+    # Explicitly deny everything else (default when policyType is Egress)
+```
+
+**iptables rules (VM/host-level)**:
+```bash
+# Allow established connections (return traffic)
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Allow outbound HTTPS
+iptables -A OUTPUT -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow DNS
+iptables -A OUTPUT -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+
+# Drop all other egress
+iptables -A OUTPUT -j DROP
+
+# Or more restrictive: drop all, then allow specific
+iptables -P OUTPUT DROP
+```
+
+**With firewalld**:
+```bash
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="10.0.0.0/8" port port="443" protocol="tcp" accept'
+```
+
+**For containers specifically**:
+```bash
+# Docker: no outbound restrictions by default
+# Use --iptables=false and manage manually, or use network driver
+
+# Example: Create custom Docker network with no internet access
+docker network create --internal internal-net
+# Containers on this network can't reach outside
+```
+
+---
+
+**Q: How does a TLS MITM proxy work and how do you detect it in your network?**
+
+A: **How MITM proxies work**:
+
+1. **Transparent proxy**: Router redirects traffic to proxy (requires network-level interception)
+2. **Explicit proxy**: Client connects to proxy directly (HTTP CONNECT or SOCKS)
+3. **SSL/BTLS bumping**: Proxy terminates TLS, re-encrypts with its own cert
+
+**SSL/TLS inspection mechanism**:
+```
+Client                Proxy                Server
+   │                     │                    │
+   │─── CONNECT ssl ────▶│                    │
+   │                     │──── TLS handshake ──▶│
+   │                     │◀─── Certificate ─────│
+   │                     │                    │
+   │◀─ Proxy's cert ─────│                    │
+   │    (signs as CA)    │                    │
+   │                     │                    │
+   │═══ Decrypted ═══════│══ Encrypted ═══════│
+   │   (can inspect)     │                    │
+```
+
+**Detection methods**:
+
+1. **Certificate pinning**: Verify server cert matches expected
+```javascript
+// In application code
+const tls = require('tls');
+const options = {
+  host: 'api.example.com',
+  port: 443,
+  cert: fs.readFileSync('/path/to/expected-cert.pem'),
+  // or check: checkServerIdentity: (host, cert) => {...}
+};
+```
+
+2. **Certificate transparency (CT) logs**: Check if cert is logged
+```bash
+# Check CT logs for unexpected certificates
+curl -s "https://crt.sh/?q=example.com&output=json" | jq '.[].name_value'
+```
+
+3. **Detect proxy cert characteristics**:
+```bash
+# Check for common proxy root CA fingerprints
+openssl s_client -connect api.example.com:443 </dev/null 2>/dev/null | \
+  openssl x509 -noout -text | grep -i issuer
+
+# Compare against known good
+```
+
+4. **Network-based detection**:
+```bash
+# Check for proxy headers
+curl -sI https://api.example.com | grep -i proxy
+
+# Check for VIA header
+curl -sI https://api.example.com | grep -i via
+```
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Confusing OSI layers**: "Ping uses TCP" is wrong — ping uses ICMP. Know which protocol belongs to which layer.
+
+2. **Not understanding NAT**: Many think NAT is just IP address translation. The issue is PAT (Port Address Translation) and its implications for connections.
+
+3. **Ignoring TCP state**: Candidates often forget about TIME_WAIT, CLOSE_WAIT, and how to handle connection cleanup.
+
+4. **Memorizing without understanding**: You should be able to explain DNS resolution, TLS handshake, and BGP path selection from memory.
+
+5. **Missing network namespaces**: In containerized environments, understanding `ip netns` and veth pairs is essential.
+
+## How to Structure Your Answers
+
+For **protocol questions**: Start with the basic exchange (what packets are exchanged), then explain each step's purpose, then discuss edge cases and optimizations.
+
+For **troubleshooting questions**: Follow the OSI model — start at layer 1, then 2, 3, 4, 7. Most candidates skip the physical layer issues.
+
+For **design questions**: Start with requirements clarification (what's the traffic pattern, what's the availability requirement), then discuss the components, then the trade-offs.
+
+## Related Topics
+
+- [Linux Questions](./linux-questions.mdx)
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [GCP Questions](./gcp-questions.mdx)
+- [Architecture Questions](./architecture-questions.mdx)

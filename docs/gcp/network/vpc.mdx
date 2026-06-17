@@ -1,0 +1,679 @@
+# Virtual Private Cloud (VPC)
+
+## Overview
+
+A Virtual Private Cloud (VPC) is a virtual network environment that provides isolated, configurable network space for your GCP resources. Every GCP project comes with a default VPC, but production environments should use custom VPCs with explicit subnetting, routing, and firewall rules. VPCs are regional resources that span entire regions but can contain subnets in multiple zones within that region.
+
+GCP VPCs are software-defined networks—no physical hardware is dedicated to your VPC. This means you can create, modify, and delete network resources programmatically without waiting for physical infrastructure. VPCs support both IPv4 and IPv6 addressing, and provide features like Private Google Access, Cloud NAT, and VPC Network Peering.
+
+Understanding VPC architecture is critical for production GCP deployments. A well-designed VPC provides the foundation for secure, performant, and cost-effective cloud infrastructure. Poor VPC design leads to address space conflicts, security vulnerabilities, and operational challenges.
+
+## When To Use
+
+- **Production environments**: Always use custom VPCs for production workloads
+- **Multi-tier architectures**: Separate subnets for web, application, and data tiers
+- **Shared VPC architectures**: Share network infrastructure across multiple projects
+- **Hybrid cloud connectivity**: Connect on-premises networks via Cloud Interconnect or VPN
+- **Private connectivity to Google APIs**: Access Google APIs without public IPs using Private Google Access
+- **Network isolation**: Isolate sensitive workloads in separate VPCs
+- **Microservices networking**: Create service meshes with proper network segmentation
+
+## When NOT To Use
+
+- **Simple experiments**: Default VPC may suffice for learning and quick experiments
+- **Single VM with no network requirements**: Use default VPC or no VPC at all
+- **Completely isolated workloads**: Consider no-VPC mode for specific use cases (though rare)
+
+## Architecture
+
+**VPC Network Types:**
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| Default VPC | Auto-created, auto-mode IPs | Learning only, not production |
+| Custom Mode VPC | User-defined subnet ranges | Production environments |
+| Legacy VPC | Single region, auto-created subnets | Deprecated, avoid |
+
+**VPC Architecture Components:**
+```
+VPC Network (global)
+├── Subnets (regional)
+│   ├── Primary CIDR: 10.0.0.0/24
+│   ├── Secondary CIDRs (alias ranges)
+│   ├── Private Google Access (on/off)
+│   ├── VPC Flow Logs (on/off)
+│   └── Firewall Rules (inbound/outbound)
+├── Routes
+│   ├── System routes (subnet routes)
+│   └── Custom routes (static/dynamic)
+├── Peering connections
+├── Shared VPC (host project)
+└── VPN connections
+```
+
+**Network Modes:**
+- **Auto Mode**: GCP automatically assigns /20 subnets to each region (cannot be changed)
+- **Custom Mode**: You control all subnet IP ranges (recommended for production)
+
+## Core Concepts
+
+### Creating a VPC
+
+```bash
+# Create custom mode VPC
+gcloud compute networks create my-vpc \
+    --subnet-mode=custom \
+    --bgp-routing-mode=regional
+
+# Create with custom routing mode
+gcloud compute networks create my-vpc \
+    --subnet-mode=custom \
+    --bgp-routing-mode=regional \
+    --description="Production VPC"
+
+# List VPCs
+gcloud compute networks list
+
+# Describe VPC
+gcloud compute networks describe my-vpc
+
+# Delete VPC (must delete subnets and resources first)
+gcloud compute networks delete my-vpc
+```
+
+### Routing Modes
+
+```bash
+# Regional routing: routes stay within region for efficiency
+gcloud compute networks create my-vpc --bgp-routing-mode=regional
+
+# Global routing: routes can traverse regions
+gcloud compute networks create my-vpc --bgp-routing-mode=global
+```
+
+**Regional vs Global Routing:**
+- **Regional**: Lower latency, lower cost for intra-region traffic, simpler
+- **Global**: Required for global load balancing, Cloud CDN, premium network tier
+
+### Private Google Access
+
+Enable instances without external IPs to reach Google APIs:
+```bash
+# Enable on subnet
+gcloud compute networks subnets update my-subnet \
+    --region=us-central1 \
+    --enable-private-ip-google-access
+
+# Check current setting
+gcloud compute networks subnets describe my-subnet --region=us-central1
+```
+
+### VPC Network Peering
+
+Connect two VPCs without public IPs:
+```bash
+# Create peering (peer A side)
+gcloud compute networks peerings create peering-a-to-b \
+    --network=my-vpc-a \
+    --peer-network=my-vpc-b \
+    --export-custom-routes \
+    --import-custom-routes
+
+# Create peering (peer B side)
+gcloud compute networks peerings create peering-b-to-a \
+    --network=my-vpc-b \
+    --peer-network=my-vpc-a \
+    --export-custom-routes \
+    --import-custom-routes
+
+# List peerings
+gcloud compute networks peerings list --network=my-vpc
+
+# Delete peering
+gcloud compute networks peerings delete peering-name --network=my-vpc
+```
+
+### Shared VPC
+
+Share VPC across multiple projects:
+```bash
+# Enable Shared VPC on host project
+gcloud compute shared-vpc enable host-project-id
+
+# Attach service project
+gcloud compute shared-vpc attach-service-project \
+    --host-project=host-project-id \
+    --service-project=service-project-id
+
+# Configure IAM on shared VPC
+gcloud compute networks subnets add-iam-policy-binding subnet-name \
+    --region=us-central1 \
+    --member="serviceAccount:sa@service-project.iam.gserviceaccount.com" \
+    --role="roles/compute.networkUser"
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| VPCs per project | 5 (expandable to 15) |
+| Subnets per VPC | 15 (regional) |
+| Custom routes per VPC | 200 |
+| VPC peerings per VPC | 25 |
+| Shared VPC host projects | 100 |
+
+### Key Gotchas
+
+- **Default VPC cannot be deleted**—only modified or disabled
+- **VPCs are global but subnets are regional**—traffic between zones stays regional
+- **Deleting a VPC requires deleting all resources first**—instances, firewall rules, routes
+- **Auto-mode subnets can't be changed to custom-mode**—must create new VPC
+- **VPN tunnels have bandwidth limits**—consider Cloud Interconnect for high throughput
+- **VPC Flow Logs can generate significant volume**—use sampling for cost control
+- **Routes are evaluated in priority order**—lower priority number wins
+
+## Real Production Example
+
+Production VPC setup:
+
+```bash
+# 1. Create custom mode VPC
+gcloud compute networks create prod-vpc \
+    --subnet-mode=custom \
+    --bgp-routing-mode=regional \
+    --description="Production VPC"
+
+# 2. Create subnets with Private Google Access
+gcloud compute networks subnets create web-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.1.0/24 \
+    --enable-private-ip-google-access \
+    --secondary-ranges=gke-pods=10.1.0.0/16,gke-services=10.2.0.0/20
+
+gcloud compute networks subnets create app-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.2.0/24 \
+    --enable-private-ip-google-access
+
+gcloud compute networks subnets create data-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.3.0/24 \
+    --enable-private-ip-google-access
+
+# 3. Enable VPC Flow Logs for monitoring
+gcloud compute networks subnets update web-subnet \
+    --region=us-central1 \
+    --enable-flow-logs \
+    --logging-flow-sampling=0.5 \
+    --logging-metadata=include-all
+
+# 4. Create firewall rules
+# Allow internal traffic
+gcloud compute firewall-rules create allow-internal \
+    --network=prod-vpc \
+    --allow=tcp,udp,icmp \
+    --source-ranges=10.0.0.0/8
+
+# Allow health checks from Google
+gcloud compute firewall-rules create allow-health-checks \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443 \
+    --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+    --target-tags=allow-health-check
+
+# 5. Create custom routes for specific traffic
+gcloud compute routes create route-to-vpn \
+    --network=prod-vpc \
+    --destination-range=172.16.0.0/12 \
+    --next-hop-address=10.0.1.1
+
+# 6. Set up VPC Peering with another VPC
+gcloud compute networks peerings create prod-to-shared \
+    --network=prod-vpc \
+    --peer-network=shared-vpc \
+    --export-custom-routes=true \
+    --import-custom-routes=true
+```
+
+```hcl
+# Terraform: Production VPC
+resource "google_compute_network" "prod_vpc" {
+  name                    = "prod-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+  description             = "Production VPC"
+}
+
+# Web subnet
+resource "google_compute_subnetwork" "web_subnet" {
+  name                       = "web-subnet"
+  network                    = google_compute_network.prod_vpc.id
+  ip_cidr_range              = "10.0.1.0/24"
+  region                     = "us-central1"
+  private_ip_google_access   = true
+
+  secondary_ip_range = [
+    {
+      range_name    = "gke-pods"
+      ip_cidr_range = "10.1.0.0/16"
+    },
+    {
+      range_name    = "gke-services"
+      ip_cidr_range = "10.2.0.0/20"
+    }
+  ]
+
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = 0.5
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+}
+
+# App subnet
+resource "google_compute_subnetwork" "app_subnet" {
+  name                     = "app-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.2.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+# Data subnet
+resource "google_compute_subnetwork" "data_subnet" {
+  name                     = "data-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.3.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+# Firewall: Allow internal
+resource "google_compute_firewall" "allow_internal" {
+  name    = "allow-internal"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.0.0.0/8"]
+}
+
+# Firewall: Allow health checks
+resource "google_compute_firewall" "allow_health_checks" {
+  name    = "allow-health-checks"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = ["allow-health-check"]
+}
+```
+
+## CLI Examples
+
+```bash
+# Create VPC
+gcloud compute networks create my-vpc --subnet-mode=custom
+
+# List VPCs
+gcloud compute networks list
+
+# Describe VPC
+gcloud compute networks describe my-vpc
+
+# Delete VPC
+gcloud compute networks delete my-vpc
+
+# Create subnet
+gcloud compute networks subnets create my-subnet \
+    --network=my-vpc \
+    --region=us-central1 \
+    --range=10.0.0.0/24
+
+# List subnets
+gcloud compute networks subnets list
+
+# Update subnet
+gcloud compute networks subnets update my-subnet \
+    --region=us-central1 \
+    --enable-private-ip-google-access
+
+# Create peering
+gcloud compute networks peerings create peer-a-to-b \
+    --network=my-vpc-a \
+    --peer-network=my-vpc-b
+
+# List peerings
+gcloud compute networks peerings list --network=my-vpc
+
+# Shared VPC
+gcloud compute shared-vpc enable host-project
+gcloud compute shared-vpc attach-service-project \
+    --host-project=host-project \
+    --service-project=service-project
+```
+
+## Terraform Example
+
+```hcl
+# Complete VPC with all components
+resource "google_compute_network" "main" {
+  name                    = "main-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+}
+
+# Subnets with different configurations
+resource "google_compute_subnetwork" "public" {
+  name                     = "public-subnet"
+  network                  = google_compute_network.main.id
+  ip_cidr_range            = "10.0.1.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = false  # Needs external access
+}
+
+resource "google_compute_subnetwork" "private" {
+  name                     = "private-subnet"
+  network                  = google_compute_network.main.id
+  ip_cidr_range            = "10.0.2.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true   # Private, access Google APIs via Private Google Access
+}
+
+# Firewall rules
+resource "google_compute_firewall" "allow_internal" {
+  name    = "allow-internal"
+  network = google_compute_network.main.name
+
+  allow {
+    protocol = "tcp"
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.0.0.0/8"]
+}
+
+resource "google_compute_firewall" "allow_ssh" {
+  name    = "allow-ssh"
+  network = google_compute_network.main.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = ["35.191.0.0/16"]  # Google Cloud internal
+  target_tags   = ["allow-ssh"]
+}
+
+# Custom route
+resource "google_compute_route" "to_vpn" {
+  name             = "to-vpn"
+  network          = google_compute_network.main.name
+  dest_range       = "172.16.0.0/12"
+  next_hop_gateway = "global/gateways/default-internet-gateway"
+  priority         = 100
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create VPC | `gcloud compute networks create NAME --subnet-mode=MODE` |
+| List VPCs | `gcloud compute networks list` |
+| Delete VPC | `gcloud compute networks delete NAME` |
+| Create subnet | `gcloud compute networks subnets create NAME --network=NETWORK --region=REGION --range=RANGE` |
+| List subnets | `gcloud compute networks subnets list` |
+| Update subnet | `gcloud compute networks subnets update NAME --region=REGION [FLAGS]` |
+| Create peering | `gcloud compute networks peerings create NAME --network=NET --peer-network=PEER` |
+| List peerings | `gcloud compute networks peerings list --network=NET` |
+| Shared VPC enable | `gcloud compute shared-vpc enable PROJECT` |
+| Shared VPC attach | `gcloud compute shared-vpc attach-service-project [FLAGS]` |
+
+## Monitoring
+
+**Key VPC Metrics:**
+
+1. **VPC Flow Logs**: Network traffic metadata
+   ```bash
+   # View flow logs in Cloud Logging
+   gcloud logging read 'resource.type="gce_subnetwork" AND resource.labels.subnetwork_name="my-subnet"'
+   ```
+
+2. **Firewall Logs**: Track allowed and denied connections
+   ```bash
+   # Query firewall logs
+   gcloud logging read 'resource.type="gce_firewall_rule"'
+   ```
+
+3. **Network Metrics**: Bytes sent/received, errors
+   - Cloud Monitoring > Network > VPC
+   - Per-subnet and per-VM metrics
+
+4. **Alerts Configuration:**
+   ```bash
+   # Alert on high network traffic
+   gcloud alpha monitoring policies create \
+       --display-name="High Egress Alert" \
+       --notification-channels=CHANNEL_ID
+   ```
+
+**Key Metrics to Track:**
+- VPC flow log volume
+- Firewall rule matches (allowed/denied)
+- Cross-VPC traffic via peering
+- External IP assignment
+- VPN tunnel status
+
+## Security
+
+**VPC Security Best Practices:**
+
+1. **Use custom mode VPCs**—never use default VPC in production
+   ```bash
+   gcloud compute networks create prod-vpc --subnet-mode=custom
+   ```
+
+2. **Disable serial port access** via organization policies
+   ```bash
+   gcloud org-policies set-policy disable-serial-port.yaml
+   ```
+
+3. **Use Private Google Access** for instances without external IPs
+   ```bash
+   gcloud compute networks subnets update my-subnet \
+       --region=us-central1 \
+       --enable-private-ip-google-access
+   ```
+
+4. **Restrict external IPs** via organization policy
+   ```bash
+   gcloud org-policies set-policy no-external-ip.yaml
+   ```
+
+5. **Use VPC Service Controls** for data exfiltration protection
+   ```bash
+   gcloud access-context-manager perimeters create secure-perimeter \
+       --title="Secure Perimeter"
+   ```
+
+6. **Enable VPC Flow Logs** for network monitoring
+   ```bash
+   gcloud compute networks subnets update my-subnet \
+       --region=us-central1 \
+       --enable-flow-logs \
+       --logging-flow-sampling=0.5
+   ```
+
+7. **Use firewall rules to limit exposure**
+   ```bash
+   # Allow only necessary ports
+   gcloud compute firewall-rules create allow-https \
+       --network=prod-vpc \
+       --allow=tcp:443 \
+       --source-ranges=0.0.0.0/0
+   ```
+
+## Cost Optimization
+
+**VPC Cost Drivers:**
+
+| Component | Cost Impact |
+|-----------|-------------|
+| Egress traffic | Primary cost driver |
+| VPC Flow Logs | Per GB of log data |
+| VPN tunnels | Per tunnel-hour |
+| Cloud NAT | Per gateway-hour + traffic |
+| Interconnects | Per port-hour + cross-region |
+
+**Optimization Strategies:**
+
+1. **Minimize egress**—use regional resources, Private Google Access
+2. **Use flow log sampling**—0.5 sample rate for non-production
+3. **Use Standard Tier** for non-critical traffic
+4. **Clean up unused IP addresses**—release static IPs not in use
+5. **Use Shared VPC efficiently**—share across related projects to reduce peerings
+
+```bash
+# Check for unused static IPs
+gcloud compute addresses list --filter="status:RESERVED"
+
+# Release unused IP
+gcloud compute addresses delete unused-ip --region=us-central1
+```
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Can't connect to VM from external**
+   ```bash
+   # Check firewall rules
+   gcloud compute firewall-rules list --filter="network:my-vpc"
+   
+   # Check if VM has external IP
+   gcloud compute instances describe vm-name --zone=us-central1-a
+   
+   # Check routing
+   gcloud compute routes list --filter="network:my-vpc"
+   ```
+
+2. **Private Google Access not working**
+   ```bash
+   # Verify subnet setting
+   gcloud compute networks subnets describe my-subnet --region=us-central1 | grep privateIpGoogleAccess
+   
+   # Check if using public DNS for Google APIs
+   # Must use external IP or Private Google Access
+   ```
+
+3. **VPC Peering not connecting**
+   ```bash
+   # Verify both sides created peering
+   gcloud compute networks peerings list --network=vpc-a
+   gcloud compute networks peerings list --network=vpc-b
+   
+   # Check for IP range conflicts
+   gcloud compute networks describe vpc-a
+   gcloud compute networks describe vpc-b
+   
+   # Check firewall rules on both sides
+   ```
+
+4. **Route not working**
+   ```bash
+   # List routes
+   gcloud compute routes list --filter="network:my-vpc"
+   
+   # Check route priority (lower number = higher priority)
+   # Check next hop (gateway, IP, VPN tunnel)
+   ```
+
+5. **Shared VPC issues**
+   ```bash
+   # Check if host project is enabled
+   gcloud compute shared-vpc get-host-project service-project-id
+   
+   # Check subnet IAM
+   gcloud compute networks subnets get-iam-policy my-subnet --region=us-central1
+   ```
+
+## Interview Questions
+
+1. **What's the difference between auto-mode and custom-mode VPCs? Why would you choose one over the other?**
+
+2. **How does VPC routing work in GCP? Explain route priority and next-hop selection.**
+
+3. **What's the difference between VPC Network Peering and Shared VPC? When would you use each?**
+
+4. **How do you secure a VPC in production? What are the key firewall and routing considerations?**
+
+5. **Explain Private Google Access. How does it allow instances without external IPs to access Google APIs?**
+
+## Cheat Sheet
+
+```
+# VPC Operations
+gcloud compute networks create NAME --subnet-mode=custom|auto
+gcloud compute networks list
+gcloud compute networks describe NAME
+gcloud compute networks delete NAME
+
+# Subnet Operations
+gcloud compute networks subnets create NAME --network=NET --region=REG --range=RANGE
+gcloud compute networks subnets list
+gcloud compute networks subnets update NAME --region=REG --enable-private-ip-google-access
+gcloud compute networks subnets describe NAME --region=REG
+
+# Peering
+gcloud compute networks peerings create NAME --network=NET --peer-network=PEER
+gcloud compute networks peerings list --network=NET
+
+# Shared VPC
+gcloud compute shared-vpc enable HOST_PROJECT
+gcloud compute shared-vpc attach-service-project --host-project=H --service-project=S
+
+# Firewall
+gcloud compute firewall-rules create NAME --network=NET --allow=PROTOCOL:PORT --source-ranges=RANGES
+
+# Routes
+gcloud compute routes create NAME --network=NET --destination-range=RANGE --next-hop-gateway=GW
+```
+
+## Labs
+
+1. **VPC Creation**: Create a custom VPC with multiple subnets
+2. **Private Connectivity**: Set up Private Google Access, verify Google API access
+3. **VPC Peering**: Connect two VPCs via peering, verify connectivity
+4. **Shared VPC**: Configure Shared VPC between host and service projects
+5. **Firewall Rules**: Create and test firewall rules for a multi-tier application
+
+## Related Services
+
+- [Subnets](./subnets)
+- [Firewall Rules](./firewall)
+- [Routes](./routes)
+- [Cloud NAT](./cloud-nat)
+- [Load Balancer](./load-balancer)
+- [Cloud DNS](./cloud-dns)

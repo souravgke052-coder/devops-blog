@@ -1,0 +1,723 @@
+---
+title: "Kubernetes Ingress"
+description: "Complete guide to Kubernetes Ingress - HTTP/HTTPS routing, load balancing, and external access"
+sidebar_position: 7
+---
+
+# Kubernetes Ingress
+
+## Overview
+
+An **Ingress** is a Kubernetes resource that provides HTTP/HTTPS routing to Services based on hostnames and URL paths. It acts as a smart router or entry point for external traffic, enabling features like load balancing, SSL termination, and name-based virtual hosting. Ingress controllers (like nginx-ingress, Traefik, or cloud load balancers) are responsible for fulfilling Ingress resources.
+
+## When To Use
+
+- **HTTP/HTTPS routing** based on hostnames and paths
+- **SSL/TLS termination** at the edge
+- **Name-based virtual hosting** for multiple applications
+- **URL path-based routing** to different services
+- **Load balancing** with advanced algorithms
+- **Canary deployments** and traffic splitting
+
+## When NOT To Use
+
+- **TCP/UDP traffic** - use Service with LoadBalancer type
+- **Non-HTTP protocols** - use port forwarding or LoadBalancer
+- **Simple internal routing** - use ClusterIP Services
+- **When service mesh** provides better control (use Istio Gateway)
+
+## Core Concepts
+
+### Ingress Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Ingress Flow                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Internet                                                                    │
+│      │                                                                         │
+│      ▼                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    Ingress Controller                                │    │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │    │
+│  │  │  nginx/     │  │   GCP L7    │  │  Traefik    │                 │    │
+│  │  │  Contour    │  │  LB         │  │             │                 │    │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│      │                                                                         │
+│      │ Routing rules from Ingress resources                               │
+│      ▼                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                         Services                                      │    │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │    │
+│  │  │   api       │  │   web       │  │   admin     │                 │    │
+│  │  │   Service   │  │   Service   │  │   Service   │                 │    │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Path-Based Routing
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Ingress Rules Example                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Host: api.example.com                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Path: /v1/users    → Service: users-service    (port: 8080)        │   │
+│  │  Path: /v1/products → Service: products-service (port: 8080)        │   │
+│  │  Path: /v1/orders   → Service: orders-service   (port: 8080)        │   │
+│  │  Path: /health      → Service: health-service   (port: 8080)        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Host: admin.example.com                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Path: /* → Service: admin-service (port: 8080)                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### Ingress Controller Types
+
+| Controller | Implementation | SSL/TLS | Features |
+|------------|----------------|---------|----------|
+| nginx-ingress | NGINX | Terminate/Passthrough | Rate limiting, auth, rewrites |
+| GCE L7 | GCP Load Balancer | Managed certs | Cloud-native integration |
+| Contour | Envoy proxy | Terminate | Dynamic updates, rate limiting |
+| Traefik | Traefik | Terminate | Auto-discovery, letsencrypt |
+| Istio Gateway | Envoy proxy | Terminate | Full mesh integration |
+
+### TLS Termination Flow
+
+```
+Client (HTTPS)
+      │
+      │ TLS handshake with certificate
+      ▼
+┌──────────────────┐
+│ Ingress          │
+│ Controller       │
+│ (Terminates TLS) │
+└────────┬─────────┘
+         │ HTTP
+         ▼
+┌──────────────────┐
+│ Services → Pods  │
+└──────────────────┘
+```
+
+## Real Production Example
+
+### Production API Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  labels:
+    app: api-service
+  annotations:
+    # nginx-ingress annotations
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: "route"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-change-on-failure: "true"
+    
+    # GKE specific
+    kubernetes.io/ingress.global-static-ip-name: "api-ip"
+    networking.gke.io/managed-certificates: "api-cert"
+    kubernetes.io/ingress.class: "gce"
+spec:
+  ingressClassName: nginx
+  
+  # Default backend (fallback)
+  defaultBackend:
+    service:
+      name: default-backend
+      port:
+        number: 80
+  
+  # TLS configuration
+  tls:
+  - hosts:
+    - api.example.com
+    - "*.api.example.com"
+    secretName: api-tls-secret
+  
+  # Routing rules
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      # API v1
+      - path: /v1/users
+        pathType: Prefix
+        backend:
+          service:
+            name: users-service
+            port:
+              number: 8080
+      - path: /v1/products
+        pathType: Prefix
+        backend:
+          service:
+            name: products-service
+            port:
+              number: 8080
+      - path: /v1/orders
+        pathType: Prefix
+        backend:
+          service:
+            name: orders-service
+            port:
+              number: 8080
+      
+      # Health check endpoint
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: health-service
+            port:
+              number: 8080
+      
+      # API docs
+      - path: /docs
+        pathType: Prefix
+        backend:
+          service:
+            name: docs-service
+            port:
+              number: 8080
+      
+      # Default: API service
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 8080
+
+---
+# Default backend service
+apiVersion: v1
+kind: Service
+metadata:
+  name: default-backend
+  namespace: production
+spec:
+  selector:
+    app: default-backend
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+# TLS Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-tls-secret
+  namespace: production
+type: kubernetes.io/tls
+data:
+  # Base64 encoded cert and key
+  tls.crt: LS0tLS1...
+  tls.key: LS0tLS1...
+```
+
+### Canary Deployment with Ingress
+
+```yaml
+# Production ingress (90% traffic)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service-v1
+            port:
+              number: 8080
+
+---
+# Canary ingress (10% traffic)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress-canary
+  namespace: production
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+    nginx.ingress.kubernetes.io/canary-by-header-value: "always"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service-v2
+            port:
+              number: 8080
+```
+
+### GKE Managed Certificate
+
+```yaml
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: api-cert
+  namespace: production
+spec:
+  domains:
+  - api.example.com
+  - "*.api.example.com"
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    networking.gke.io/managed-certificates: "api-cert"
+    kubernetes.io/ingress.global-static-ip-name: "api-ip"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+```
+
+## YAML Examples
+
+### Basic Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: basic-ingress
+  namespace: production
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp-service
+            port:
+              number: 80
+```
+
+### Multi-Host Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multi-host-ingress
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - app1.example.com
+    secretName: app1-tls
+  - hosts:
+    - app2.example.com
+    secretName: app2-tls
+  rules:
+  - host: app1.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app1-service
+            port:
+              number: 80
+  - host: app2.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app2-service
+            port:
+              number: 80
+```
+
+### Path-Based Routing
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: path-routing-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /users
+        pathType: Prefix
+        backend:
+          service:
+            name: users-service
+            port:
+              number: 8080
+      - path: /products
+        pathType: Prefix
+        backend:
+          service:
+            name: products-service
+            port:
+              number: 8080
+      - path: /orders
+        pathType: Prefix
+        backend:
+          service:
+            name: orders-service
+            port:
+              number: 8080
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create ingress
+kubectl apply -f ingress.yaml
+
+# List ingress
+kubectl get ingress
+kubectl get ing
+kubectl get ing -n production
+
+# Describe ingress
+kubectl describe ingress api-ingress
+
+# Get ingress YAML
+kubectl get ingress api-ingress -o yaml
+
+# Delete ingress
+kubectl delete ingress api-ingress
+
+# Edit ingress
+kubectl edit ingress api-ingress
+```
+
+### Debugging
+
+```bash
+# Check ingress class
+kubectl get ingressclass
+kubectl get ingressclass nginx -o yaml
+
+# Check ingress controller pods
+kubectl get pods -n ingress-nginx -l app=nginx-ingress-ingress-nginx-controller
+
+# Check ingress controller logs
+kubectl logs -n ingress-nginx -l app=nginx-ingress-ingress-nginx-controller --tail=100
+
+# Test ingress from outside
+curl -H "Host: api.example.com" http://<ingress-ip>/
+```
+
+### TLS Commands
+
+```bash
+# Create TLS secret
+kubectl create secret tls api-tls \
+  --cert=path/to/cert.pem \
+  --key=path/to/key.pem \
+  -n production
+
+# Check certificate
+kubectl get certificate -n production
+kubectl describe certificate api-cert -n production
+
+# Check secret
+kubectl get secret api-tls -n production -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
+```
+
+## Common Commands
+
+```bash
+# Create basic ingress
+kubectl create ingress basic --class=nginx --rule="api.example.com/*=svc:80"
+
+# Scale related services
+kubectl scale deployment api-service --replicas=10 -n production
+
+# Check TLS status
+kubectl get managedcertificate -n production
+
+# View endpoints behind ingress
+kubectl get endpoints -l app=api-service -n production
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| nginx_ingress_controller_requests | Total requests |
+| nginx_ingress_controller_connections | Active connections |
+| ingress_controller_ssl_expire_time_seconds | SSL cert expiration |
+
+### Prometheus Queries
+
+```promql
+# Request rate by ingress
+sum(rate(nginx_ingress_controller_requests[5m])) by (ingress)
+
+# Error rate
+sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m])) by (ingress)
+
+# SSL certificate expiration
+min(nginx_ingress_controller_ssl_expire_time_seconds) by (secret_name)
+```
+
+## Security
+
+### RBAC for Ingress
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ingress-manager
+  namespace: production
+rules:
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "ingresses/status"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ingress-manager-binding
+subjects:
+- kind: ServiceAccount
+  name: ci-pipeline
+  namespace: production
+roleRef:
+  kind: Role
+  name: ingress-manager
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Security Headers
+
+```yaml
+annotations:
+  nginx.ingress.kubernetes.io/configuration-snippet: |
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
+```
+
+## Cost Optimization
+
+### Resource Management
+
+```bash
+# Right-size ingress controller
+# nginx-ingress controller with autoscaling
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-configuration
+  namespace: ingress-nginx
+data:
+  proxy-body-size: "50m"
+  proxy-read-timeout: "300"
+  proxy-send-timeout: "300"
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| 404 on all paths | Wrong ingress class | Check ingressClassName |
+| TLS not working | Invalid cert/secret | Check certificate validity |
+| Path routing fails | pathType mismatch | Use correct pathType |
+| Health check fails | Missing health endpoint | Add /healthz endpoint |
+
+### Diagnostic Commands
+
+```bash
+# Check ingress exists
+kubectl get ingress api-ingress
+
+# Check ingress class
+kubectl get ingressclass
+
+# Check ingress controller
+kubectl get pods -n ingress-nginx
+
+# Check controller logs
+kubectl logs -n ingress-nginx -l app=nginx-ingress-ingress-nginx-controller
+
+# Test with curl
+curl -v -H "Host: api.example.com" http://INGRESS_IP/
+
+# Check events
+kubectl get events --field-selector involvedObject.name=api-ingress
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is an Ingress in Kubernetes?**
+A: An Ingress is a Kubernetes resource that provides HTTP/HTTPS routing to Services based on hostnames and URL paths. It requires an Ingress controller to fulfill the Ingress rules.
+
+**Q: What is an Ingress Controller?**
+A: An Ingress controller is a pod that watches the API server for Ingress resources and configures a web server (like NGINX, Traefik, or Envoy) to route traffic accordingly.
+
+**Q: What is the difference between Ingress and Service?**
+A: A Service provides layer-4 load balancing within the cluster. An Ingress provides layer-7 HTTP/HTTPS routing based on hostnames and paths, with SSL termination capabilities.
+
+### Intermediate Questions
+
+**Q: How do you configure TLS in an Ingress?**
+A: Create a TLS Secret with the certificate and key, then reference it in the Ingress spec's tls section with the hosts. The Ingress controller terminates SSL.
+
+**Q: What is the purpose of pathType in Ingress?**
+A: pathType determines how the path is matched: ImplementationSpecific (controller-dependent), Exact (exact match), or Prefix (URL prefix match).
+
+### Advanced Questions
+
+**Q: How would you implement canary deployments with Ingress?**
+A: Create two Ingress resources: the main one and a canary one with canary annotations (canary-weight, canary-by-header). Route a percentage of traffic to the canary version.
+
+## Cheat Sheet
+
+### Ingress YAML Template
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx  # or "gce", etc.
+  
+  # TLS configuration
+  tls:
+  - hosts:
+    - app.example.com
+    secretName: app-tls
+  
+  # Routing rules
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp-service
+            port:
+              number: 80
+```
+
+### Common Annotations (nginx-ingress)
+
+| Annotation | Purpose |
+|------------|---------|
+| nginx.ingress.kubernetes.io/ssl-redirect | Force HTTPS |
+| nginx.ingress.kubernetes.io/rate-limit | Rate limiting |
+| nginx.ingress.kubernetes.io/canary | Canary routing |
+| nginx.ingress.kubernetes.io/rewrite-target | URL rewriting |
+| nginx.ingress.kubernetes.io/proxy-body-size | Max body size |
+
+### Essential Commands
+
+```bash
+# Create
+kubectl apply -f ingress.yaml
+
+# List
+kubectl get ingress
+kubectl get ing
+
+# Describe
+kubectl describe ingress my-ingress
+
+# TLS secret
+kubectl create secret tls my-tls --cert=cert.pem --key=key.pem
+```
+
+## Related Topics
+
+- [Services](./services) - Backend services
+- [Networking](./networking) - Network policies
+- [Security](./security) - TLS and network security
+- [GKE](./gke) - GKE-specific ingress

@@ -1,0 +1,878 @@
+---
+title: "Google Kubernetes Engine (GKE)"
+description: "Complete guide to GKE - Google's managed Kubernetes service on Google Cloud"
+sidebar_position: 22
+---
+
+# Google Kubernetes Engine (GKE)
+
+## Overview
+
+**Google Kubernetes Engine (GKE)** is Google's fully managed Kubernetes service that provides enterprise-grade container orchestration on Google Cloud. GKE handles control plane management, node provisioning, and infrastructure operations, allowing teams to focus on application workloads.
+
+## When to Use
+
+- **Enterprise workloads** requiring high availability
+- **Cloud-native applications** on Google Cloud
+- **Hybrid cloud** with GKE Enterprise
+- **ML/AI workloads** with GPU node pools
+- **Microservices** requiring managed infrastructure
+- **Compliance requirements** with FIPS 140-2 validated modules
+
+## When NOT to Use
+
+- **Cost-sensitive projects** - EKS or AKS may be cheaper
+- **Multi-cloud strategy** - consider cloud-agnostic solutions
+- **Very small teams** - learning curve for GCP
+- **Legacy workloads** - requires containerization effort
+
+## Core Concepts
+
+### GKE Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         GKE Architecture                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    Google Cloud                                       │   │
+│  │                                                                      │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐  │   │
+│  │  │                  Managed Control Plane                         │  │   │
+│  │  │  - Multi-zone replication                                      │  │   │
+│  │  │  - Automatic upgrades                                          │  │   │
+│  │  │  - Auto-repair                                                  │  │   │
+│  │  │  - Certificate management                                       │  │   │
+│  │  └───────────────────────────────────────────────────────────────┘  │   │
+│  │                              │                                        │   │
+│  │                              │ VPC Network                            │   │
+│  │                              ▼                                        │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐  │   │
+│  │  │                    Node Pools                                   │  │   │
+│  │  │  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐        │  │   │
+│  │  │  │  system-pool  │ │ workload-pool │ │   gpu-pool    │        │  │   │
+│  │  │  │  (n2-standard-4)│(n2-standard-8)│ │  (a2-highgpu-1g)│     │  │   │
+│  │  │  └───────────────┘ └───────────────┘ └───────────────┘        │  │   │
+│  │  └───────────────────────────────────────────────────────────────┘  │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### GKE Editions
+
+| Feature | GKE Standard | GKE Enterprise |
+|---------|--------------|----------------|
+| Managed control plane | Yes | Yes |
+| Multi-cluster management | No | Yes |
+| Config Sync | No | Yes |
+| Policy Controller | No | Yes |
+| GitOps with Anthos Config Management | No | Yes |
+| Service mesh (Anthos Service Mesh) | No | Yes |
+| Hybrid connectivity | No | Yes |
+| Cost | Lower | Higher |
+
+## Architecture / How It Works
+
+### GKE Networking
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GKE Networking Model                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  VPC Native (Alias IP)                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Subnet: 10.0.0.0/20                                                  │   │
+│  │    ├─ Pods: 10.4.0.0/14 (auto-allocated)                             │   │
+│  │    └─ Services: 10.0.4.0/20 (auto-allocated)                         │   │
+│  │                                                                       │   │
+│  │  Routes created automatically for pod ranges                         │   │
+│  │  Cloud Router for VPC peering                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Private Clusters                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Control plane: Internal IP only (or private with public endpoint) │   │
+│  │  - Nodes: No public IPs                                              │   │
+│  │  - Firewall rules for API server access                              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production GKE Cluster
+
+```yaml
+# Terraform for GKE cluster
+# (Note: Terraform is typically used for production GKE)
+
+# gke-cluster.tf
+resource "google_container_cluster" "production" {
+  name = "production-cluster"
+  location = "us-central1"
+  project = "my-project"
+  
+  # Release channel (Stable, Regular, Rapid)
+  release_channel {
+    channel = "Stable"
+  }
+  
+  # Network
+  network    = google_compute_network.vpc.name
+  subnetwork = google_compute_subnetwork.subnet.name
+  
+  # IP allocation (VPC Native)
+  ip_allocation_policy {
+    cluster_ipv4_cidr_block  = "/14"
+    services_ipv4_cidr_block = "/20"
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+  }
+  
+  # Private cluster
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+  
+  # Master authorized networks
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "10.0.0.0/8"
+      display_name = "VPN Network"
+    }
+  }
+  
+  # Node pools
+  node_pool {
+    name = "system-pool"
+    node_count = 3
+    
+    node_config {
+      machine_type = "n2-standard-4"
+      disk_size_gb = 100
+      disk_type    = "pd-standard"
+      
+      preemptible = false
+      
+      shielded_instance_config {
+        enable_secure_boot = true
+        enable_integrity_monitoring = true
+      }
+      
+      labels = {
+        "node-pool" = "system"
+      }
+    }
+    
+    management {
+      auto_upgrade = true
+      auto_repair  = true
+    }
+  }
+  
+  node_pool {
+    name = "workload-pool"
+    node_count = 5
+    
+    autoscaling {
+      min_node_count = 3
+      max_node_count = 20
+    }
+    
+    node_config {
+      machine_type = "n2-standard-8"
+      disk_size_gb = 100
+      disk_type    = "pd-standard"
+      
+      preemptible = false
+      
+      labels = {
+        "node-pool" = "workload"
+      }
+      
+      taint {
+        key    = "workload-type"
+        value  = "production"
+        effect = "NoExecute"
+      }
+    }
+    
+    management {
+      auto_upgrade = true
+      auto_repair  = true
+    }
+  }
+  
+  # Security
+  enable_legacy_abac         = false
+  enable_integrity_monitoring = true
+  enable_shielded_nodes       = true
+  
+  # Network policy
+  network_policy {
+    enabled  = true
+    provider = "CALICO"
+  }
+  
+  # Vertical Pod Autoscaling
+  vertical_pod_autoscaling {
+    enabled = true
+  }
+  
+  # Workload Identity
+  workload_identity_config {
+    workload_pool = "${var.project}.svc.id.goog"
+  }
+  
+  # Maintenance window
+  maintenance_window {
+    day_of_week = "SUNDAY"
+    start_time  = "02:00"
+  }
+  
+  # Logging and monitoring
+  logging_config {
+    component_config {
+      enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+    }
+  }
+  
+  monitoring_config {
+    component_config {
+      enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
+    }
+  }
+}
+
+# Node pool for GPUs
+resource "google_container_node_pool" "gpu-pool" {
+  name     = "gpu-pool"
+  location = "us-central1"
+  cluster  = google_container_cluster.production.name
+  
+  initial_node_count = 0
+  
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 5
+  }
+  
+  node_config {
+    machine_type   = "a2-highgpu-1g"
+    accelerator_count = 1
+    accelerator_type  = "nvidia-tesla-t4"
+    
+    disk_size_gb = 100
+    disk_type    = "pd-standard"
+    
+    preemptible = true
+    
+    labels = {
+      "gpu" = "true"
+    }
+    
+    taint {
+      key    = "nvidia.com/gpu"
+      value  = "present"
+      effect = "NoSchedule"
+    }
+    
+    labels = {
+      "cloud.google.com/gke-accelerator" = "nvidia-tesla-t4"
+    }
+  }
+}
+```
+
+### GKE Workload Identity
+
+```yaml
+# Bind Kubernetes service account to GCP service account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-service-account
+  namespace: production
+  annotations:
+    iam.gke.io/gcp-service-account: api-sa@my-project.iam.gserviceaccount.com
+
+---
+# RBAC for the Kubernetes service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: workload-identity-role
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workload-identity-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: api-service-account
+  namespace: production
+roleRef:
+  kind: Role
+  name: workload-identity-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# GCP IAM binding (via gcloud or Terraform)
+# gcloud iam service-accounts add-iam-policy-binding \
+#   api-sa@my-project.iam.gserviceaccount.com \
+#   --role=roles/storage.objectViewer \
+#   --member=serviceAccount:production.svc.id.goog[production/api-service-account]
+```
+
+### GKE Config Connector
+
+```yaml
+# Config Connector for managing GCP resources from Kubernetes
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeInstance
+metadata:
+  name: gce-vm
+  namespace: production
+spec:
+  machineType: n1-standard-2
+  zone: us-central1-a
+  bootDiskSizeGb: 100
+  networkInterfaces:
+  - network: ref.compute.network/production-network
+    subnetwork: ref.compute.subnetwork/production-subnet
+  serviceAccount:
+    email: compute@my-project.iam.gserviceaccount.com
+    scopes:
+    - https://www.googleapis.com/auth/cloud-platform
+```
+
+## YAML Examples
+
+### GKE Ingress with Managed Certificate
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    networking.gke.io/managed-certificates: "api-cert"
+    kubernetes.io/ingress.global-static-ip-name: "api-ip"
+    kubernetes.io/ingress.allow-http: "false"
+spec:
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: api-cert
+  namespace: production
+spec:
+  domains:
+  - api.example.com
+```
+
+### GKE BackendConfig for Cloud Armor
+
+```yaml
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: api-backendconfig
+  namespace: production
+spec:
+  healthCheck:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /healthz/ready
+    port: 8080
+  
+  securityPolicy:
+    name: api-security-policy
+  
+  connectionDraining:
+    drainingTimeoutSec: 60
+  
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
+    affinityDurationSeconds: 10800
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  annotations:
+    cloud.google.com/backend-config: '{"default": "api-backendconfig"}'
+spec:
+  type: NodePort
+  selector:
+    app: api-service
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+### GKE Autopilot (Serverless-like)
+
+```yaml
+# GKE Autopilot managed workloads
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+    spec:
+      # Autopilot handles node provisioning
+      # Just set resource requests
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.0
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          # Limits are optional in Autopilot
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+```
+
+## CLI Examples (kubectl)
+
+### GKE Cluster Operations
+
+```bash
+# Create cluster
+gcloud container clusters create production-cluster \
+  --region=us-central1 \
+  --node-pool=default-pool \
+  --num-nodes=3 \
+  --machine-type=n2-standard-4 \
+  --enable-ip-alias \
+  --enable-private-nodes
+
+# Update cluster
+gcloud container clusters update production-cluster \
+  --region=us-central1 \
+  --enable-maintenance-window
+
+# Upgrade cluster
+gcloud container clusters upgrade production-cluster \
+  --region=us-central1 \
+  --master
+
+# Resize cluster
+gcloud container clusters resize production-cluster \
+  --region=us-central1 \
+  --node-pool=default-pool \
+  --num-nodes=5
+
+# Delete cluster
+gcloud container clusters delete production-cluster \
+  --region=us-central1
+```
+
+### Node Pool Operations
+
+```bash
+# Create node pool
+gcloud container node-pools create workload-pool \
+  --cluster=production-cluster \
+  --region=us-central1 \
+  --machine-type=n2-standard-8 \
+  --num-nodes=3 \
+  --enable-autoscaling \
+  --min-nodes=1 \
+  --max-nodes=10
+
+# Update node pool
+gcloud container node-pools update workload-pool \
+  --cluster=production-cluster \
+  --region=us-central1 \
+  --enable-autoscaling \
+  --min-nodes=2 \
+  --max-nodes=15
+
+# Upgrade node pool
+gcloud container node-pools upgrade workload-pool \
+  --cluster=production-cluster \
+  --region=us-central1
+
+# Delete node pool
+gcloud container node-pools delete workload-pool \
+  --cluster=production-cluster \
+  --region=us-central1
+```
+
+### GKE Workload Operations
+
+```bash
+# Get credentials
+gcloud container clusters get-credentials production-cluster \
+  --region=us-central1
+
+# Set context
+kubectl config use-context gke_my-project_us-central1_production-cluster
+
+# Check cluster info
+kubectl cluster-info
+kubectl get nodes -o wide
+
+# View workload status
+gcloud container clusters describe production-cluster \
+  --region=us-central1 \
+  --format="yaml(status)"
+
+# View GKE workloads in console
+gcloud container workloads list --region=us-central1
+```
+
+## Common Commands
+
+```bash
+# Get cluster credentials
+gcloud container clusters get-credentials my-cluster --region=us-central1
+
+# Check cluster status
+gcloud container clusters describe my-cluster --region=us-central1
+
+# List clusters
+gcloud container clusters list
+
+# Update cluster for maintenance
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --maintenance-window-start=2024-01-01T02:00:00Z
+
+# Create cluster with specific version
+gcloud container clusters create my-cluster \
+  --region=us-central1 \
+  --cluster-version=1.28
+```
+
+## Monitoring
+
+### Cloud Monitoring for GKE
+
+```bash
+# Enable GKE monitoring
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-monitoring
+
+# View GKE metrics in Cloud Monitoring
+# Metrics are in "Kubernetes Engine" category
+# - kubernetes.io/container/cpu/core_usage_time
+# - kubernetes.io/container/memory/usage_bytes
+# - kubernetes.io/container/uptime
+
+# List available metrics
+gcloud monitoring metrics list | grep kubernetes
+
+# Create alerting policy
+gcloud alpha monitoring policies create \
+  --notification-channels=CHANNEL_ID \
+  --display-name="High CPU Alert" \
+  --condition-display-name="CPU > 80%" \
+  --condition-filter='resource.type="k8s_container" metric.type="kubernetes.io/container/cpu/limit_utilization"'
+```
+
+### GKE Logging
+
+```bash
+# View logs in Cloud Logging
+gcloud logging read "resource.type=k8s_container" --project=my-project --limit=50
+
+# View logs for specific pod
+gcloud logging read 'resource.type="k8s_container" labels."k8s-pod/app"="api"' --project=my-project
+
+# View logs for specific namespace
+gcloud logging read "resource.type=k8s_container" "labels.\"kubernetes.io/metadata.name\"=\"production\"" --project=my-project
+
+# Create log sink
+gcloud logging sinks create my-sink \
+  storage.googleapis.com/my-bucket \
+  --log-filter='resource.type="k8s_container"'
+```
+
+## Security
+
+### GKE Security Best Practices
+
+```bash
+# Enable VPA
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-vertical-pod-autoscaling
+
+# Enable Shielded GKE nodes
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-shielded-nodes
+
+# Enable GKE Sandbox
+gcloud container node-pools create sandbox-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --enable-gke-enterprise \
+  --workload-pool=${PROJECT_ID}.svc.id.goog
+
+# Enable Binary Authorization
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-binauthz
+
+# Enable database encryption with CMEK
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --cluster-encryption-level=CMEK \
+  --encryption-key-name=projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
+```
+
+### Workload Identity Setup
+
+```bash
+# Create GCP service account
+gcloud iam service-accounts create api-sa \
+  --display-name="API Service Account"
+
+# Grant permissions
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:api-sa@my-project.iam.gserviceaccount.com \
+  --role=roles/storage.objectViewer
+
+# Bind to Kubernetes service account
+gcloud iam service-accounts add-iam-policy-binding \
+  api-sa@my-project.iam.gserviceaccount.com \
+  --role=roles/iam.workloadIdentityUser \
+  --member=serviceAccount:my-project.svc.id.goog[production/api-service-account]
+```
+
+## Cost Optimization
+
+### GKE Cost Management
+
+```bash
+# Use spot instances for batch workloads
+gcloud container node-pools create spot-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --spot \
+  --num-nodes=0 \
+  --enable-autoscaling \
+  --min-nodes=0 \
+  --max-nodes=50
+
+# Use committed use discounts
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --reservation-affinity=any
+
+# Use node auto-provisioning
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-autoscaling-profile=BALANCED
+
+# Right-size with VPA
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-vertical-pod-autoscaling
+```
+
+### Autopilot Mode
+
+```bash
+# GKE Autopilot handles node provisioning and scaling
+gcloud container clusters create autopilot-cluster \
+  --region=us-central1 \
+  --enable-autopilot
+
+# In Autopilot mode:
+# - No node pools to manage
+# - Resources are provisioned on demand
+# - Scaling is automatic
+# - Resource requests become actual resource allocation
+```
+
+## Troubleshooting
+
+### Common GKE Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Can't connect to cluster | Credentials expired | Refresh: `gcloud container clusters get-credentials` |
+| Pod scheduling failed | Resource quotas | Check quotas in Cloud Console |
+| ImagePullBackOff | Registry permissions | Check Workload Identity binding |
+| Node provisioning slow | Quota limits | Check Compute Engine quotas |
+| Control plane issues | GCP networking | Check Cloud Console status |
+
+### Diagnostic Commands
+
+```bash
+# Check cluster status
+gcloud container clusters describe my-cluster --region=us-central1
+
+# Check node pools
+gcloud container node-pools list --cluster=my-cluster --region=us-central1
+
+# Get cluster credentials
+gcloud container clusters get-credentials my-cluster --region=us-central1
+
+# Check GKE cluster operations
+gcloud container operations list --cluster=my-cluster --region=us-central1
+
+# View GKE logs
+gcloud logging read "resource.type=k8s_cluster" --project=my-project
+
+# Check Cloud Console for status
+# https://console.cloud.google.com/kubernetes/list
+
+# Verify kubectl context
+kubectl config get-contexts
+kubectl config current-context
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is GKE?**
+A: Google Kubernetes Engine (GKE) is Google's fully managed Kubernetes service that handles control plane management, node provisioning, and infrastructure operations on Google Cloud Platform.
+
+**Q: What are the benefits of GKE over self-managed Kubernetes?**
+A: GKE provides automatic control plane management, automatic upgrades, node auto-repair, integrated logging/monitoring, Workload Identity for GCP IAM, and managed add-ons like Ingress and Config Connector.
+
+**Q: What is Workload Identity?**
+A: Workload Identity allows Kubernetes service accounts to authenticate as GCP service accounts, enabling pods to access GCP APIs without storing service account keys.
+
+### Intermediate Questions
+
+**Q: What is the difference between GKE Standard and GKE Autopilot?**
+A: Autopilot provisions and manages nodes automatically based on workload needs. Standard gives full control over node pools. Autopilot is serverless-like with simplified operations.
+
+**Q: How does GKE networking work with VPC-native clusters?**
+A: VPC-native clusters use alias IP ranges for pods and services, eliminating the need for additional routing tables. Pod IPs are automatically routable within the VPC.
+
+**Q: What are GKE node pool upgrade strategies?**
+A: Node pools can be upgraded using surge upgrades (surge count configurable) or blue-green upgrades (create new nodes, then delete old). GKE handles the upgrade with zero-downtime if PDBs are configured.
+
+### Advanced Questions
+
+**Q: How would you implement disaster recovery for GKE?**
+A: Use etcd backups via Cloud Storage, regular application backups, cross-region cluster replication, or multi-cluster services. Test restore procedures regularly. Use Config Sync for GitOps.
+
+**Q: How does GKE handle multi-tenancy?**
+A: GKE supports namespace-based isolation, RBAC, NetworkPolicies, and node isolation with node pools. For stronger isolation, use GKE Enterprise with Policy Controller and Config Sync.
+
+## Cheat Sheet
+
+### GKE Quick Reference
+
+```bash
+# Cluster management
+gcloud container clusters create my-cluster --region=us-central1
+gcloud container clusters get-credentials my-cluster --region=us-central1
+gcloud container clusters describe my-cluster --region=us-central1
+gcloud container clusters update my-cluster --region=us-central1 --enable-maintenance-window
+
+# Node pool management
+gcloud container node-pools create my-pool --cluster=my-cluster --region=us-central1
+gcloud container node-pools upgrade my-pool --cluster=my-cluster --region=us-central1
+
+# GKE features
+gcloud container clusters update my-cluster --region=us-central1 --enable-vertical-pod-autoscaling
+gcloud container clusters update my-cluster --region=us-central1 --enable-shielded-nodes
+gcloud container clusters update my-cluster --region=us-central1 --enable-network-policy
+```
+
+### GKE Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GKE vs Self-Managed Kubernetes                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  GKE provides:                                                               │
+│  ✓ Managed control plane (HA, upgrades, repair)                             │
+│  ✓ Integrated IAM (Workload Identity)                                       │
+│  ✓ Cloud Logging and Monitoring                                             │
+│  ✓ Managed add-ons (Ingress, ConfigConnector)                               │
+│  ✓ Node auto-provisioning                                                   │
+│  ✓ Binary Authorization                                                     │
+│  ✓ Security Command Center integration                                      │
+│                                                                              │
+│  You manage:                                                                 │
+│  ✓ Node pools configuration                                                 │
+│  ✓ Application deployments                                                  │
+│  ✓ Network policies                                                         │
+│  ✓ RBAC configuration                                                       │
+│  ✓ Secrets management                                                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Essential Commands
+
+```bash
+# Get credentials
+gcloud container clusters get-credentials my-cluster --region=us-central1
+
+# List clusters
+gcloud container clusters list
+
+# Cluster info
+kubectl cluster-info
+kubectl get nodes
+
+# Check GKE workload
+gcloud container workloads list --region=us-central1
+```
+
+## Related Topics
+
+- [Architecture](./architecture) - Kubernetes architecture
+- [Security](./security) - GKE security features
+- [Networking](./networking) - GKE networking
+- [Production Operations](./production-operations) - GKE operations

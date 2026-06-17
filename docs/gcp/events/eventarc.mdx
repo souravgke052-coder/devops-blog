@@ -1,0 +1,576 @@
+# Eventarc
+
+## Overview
+
+Google Cloud Eventarc is an event-driven routing service that delivers events from GCP services, custom sources, and third parties to Cloud Run, GKE, Cloud Functions, and other targets. It provides a uniform way to consume events without managing infrastructure, with built-in audit logging and delivery guarantees.
+
+## When To Use
+
+- Event-driven architectures with Cloud Run/GKE
+- Triggering workflows from GCP service events
+- Audit log event processing
+- Third-party SaaS event ingestion
+- Building event mesh across services
+- Serverless event handlers
+
+## When NOT To Use
+
+- Direct Pub/Sub publishing (use Pub/Sub directly)
+- Synchronous request handling
+- Complex message transformations (use Dataflow)
+- Long-running batch jobs (use Dataflow or Composer)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Eventarc                                │
+├─────────────────────────────────────────────────────────────┤
+│  Event Sources:                                             │
+│  ├── Cloud Audit Logs (all GCP services)                   │
+│  ├── Pub/Sub (custom publishers)                           │
+│  ├── Storage (GCS events)                                  │
+│  ├── Kubernetes (GKE events)                               │
+│  └── Direct (HTTP custom events)                           │
+├─────────────────────────────────────────────────────────────┤
+│  Targets:                                                   │
+│  ├── Cloud Run                                             │
+│  ├── Google Kubernetes Engine                              │
+│  ├── Cloud Functions (1st gen)                             │
+│  ├── GCS (storage triggers)                                │
+│  └── Workflows                                             │
+├─────────────────────────────────────────────────────────────┤
+│  Features:                                                 │
+│  ├── Event type filtering                                  │
+│  ├── Event ordering (at-least-once)                        │
+│  ├── Built-in retries                                      │
+│  └── Cloud Audit Log integration                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Event
+A message describing an action or change in a GCP service.
+
+### Trigger
+A resource that listens for events and forwards them to a target.
+
+### Event Provider
+GCP service or source that generates events.
+
+### Transport
+Underlying channel (typically Cloud Audit Logs or Pub/Sub) for event delivery.
+
+## Real Production Example
+
+**Order Processing Event Pipeline**
+
+```hcl
+# Terraform configuration for event-driven order processing
+
+# Enable required APIs
+resource "google_project_service" "eventarc" {
+  service = "eventarc.googleapis.com"
+}
+
+resource "google_project_service" "audit" {
+  service = "cloudaudit.googleapis.com"
+}
+
+# Cloud Run service for order processing
+resource "google_cloud_run_v2_service" "order_processor" {
+  name     = "order-processor"
+  location = var.region
+  
+  template {
+    service_account = google_service_account.order_processor.email
+    
+    containers {
+      image = "gcr.io/my-project/order-processor:v1"
+      
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "512Mi"
+        }
+      }
+      
+      ports {
+        container_port = 8080
+      }
+      
+      env {
+        name  = "TARGET_REGION"
+        value = var.region
+      }
+    }
+    
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 10
+    }
+    
+    vpc_access {
+      connector = google_vpc_access_connector.connector.id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
+  }
+  
+  ingress = "INGRESS_TRAFFIC_ALL"
+}
+
+# Eventarc trigger for Cloud Storage object finalization
+resource "google_eventarc_trigger" "storage_trigger" {
+  name     = "order-storage-trigger"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.storage.object.v1.finalized"
+  }
+  
+  matching_criteria {
+    attribute = "bucket"
+    value     = google_storage_bucket.orders.name
+  }
+  
+  destination {
+    cloud_run_service {
+      service   = google_cloud_run_v2_service.order_processor.name
+      region    = var.region
+      path      = "/process"
+    }
+  }
+  
+  service_account = google_service_account.eventarc_sa.email
+  
+  traffic {
+    type = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+}
+
+# Eventarc trigger for Cloud SQL create events
+resource "google_eventarc_trigger" "cloudsql_trigger" {
+  name     = "cloudsql-trigger"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.sql.instance.v1.created"
+  }
+  
+  matching_criteria {
+    attribute = "serviceName"
+    value     = "cloudsql.googleapis.com"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.order_processor.name
+      region  = var.region
+      path    = "/sql-event"
+    }
+  }
+}
+
+# Eventarc trigger for Pub/Sub messages
+resource "google_eventarc_trigger" "pubsub_trigger" {
+  name     = "pubsub-trigger"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.pubsub.topic.v1.messagePublished"
+  }
+  
+  matching_criteria {
+    attribute = "topic"
+    value     = "order-events-${var.environment}"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.order_processor.name
+      region  = var.region
+    }
+  }
+}
+
+# Eventarc trigger for Audit Log events
+resource "google_eventarc_trigger" "audit_trigger" {
+  name     = "audit-trigger"
+  location = var.region
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.audit.v1.written"
+  }
+  
+  matching_criteria {
+    attribute = "serviceName"
+    value     = "compute.googleapis.com"
+  }
+  
+  matching_criteria {
+    attribute = "methodName"
+    value     = "v1.compute.instances.insert"
+  }
+  
+  matching_criteria {
+    attribute = "resourceName"
+    value     = "projects/${var.project}/zones/*"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.order_processor.name
+      region  = var.region
+      path    = "/audit-event"
+    }
+  }
+  
+  channel = google_eventarc_channel.channel.id
+}
+
+# Custom Eventarc channel
+resource "google_eventarc_channel" "channel" {
+  name        = "custom-channel"
+  location    = var.region
+  third_party_audit_config = google_eventarc_google_channel_config.config.id
+}
+
+# Google Channel for third-party events
+resource "google_eventarc_google_channel_config" "config" {
+  location = var.region
+  
+  config {
+    upstream_provider = "PROVIDER_UNSPECIFIED"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create trigger for Cloud Storage
+gcloud eventarc triggers create my-storage-trigger \
+  --location=us-central1 \
+  --destination-run-service=my-service \
+  --destination-run-region=us-central1 \
+  --matching-criteria="type=google.cloud.storage.object.v1.finalized" \
+  --matching-criteria="bucket=my-bucket"
+
+# Create trigger for Pub/Sub
+gcloud eventarc triggers create my-pubsub-trigger \
+  --location=us-central1 \
+  --destination-run-service=my-service \
+  --destination-run-region=us-central1 \
+  --matching-criteria="type=google.cloud.pubsub.topic.v1.messagePublished" \
+  --matching-criteria="topic=my-topic"
+
+# Create trigger for Audit Log
+gcloud eventarc triggers create my-audit-trigger \
+  --location=us-central1 \
+  --destination-run-service=my-service \
+  --destination-run-region=us-central1 \
+  --matching-criteria="type=google.cloud.audit.v1.written" \
+  --matching-criteria="serviceName=cloudsql.googleapis.com" \
+  --matching-criteria="methodName=v1.instances.insert"
+
+# Create trigger with filtering
+gcloud eventarc triggers create my-filtered-trigger \
+  --location=us-central1 \
+  --destination-run-service=my-service \
+  --destination-run-path=/filtered \
+  --matching-criteria="type=google.cloud.storage.object.v1.finalized" \
+  --matching-criteria="bucket=my-bucket" \
+  --event-filters="object.prefix=orders/"
+
+# List triggers
+gcloud eventarc triggers list --location=us-central1
+
+# Describe trigger
+gcloud eventarc triggers describe my-trigger --location=us-central1
+
+# Update trigger
+gcloud eventarc triggers update my-trigger \
+  --location=us-central1 \
+  --destination-run-service=my-new-service
+
+# Delete trigger
+gcloud eventarc triggers delete my-trigger --location=us-central1 --quiet
+
+# Create channel
+gcloud eventarc channels create my-channel --location=us-central1
+
+# List channels
+gcloud eventarc channels list --location=us-central1
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Storage trigger
+resource "google_eventarc_trigger" "storage" {
+  name     = "storage-trigger"
+  location = "us-central1"
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.storage.object.v1.finalized"
+  }
+  
+  matching_criteria {
+    attribute = "bucket"
+    value     = google_storage_bucket.my_bucket.name
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.my_service.name
+      region  = "us-central1"
+    }
+  }
+}
+
+# Pub/Sub trigger
+resource "google_eventarc_trigger" "pubsub" {
+  name     = "pubsub-trigger"
+  location = "us-central1"
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.pubsub.topic.v1.messagePublished"
+  }
+  
+  matching_criteria {
+    attribute = "topic"
+    value     = google_pubsub_topic.my_topic.name
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.my_service.name
+      region  = "us-central1"
+    }
+  }
+}
+
+# Audit Log trigger
+resource "google_eventarc_trigger" "audit" {
+  name     = "audit-trigger"
+  location = "us-central1"
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.audit.v1.written"
+  }
+  
+  matching_criteria {
+    attribute = "serviceName"
+    value     = "cloudsql.googleapis.com"
+  }
+  
+  matching_criteria {
+    attribute = "methodName"
+    value     = "v1.instances.insert"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.my_service.name
+      region  = "us-central1"
+    }
+  }
+}
+
+# GKE trigger
+resource "google_eventarc_trigger" "gke" {
+  name     = "gke-trigger"
+  location = "us-central1"
+  
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.run.topic.v1.could"
+  }
+  
+  matching_criteria {
+    attribute = "trigger"
+    value     = "my-gke-trigger"
+  }
+  
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.my_service.name
+      region  = "us-central1"
+    }
+  }
+}
+
+# Custom channel
+resource "google_eventarc_google_channel_config" "config" {
+  location = "us-central1"
+}
+```
+
+## Common Commands
+
+```bash
+# Trigger management
+gcloud eventarc triggers create TRIGGER --location=LOC [flags]
+gcloud eventarc triggers list --location=LOC
+gcloud eventarc triggers describe TRIGGER --location=LOC
+gcloud eventarc triggers update TRIGGER --location=LOC [flags]
+gcloud eventarc triggers delete TRIGGER --location=LOC
+
+# Channel management
+gcloud eventarc channels create CHANNEL --location=LOC
+gcloud eventarc channels list --location=LOC
+gcloud eventarc channels describe CHANNEL --location=LOC
+```
+
+## Monitoring
+
+### Key Metrics
+- **Trigger invocations**: Number of event deliveries
+- **Delivery latency**: Time from event to target
+- **Delivery failures**: Failed event deliveries
+- **Retry count**: Number of retries
+
+### Cloud Monitoring
+
+```bash
+# View Eventarc metrics
+gcloud monitoring metrics list --filter="resource.type=eventarc_trigger"
+
+# Create alert for failures
+gcloud monitoring policies create \
+  --display-name="Eventarc Delivery Failure" \
+  --condition-display-name="Failure rate > 1%" \
+  --condition-filter='resource.type="eventarc_trigger" AND metric.type="eventarc.googleapis.com/trigger/failures"' \
+  --condition-threshold-value=0.01 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### IAM Permissions
+```bash
+# Eventarc Admin
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:admin@company.com \
+  --role=roles/eventarc.admin
+
+# Eventarc Publisher
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:trigger@project.iam.gserviceaccount.com \
+  --role=roles/eventarc.publisher
+
+# Cloud Run Invoker (for triggers)
+gcloud run services add-iam-policy-binding my-service \
+  --member=serviceAccount:eventarc@project.iam.gserviceaccount.com \
+  --role=roles/run.invoker
+```
+
+## Troubleshooting
+
+### Trigger Not Firing
+```bash
+# Check trigger exists and is enabled
+gcloud eventarc triggers describe my-trigger --location=us-central1
+
+# Verify event source is generating events
+gcloud logging read "resource.type=gcs_bucket" --limit=10
+
+# Check Cloud Run service is accessible
+gcloud run services describe my-service --region=us-central1
+```
+
+### Permission Errors
+```bash
+# Verify Eventarc service account can invoke Cloud Run
+gcloud run services get-iam-policy my-service --region=us-central1
+
+# Check trigger service account
+gcloud eventarc triggers describe my-trigger --location=us-central1 \
+  --format="yaml(serviceAccount)"
+```
+
+## Interview Questions
+
+**Q: How does Eventarc differ from direct Pub/Sub triggers?**
+A: Eventarc provides a higher-level abstraction with built-in audit log integration, filtering, and managed delivery. Pub/Sub direct triggers give you more control but require more setup. Eventarc is preferred for GCP-native events; Pub/Sub for custom event sources.
+
+**Q: What is the difference between Eventarc and Cloud Functions triggers?**
+A: Cloud Functions triggers are built into Cloud Functions. Eventarc can trigger any HTTP target (Cloud Run, GKE, etc.) and has richer event filtering. Eventarc is the recommended approach for event-driven architectures.
+
+**Q: What event delivery guarantees does Eventarc provide?**
+A: Eventarc provides at-least-once delivery with retries for failed deliveries. It uses Cloud Audit Logs or Pub/Sub as the underlying transport depending on the event source.
+
+**Q: How do you filter events in Eventarc triggers?**
+A: Use `--matching-criteria` for exact matches on event attributes. Use `--event-filters` for prefix matching on data fields. Multiple criteria are ANDed together.
+
+## Cheat Sheet
+
+```bash
+# Create trigger
+gcloud eventarc triggers create TRIGGER \
+  --location=REGION \
+  --destination-run-service=SERVICE \
+  --matching-criteria="type=EVENT_TYPE"
+
+# Common event types
+google.cloud.storage.object.v1.finalized
+google.cloud.pubsub.topic.v1.messagePublished
+google.cloud.audit.v1.written
+google.cloud.sql.instance.v1.created
+
+# Update trigger
+gcloud eventarc triggers update TRIGGER --location=REGION \
+  --destination-run-service=NEW_SERVICE
+```
+
+## Labs
+
+### Lab 1: Cloud Run Event Handler
+Build event-driven Cloud Run service.
+1. Create Cloud Run service
+2. Create Eventarc trigger for Storage
+3. Implement event handling logic
+4. Add error handling and retries
+5. Test with sample events
+
+### Lab 2: Audit Log Processing
+Process GCP audit logs.
+1. Enable Cloud Audit Logs
+2. Create Eventarc trigger for specific method
+3. Parse audit log format
+4. Implement alert logic
+5. Set up notifications
+
+### Lab 3: Multi-Source Event Router
+Build event aggregation.
+1. Create triggers for multiple sources
+2. Normalize event formats
+3. Route to appropriate handlers
+4. Implement dead letter handling
+5. Monitor all triggers
+
+## Related Services
+
+- **Pub/Sub**: Message broker infrastructure
+- **Cloud Run**: Event-driven container execution
+- **Cloud Functions**: Serverless function triggers
+- **Workflows**: Event-driven workflow orchestration
+- **Cloud Audit Logs**: Event source for GCP services

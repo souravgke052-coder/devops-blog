@@ -1,0 +1,560 @@
+# TCP/IP Model
+
+## Overview
+
+The TCP/IP model (DoD model) is the practical framework underlying all modern networking. Unlike the OSI model's theoretical elegance, the TCP/IP 4-layer model maps directly to how protocols actually operate. Understanding this model is essential because every network troubleshooting session, every load balancer configuration, every Kubernetes service deployment involves these layers in action.
+
+The TCP/IP model consists of: Link Layer (physical transmission + data link), Internet Layer (IP addressing and routing), Transport Layer (TCP/UDP end-to-end delivery), and Application Layer (HTTP, DNS, gRPC, etc.). This structure—sometimes extended to 5 layers by splitting the link layer—explains why network problems manifest where they do: a latency issue in HTTP might actually be TCP retransmission in the transport layer, which might actually be congestion on the link layer.
+
+In production, the TCP/IP model guides architectural decisions: load balancers operate at multiple layers (L4 for raw TCP, L7 for HTTP), network policies apply at L3/L4, and observability tools capture metrics per layer. The model also clarifies cloud networking: VPCs operate at L2/L3, security groups at L3/L4, and NACLs at L3.
+
+## When To Use
+
+- **Designing network architecture**: Choosing between L4 and L7 load balancing, understanding when to use VPC endpoints vs NAT Gateways
+- **Debugging cross-cloud connectivity**: Understanding how packets traverse between AWS VPCs, on-prem, and GCP
+- **Performance tuning**: Knowing whether to tune TCP buffers, NIC settings, or application behavior
+- **Security policy creation**: Applying rules at correct layer (IP-based rules are L3, port-based are L4)
+- **Protocol analysis**: Reading tcpdump output and understanding what you're seeing
+
+## When NOT To Use
+
+- **Hardware/network device configuration**: Network equipment has its own abstractions
+- **Understanding real-time protocol details**: The model abstracts away timing, reliability mechanisms, and protocol-specific behaviors
+- **Predicting exact behavior in complex systems**: Production issues often span multiple layers and involve subtle interactions
+
+## Core Concepts
+
+### The 4-Layer TCP/IP Model
+
+**Layer 1 — Link (Network Interface)**: Combines OSI Physical and Data Link layers. Handles framing, MAC addressing, physical transmission, and interface configuration. In Linux, this is the `eth0`, `ens33`, `bond0` interfaces you configure with `ip link`. Protocols: Ethernet (802.3), Wi-Fi (802.11), ARP, PPP, VLAN (802.1Q).
+
+**Layer 2 — Internet (Network)**: IP addressing, routing, and packet delivery. Provides logical addressing independent of physical topology. In Linux: `ip addr`, `ip route`, `ip rule`. Protocols: IPv4, IPv6, ICMP, ICMPv6, BGP, OSPF.
+
+**Layer 3 — Transport (Host-to-Host)**: End-to-end communication between processes on different hosts. Multiplexes using ports (16-bit). TCP provides reliability, ordering, flow control; UDP provides connectionless best-effort. In Linux: `ss`, `netstat`, connection tracking. Protocols: TCP, UDP, SCTP.
+
+**Layer 4 — Application**: User-facing protocols. HTTP, HTTPS, DNS, SSH, SMTP, gRPC, PostgreSQL wire protocol. Often runs over TLS (Session layer in OSI) which itself runs over TCP.
+
+### Mapping TCP/IP to OSI
+
+| TCP/IP Layer | OSI Equivalent | Example Protocols |
+|--------------|----------------|-------------------|
+| Application | OSI 5-7 | HTTP, DNS, SSH, gRPC |
+| Transport | OSI 4 | TCP, UDP |
+| Internet | OSI 3 | IPv4, IPv6, ICMP |
+| Link | OSI 1-2 | Ethernet, ARP, Wi-Fi |
+
+The practical difference: OSI separates Presentation and Session (often bundled into Application in TCP/IP), and separates Physical from Data Link (often combined in TCP/IP Link layer).
+
+### IPv4 vs IPv6
+
+**IPv4**: 32-bit addresses (~4.3 billion addresses). Exhausted since 2011 (IANA), now allocated from /8 blocks to RIRs. Private ranges: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16. NAT commonly used to extend address space.
+
+**IPv6**: 128-bit addresses (~340 undecillion addresses). Native end-to-end connectivity, no NAT needed. Format: 8 groups of 4 hex digits: `2001:0db8:85a3:0000:0000:8a2e:0370:7334`. Abbreviated: `2001:db8::85a3::8a2e:370:7334` (:: replaces consecutive zeros). Global unicast: `2000::/3`. Link-local: `fe80::/10`.
+
+```bash
+# IPv4 commands
+ip -4 addr show
+ip route show
+
+# IPv6 commands
+ip -6 addr show
+ip -6 route show
+
+# IPv6 in dual-stack configuration
+# eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP
+#     inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0
+#     inet6 2600:1900:4000:1::5/128 scope global dynamic
+
+# Test IPv6 connectivity
+ping6 -c 3 2600:1900:4000:1::1
+curl -6 -v https://ipv6.google.com
+```
+
+### IP Addressing and Subnetting
+
+IP addresses identify interfaces, not hosts. A host with multiple interfaces (multi-homed) has multiple IPs. CIDR notation (`/24`) indicates prefix length—the number of network bits.
+
+```bash
+# Calculate network and broadcast from IP/CIDR
+# 192.168.1.100/24
+# Network: 192.168.1.0 (first 24 bits = 192.168.1)
+# Host bits: last 8 bits = 100 = 01100100
+# Broadcast: 192.168.1.255 (all host bits = 1)
+# Usable IPs: 192.168.1.1 - 192.168.1.254 (254 hosts)
+
+# Subnet with 26 bits: /26 = 4 subnets of 62 hosts each
+# 10.0.0.0/26: network 10.0.0.0, hosts 10.0.0.1-10.0.0.62, broadcast 10.0.0.63
+# 10.0.0.64/26: network 10.0.0.64, hosts 10.0.0.65-10.0.0.126
+```
+
+### Autonomous Systems and BGP
+
+An Autonomous System (AS) is a collection of IP prefixes under single administrative control. AS numbers (ASN) are 16-bit (0-65535, some extended to 32-bit). BGP (Border Gateway Protocol) routes between ASes.
+
+**BGP attributes** determine path selection:
+- AS_PATH: sequence of ASNs traffic traverses
+- LOCAL_PREF: preference for outbound traffic
+- MED (Multi-Exit Discriminator): preference for inbound traffic from specific neighbor
+- NEXT_HOP: IP address of next hop router
+
+```bash
+# View BGP neighbors (Cisco/Juniper style output)
+# show ip bgp summary
+# Neighbor        AS    MsgRcvd MsgSent  Up/Down   State
+# 10.0.0.1      65001    12345    8900  45d 12h33m       5
+
+# BGP route example
+# show ip bgp 8.8.8.0/24
+# BGP routing table entry for 8.8.8.0/24, version 12345
+# Paths: (1 available, best #1, table default)
+#   Not advertised to any peer
+#   15169
+#     8.8.8.1 (metric 100) from 10.0.0.1 (10.0.0.1)
+#     Origin IGP, localpref 100, valid, internal, best
+```
+
+### MTU, MSS, and Fragmentation
+
+**MTU (Maximum Transmission Unit)**: Maximum packet size for interface. Ethernet default: 1500 bytes. Jumbo frames: 9000 bytes.
+
+**MSS (Maximum Segment Size)**: Largest TCP payload. Typically MTU - 40 bytes (20 IP header + 20 TCP header). For Ethernet MTU 1500: MSS = 1460 bytes.
+
+**Fragmentation**: If packet exceeds outgoing MTU, IPv4 can fragment; IPv6 never fragments at router.
+
+```bash
+# Check interface MTU
+ip link show eth0 | grep mtu
+# eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000
+
+# Path MTU Discovery (PMTUD)
+# Host sends packets with Don't Fragment bit set
+# Router with smaller MTU sends ICMP "Fragmentation Needed"
+# If ICMP blocked: connections hang (black hole)
+
+# Manual MSS clamping with iptables
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
+  -j TCPMSS --set-mss 1400
+# This ensures packets never exceed 1400 + 40 = 1440 bytes
+```
+
+## Real Production Example
+
+### Multi-Region AWS Architecture with Transit Gateway
+
+```bash
+# AWS Transit Gateway Attachments
+# VPC us-west-2 (10.1.0.0/16) - Production workloads
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-0a1b2c3d4e5f6g7h8 \
+  --vpc-id vpc-0abcd1234efgh5678 \
+  --subnet-ids subnet-0abcd1234efgh5678a subnet-0abcd1234efgh5678b
+
+# VPC us-east-1 (10.2.0.0/16) - DR site
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-0a1b2c3d4e5f6g7h8 \
+  --vpc-id vpc-0efgh5678ijkl9012 \
+  --subnet-ids subnet-0efgh5678ijkl9012a subnet-0efgh5678ijkl9012b
+
+# Create Transit Gateway Route Table
+aws ec2 create-transit-gateway-route-table \
+  --transit-gateway-id tgw-0a1b2c3d4e5f6g7h8
+
+# Associate attachments with route table
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-0abc123def456 \
+  --transit-gateway-attachment-id tgw-attach-0abc123def456
+
+# Propagate routes from VPC attachments
+aws ec2 enable-transit-gateway-route-table-propagation \
+  --transit-gateway-route-table-id tgw-rtb-0abc123def456 \
+  --transit-gateway-attachment-id tgw-attach-0abc123def456
+```
+
+### Routing Configuration
+
+```bash
+# Static routes
+ip route add 10.2.0.0/16 via 10.1.0.1 dev eth0
+
+# Policy-based routing (multiple routing tables)
+# Route based on source IP
+ip rule add from 10.1.0.0/16 lookup 100
+ip rule add from 10.2.0.0/16 lookup 200
+
+# Routing table 100 (for VPC 10.1)
+echo "100 t100" >> /etc/iproute2/rt_tables
+ip route add default via 10.1.0.1 dev eth0 table t100
+
+# Routing table 200 (for VPC 10.2)
+echo "200 t200" >> /etc/iproute2/rt_tables
+ip route add default via 10.2.0.1 dev eth1 table t200
+
+# View all routing tables
+ip route show table all
+```
+
+## CLI Examples
+
+```bash
+# IP address management
+ip addr add 10.0.0.5/24 dev eth0 label eth0:0
+ip addr del 10.0.0.5/24 dev eth0
+ip addr show master bridge0  # Addresses on bridge
+
+# Interface management
+ip link set eth0 up/down
+ip link set eth0 mtu 9000
+ip link add link eth0 name eth0.100 type vlan id 100
+ip link add bond0 type bond mode 802.3ad
+
+# Routing
+ip route show
+ip route get 8.8.8.8  # See which route would be used
+ip route add 172.16.0.0/12 via 10.0.0.1
+ip route add default via 10.0.0.1
+ip route flush cache
+
+# Policy routing
+ip rule show
+ip rule add from 192.168.1.0/24 nat 10.0.0.5
+ip rule add iif eth0 table 100
+
+# Neighbor (ARP) management
+ip neigh show
+ip neigh add 10.0.0.1 lladdr 00:11:22:33:44:55 dev eth0 nud permanent
+ip neigh del 10.0.0.1 dev eth0
+
+# Network namespace (isolate stack)
+ip netns add test
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns test
+```
+
+## Common Commands
+
+| Command | Layer | Purpose |
+|---------|-------|---------|
+| `ip addr` | L3 | Manage IP addresses |
+| `ip link` | L2 | Manage interfaces |
+| `ip route` | L3 | Manage routing table |
+| `ip rule` | L3 | Policy routing rules |
+| `ip neigh` | L2-3 | ARP/NDP table |
+| `ip netns` | All | Network namespaces |
+| `ss` | L4 | Socket statistics |
+| `netstat` | L4 | Network statistics |
+| `tcpdump` | L2-7 | Packet capture |
+| `ping` | L3 | ICMP echo |
+| `traceroute` | L3 | Trace route |
+| `tracepath` | L3 | Path MTU discovery |
+| `ethtool` | L1-2 | NIC settings |
+| `bridge` | L2 | Bridge management |
+| `tc` | L2-3 | Traffic control |
+| `conntrack` | L4 | Connection tracking |
+
+## Monitoring
+
+### Link Layer Metrics
+
+```bash
+# Interface statistics
+ip -s link show
+cat /proc/net/dev
+ethtool -S eth0
+
+# Key metrics to watch:
+# - rx_dropped: Kernel buffer exhaustion
+# - rx_errors: CRC errors, frame alignment
+# - tx_errors: Late collisions, carrier errors
+```
+
+### IP Layer Metrics
+
+```bash
+# View IP statistics
+cat /proc/net/snmp
+# Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors
+#    ForwDatagrams UnknownProtos ReassemblyTimeout ReassemblyOK
+#    FragmentFails
+
+# ICMP statistics
+cat /proc/net/netstat | grep Icmp
+```
+
+### Transport Layer Metrics
+
+```bash
+# TCP statistics summary
+ss -s
+# Total: 145 (established 42, time-wait 89)
+# TCP:   inuse 3 orphan 0 tw 89 alloc 45 mem 2
+
+# Detailed TCP states
+ss -tna | awk '{print $1}' | sort | uniq -c
+# 89 TIME-WAIT
+# 42 ESTAB
+
+# Memory usage
+cat /proc/net/sockstat
+# socks: used 312
+# TCP: inuse 45 orphan 0 tw 89 mem 2
+# UDP: inuse 23
+# skbuff size: 65536 131072 262144
+```
+
+### Prometheus Metrics (node_exporter)
+
+```promql
+# Interface throughput (bytes/sec)
+rate(node_network_receive_bytes_total{device="eth0"}[5m])
+rate(node_network_transmit_bytes_total{device="eth0"}[5m])
+
+# Packet rates
+rate(node_network_receive_packets_total{device="eth0"}[5m])
+
+# Interface errors
+rate(node_network_receive_errors_total{device="eth0"}[5m])
+rate(node_network_receive_drop_total{device="eth0"}[5m])
+
+# TCP stats
+rate(node_netstat_Tcp_InSegs[5m])
+rate(node_netstat_Tcp_OutSegs[5m])
+rate(node_netstat_Tcp_RetoSegs[5m])
+```
+
+## Security
+
+### IP Spoofing Prevention
+
+```bash
+# Enable Reverse Path Filtering (RPF)
+# Strict mode: packet's source must be reachable via incoming interface
+sysctl -w net.ipv4.conf.all.rp_filter=1
+sysctl -w net.ipv4.conf.default.rp_filter=1
+sysctl -w net.ipv6.conf.all.rp_filter=2
+sysctl -w net.ipv6.conf.default.rp_filter=2
+
+# Disable source routing
+sysctl -w net.ipv4.conf.all.accept_source_route=0
+sysctl -w net.ipv6.conf.all.accept_source_route=0
+
+# Disable ICMP redirects
+sysctl -w net.ipv4.conf.all.accept_redirects=0
+sysctl -w net.ipv4.conf.default.accept_redirects=0
+sysctl -w net.ipv6.conf.all.accept_redirects=0
+```
+
+### IPv6 Security
+
+```bash
+# Disable IPv6 if not needed
+sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sysctl -w net.ipv6.conf.default.disable_ipv6=1
+
+# Or secure IPv6 instead
+sysctl -w net.ipv6.conf.all.accept_ra=0
+sysctl -w net.ipv6.conf.default.accept_ra=0
+sysctl -w net.ipv6.conf.all.forwarding=0  # If not a router
+
+# Configure IPv6 firewall (if using)
+ip6tables -A INPUT -p ipv6-icmp --icmpv6-type router-advertisement -j DROP
+ip6tables -A INPUT -p ipv6-icmp --icmpv6-type neighbor-solicitation -j ACCEPT
+```
+
+### Cloud Security Groups (L3/L4)
+
+```bash
+# AWS: Restrictive security group
+aws ec2 create-security-group \
+  --group-name production-web \
+  --description "Web tier security group" \
+  --vpc-id vpc-0abcd1234efgh5678
+
+# Allow only from ALB
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0abc123def456 \
+  --protocol tcp \
+  --port 8080 \
+  --source-group sg-0xyz789abc123
+
+# Allow health checks from VPC CIDR
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0abc123def456 \
+  --protocol tcp \
+  --port 8080 \
+  --cidr 10.0.0.0/16
+
+# Deny all else (implicit)
+```
+
+## Cost Optimization
+
+### Bandwidth and Instance Sizing
+
+AWS EC2 instance types have different network performance levels:
+
+```bash
+# Check instance network performance
+aws ec2 describe-instance-types \
+  --instance-types c5.xlarge \
+  --query 'InstanceTypes[0].NetworkInfo'
+
+# Output includes:
+# - NetworkPerformance: Up to 10Gbps
+# - EfaSupported: false
+# - EncryptionSupported: true
+
+# For network-intensive workloads, consider:
+# - c5n.xlarge: 25Gbps with ENA Express
+# - c5n.18xlarge: 100Gbps
+# - trn1.2xlarge: 800Gbps for ML training
+```
+
+### Data Transfer Costs (AWS)
+
+| Traffic Type | Cost per GB |
+|--------------|-------------|
+| Within AZ | Free |
+| AZ to AZ (same region) | $0.01 |
+| Region to Region | $0.02 |
+| Out to Internet | $0.09 (first 10TB) |
+| S3 via VPC Endpoint | Free |
+
+**Optimization strategies**:
+1. Use VPC endpoints for S3, DynamoDB
+2. Co-locate services in same AZ for high traffic
+3. Use CloudFront for static content
+4. Consider Direct Connect for high-volume transfers
+
+## Troubleshooting
+
+### Connectivity Issues
+
+```bash
+# Step 1: Verify IP configuration
+ip addr show eth0
+# Check: correct IP? correct subnet? interface up?
+
+# Step 2: Verify gateway reachable
+ping -c 1 10.0.0.1
+ip neigh show 10.0.0.1
+# If no ARP entry: check VLAN, check switch port
+
+# Step 3: Verify routing
+ip route get 8.8.8.8
+# Expected: via 10.0.0.1 dev eth0 src 10.0.0.5
+
+# Step 4: Verify DNS
+dig +short example.com
+# If fails: check /etc/resolv.conf, nameserver reachable?
+
+# Step 5: Test TCP connectivity
+nc -zv 8.8.8.8 53
+# If fails: check firewall, routing
+```
+
+### Common Issues Table
+
+| Issue | Check | Fix |
+|-------|-------|-----|
+| Can't ping gateway | `ip neigh show` | Check VLAN, switch config |
+| Can ping but no TCP | Firewall? `tcpdump` | Check iptables, security groups |
+| DNS resolution fails | `dig +trace` | Check /etc/resolv.conf |
+| MTU issues | `ping -M do -s 1472` | Clamp MSS, increase MTU |
+| ARP timeout | `ip neigh show` | Static ARP entry, check switch |
+| Route missing | `ip route get` | Add route, check BGP |
+
+### Debugging with tcpdump
+
+```bash
+# Capture DNS traffic
+tcpdump -i any -nn port 53
+
+# Capture all traffic to/from specific host
+tcpdump -i any -nn host 10.0.0.5
+
+# Capture TCP handshake
+tcpdump -i any -nn host 10.0.0.5 and port 443 'tcp[tcpflags] & (tcp-syn|tcp-ack) != 0'
+
+# Capture with ring buffer (200MB max)
+tcpdump -i eth0 -W 10 -C 20 -w /tmp/capture.pcap port 80
+# -W: max files, -C: max file size (MB)
+
+# Read pcap with filters
+tcpdump -r /tmp/capture.pcap 'tcp[tcpflags] & tcp-ack != 0'
+```
+
+## Interview Questions
+
+**Q1: What's the difference between TCP/IP 4-layer model and OSI 7-layer model? Which should I use?**
+
+A: The TCP/IP model maps more directly to real protocols: Link (Ethernet/Wi-Fi), Internet (IP), Transport (TCP/UDP), Application (HTTP/DNS). OSI adds Presentation and Session layers that don't map cleanly to modern protocols (TLS handles encryption, but is it session or presentation?). Use OSI for understanding and communication, use TCP/IP layers (L2-L4) for practical work (L4 load balancer, L3 routing table). In cloud contexts, AWS uses "network layer" for L3 and "transport layer" for L4, making TCP/IP naming practical.
+
+**Q2: How does IPv6 address space differ from IPv4, and why does it matter?**
+
+A: IPv4 uses 32 bits, giving ~4.3 billion addresses. IPv6 uses 128 bits, giving approximately 340 undecillion (3.4×10^38). IPv4 exhaustion required NAT and complex address management. IPv6 provides enough addresses to assign every device a globally unique address without NAT, enabling true end-to-end connectivity. In production, dual-stack (supporting both) is common during transition. IPv6 also includes SLAAC for automatic address configuration and IPsec support built into the protocol.
+
+**Q3: What is an Autonomous System and why does BGP matter?**
+
+A: An AS is a collection of IP prefixes under one organization's control with a unique ASN. BGP routes between ASes using path-vector routing (AS_PATH attribute). BGP is the protocol of the internet backbone—it determines how traffic flows between carriers. For enterprises, BGP is used for multi-homed connectivity (two ISPs, dual region), giving you control over traffic path and enabling failover. Without BGP, you'd be dependent on static routes and ISP cooperation for complex topologies.
+
+**Q4: Walk through Path MTU Discovery and why it sometimes fails.**
+
+A: PMTUD works by sending packets with the Don't Fragment (DF) bit set. If a router can't forward without fragmenting, it drops the packet and returns ICMP "Fragmentation Needed" with the MTU of the next hop. The sender reduces its MTU estimate and retries. PMTUD fails when firewalls block ICMP—especially the "Fragmentation Needed" messages—creating a "black hole" where packets are silently dropped. This commonly happens with VPN tunnels that have lower MTU, or strict firewalls that block all ICMP. Solutions: MSS clamping at firewall, enabling PMTUD on endpoints, or setting lower MTU on tunnel interfaces.
+
+**Q5: What's the difference between a router, a layer 3 switch, and a layer 2 switch?**
+
+A: A layer 2 switch operates at the data link layer, forwarding frames based on MAC addresses. It learns MAC addresses from incoming frames and maintains a forwarding table. No IP routing capability. A layer 3 switch adds routing capability at wire speed using ASICs—it can route based on IP addresses while maintaining switch-like performance. Used for VLAN routing in enterprise networks. A router operates at layer 3 with more sophisticated routing protocol support (BGP, OSPF, IS-IS), often with software-based forwarding for complex policies. In cloud, "router" is often a software-defined virtual router (AWS Transit Gateway, GCP Cloud Router).
+
+## Cheat Sheet
+
+### TCP/IP Layers and Responsibilities
+
+| Layer | Responsibilities | Linux Tools |
+|-------|-----------------|-------------|
+| Application | HTTP, DNS, TLS, gRPC | curl, dig, openssl |
+| Transport | TCP, UDP, ports | ss, netstat |
+| Internet | IP, ICMP, routing | ip route, ip rule |
+| Link | Ethernet, ARP, VLAN | ip link, ethtool |
+
+### RFC 1918 Private Ranges
+
+| CIDR | Description | Size |
+|------|-------------|------|
+| 10.0.0.0/8 | Class A private | 16M hosts |
+| 172.16.0.0/12 | Class B private | 1M hosts |
+| 192.168.0.0/16 | Class C private | 65K hosts |
+
+### Well-Known Ports
+
+| Port | Service | Protocol |
+|------|---------|----------|
+| 22 | SSH | TCP |
+| 53 | DNS | TCP/UDP |
+| 80 | HTTP | TCP |
+| 443 | HTTPS | TCP |
+| 3306 | MySQL | TCP |
+| 5432 | PostgreSQL | TCP |
+| 6379 | Redis | TCP |
+| 6443 | K8s API | TCP |
+| 2379 | etcd client | TCP |
+
+### Key Linux Files
+
+| File | Purpose |
+|------|---------|
+| `/proc/net/dev` | Interface statistics |
+| `/proc/net/snmp` | IP/ICMP/TCP/UDP stats |
+| `/proc/net/netstat` | Detailed network stats |
+| `/proc/sys/net/ipv4/*` | Kernel tuning |
+| `/etc/iproute2/rt_tables` | Routing tables |
+| `/etc/resolv.conf` | DNS resolvers |
+
+## Related Topics
+
+- [OSI Model](./osi-model) — The 7-layer reference model
+- [TCP](./tcp) — Transmission Control Protocol deep dive
+- [UDP](./udp) — User Datagram Protocol
+- [Subnets](./subnets) — IP addressing and subnetting
+- [CIDR](./cidr) — Classless Inter-Domain Routing
+- [Routing](./routing) — Routing protocols and route tables
+- [VPC](./vpc) — Cloud VPC architecture

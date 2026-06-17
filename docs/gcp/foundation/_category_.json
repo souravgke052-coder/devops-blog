@@ -1,0 +1,8 @@
+{
+  "label": "Foundation",
+  "position": 1,
+  "link": {
+    "type": "generated-index",
+    "description": "GCP fundamentals, project structure, IAM, and core concepts for building on Google Cloud."
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "label": "Linux",
+  "position": 2,
+  "link": {
+    "type": "generated-index",
+    "description": "Shell scripting, process management, system tuning, and production server operations for infrastructure engineers."
+  }
+}

@@ -1,0 +1,671 @@
+---
+title: "Kubernetes Networking"
+description: "Complete guide to Kubernetes networking - CNI, Services, Ingress, DNS, and NetworkPolicies"
+sidebar_position: 18
+---
+
+# Kubernetes Networking
+
+## Overview
+
+Kubernetes networking defines how pods communicate with each other, with services, and with external resources. It encompasses the Container Network Interface (CNI), service mesh, DNS resolution, Ingress controllers, and NetworkPolicies for security. Understanding networking is essential for debugging connectivity issues and designing scalable architectures.
+
+## When to Use
+
+- **Designing multi-tier applications** - frontend, backend, database communication
+- **Debugging connectivity issues** - pod-to-pod, service-to-service
+- **Implementing network security** - isolating workloads with NetworkPolicies
+- **Configuring load balancing** - internal and external traffic
+- **Setting up service discovery** - DNS-based naming
+
+## When NOT to Use
+
+- **Simple single-node setups** - networking is complex, start simple
+- **When managed solutions exist** - GKE handles much networking automatically
+
+## Core Concepts
+
+### Network Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Kubernetes Network Model                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Every Pod gets unique IP                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Node 1                                                             │   │
+│  │  ┌─────────┐  ┌─────────┐                                          │   │
+│  │  │ Pod A   │  │ Pod B   │  pod IPs: 10.4.1.5, 10.4.1.8             │   │
+│  │  │ 10.4.1.5│  │ 10.4.1.8│                                          │   │
+│  │  └─────────┘  └─────────┘                                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Pods on same node: can communicate directly                                │
+│  Pods on different nodes: via overlay network or CNI                        │
+│                                                                              │
+│  Container-to-container: via localhost (shared network namespace)           │
+│  Pod-to-pod: via pod IP directly                                            │
+│  Pod-to-service: via service cluster IP (kube-proxy)                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Traffic Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Traffic Flow Examples                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Pod → Pod (same node)                                                       │
+│  ┌─────────┐  localhost  ┌─────────┐                                        │
+│  │ Pod A   │ ──────────> │ Pod B   │                                        │
+│  └─────────┘             └─────────┘                                        │
+│                                                                              │
+│  Pod → Service                                                               │
+│  ┌─────────┐             ┌─────────┐                                        │
+│  │ Pod A   │ ──────────> │ Service │ ──> Endpoints (Pod IPs)              │
+│  └─────────┘             └─────────┘                                        │
+│         │                   │                                               │
+│         │              kube-proxy                                           │
+│         │                   │                                               │
+│         │              iptables/IPVS                                        │
+│                                                                              │
+│  External → Ingress → Service → Pod                                         │
+│  ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐               │
+│  │ Client  │ ──> │ Ingress │ ──> │ Service │ ──> │ Pod     │               │
+│  └─────────┘     └─────────┘     └─────────┘     └─────────┘               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### CNI Plugin Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CNI Plugin Flow                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Pod Creation:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. kubelet requests CNI plugin for network setup                    │   │
+│  │  2. CNI plugin creates network namespace for pod                     │   │
+│  │  3. CNI plugin creates veth pair (virtual ethernet)                  │   │
+│  │  4. One end goes to pod, other to bridge                             │   │
+│  │  5. CNI plugin assigns IP address to pod                             │   │
+│  │  6. CNI plugin configures routes                                     │   │
+│  │  7. CNI plugin configures DNS via /etc/resolv.conf                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Common CNI Plugins:                                                         │
+│  - Calico: BGP, network policies, overlay                                   │
+│  - Cilium: eBPF-based, L7 filtering                                         │
+│  - Flannel: simple overlay network                                          │
+│  - Weave: overlay with encryption                                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Service Load Balancing
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    kube-proxy Load Balancing                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  iptables Mode:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Chain: KUBE-SVC-XXXX                                                │   │
+│  │  Rules with probability distribution                                  │   │
+│  │  - 33% → KUBE-SEP-1                                                  │   │
+│  │  - 33% → KUBE-SEP-2                                                  │   │
+│  │  - 34% → KUBE-SEP-3                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  IPVS Mode:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Virtual Server: Service IP:Port                                     │   │
+│  │  Real Servers: Pod IPs                                               │   │
+│  │  Scheduling: rr, lc, wrr, sh, sed, nq                                │   │
+│  │  O(1) lookup performance                                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Network Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Production Network Architecture                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  GKE Cluster (VPC Native)                                                    │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │ Subnet: 10.0.0.0/20                                                   │  │
+│  │   Pods: 10.4.0.0/14 (secondary)                                       │  │
+│  │   Services: 10.0.4.0/20 (secondary)                                   │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Node: 10.0.1.5                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  Pods:                                                                │  │
+│  │  - frontend-xxx (10.4.1.5)                                            │  │
+│  │  - api-xxx (10.4.1.8)                                                 │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Node: 10.0.2.7                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  Pods:                                                                │  │
+│  │  - api-yyy (10.4.2.12)                                                │  │
+│  │  - worker-yyy (10.4.2.15)                                             │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Traffic Routing:                                                            │
+│  - Pod to Pod: direct via CNI routing                                       │
+│  - Pod to Service: kube-proxy → endpoints                                   │
+│  - External: Cloud Load Balancer → NodePort → Service                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### NetworkPolicies for Production
+
+```yaml
+# Frontend namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: frontend
+  labels:
+    tier: frontend
+
+---
+# Frontend to API communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-egress
+  namespace: frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow traffic to API service in backend namespace
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: backend
+      podSelector:
+        matchLabels:
+          app: api
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+# Backend namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend
+  labels:
+    tier: backend
+
+---
+# Backend default deny
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-default-deny
+  namespace: backend
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+# API ingress rules
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+  namespace: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow from frontend namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow to database
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow to Redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+```
+
+### Internal Load Balancer (GKE)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-internal
+  namespace: production
+  annotations:
+    # GCP Internal Load Balancer
+    networking.gke.io/load-balancer-type: "Internal"
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  # Preserve client source IP
+  externalTrafficPolicy: Local
+  healthCheckNodePort: 30000
+```
+
+## YAML Examples
+
+### ClusterIP Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: api-service
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+```
+
+### NodePort Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: api-service
+  ports:
+  - port: 80
+    targetPort: 8080
+    nodePort: 30080  # Optional specific port
+    protocol: TCP
+```
+
+### Headless Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: statefulset-headless
+spec:
+  clusterIP: None  # Makes it headless
+  selector:
+    app: mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
+```
+
+## CLI Examples (kubectl)
+
+### Network Debugging
+
+```bash
+# Check DNS resolution
+kubectl run dnsutils --image=tutum/dnsutils -it --rm -- nslookup api-service.production.svc.cluster.local
+
+# Test connectivity
+kubectl run curl --image=curlimages/curl -it --rm -- sh
+
+# Check service endpoints
+kubectl get endpoints api-service -n production
+
+# Check kube-proxy status
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+
+# Check CNI plugin status
+kubectl get pods -n kube-system -l k8s-app=calico-node
+
+# View network policies
+kubectl get networkpolicy -A
+
+# Test from inside cluster
+kubectl exec -it frontend-pod -- sh
+# Then: curl http://api-service.backend.svc.cluster.local
+```
+
+### Service Operations
+
+```bash
+# Create service
+kubectl expose deployment api-service --port=80 --target-port=8080
+
+# Get service details
+kubectl get service api-service -o wide
+
+# Get service cluster IP
+kubectl get service api-service -o jsonpath='{.spec.clusterIP}'
+
+# Describe service
+kubectl describe service api-service
+
+# Port forward
+kubectl port-forward svc/api-service 8080:80
+```
+
+### Network Policy Operations
+
+```bash
+# Create network policy
+kubectl apply -f network-policy.yaml
+
+# List policies
+kubectl get networkpolicy
+kubectl get networkpolicy -n production
+
+# Describe policy
+kubectl describe networkpolicy api-policy -n production
+
+# Delete policy
+kubectl delete networkpolicy api-policy -n production
+```
+
+## Common Commands
+
+```bash
+# Get all services
+kubectl get svc -A
+
+# Check pod IPs
+kubectl get pods -o wide
+
+# View endpoints
+kubectl get endpoints -A
+
+# Check CoreDNS
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# Check node addresses
+kubectl get nodes -o wide
+
+# DNS lookup from pod
+kubectl exec -it test-pod -- nslookup kubernetes.default
+```
+
+## Monitoring
+
+### Network Metrics
+
+| Metric | Description |
+|--------|-------------|
+| kubelet_network_plugin_operations_total | CNI operations |
+| kubeproxy_sync_proxy_rules_duration_seconds | kube-proxy latency |
+| service_endpoint_ready_endpoints | Ready service endpoints |
+| network_policy_changes_total | Network policy changes |
+
+### Prometheus Queries
+
+```promql
+# Service endpoints by service
+sum(kube_endpoint_addresses_ready) by (service, namespace)
+
+# Network policy evaluations
+sum(rate(network_policy_changes_total[5m]))
+
+# kube-proxy sync duration
+histogram_quantile(0.99, rate(kubeproxy_sync_proxy_rules_duration_seconds_bucket[5m]))
+```
+
+## Security
+
+### NetworkPolicy Best Practices
+
+```yaml
+# Default deny all ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+# Default deny all egress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+```
+
+### RBAC for Network Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: network-manager
+rules:
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies", "ingresses", "services"]
+  verbs: ["*"]
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pod can't reach service | Wrong DNS, missing endpoints | Check kube-proxy, service selector |
+| Service has no endpoints | Selector doesn't match pods | Check pod labels |
+| External traffic blocked | Firewall rules, NodePort | Check cloud firewall |
+| DNS not resolving | CoreDNS issues | Check CoreDNS pods |
+| Network policy blocking | Policy too restrictive | Add appropriate rules |
+
+### Diagnostic Commands
+
+```bash
+# Check pod networking
+kubectl exec -it my-pod -- ip addr
+kubectl exec -it my-pod -- ip route
+kubectl exec -it my-pod -- cat /etc/resolv.conf
+
+# Check kube-proxy logs
+kubectl logs -n kube-system -l k8s-app=kube-proxy --tail=100
+
+# Check CNI logs
+kubectl logs -n kube-system -l k8s-app=calico-node --tail=100
+
+# Check endpoints
+kubectl get endpoints <service-name> -n production -o yaml
+
+# Check service selector
+kubectl get service api-service -n production -o jsonpath='{.spec.selector}'
+
+# Trace network path
+kubectl run trace --image=busybox -- sh -c "wget -O- <target>"
+```
+
+### DNS Troubleshooting
+
+```bash
+# Test DNS from pod
+kubectl exec -it test-pod -- nslookup kubernetes.default
+kubectl exec -it test-pod -- nslookup api-service.production.svc.cluster.local
+
+# Check CoreDNS configmap
+kubectl get configmap coredns -n kube-system -o yaml
+
+# Check CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100
+
+# Test with different DNS configurations
+kubectl run dns-test --image=busybox -- nslookup kubernetes.default
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: How does Kubernetes networking work?**
+A: Every pod gets a unique IP address. Pods on the same node communicate via a bridge. Pods on different nodes communicate via an overlay network managed by the CNI plugin. Services provide stable virtual IPs that load-balance to pods.
+
+**Q: What is the difference between ClusterIP, NodePort, and LoadBalancer?**
+A: ClusterIP is internal-only. NodePort exposes on each node's IP at a static port. LoadBalancer provisions an external load balancer (cloud-specific).
+
+**Q: What does kube-proxy do?**
+A: kube-proxy maintains network rules on each node that forward traffic to service endpoints. It uses iptables or IPVS for load balancing.
+
+### Intermediate Questions
+
+**Q: How do NetworkPolicies work?**
+A: NetworkPolicies are namespace-scoped. They filter ingress and egress traffic based on pod selectors, namespace selectors, and ports. The CNI plugin enforces these rules.
+
+**Q: How does DNS work in Kubernetes?**
+A: CoreDNS watches the API server for Services and creates DNS records. Pod DNS: pod-ip.namespace.pod.cluster.local. Service DNS: service-name.namespace.svc.cluster.local.
+
+**Q: What is a Headless Service?**
+A: A Headless Service has clusterIP: None. DNS returns pod IPs directly instead of a service IP. Useful for stateful applications needing direct pod access.
+
+### Advanced Questions
+
+**Q: How would you troubleshoot pod-to-pod connectivity issues?**
+A: 1) Check pod IPs, 2) Verify CNI plugin is working, 3) Check network policies, 4) Test with busybox pod, 5) Check kube-proxy, 6) Verify routing tables.
+
+**Q: How does IPVS mode differ from iptables mode in kube-proxy?**
+A: IPVS uses the Linux Virtual Server for O(1) load balancing regardless of service count. iptables uses probability rules with O(n) lookup. IPVS supports more scheduling algorithms.
+
+## Cheat Sheet
+
+### Network Flow Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Network Reference                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Pod → ClusterIP Service:                                                    │
+│  Pod → kube-proxy → iptables/IPVS → Pod                                     │
+│                                                                              │
+│  Pod → NodePort Service:                                                     │
+│  External → Node IP:NodePort → kube-proxy → Pod                             │
+│                                                                              │
+│  Pod → LoadBalancer Service:                                                 │
+│  External → Cloud LB → NodePort → kube-proxy → Pod                          │
+│                                                                              │
+│  DNS Resolution:                                                              │
+│  Pod → /etc/resolv.conf → CoreDNS → Service/Pod records                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Service Types
+
+| Type | Scope | External Access | Use Case |
+|------|-------|-----------------|----------|
+| ClusterIP | Internal | No | Microservice to microservice |
+| NodePort | External | NodeIP:Port | Development, simple exposure |
+| LoadBalancer | External | Cloud LB | Production external access |
+| ExternalName | External | CNAME | External service alias |
+| Headless | Internal | Direct pod IPs | StatefulSets |
+
+### Essential Commands
+
+```bash
+# Get service
+kubectl get svc
+
+# Get endpoints
+kubectl get endpoints
+
+# Port forward
+kubectl port-forward svc/my-svc 8080:80
+
+# Test DNS
+kubectl exec -it test -- nslookup my-svc
+
+# Create service
+kubectl expose deployment my-app --port=80
+
+# Check pod IPs
+kubectl get pods -o wide
+```
+
+## Related Topics
+
+- [Services](./services) - Service types and configuration
+- [Ingress](./ingress) - HTTP/HTTPS routing
+- [Security](./security) - NetworkPolicies
+- [GKE](./gke) - GKE networking specifics

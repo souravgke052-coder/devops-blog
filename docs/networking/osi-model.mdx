@@ -1,0 +1,459 @@
+# OSI Model
+
+## Overview
+
+The OSI (Open Systems Interconnection) 7-layer model is the foundational conceptual framework for network communication. While production systems rarely map neatly to all 7 layers—modern networking collapses some (Sessions and Presentation are largely absorbed into TLS/HTTP)—understanding the model provides mental scaffolding for debugging and architecture. The real value isn't memorizing the layers; it's understanding where protocols operate, what transformations data undergoes, and where problems manifest.
+
+In production Linux environments, you interact with OSI layers through specific subsystems: network interface drivers (Layer 1-2), netfilter/iptables (Layer 3-4), and application protocols (Layers 5-7). A thorough understanding of how packets traverse these layers—how encapsulation adds headers at send and removes them at receive—clarifies why tcpdump sees what it sees, why firewall rules behave as they do, and why MTU matters.
+
+## When To Use
+
+- **Debugging connectivity issues**: Pinpointing which layer is failing (can I ping the gateway? Can I establish TCP connection? Does the application respond?)
+- **Designing network architecture**: Understanding where load balancers, firewalls, and proxies operate
+- **Performance analysis**: Identifying whether latency is physical (Layer 1-2), routing (Layer 3), TCP-level (Layer 4), or application-level (Layer 7)
+- **Security hardening**: Applying controls at the appropriate layer (L2 VLANs, L3 routing filters, L4 firewall rules, L7 WAF)
+- **Protocol analysis**: Reading packet captures with understanding of what's happening at each layer
+
+## When NOT To Use
+
+- **Mapping every protocol precisely**: Some protocols blur layers (TLS is arguably Layer 5-6, VXLAN is L2-in-L3)
+- **Forcing cloud-native patterns into strict layer separation**: Kubernetes networking, service meshes, and sidecars complicate the model
+- **As the only mental model**: The TCP/IP 4-layer model is more practical for day-to-day operations; use OSI for pedagogical clarity
+
+## Core Concepts
+
+### The 7 Layers Explained
+
+**Layer 1 — Physical**: Cables, connectors, transceivers, electrical signals. In production, this is your fiber runs, copper cables, SFP+ modules, and the physical properties of your network infrastructure. When troubleshooting Layer 1, you check link lights, verify duplex/speed negotiation, and inspect cables. A layer 1 problem manifests as "complete loss of connectivity" or "constant collisions/errors."
+
+**Layer 2 — Data Link**: Ethernet frames, MAC addresses, switch forwarding, VLANs (802.1Q), LACP for link aggregation, STP for loop prevention. Layer 2 switches learn MAC addresses and forward frames based on destination MAC. In cloud environments, VPCs emulate Layer 2 across availability zones using overlays (VXLAN, GENEVE). The data unit is a frame with source/destination MAC, VLAN tag, and CRC.
+
+```
+Ethernet Frame (without VLAN):
++----------------+--------+--------+----------+--------+----------------
+| Dest MAC (6B)  | Src MAC (6B) | EtherType (2B) | Payload | CRC (4B) |
++----------------+--------+--------+----------+--------+----------------
+Total: 14 bytes header + payload (46-1500 bytes) + 4 bytes CRC
+
+VLAN-tagged Frame (802.1Q):
++----------------+--------+--------+----+----------+--------+--------+----------------
+| Dest MAC (6B)  | Src MAC (6B) | 0x8100 | VLAN ID (2B) | EtherType (2B) | Payload | CRC (4B) |
++----------------+--------+--------+----+----------+--------+--------+----------------
+```
+
+**Layer 3 — Network**: IP packets, routing, ICMP, layer 3 switching. The network layer provides logical addressing (IP) and determines the best path through the network. Routers and layer 3 switches operate at this level, making forwarding decisions based on destination IP address. Key protocols: IP (IPv4/IPv6), ICMP, ICMPv6, BGP, OSPF.
+
+**Layer 4 — Transport**: TCP and UDP. The transport layer provides end-to-end communication services. TCP offers reliability (acknowledgment, retransmission), ordered delivery, flow control (sliding window), and congestion control. UDP provides connectionless, best-effort delivery with no reliability guarantees. The concept of ports (16-bit) multiplexes multiple conversations on the same host.
+
+**Layer 5 — Session**: TLS, SSH, RPC, QuicConnection. The session layer manages persistent connections, authentication, and data synchronization. TLS establishes encrypted sessions with handshakes, certificates, and session tickets. QUIC (used by HTTP/3) combines session management with transport reliability. In practice, sessions are often managed by the application framework or library.
+
+**Layer 6 — Presentation**: JSON/XML parsing, TLS encryption/decryption, ASCII/UTF-8 encoding, MIME types. This layer handles data format translation. While often implicit in modern stacks (JSON is just bytes), TLS encryption at this layer transforms data for confidentiality and integrity. In production, you rarely interact with this layer directly.
+
+**Layer 7 — Application**: HTTP, DNS, gRPC, SMTP, SSH, NTP, DHCP. The application layer is what users and most developers directly interact with. HTTP/1.1, HTTP/2, and HTTP/3 are application protocols running over TLS/TCP. gRPC uses HTTP/2 as its transport. DNS queries use DNS protocol over UDP/TCP. Understanding application protocols requires knowing request/response formats, status codes, and header semantics.
+
+### Encapsulation and Decapsulation
+
+When you send an HTTP request, data gets encapsulated at each layer:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Application Layer: "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"   │
+├─────────────────────────────────────────────────────────────────────┤
+│ Presentation (TLS): [encrypted HTTP message]                        │
+├─────────────────────────────────────────────────────────────────────┤
+│ Transport (TCP): [TLS segment] Seq=1000, Ack=500, Flags=SYN,ACK    │
+├─────────────────────────────────────────────────────────────────────┤
+│ Network (IP): [TCP segment] Src=10.0.0.5, Dst=93.184.216.34         │
+├─────────────────────────────────────────────────────────────────────┤
+│ Data Link (Ethernet): [IP packet] SrcMAC=aa:bb:cc:dd:ee:ff         │
+│                                   DstMAC=RouterMAC                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+At the receiving end, each layer strips its header and passes payload to the layer above. This is why a tcpdump at eth0 shows Ethernet headers, while tcpdump on lo shows only IP/TCP/HTTP.
+
+### Linux Netfilter Hooks
+
+Linux implements OSI layers 3-4 filtering through netfilter, which provides hooks at specific points in the kernel's network stack:
+
+```
+Packet arrives at NIC
+        │
+        ▼
+┌───────────────────┐
+│ PREROUTING        │ ← First hook: DNAT (destination NAT before routing)
+│ (mangle, nat)     │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│ Routing Decision  │ ← Forward? → FORWARD | Local? → INPUT
+│                   │
+└─────────┬─────────┘
+          │
+   ┌──────┴──────┐
+   ▼             ▼
+┌─────────┐  ┌─────────┐
+│ FORWARD │  │  INPUT  │
+│ (filter │  │(mangle  │ ← Local process socket receives here
+│ ,mangle)│  │,filter) │
+└────┬────┘  └────┬────┘
+     │            │
+     └─────┬──────┘
+           ▼
+┌───────────────────┐
+│   OUTPUT          │ ← Local process sends from here
+│ (raw, mangle,     │
+│  nat, filter)     │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│ POSTROUTING       │ ← SNAT (source NAT) applied here
+│ (mangle, nat)     │
+└───────────────────┘
+          │
+          ▼
+Packet leaves NIC
+```
+
+This matters because:
+- `PREROUTING` catches packets before routing decision (DNAT for port forwarding)
+- `INPUT` is where firewall rules protect local services
+- `FORWARD` is where router/firewall appliances filter transit traffic
+- `OUTPUT` is where locally-generated traffic is filtered
+- `POSTROUTING` is where SNAT/MASQUERADE is applied
+
+## Real Production Example
+
+### Packet Capture of HTTP Request Through OSI Layers
+
+Let's examine what tcpdump shows at different points:
+
+```bash
+# Capture at eth0 (Layer 2/3 visible)
+tcpdump -i eth0 -nn host 93.184.216.34 and port 80 -vv
+
+# Output shows Ethernet header (MAC addresses), IP header, TCP header:
+# 10:23:41.194372 IP (tos 0x0, ttl 64, id=54321, offset=0, flags[DF], proto TCP (6), length 60)
+#     10.0.0.5.42345 > 93.184.216.34.80: Flags [S], cksum 0xabcd, seq 1000:1060, win 65535,
+#     options [mss 1460, sackOK, TS val 100 ecr 0, nop, wscale 10], length 0
+
+# Capture at lo (Layer 3/4 visible, no Ethernet)
+tcpdump -i lo -nn port 8080 -vv
+
+# Output (no MAC addresses visible):
+# 10:23:41.194372 IP (tos 0x0, ttl 64, id=54321, offset=0, flags[DF], proto TCP (6), length 60)
+#     10.0.0.5.42345 > 93.184.216.34.80: Flags [S], seq 1000:1060, win 65535,
+#     options [mss 1460, sackOK, TS val 100 ecr 0, nop, wscale 10], length 0
+```
+
+### MTU and Fragmentation Example
+
+MTU (Maximum Transmission Unit) determines the largest packet that can be transmitted without fragmentation:
+
+```bash
+# View interface MTU
+ip link show eth0
+# eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 qdisc fq_codel state UP
+# Default MTU for standard Ethernet: 1500 bytes
+# Jumbo frames: 9000 bytes (common in data centers)
+
+# Test path MTU to Google DNS
+ping -M do -s 1472 8.8.8.8
+# 1472 bytes + 28 byte ICMP/IP header = 1500 bytes (exact MTU)
+# If this fails with "Message too long", path MTU is lower
+
+# Discover path MTU
+tracepath 8.8.8.8
+#  1?: [LOCALHOST]                      pmtu 9000
+#  1:  gateway                              1500/1500
+#  2:  10.0.0.1                            1500/1500
+#  3:  no reply (path has a link with smaller MTU)
+```
+
+In cloud environments, VPCs typically support 9000 byte MTU (jumbo frames), but traffic exiting to the internet fragments to 1500. This matters for storage protocols (iSCSI uses 9000 byte frames for efficiency).
+
+## CLI Examples
+
+```bash
+# View network interfaces and their layer 1/2 properties
+ip link show
+ip -s link show eth0
+ethtool eth0              # Detailed physical layer info
+ethtool -i eth0           # Driver and firmware info
+ethtool -S eth0           # NIC statistics (errors, drops)
+
+# Check duplex/speed negotiation
+ethtool eth0 | grep -E "Speed|Duplex|Auto-neg"
+# Settings for eth0:
+# 	Speed: 10000Mb/s
+# 	Duplex: Full
+# 	Auto-negotiation: on
+
+# View MAC address table (switch learning)
+bridge fdb show
+# Show VLAN configuration
+ip -d link show eth0
+
+# View how packets traverse hooks
+cat /proc/net/netfilter/nf_log
+# Check iptables counters
+iptables -L -v -n -Z  # Zero counters, then observe
+
+# Trace packet path through layers
+conntrack -L  # View connection tracking table
+conntrack -L -p tcp --sport 443 --state ESTABLISHED
+```
+
+## Common Commands
+
+| Command | Layer | Purpose |
+|---------|-------|---------|
+| `ethtool` | L1-2 | View/modify physical and link layer settings |
+| `ip link` | L2 | Manage interfaces, VLANs, bridges |
+| `bridge` | L2 | Manage bridges, view FDB |
+| `vconfig` | L2 | Create/manipulate VLAN interfaces |
+| `tcpdump` | L2-7 | Capture packets, analyze headers |
+| `ip` | L3 | Manage IP addresses, routes |
+| `ping/ping6` | L3 | ICMP echo (layer 3 connectivity) |
+| `traceroute` | L3 | Trace path with TTL probes |
+| `ip neigh` | L3 | View/manipulate ARP table |
+| `ss/netstat` | L4 | View socket state, connections |
+| `conntrack` | L4 | View connection tracking entries |
+| `iptables/nft` | L3-4 | Firewall rules, NAT |
+| `tc` | L2-3 | Traffic control, QoS |
+
+## Monitoring
+
+### Physical Layer Metrics
+
+- **Link state**: Is the interface up? `cat /sys/class/net/eth0/operstate`
+- **Speed/duplex**: Matched to switch port? Mismatches cause drops and errors
+- **Error counters**: `ethtool -S eth0 | grep -E "error|drop|miss"`
+  - `rx_errors`: CRC errors, frame alignment errors
+  - `rx_dropped`: Buffer exhaustion
+  - `tx_errors`: Late collisions, aborts
+- **Statistics**: `ip -s link show eth0` (collisions, carrier sense)
+
+### Data Link Metrics
+
+- **MAC table utilization**: Switch MAC address table utilization
+- **VLAN trunk status**: Verify tagged VLANs are expected
+- **LACP status**: `cat /proc/net/bonding/bond0`
+- **Spanning tree**: Port states (designated, blocking, forwarding)
+
+### Network/Transport Metrics
+
+- **Routing table changes**: Monitor for unexpected route flapping
+- **TCP stats**: `ss -s` (established, time-wait, retransmits)
+- **Connection tracking**: `/proc/net/nf_conntrack` usage vs. max
+
+```bash
+# Script to collect layer 1-4 metrics
+for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -v lo); do
+    echo "=== $iface ==="
+    ethtool -S $iface 2>/dev/null | grep -E "error|drop|miss"
+    ip -s link show $iface | tail -3
+done
+```
+
+## Security
+
+### Layer 2 Security
+
+**802.1X Port Security**: Supplicant authentication before port access. Prevents unauthorized devices connecting to switch ports.
+
+**MAC filtering**: Limit which MAC addresses can send traffic (not foolproof—MAC can be spoofed).
+
+**VLAN isolation**: Separate sensitive workloads into VLANs with routing ACLs.
+
+**ARP spoofing mitigation**: `ip neigh add` for static ARP entries, or arp_ignore settings.
+
+```bash
+# Prevent ARP spoofing with static entries
+ip neigh add 192.168.1.1 lladdr 00:11:22:33:44:55 dev eth0 nud permanent
+
+# Enable reverse path filtering
+sysctl -w net.ipv4.conf.all.rp_filter=1
+sysctl -w net.ipv4.conf.default.rp_filter=1
+```
+
+### Layer 3-4 Security
+
+**Firewall rules**: Default-deny at iptables/nftables level.
+
+**uRPF (Unicast Reverse Path Forwarding)**: Prevents IP spoofing by checking source IP against routing table.
+
+```bash
+# Enable uRPF check on interface
+ip addr add 10.0.0.1/24 dev eth0
+# strict RPF: packet must arrive via best return path
+# loose RPF: packet's source must be routable via any interface
+sysctl -w net.ipv4.conf.eth0.rp_filter=1
+```
+
+### Layer 7 Security
+
+- **WAF**: ModSecurity, AWS WAF, Cloudflare for HTTP(S) protection
+- **mTLS**: Mutual TLS for service-to-service authentication
+- **DPI**: Deep packet inspection for intrusion detection (Suricata, Zeek)
+
+## Cost Optimization
+
+Layer 1-2 decisions affect cloud costs:
+
+**NIC selection**: In AWS, larger instance types offer higher bandwidth. A `c5.xlarge` has up to 10Gbps, while `c5n.xlarge` adds ENA Express for 25Gbps. Match NIC to throughput needs.
+
+**Jumbo frames (MTU 9000)**: Reduces per-packet overhead for large transfers (backup replication, storage). In AWS VPC, intra-VPC traffic with 9000 MTU processes fewer packets.
+
+**ENI and Hyperplane**: GCP Cloud NDB and AWS ENI limits scale differently. Over-provisioning ENIs for network throughput adds cost.
+
+```bash
+# Calculate packet overhead for MTU comparison
+# MTU 1500: payload=1460 bytes (TCP) or 1472 (ICMP), overhead per packet = 40-58 bytes
+# MTU 9000: payload=8960 bytes (TCP), overhead per packet = 40 bytes
+# For 1GB transfer:
+#   MTU 1500: ~710 packets, 28KB overhead (1.9%)
+#   MTU 9000: ~113 packets, 4.5KB overhead (0.5%)
+# Savings: 24KB per 1GB transferred
+```
+
+## Troubleshooting
+
+### Layer 1-2 Issues
+
+```bash
+# Check physical connectivity
+ethtool eth0
+# Look for: "Link detected: no", wrong speed/duplex, no carrier
+
+# Check for errors
+ethtool -S eth0 | grep -E "error|drop"
+# rx_crc_errors: cable or SFP issues
+# alignment_errors: duplex mismatch
+# late_collisions: cable too long or duplex mismatch
+
+# Verify switch port config matches
+# On switch: show interface status, verify trunk/access mode, native VLAN
+```
+
+### Layer 3 Issues
+
+```bash
+# Can you reach the gateway?
+ping -c 3 10.0.0.1
+
+# Is the gateway in ARP table?
+ip neigh show 10.0.0.1
+
+# Is routing correct?
+ip route get 8.8.8.8
+ip route show
+
+# Check for black holes (ICMP unreachable)
+tcpdump -i any icmp and host 8.8.8.8
+# Look for "ICMP redirect" or "ICMP host unreachable"
+```
+
+### Layer 4 Issues
+
+```bash
+# Is port listening?
+ss -tuln | grep :80
+netstat -tuln | grep :80
+
+# What's connection state?
+ss -ti state established '( sport = :443 )'
+
+# Check conntrack table for NAT issues
+conntrack -L -p tcp --dport 80 | head -5
+conntrack -L -p tcp --dport 80 | wc -l  # Count entries
+```
+
+### Layer 7 Issues
+
+```bash
+# Does application respond?
+curl -v http://localhost:8080/health
+
+# Check TLS certificate
+openssl s_client -connect example.com:443 -servername example.com
+# Verify cert chain, expiration, cipher suite
+
+# Check application logs
+journalctl -u nginx -f
+kubectl logs -f deployment/api -n production
+```
+
+## Interview Questions
+
+**Q1: At which OSI layer does a router operate? What about a layer 3 switch?**
+
+A: A router operates at Layer 3 (Network), making forwarding decisions based on IP addresses. A traditional layer 3 switch also operates at Layer 3—it routes based on IP addresses but uses ASICs for hardware acceleration. However, layer 3 switches typically support fewer routing protocols and features than dedicated routers. Both perform routing; routers are generally more capable for WAN/gateway roles, while layer 3 switches are optimized for intra-VLAN routing.
+
+**Q2: What's the difference between a hub, a switch, and a router?**
+
+A: A hub operates at Layer 1—it simply repeats incoming bits to all ports. No frame filtering, no collision prevention (half-duplex). A switch operates at Layer 2—it learns MAC addresses and forwards frames only to the relevant port, creating dedicated collision domains. A router operates at Layer 3—it makes forwarding decisions based on IP addresses, maintains routing tables, and connects different network segments (like LAN to WAN). Switches are "intelligent hubs," routers are "intelligent switches" at a higher layer.
+
+**Q3: Walk through what happens when a TCP packet arrives at a Linux server. Which netfilter hooks are traversed?**
+
+A: When a packet arrives: (1) NIC driver puts packet in ring buffer, (2) kernel processes it, (3) netfilter PREROUTING hook runs (for DNAT), (4) routing decision: forward to FORWARD chain or deliver locally to INPUT chain, (5) if local: INPUT chain processes (firewall rules protecting local sockets), (6) local process reads from socket, (7) for outgoing: OUTPUT chain, (8) POSTROUTING chain (for SNAT/MASQUERADE). Packets traversing through the router (not destined for local) skip INPUT and OUTPUT, going PREROUTING → FORWARD → POSTROUTING.
+
+**Q4: Why does MTU matter, and what happens when there's an MTU mismatch?**
+
+A: MTU determines the maximum payload a packet can carry without fragmentation. Ethernet's default MTU is 1500 bytes. When a packet exceeds the outgoing interface's MTU, the sending host can either fragment it (IPv4) or drop it and send ICMP "Fragmentation Needed" (IPv6 always drops). If intermediate routers have different MTUs and ICMP is blocked by firewall, you get the "black hole" problem—connections stall because packets never arrive and the sender never learns about the MTU issue. Solution: Path MTU Discovery (PMTUD), or clamp MSS with iptables `tcpmss` target.
+
+**Q5: How would you use tcpdump to diagnose a Layer 2 loop?**
+
+A: First, you wouldn't run tcpdump on the affected switch itself (you'd use SPAN/mirror port). I'd capture on mirror port and look for: (1) duplicate MAC addresses appearing on multiple ports, (2) packets with corrupted CRC (switch might show "interface resets"), (3) broadcasts flooding—all ports showing broadcast traffic at high rate, (4) MAC address table instability (same MAC oscillating between ports). On Linux bridges, `bridge -s monitor` shows FDB changes in real-time. The fix is typically enabling STP or checking if STP root bridge is correct.
+
+## Cheat Sheet
+
+### OSI 7 Layers Summary
+
+| Layer | Name | PDU | Devices/Protocols |
+|-------|------|-----|-------------------|
+| 7 | Application | Data | HTTP, DNS, SSH, SMTP, gRPC |
+| 6 | Presentation | Data | TLS, SSL, ASCII, JSON, MIME |
+| 5 | Session | Data | TLS, QUIC, RPC, PPTP |
+| 4 | Transport | Segment/Datagram | TCP, UDP, SCTP, DCCP |
+| 3 | Network | Packet | IP, ICMP, BGP, OSPF, VRRP |
+| 2 | Data Link | Frame | Ethernet, VLAN, LACP, STP, ARP |
+| 1 | Physical | Bits | Copper, Fiber, SFP, Electrical signals |
+
+### Netfilter Hook Order
+
+```
+Inbound:      PREROUTING → INPUT
+Outbound:     OUTPUT → POSTROUTING
+Transit:      PREROUTING → FORWARD → POSTROUTING
+```
+
+### MTU Values
+
+| Technology | MTU |
+|------------|-----|
+| Standard Ethernet | 1500 |
+| Jumbo Frames | 9000 |
+| PPPoE | 1492 (1500 - 8 PPPoE overhead) |
+| VXLAN | 1450 (1500 - 50 bytes for UDP/VXLAN) |
+| IPSec (ESP) | 1400-1500 depending on mode and cipher |
+
+### iptables Tables
+
+| Table | Chains | Used For |
+|-------|--------|----------|
+| filter | INPUT, FORWARD, OUTPUT | Firewall (default) |
+| nat | PREROUTING, INPUT, OUTPUT, POSTROUTING | NAT, port forwarding |
+| mangle | All 5 chains | Packet alteration (TTL, ToS, marks) |
+| raw | PREROUTING, OUTPUT | Exclude from conntrack |
+
+## Related Topics
+
+- [TCP/IP Model](./tcp-ip) — Practical 4-layer model
+- [TCP](./tcp) — Transmission Control Protocol
+- [Subnets](./subnets) — IP addressing and subnetting
+- [Routing](./routing) — Layer 3 routing
+- [Firewall](./firewall) — Linux firewall configuration
+- [Packet Flow](./packet-flow) — Deep dive into Linux packet processing

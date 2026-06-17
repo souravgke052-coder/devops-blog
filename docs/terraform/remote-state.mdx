@@ -1,0 +1,784 @@
+# Terraform Remote State
+
+## Overview
+
+Remote state allows Terraform configurations to access state outputs from other configurations. This enables cross-environment references, module composition, and infrastructure dependency management. Remote state is the foundation for building scalable, modular Terraform architectures.
+
+## When To Use
+
+- **Cross-environment references**: Reference network outputs in compute configuration
+- **Module composition**: Share outputs between infrastructure components
+- **Dependency management**: Establish infrastructure relationships
+- **Team collaboration**: Different teams manage different parts of infrastructure
+
+## When NOT To Use
+
+- **Tight coupling**: If components change together, consider a single module
+- **Real-time data needs**: Use data sources for actual API queries
+
+## Core Concepts
+
+### Remote State Data Source
+
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-terraform-state"
+    prefix = "network"
+  }
+}
+
+# Access outputs
+data.terraform_remote_state.network.outputs["vpc_id"]
+```
+
+### State Outputs
+
+```hcl
+# Outputs from one configuration
+output "vpc_id" {
+  value = google_compute_network.vpc.id
+}
+
+output "subnet_ids" {
+  value = {
+    for name, subnet in google_compute_subnetwork.subnets : name => subnet.id
+  }
+}
+```
+
+## Real Production Example
+
+### Network Configuration (State Producer)
+
+```hcl
+# environments/prod/network/main.tf
+
+terraform {
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "prod/network"
+  }
+}
+
+variable "environment" {
+  default = "prod"
+}
+
+variable "vpc_cidr" {
+  default = "10.0.0.0/16"
+}
+
+# VPC
+resource "google_compute_network" "vpc" {
+  name                    = "vpc-${var.environment}"
+  auto_create_subnetworks = false
+}
+
+# Subnets
+resource "google_compute_subnetwork" "private" {
+  name          = "subnet-private-${var.environment}"
+  ip_cidr_range = var.vpc_cidr
+  network       = google_compute_network.vpc.id
+  region        = "us-central1"
+  
+  private_ip_google_access = true
+}
+
+resource "google_compute_subnetwork" "database" {
+  name          = "subnet-database-${var.environment}"
+  ip_cidr_range = "10.0.1.0/24"
+  network       = google_compute_network.vpc.id
+  region        = "us-central1"
+  
+  private_ip_google_access = true
+}
+
+# Firewall
+resource "google_compute_firewall" "allow_internal" {
+  name        = "allow-internal"
+  network     = google_compute_network.vpc.id
+  source_ranges = ["10.0.0.0/8"]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+}
+
+# Outputs
+output "vpc_id" {
+  description = "VPC network ID"
+  value       = google_compute_network.vpc.id
+}
+
+output "vpc_name" {
+  description = "VPC network name"
+  value       = google_compute_network.vpc.name
+}
+
+output "vpc_self_link" {
+  description = "VPC network self link"
+  value       = google_compute_network.vpc.self_link
+}
+
+output "subnet_private_id" {
+  description = "Private subnet ID"
+  value       = google_compute_subnetwork.private.id
+}
+
+output "subnet_private_self_link" {
+  description = "Private subnet self link"
+  value       = google_compute_subnetwork.private.self_link
+}
+
+output "subnet_database_id" {
+  description = "Database subnet ID"
+  value       = google_compute_subnetwork.database.id
+}
+
+output "subnet_database_self_link" {
+  description = "Database subnet self link"
+  value       = google_compute_subnetwork.database.self_link
+}
+
+output "vpc_cidr" {
+  description = "VPC CIDR range"
+  value       = var.vpc_cidr
+}
+
+output "database_cidr" {
+  description = "Database subnet CIDR"
+  value       = google_compute_subnetwork.database.ip_cidr_range
+}
+```
+
+### Compute Configuration (State Consumer)
+
+```hcl
+# environments/prod/compute/main.tf
+
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+  
+  # Local state for this configuration
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "prod/compute"
+  }
+}
+
+# =============================================================================
+# Remote State - Import network outputs
+# =============================================================================
+
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-project-terraform-state"
+    prefix = "prod/network"
+  }
+}
+
+# =============================================================================
+# Database Remote State (cross-environment)
+# =============================================================================
+
+data "terraform_remote_state" "database" {
+  backend = "gcs"
+  config = {
+    bucket = "my-project-terraform-state"
+    prefix = "prod/database"
+  }
+}
+
+# =============================================================================
+# Service Account
+# =============================================================================
+
+resource "google_service_account" "app" {
+  account_id   = "app-service-${data.terraform_remote_state.network.outputs.vpc_name}"
+  display_name = "Application Service Account"
+}
+
+# =============================================================================
+# Instance Template
+# =============================================================================
+
+resource "google_compute_instance_template" "app" {
+  name        = "app-template"
+  description = "Application instance template"
+  
+  machine_type = "e2-medium"
+  
+  service_account {
+    email  = google_service_account.app.email
+    scopes = ["cloud-platform"]
+  }
+  
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+  }
+  
+  # Use network from remote state
+  network_interface {
+    network    = data.terraform_remote_state.network.outputs.vpc_self_link
+    subnetwork = data.terraform_remote_state.network.outputs.subnet_private_self_link
+    
+    access_config {
+      // Ephemeral IP
+    }
+  }
+  
+  tags = ["http-server", "https-server"]
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# =============================================================================
+# Managed Instance Group
+# =============================================================================
+
+resource "google_compute_region_instance_group_manager" "app_mig" {
+  name        = "app-mig"
+  base_instance_name = "app"
+  region      = "us-central1"
+  
+  version {
+    instance_template = google_compute_instance_template.app.id
+    name              = "v1"
+  }
+  
+  target_size = 3
+  
+  auto_healing_policies {
+    initial_delay_sec = 60
+    health_check      = google_compute_health_check.app.id
+  }
+}
+
+# =============================================================================
+# Health Check
+# =============================================================================
+
+resource "google_compute_health_check" "app" {
+  name               = "app-health-check"
+  check_interval_sec = 10
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
+  
+  http_health_check {
+    port         = 8080
+    request_path = "/health"
+  }
+}
+
+# =============================================================================
+# Load Balancer
+# =============================================================================
+
+resource "google_compute_global_forwarding_rule" "app" {
+  name       = "app-lb"
+  target     = google_compute_target_http_proxy.app.id
+  port_range = "80"
+  
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+}
+
+resource "google_compute_target_http_proxy" "app" {
+  name    = "app-tp"
+  url_map = google_compute_url_map.app.id
+}
+
+resource "google_compute_url_map" "app" {
+  name            = "app-url-map"
+  default_service = google_compute_backend_service.app.id
+  
+  host_rule {
+    hosts        = ["app.example.com"]
+    path_matcher = "paths"
+  }
+  
+  path_matcher {
+    name            = "paths"
+    default_service = google_compute_backend_service.app.id
+    
+    path_rule {
+      paths   = ["/*"]
+      service = google_compute_backend_service.app.id
+    }
+  }
+}
+
+resource "google_compute_backend_service" "app" {
+  name        = "app-backend"
+  protocol    = "HTTP"
+  port_name   = "http"
+  timeout_sec = 30
+  
+  backend {
+    group           = google_compute_region_instance_group_manager.app_mig.instance_group
+    balancing_mode  = "RATE"
+    max_rate_per_instance = 100
+  }
+  
+  health_checks = [google_compute_health_check.app.id]
+}
+
+# =============================================================================
+# Database Connection
+# =============================================================================
+
+# Access database outputs from remote state
+locals {
+  db_host     = data.terraform_remote_state.database.outputs.private_ip
+  db_name     = data.terraform_remote_state.database.outputs.database_name
+  db_username = data.terraform_remote_state.database.outputs.username
+}
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+output "vpc_id" {
+  description = "VPC ID from remote state"
+  value       = data.terraform_remote_state.network.outputs.vpc_id
+}
+
+output "load_balancer_ip" {
+  description = "Load balancer IP"
+  value       = google_compute_global_forwarding_rule.app.ip_address
+}
+
+output "database_connection" {
+  description = "Database connection info"
+  value       = "Host: ${local.db_host}, Database: ${local.db_name}"
+  sensitive   = true
+}
+```
+
+### Database Configuration
+
+```hcl
+# environments/prod/database/main.tf
+
+terraform {
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "prod/database"
+  }
+}
+
+variable "db_name" {
+  default = "appdb"
+}
+
+variable "db_tier" {
+  default = "db-n1-standard-2"
+}
+
+variable "vpc_self_link" {
+  type = string
+}
+
+# Cloud SQL
+resource "google_sql_database_instance" "postgres" {
+  name             = "postgres-db"
+  database_version = "POSTGRES_15"
+  region           = "us-central1"
+  
+  deletion_protection = true
+  
+  settings {
+    tier              = var.db_tier
+    availability_type = "REGIONAL"
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = var.vpc_self_link
+      
+      require_ssl = true
+    }
+    
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+    }
+  }
+}
+
+resource "google_sql_database" "app" {
+  name     = var.db_name
+  instance = google_sql_database_instance.postgres.name
+}
+
+# Outputs
+output "instance_id" {
+  value = google_sql_database_instance.postgres.id
+}
+
+output "private_ip" {
+  value = google_sql_database_instance.postgres.private_ip_address
+}
+
+output "database_name" {
+  value = google_sql_database.app.name
+}
+
+output "connection_name" {
+  value = google_sql_database_instance.postgres.connection_name
+}
+
+output "username" {
+  value = "app_user"  # In real config, this would come from resource
+}
+```
+
+## HCL Examples
+
+### Remote State with Default Backend
+
+```hcl
+data "terraform_remote_state" "vpc" {
+  backend = "gcs"
+  config = {
+    bucket = "my-terraform-state"
+    prefix = "prod/vpc"
+  }
+}
+
+# Access VPC ID
+resource "google_compute_instance" "app" {
+  network_interface {
+    subnetwork = data.terraform_remote_state.vpc.outputs.subnet_id
+  }
+}
+```
+
+### Remote State with S3 Backend
+
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "s3"
+  config = {
+    bucket = "my-terraform-state"
+    key    = "network/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+```
+
+### Remote State with Outputs Map
+
+```hcl
+# Access outputs as map
+locals {
+  vpc_id     = data.terraform_remote_state.network.outputs.vpc_id
+  subnet_ids = data.terraform_remote_state.network.outputs.subnet_ids
+  all_outputs = data.terraform_remote_state.network.outputs
+}
+
+# Access specific output
+resource "google_compute_subnetwork" "private" {
+  # ...
+}
+```
+
+## CLI Examples
+
+### Remote State Operations
+
+```bash
+# Pull remote state
+terraform state pull
+
+# List remote state
+terraform state list
+
+# Show remote state resource
+terraform state show google_compute_network.vpc
+
+# Reference remote state in CLI
+terraform output -state=../network/terraform.tfstate vpc_id
+```
+
+### State Import
+
+```bash
+# Import existing resource
+terraform import google_compute_instance.app \
+  projects/my-project/zones/us-central1-a/instances/app-server
+
+# Import module output
+terraform import module.vpc.google_compute_network.vpc \
+  projects/my-project/global/networks/vpc-network
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform state pull` | Pull remote state |
+| `terraform state push` | Push state to remote |
+| `terraform output` | Show outputs |
+| `terraform output -state=PATH` | Show specific state outputs |
+| `terraform show` | Show full state |
+
+## Best Practices
+
+### 1. Use Separate State Per Component
+
+```
+my-terraform-state/
+├── prod/
+│   ├── network/
+│   │   └── terraform.tfstate
+│   ├── compute/
+│   │   └── terraform.tfstate
+│   └── database/
+│       └── terraform.tfstate
+```
+
+### 2. Establish Clear Output Contracts
+
+```hcl
+# In network module - always output these
+output "vpc_id" { value = ... }
+output "subnet_ids" { value = { ... } }
+output "vpc_cidr" { value = ... }
+```
+
+### 3. Use Semantic Output Names
+
+```hcl
+# Good: descriptive names
+output "subnet_private_id" { ... }
+output "subnet_database_id" { ... }
+
+# Bad: generic names
+output "subnet_id" { ... }  # Which subnet?
+```
+
+### 4. Pin Remote State References
+
+```hcl
+# Use specific prefix for state
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-terraform-state"
+    prefix = "prod/network"  # Specific environment
+  }
+}
+```
+
+### 5. Document Dependencies
+
+```hcl
+# In compute/main.tf
+# Dependencies:
+# - prod/network: VPC, subnets, firewall rules
+# - prod/database: Cloud SQL instance
+data "terraform_remote_state" "network" {
+  # ...
+}
+```
+
+## Monitoring / State Management
+
+### State Dependencies
+
+```bash
+# Show all remote state references
+grep -r "terraform_remote_state" .
+
+# Show state dependencies
+terraform graph | grep terraform_remote_state
+```
+
+### State Outputs
+
+```bash
+# Show outputs from another state
+terraform output -state=../network/terraform.tfstate
+
+# Show specific output
+terraform output -state=../network/terraform.tfstate -raw vpc_id
+```
+
+## Security
+
+### State Access Control
+
+```hcl
+# Use IAM to restrict state access
+resource "google_storage_bucket_iam_member" "compute_state_reader" {
+  bucket = "my-terraform-state"
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:compute-ci@project.iam.gserviceaccount.com"
+}
+
+resource "google_storage_bucket_iam_member" "network_state_admin" {
+  bucket = "my-terraform-state"
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:network-ci@project.iam.gserviceaccount.com"
+}
+```
+
+### State Encryption
+
+```hcl
+# Enable encryption on state bucket
+resource "google_storage_bucket" "terraform_state" {
+  encryption {
+    default_kms_key_name = google_kms_key.terraform_state_key.id
+  }
+}
+```
+
+## Cost Optimization
+
+### State File Organization
+
+```bash
+# Split state to minimize file size
+# Good structure:
+# - network/terraform.tfstate
+# - compute/terraform.tfstate
+# - database/terraform.tfstate
+
+# Each state is small and fast to load
+```
+
+## Troubleshooting
+
+### Remote State Not Found
+
+```bash
+# Error: No state found
+# Solution: Ensure state was created
+gcloud storage ls gs://my-terraform-state/prod/network/
+
+# Apply network configuration first
+cd environments/prod/network
+terraform apply
+```
+
+### Output Not Found
+
+```bash
+# Error: Output not found
+# Solution: Check output name
+terraform output -state=../network/terraform.tfstate
+terraform output -state=../network/terraform.tfstate -json
+
+# Check if output exists in state
+terraform state show output.vpc_id
+```
+
+### Stale State Reference
+
+```bash
+# State changed but local config not updated
+# Solution: Update data source
+terraform refresh
+
+# Or re-initialize
+terraform init -upgrade
+```
+
+## Interview Questions
+
+### Q1: What is remote state in Terraform?
+**A:** Remote state allows one Terraform configuration to read outputs from another configuration's state file using the `terraform_remote_state` data source.
+
+### Q2: Why use remote state instead of direct references?
+**A:** Enables separation of concerns between teams, allows independent state management per component, and supports different deployment lifecycles.
+
+### Q3: How do you reference remote state?
+**A:** Using `data "terraform_remote_state" "NAME"` with backend configuration, then accessing outputs via `data.terraform_remote_state.NAME.outputs["output_name"]`.
+
+### Q4: What backends support remote state?
+**A:** GCS, S3, Azure Blob, Consul, etcd, Terraform Cloud, and others.
+
+### Q5: How do you handle state dependencies securely?
+**A:** Use IAM to restrict state access, enable encryption at rest and in transit, use service accounts with minimal permissions.
+
+### Q6: What happens if remote state is deleted?
+**A:** Configurations depending on it will fail. Always enable state versioning and backups.
+
+### Q7: How do you handle circular dependencies between states?
+**A:** Break the cycle by restructuring, using data sources instead of remote state, or consolidating into single state.
+
+### Q8: What's the difference between remote state and data sources?
+**A:** Remote state reads Terraform outputs. Data sources query live infrastructure APIs. Remote state is for Terraform-to-Terraform communication.
+
+## Cheat Sheet
+
+### Remote State Data Source
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-terraform-state"
+    prefix = "prod/network"
+  }
+}
+
+# Access output
+data.terraform_remote_state.network.outputs["vpc_id"]
+data.terraform_remote_state.network.outputs.vpc_id
+```
+
+### State Output Definition
+```hcl
+# In producer configuration
+output "vpc_id" {
+  value = google_compute_network.vpc.id
+  description = "VPC network ID"
+}
+```
+
+### Common Backend Configs
+```hcl
+# GCS
+data "terraform_remote_state" "gcs" {
+  backend = "gcs"
+  config = {
+    bucket = "my-bucket"
+    prefix = "env/resource"
+  }
+}
+
+# S3
+data "terraform_remote_state" "s3" {
+  backend = "s3"
+  config = {
+    bucket = "my-bucket"
+    key    = "env/resource.tfstate"
+    region = "us-east-1"
+  }
+}
+```
+
+## Related Topics
+
+- [State](./state.mdx) - State management
+- [Backend](./backend.mdx) - Backend configuration
+- [Workspaces](./workspaces.mdx) - Workspace management
+- [Modules](./modules.mdx) - Module composition
+- [CI/CD](./cicd.mdx) - CI/CD integration

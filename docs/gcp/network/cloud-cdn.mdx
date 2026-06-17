@@ -1,0 +1,579 @@
+# Cloud CDN
+
+## Overview
+
+Cloud CDN (Content Delivery Network) accelerates content delivery by caching content at Google's globally distributed edge locations. When enabled on a backend service or backend bucket, Cloud CDN serves cached content from locations closest to users, reducing latency, decreasing origin load, and lowering network costs. Cloud CDN is integrated with Google Cloud's global load balancer and uses Google's Premium Tier network for optimal performance.
+
+Cloud CDN automatically determines the optimal edge location for each user based on their geographic location and the location of your origin servers. It supports both cache-mode and origin-point-of-presence (PoP) caching, with intelligent cache key management and automatic cache invalidation. The service handles millions of requests per second across Google's global infrastructure.
+
+Key features include HTTP/S load balancer integration, automatic HTTPS, cache key policies, cache invalidation, signed URLs for content access control, and detailed cache hit/miss analytics. Cloud CDN is particularly effective for static content (images, videos, JavaScript, CSS) but can also accelerate dynamic content with appropriate cache settings.
+
+## When To Use
+
+- **Static content delivery**: Images, videos, CSS, JavaScript files
+- **Global applications**: Users distributed across multiple geographic regions
+- **Reduce origin load**: Cache responses to minimize requests to origin servers
+- **Improve user experience**: Lower latency through edge caching
+- **Video streaming**: Progressive video, live streaming support
+- **Software distribution**: Deliver binaries, patches, container images
+- **API caching**: Cache API responses that don't change frequently
+
+## When NOT To Use
+
+- **Frequently changing content**: Dynamic content that changes every request
+- **Real-time data**: Stock prices, live sports scores, instant messaging
+- **Personalized content**: Content that varies per user and can't be cached
+- **Authenticated requests**: Cannot cache requests with authentication headers by default
+- **Large file uploads**: Cloud CDN is for downloading, not uploading
+
+## Architecture
+
+**Cloud CDN Architecture:**
+```
+User Request
+    ↓
+Google Edge PoP (cache miss)
+    ↓
+Origin Server (backend)
+    ↓
+Response cached at edge
+    ↓
+Cache hit response (subsequent requests)
+```
+
+**Cache Flow:**
+```
+Request → Check Edge Cache
+    ├── HIT: Return cached content
+    ├── MISS: Check origin
+    │       ├── Fresh: Cache and return
+    │       └── STALE: Return stale, async refresh
+    └── ERROR: Return error or bypass cache
+```
+
+**Integration with Load Balancer:**
+```
+Internet
+    ↓
+Global HTTPS Load Balancer
+    ↓ (Cloud CDN enabled)
+Backend Service/Bucket
+    ↓
+Origin: Cloud Storage, Instance Group, GKE Service, etc.
+```
+
+## Core Concepts
+
+### Enabling Cloud CDN on Backend Service
+
+```bash
+# Create backend bucket with CDN
+gcloud compute backend-buckets create my-cdn-backend \
+    --gcs-bucket-name=my-bucket \
+    --enable-cdn \
+    --cache-mode=CACHE_ALL_STATIC
+
+# Enable CDN on existing backend service
+gcloud compute backend-services update my-backend \
+    --global \
+    --enable-cdn
+
+# Disable CDN
+gcloud compute backend-services update my-backend \
+    --global \
+    --disable-cdn
+```
+
+### Cache Mode Configuration
+
+```bash
+# CACHE_ALL_STATIC: Cache static content based on Content-Type
+gcloud compute backend-buckets create static-backend \
+    --gcs-bucket-name=my-static-bucket \
+    --enable-cdn \
+    --cache-mode=CACHE_ALL_STATIC
+
+# USE_ORIGIN_HEADERS: Use origin Cache-Control headers
+gcloud compute backend-buckets create origin-backend \
+    --gcs-bucket-name=my-bucket \
+    --enable-cdn \
+    --cache-mode=USE_ORIGIN_HEADERS
+
+# FORCE_CACHE_ALL: Cache everything regardless of headers
+gcloud compute backend-buckets create force-backend \
+    --gcs-bucket-name=my-bucket \
+    --enable-cdn \
+    --cache-mode=CACHE_ALL_STATIC \
+    --default-ttl=3600 \
+    --max-ttl=86400
+```
+
+### Cache Key Configuration
+
+```bash
+# Default: Include scheme, host, and path
+# Custom cache key with query strings
+gcloud compute backend-services update my-backend \
+    --global \
+    --cache-key-include-query-strings
+
+# Exclude specific query params
+gcloud compute backend-services update my-backend \
+    --global \
+    --cache-key-include-query-strings \
+    --query-string-blacklist="utm_*,fbclid"
+
+# Include only specific query params
+gcloud compute backend-services update my-backend \
+    --global \
+    --cache-key-include-query-strings \
+    --query-string-whitelist="page,limit"
+```
+
+### Signed URLs
+
+```bash
+# Create signed URL key
+gcloud compute url-maps add-signed-url-key my-url-map \
+    --key-name=my-signing-key \
+    --key-value="BASE64_ENCODED_KEY" \
+    --global
+
+# Remove signed URL key
+gcloud compute url-maps remove-signed-url-key my-url-map \
+    --key-name=my-signing-key \
+    --global
+
+# Generate signed URL (using gcloud or application code)
+# Example using Python:
+# import cdn_signing
+# url = cdn_signing.generate_signed_url("https://example.com/path", key_name, key_value, expiration)
+```
+
+### Cache Invalidation
+
+```bash
+# Invalidate all content
+gcloud compute url-maps invalidate-cdn-cache my-url-map \
+    --path="/*" \
+    --global
+
+# Invalidate specific path
+gcloud compute url-maps invalidate-cdn-cache my-url-map \
+    --path="/static/*" \
+    --global
+
+# Invalidate with host header
+gcloud compute url-maps invalidate-cdn-cache my-url-map \
+    --path="/images/logo.png" \
+    --host=www.example.com \
+    --global
+
+# Batch invalidation
+gcloud compute url-maps invalidate-cdn-cache my-url-map \
+    --path="/css/*,/js/*,/images/*" \
+    --global
+```
+
+### Custom Origin Headers
+
+```bash
+# Add custom header to requests to origin
+gcloud compute backend-services update my-backend \
+    --global \
+    --custom-request-header="X-Custom-Header:value" \
+    --custom-request-header="X-CDN-Cache:true"
+
+# Remove custom header
+gcloud compute backend-services update my-backend \
+    --global \
+    --remove-custom-request-header="X-Custom-Header"
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Signed URL keys per URL map | 5 |
+| Cache invalidation requests per minute | 1 |
+| Cache invalidation paths per request | 100 |
+| Maximum invalidation size | 1 TB |
+
+### Key Gotchas
+
+- **Cache mode matters**: `CACHE_ALL_STATIC` caches based on Content-Type, `USE_ORIGIN_HEADERS` respects origin headers
+- **Cache key defaults**: Include scheme, host, path by default—query strings excluded by default
+- **Cache invalidation is not instant**: Takes 1-10 seconds for propagation
+- **CORS headers**: Ensure origin returns proper CORS headers for cross-origin requests
+- **Vary header**: Cloud CDN respects the Vary header for cache differentiation
+- **Authenticated requests**: Cannot be cached (unless using signed URLs)
+- **GCS backend**: Cloud CDN with Cloud Storage is the simplest setup for static content
+
+## Real Production Example
+
+Production CDN setup:
+
+```bash
+#!/bin/bash
+set -e
+
+# 1. Create Cloud Storage bucket for static assets
+gsutil mb -l us-central1 gs://my-cdn-bucket
+
+# 2. Make bucket publicly readable
+gsutil iam ch allUsers:objectViewer gs://my-cdn-bucket
+
+# 3. Upload static assets
+gsutil -m cp -r ./static/* gs://my-cdn-bucket/static/
+
+# 4. Create backend bucket with CDN
+gcloud compute backend-buckets create static-backend \
+    --gcs-bucket-name=my-cdn-bucket \
+    --enable-cdn \
+    --cache-mode=CACHE_ALL_STATIC \
+    --default-ttl=3600 \
+    --max-ttl=86400 \
+    --client-ttl=600
+
+# 5. Create URL map
+gcloud compute url-maps create cdn-map \
+    --default-backend-bucket=static-backend
+
+# 6. Create HTTPS proxy with SSL certificate
+gcloud compute ssl-certificates create cdn-cert \
+    --domains=cdn.example.com
+
+gcloud compute target-https-proxies create cdn-proxy \
+    --url-map=cdn-map \
+    --ssl-certificates=cdn-cert
+
+# 7. Create forwarding rule
+gcloud compute forwarding-rules create cdn-https \
+    --global \
+    --target-https-proxy=cdn-proxy \
+    --ports=443 \
+    --address=cdn-ip
+
+# 8. Configure cache key to include version hash
+gcloud compute backend-buckets update static-backend \
+    --cache-mode=CACHE_ALL_STATIC
+
+# 9. Add signed URL support (for premium content)
+gcloud compute url-maps add-signed-url-key cdn-map \
+    --key-name=premium-signing-key \
+    --key-value="your-base64-key"
+
+# 10. Create Cloud Armor policy for DDoS protection
+gcloud compute security-policies create cdn-security \
+    --description="CDN Security Policy"
+
+gcloud compute security-policies add-rule cdn-security \
+    --expression="evaluatePreconfiguredExpr('xss-stable')" \
+    --action=deny-403
+
+# Attach to backend
+gcloud compute backend-buckets update static-backend \
+    --security-policy=cdn-security
+
+# 11. Test cache headers
+curl -I https://cdn.example.com/static/js/app.js
+
+# 12. Perform cache invalidation if needed
+gcloud compute url-maps invalidate-cdn-cache cdn-map \
+    --path="/static/*" \
+    --global
+```
+
+```hcl
+# Terraform: Cloud CDN configuration
+resource "google_storage_bucket" "cdn" {
+  name     = "my-cdn-bucket"
+  location = "US"
+  uniform_bucket_level_access = true
+}
+
+resource "google_storage_bucket_object" "static" {
+  for_each = fileset("./static/", "**/*")
+  name     = each.value
+  bucket   = google_storage_bucket.cdn.name
+  source   = "./static/${each.value}"
+}
+
+resource "google_compute_backend_bucket" "cdn_backend" {
+  name        = "cdn-backend"
+  bucket_name = google_storage_bucket.cdn.name
+  enable_cdn  = true
+
+  cdn_policy {
+    cache_mode        = "CACHE_ALL_STATIC"
+    default_ttl       = 3600
+    max_ttl           = 86400
+    client_ttl        = 600
+    serve_while_stale = 3600
+
+    cache_key_policy {
+      include_host           = true
+      include_protocol       = true
+      include_query_string   = false
+    }
+  }
+}
+
+resource "google_compute_url_map" "cdn" {
+  name            = "cdn-url-map"
+  default_backend = google_compute_backend_bucket.cdn_backend.name
+}
+
+resource "google_compute_managed_ssl_certificate" "cdn" {
+  name = "cdn-cert"
+
+  managed {
+    domains = ["cdn.example.com"]
+  }
+}
+
+resource "google_compute_target_https_proxy" "cdn" {
+  name             = "cdn-proxy"
+  url_map          = google_compute_url_map.cdn.name
+  ssl_certificates = [google_compute_managed_ssl_certificate.cdn.name]
+}
+
+resource "google_compute_global_forwarding_rule" "cdn" {
+  name       = "cdn-https"
+  target     = google_compute_target_https_proxy.cdn.name
+  port_range = "443"
+}
+```
+
+## CLI Examples
+
+```bash
+# Backend bucket with CDN
+gcloud compute backend-buckets create NAME --gcs-bucket-name=BUCKET --enable-cdn
+
+# Backend service with CDN
+gcloud compute backend-services update NAME --global --enable-cdn
+
+# Cache invalidation
+gcloud compute url-maps invalidate-cdn-cache URL_MAP --path="/*" --global
+
+# Signed URL key management
+gcloud compute url-maps add-signed-url-key URL_MAP --key-name=NAME --key-value=KEY --global
+
+# CDN policy settings
+gcloud compute backend-buckets update NAME --cache-mode=CACHE_ALL_STATIC --default-ttl=3600
+```
+
+## Terraform Example
+
+```hcl
+# Backend bucket with CDN policy
+resource "google_compute_backend_bucket" "cdn" {
+  name        = "static-cdn"
+  bucket_name = google_storage_bucket.static.name
+  enable_cdn  = true
+
+  cdn_policy {
+    cache_mode        = "CACHE_ALL_STATIC"
+    default_ttl       = 3600
+    max_ttl           = 86400
+    client_ttl        = 600
+
+    cache_key_policy {
+      include_host         = true
+      include_protocol     = true
+      include_query_string = false
+    }
+  }
+}
+
+# Signed URL configuration
+resource "google_compute_url_map" "cdn" {
+  name            = "signed-url-map"
+  default_backend = google_compute_backend_bucket.cdn.name
+}
+
+resource "google_compute_signed_url_key" "signing" {
+  name  = "signing-key"
+  value = "your-256-bit-key-in-base64"
+}
+
+resource "google_compute_backend_bucket" "private_cdn" {
+  name        = "private-cdn"
+  bucket_name = google_storage_bucket.private.name
+  enable_cdn  = true
+
+  cdn_policy {
+    # Requires signed URL for access
+  }
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Enable CDN | `gcloud compute backend-buckets update NAME --enable-cdn` |
+| Disable CDN | `gcloud compute backend-services update NAME --global --disable-cdn` |
+| Cache invalidation | `gcloud compute url-maps invalidate-cdn-cache MAP --path=PATH --global` |
+| Add signed URL key | `gcloud compute url-maps add-signed-url-key MAP --key-name=NAME --key-value=KEY --global` |
+| List CDN policies | `gcloud compute backend-buckets describe NAME` |
+
+## Monitoring
+
+**Cloud CDN Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| Request count | Total requests to CDN |
+| Cache hit ratio | % of requests served from cache |
+| Cache hits | Requests served from cache |
+| Cache misses | Requests forwarded to origin |
+| Origin request count | Requests to origin |
+| Bytes served | Total bytes served |
+| Latency | Time to serve requests |
+
+```bash
+# View CDN metrics in Cloud Monitoring
+gcloud monitoring metrics list --filter="metric.type:starts_with('cloudcdn.googleapis.com')"
+
+# Check cache hit ratio
+gcloud monitoring metrics describe cloudcdn.googleapis.com/request_count \
+    --filter='metric.labels.cache_result="HIT"'
+
+# View cache statistics
+gcloud compute backend-buckets describe my-backend --format="yaml(cdnPolicy)"
+```
+
+**Cloud Logging for CDN:**
+```bash
+# View CDN logs
+gcloud logging read 'resource.type="http_load_balancer" AND jsonPayload.cacheHit=true'
+
+# Cache miss logs
+gcloud logging read 'resource.type="http_load_balancer" AND jsonPayload.cacheHit=false'
+```
+
+## Security
+
+**CDN Security Best Practices:**
+
+1. **Enable Cloud Armor** for DDoS and WAF protection
+   ```bash
+   gcloud compute backend-buckets update my-cdn --security-policy=my-policy
+   ```
+
+2. **Use HTTPS only**
+   ```bash
+   gcloud compute forwarding-rules update my-rule --global --ssl-policy=modern
+   ```
+
+3. **Use signed URLs** for premium/restricted content
+   ```bash
+   gcloud compute url-maps add-signed-url-key my-map --key-name=my-key --key-value=KEY
+   ```
+
+4. **Set appropriate cache TTLs** to balance freshness and performance
+5. **Enable CORS** on Cloud Storage buckets for cross-origin requests
+
+## Cost Optimization
+
+**Cloud CDN Pricing:**
+
+| Resource | Price |
+|----------|-------|
+| Cache hit traffic | Free (within GCP network) |
+| Cache miss to origin | Standard egress rates |
+| External egress from edge | ~$0.08-0.12/GB (varies by region) |
+| Cache invalidation | Free |
+
+**Optimization:**
+- Increase cache TTL for static content
+- Use versioning in URLs (e.g., `/v1/js/app.js`) for cache busting
+- Enable compression to reduce bandwidth
+- Use `stale-while-revalidate` for better cache efficiency
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Content not being cached**
+   ```bash
+   # Check CDN is enabled
+   gcloud compute backend-buckets describe my-backend | grep enableCdn
+   
+   # Check cache mode and TTL settings
+   gcloud compute backend-buckets describe my-backend --format="yaml(cdnPolicy)"
+   
+   # Check cacheable content types
+   # Ensure not setting Cache-Control: private or no-store
+   
+   # Check query string configuration
+   ```
+
+2. **Cache invalidation not working**
+   ```bash
+   # Invalidation takes 1-10 seconds
+   # Check path syntax (use /* for all, /path/* for directory)
+   gcloud compute url-maps invalidate-cdn-cache my-map --path="/*" --global
+   
+   # Verify invalidation completed
+   # Check Cloud Logging for invalidation events
+   ```
+
+3. **CORS errors**
+   ```bash
+   # Set CORS on Cloud Storage bucket
+   gsutil cors set cors.json gs://my-bucket
+   
+   # cors.json:
+   # [{"origin": ["*"], "method": ["GET"], "maxAgeSeconds": 3600}]
+   ```
+
+## Interview Questions
+
+1. **How does Cloud CDN caching work and what determines what gets cached?**
+
+2. **What's the difference between cache modes in Cloud CDN?**
+
+3. **How would you implement signed URLs for premium content access?**
+
+4. **Explain how cache invalidation works and when you would use it.**
+
+5. **What's the cache hit ratio you should aim for and how do you improve it?**
+
+## Cheat Sheet
+
+```
+# CDN Commands
+gcloud compute backend-buckets create NAME --gcs-bucket-name=BUCKET --enable-cdn
+gcloud compute backend-buckets update NAME --enable-cdn
+gcloud compute backend-services update NAME --global --enable-cdn
+gcloud compute url-maps invalidate-cdn-cache MAP --path=PATH --global
+gcloud compute url-maps add-signed-url-key MAP --key-name=NAME --key-value=KEY
+
+# Cache Mode Options
+CACHE_ALL_STATIC     # Cache static content based on Content-Type
+USE_ORIGIN_HEADERS   # Respect origin Cache-Control headers
+FORCE_CACHE_ALL      # Cache everything
+
+# Cache Key Settings
+--cache-key-include-query-strings    # Include query strings in cache key
+--query-string-whitelist="page,limit"  # Only these params
+--query-string-blacklist="utm_*"     # Exclude these params
+```
+
+## Labs
+
+1. **Static Website CDN**: Create GCS bucket, enable CDN, configure caching
+2. **Cache Invalidation**: Test cache invalidation with versioning URLs
+3. **Signed URLs**: Configure signed URL access for premium content
+4. **Performance Testing**: Compare latency with/without CDN
+5. **Cloud Armor Integration**: Add security policy to CDN backend
+
+## Related Services
+
+- [Cloud Load Balancer](./load-balancer)
+- [Cloud Storage](https://cloud.google.com/storage)
+- [Cloud Armor](https://cloud.google.com/armor)
+- [VPC](./vpc)

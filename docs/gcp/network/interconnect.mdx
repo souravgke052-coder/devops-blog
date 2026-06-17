@@ -1,0 +1,641 @@
+# Cloud Interconnect
+
+## Overview
+
+Cloud Interconnect provides dedicated, private connectivity between your on-premises network and Google's network. Unlike VPN which encrypts traffic over the public internet, Interconnect establishes physical connections to Google's edge points of presence (PoPs), providing lower latency, higher throughput, and more consistent performance than VPN-based connections.
+
+GCP offers several Interconnect options: Dedicated Interconnect (1-100 Gbps dedicated physical connections), Partner Interconnect (via service providers), and Cross-Cloud Interconnect for connecting to other cloud providers. For organizations running hybrid workloads or migrating from on-premises, Interconnect is the recommended connectivity option when bandwidth or latency requirements exceed what VPN can provide.
+
+Understanding Interconnect is essential for enterprises building hybrid cloud architectures, running latency-sensitive workloads between on-premises and GCP, or requiring consistent high-bandwidth connectivity without the variability of internet-based connections.
+
+## When To Use
+
+- **Hybrid cloud architectures**: Connect on-premises data centers to GCP
+- **Large data transfers**: Migrating terabytes of data to Cloud Storage
+- **Latency-sensitive applications**: Database replication, HPC workloads
+- **High-bandwidth requirements**: >1 Gbps sustained throughput
+- **Compliance requirements**: Data must traverse private networks
+- **Mission-critical connectivity**: Need SLA-backed availability
+- **Cross-cloud connectivity**: Connect GCP to AWS or Azure
+
+## When NOT To Use
+
+- **Small bandwidth needs**: VPN can handle up to 3 Gbps with HA VPN
+- **Spike-based workloads**: Consider VPN for occasional needs
+- **Global distribution**: VPN is easier for multiple regions
+- **Quick prototyping**: VPN is faster to set up
+- **Cost-sensitive projects**: VPN is significantly cheaper for most use cases
+
+## Architecture
+
+**Dedicated Interconnect Architecture:**
+```
+On-Premises Network
+    ↓
+Customer Router (BGP peer)
+    ↓
+Cross Connect (Layer 2)
+    ↓
+Google Interconnect Interface
+    ↓
+Google Network
+    ↓
+Cloud Router (BGP)
+    ↓
+VPC Network
+```
+
+**Interconnect Components:**
+```
+Interconnect Attachment
+├── Type: DEDICATED | PARTNER
+├── VLAN (802.1Q)
+├── BGP Session (to Cloud Router)
+├── Google IP Range (for interconnect)
+└── On-premises IP Range
+```
+
+**Connection Options:**
+| Type | Speed | Use Case |
+|------|-------|----------|
+| Dedicated Interconnect | 1, 2, 5, 10, 100 Gbps | Direct to Google |
+| Partner Interconnect | 50 Mbps - 10 Gbps | Via service provider |
+| Cross-Cloud Interconnect | 10, 100 Gbps | GCP to other clouds |
+
+## Core Concepts
+
+### Prerequisites and Planning
+
+```bash
+# Before creating interconnect:
+# 1. Request dedicated interconnect in Google Cloud Console
+# 2. Schedule cross-connect at Google facility
+# 3. Exchange LOA (Letter of Authorization) with provider
+# 4. Configure BGP on customer router
+```
+
+### Creating Dedicated Interconnect
+
+```bash
+# Create interconnect resource (after cross-connect is complete)
+gcloud compute interconnects create my-interconnect \
+    --region=us-central1 \
+    --router=my-router \
+    --interconnect-type=DEDICATED \
+    --link-type=LINK_10G \
+    --description="My dedicated interconnect" \
+    --requested-total-link-count=4
+
+# List interconnects
+gcloud compute interconnects list
+
+# Describe interconnect
+gcloud compute interconnects describe my-interconnect --region=us-central1
+
+# Delete interconnect
+gcloud compute interconnects delete my-interconnect --region=us-central1
+```
+
+### Creating VLAN Attachments (HA Configuration)
+
+```bash
+# Create VLAN attachment (for HA, create two)
+gcloud compute interconnects attachments dedicated create attachment-1 \
+    --region=us-central1 \
+    --router=my-router \
+    --interconnect=my-interconnect \
+    --description="VLAN for primary connection"
+
+gcloud compute interconnects attachments dedicated create attachment-2 \
+    --region=us-central2 \
+    --router=my-router-backup \
+    --interconnect=my-interconnect-backup \
+    --description="VLAN for backup connection"
+
+# List attachments
+gcloud compute interconnects attachments list
+
+# Describe attachment (get VLAN ID and peer IP)
+gcloud compute interconnects attachments describe attachment-1 \
+    --region=us-central1
+```
+
+### Partner Interconnect
+
+```bash
+# Create partner VLAN attachment
+gcloud compute interconnects attachments partner create partner-attachment \
+    --region=us-central1 \
+    --router=my-router \
+    --description="Partner interconnect"
+
+# Get VLAN ID to give to service provider
+gcloud compute interconnects attachments partner describe partner-attachment \
+    --region=us-central1
+
+# Enable BGP on partner attachment (after provider sets up)
+gcloud compute interconnects attachments partner update partner-attachment \
+    --region=us-central1 \
+    --advertised-routes=PUBLIC --enabled
+```
+
+### Cloud Router Configuration
+
+```bash
+# Create Cloud Router with BGP
+gcloud compute routers create my-router \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --asn=65001 \
+    --description="Interconnect router"
+
+# Add BGP interface to router
+gcloud compute routers add-interface my-router \
+    --region=us-central1 \
+    --interfaceName=interface-1 \
+    --interconnect-attachment=attachment-1 \
+    --ip-address=169.254.0.1 \
+    --mask-length=30
+
+# Configure BGP peer on router
+gcloud compute routers add-bgp-peer my-router \
+    --region=us-central1 \
+    --peer-name=peer-1 \
+    --interface=interface-1 \
+    --peer-asn=65002 \
+    --peer-ip-address=169.254.0.2
+
+# List router BGP info
+gcloud compute routers describe my-router --region=us-central1 \
+    --format="yaml(bgpPeers,bgp)"
+
+# Get router status
+gcloud compute routers get-status my-router --region=us-central1
+```
+
+### Advertised Routes
+
+```bash
+# Configure what routes to advertise to on-premises
+gcloud compute routers update my-router \
+    --region=us-central1 \
+    --advertisement-mode=CUSTOM \
+    --set-advertisement-groups=ALL_SUBNETS
+
+# Or specify custom ranges
+gcloud compute routers update my-router \
+    --region=us-central1 \
+    --advertisement-mode=CUSTOM \
+    --set-advertisement-ranges=10.0.0.0/8,10.10.0.0/16
+
+# Check advertised routes
+gcloud compute routers announce my-router --region=us-central1
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Dedicated Interconnect per project | 200 |
+| VLAN attachments per interconnect | 50 |
+| BGP sessions per Cloud Router | 50 |
+| Interconnect port speeds | 1, 2, 5, 10, 100 Gbps |
+| Partner interconnect capacity | 50 Mbps - 10 Gbps |
+
+### Key Gotchas
+
+- **Cross-connect required**: Physical installation at Google facility takes time
+- **VLAN tagging**: Each attachment uses 802.1Q VLAN
+- **BGP required**: Interconnect uses BGP for route exchange
+- **HA requires redundant connections**: Single connection is no HA SLA
+- **Regional resources**: Attachments are regional
+- **MACSEC optional**: Can enable layer 2 encryption
+- **BFD recommended**: Bidirectional Forwarding Detection for fast failover
+
+## Real Production Example
+
+Complete production Interconnect setup:
+
+```bash
+#!/bin/bash
+set -e
+
+PROJECT="my-project"
+VPC="prod-vpc"
+REGION1="us-central1"
+REGION2="us-east1"
+ROUTER1="router-us-central"
+ROUTER2="router-us-east"
+INTERCONNECT1="interconnect-central"
+INTERCONNECT2="interconnect-east"
+VLAN1="vlan-attachment-1a"
+VLAN2="vlan-attachment-1b"
+
+# 1. Create VPC
+gcloud compute networks create $VPC --subnet-mode=custom
+
+gcloud compute networks subnets create subnet-central \
+    --network=$VPC --region=$REGION1 --range=10.0.1.0/24
+
+gcloud compute networks subnets create subnet-east \
+    --network=$VPC --region=$REGION2 --range=10.0.2.0/24
+
+# 2. Create Cloud Router
+gcloud compute routers create $ROUTER1 \
+    --network=$VPC \
+    --region=$REGION1 \
+    --asn=65001 \
+    --description="Primary interconnect router"
+
+gcloud compute routers create $ROUTER2 \
+    --network=$VPC \
+    --region=$REGION2 \
+    --asn=65001 \
+    --description="Secondary interconnect router"
+
+# 3. Create HA VPN as backup (recommended)
+gcloud compute vpn-gateways create vpn-backup \
+    --network=$VPC \
+    --region=$REGION1
+
+gcloud compute routers create vpn-router-backup \
+    --network=$VPC \
+    --region=$REGION1 \
+    --asn=65003
+
+gcloud compute routers update vpn-router-backup \
+    --region=$REGION1 \
+    --vpn-gateway=vpn-backup \
+    --interface=0
+
+# 4. Create dedicated interconnect (after cross-connect)
+gcloud compute interconnects create $INTERCONNECT1 \
+    --region=$REGION1 \
+    --router=$ROUTER1 \
+    --interconnect-type=DEDICATED \
+    --link-type=LINK_10G \
+    --requested-total-link-count=2
+
+# 5. Create VLAN attachments (HA pair)
+gcloud compute interconnects attachments dedicated create $VLAN1 \
+    --region=$REGION1 \
+    --router=$ROUTER1 \
+    --interconnect=$INTERCONNECT1 \
+    --vlan=100 \
+    --description="Primary VLAN"
+
+gcloud compute interconnects attachments dedicated create vlan-attachment-1b \
+    --region=$REGION1 \
+    --router=$ROUTER1 \
+    --interconnect=$INTERCONNECT1 \
+    --vlan=101 \
+    --description="Secondary VLAN"
+
+# 6. Get attachment details (VLAN ID, peer IP) for customer router config
+gcloud compute interconnects attachments dedicated describe $VLAN1 \
+    --region=$REGION1
+
+# 7. Configure BGP on Cloud Router
+# Add BGP interface
+gcloud compute routers add-interface $ROUTER1 \
+    --region=$REGION1 \
+    --interfaceName=interface-0 \
+    --interconnect-attachment=$VLAN1 \
+    --ip-address=169.254.0.1 \
+    --mask-length=30
+
+# Add BGP peer (customer router)
+gcloud compute routers add-bgp-peer $ROUTER1 \
+    --region=$REGION1 \
+    --peer-name=customer-peer \
+    --interface=interface-0 \
+    --peer-asn=65002 \
+    --peer-ip-address=169.254.0.2 \
+    --enabled \
+    --md5-authentication-key=my-secret-key
+
+# Enable BFD for fast failover
+gcloud compute routers update $ROUTER1 \
+    --region=$REGION1 \
+    --set-bfd-session-initialization-mode=ASYMMETRIC_PER_PEER \
+    --bfd-min-receive-interval=1000 \
+    --bfd-min-transmit-interval=1000 \
+    --bfd-multiplier=5
+
+# 8. Configure route advertisement
+gcloud compute routers update $ROUTER1 \
+    --region=$REGION1 \
+    --advertisement-mode=CUSTOM \
+    --set-advertisement-ranges=10.0.0.0/8
+
+# 9. Verify BGP session is up
+gcloud compute routers get-status $ROUTER1 --region=$REGION1
+
+# 10. On-premises router configuration (example for Cisco IOS)
+# router bgp 65002
+# neighbor 169.254.0.1 remote-as 65001
+# neighbor 169.254.0.1 password my-secret-key
+# neighbor 169.254.0.1 description Google Cloud Router
+# !
+# ip route 10.0.0.0 255.0.0.0 169.254.0.1
+
+# 11. Test connectivity
+# From on-premises:
+# ping 10.0.1.1  # Should reach subnet-central
+# traceroute 10.0.1.1
+```
+
+```hcl
+# Terraform: Cloud Interconnect configuration
+resource "google_compute_network" "prod_vpc" {
+  name = "prod-vpc"
+}
+
+resource "google_compute_subnetwork" "subnet_central" {
+  name               = "subnet-central"
+  network            = google_compute_network.prod_vpc.id
+  ip_cidr_range      = "10.0.1.0/24"
+  region             = "us-central1"
+}
+
+# Cloud Router
+resource "google_compute_router" "router" {
+  name    = "interconnect-router"
+  network = google_compute_network.prod_vpc.id
+  region  = "us-central1"
+
+  bgp {
+    asn = 65001
+  }
+}
+
+# VLAN Attachment (Dedicated Interconnect)
+resource "google_compute_interconnects_attachment" "primary" {
+  name         = "primary-attachment"
+  router       = google_compute_router.router.id
+  region       = "us-central1"
+  interconnect = "projects/${var.project_id}/global/interconnects/my-interconnect"
+  vlan         = 100
+
+  bandwidth         = "BPS_10G"
+  candidate_subnets  = ["169.254.0.0/29"]
+  vlan_id            = 100
+  admin_enabled      = true
+}
+
+# BGP Peer
+resource "google_compute_router_peer" "peer" {
+  name            = "on-prem-peer"
+  router          = google_compute_router.router.name
+  region          = "us-central1"
+  peer_asn        = 65002
+  interface       = google_compute_router_interface.interface.name
+  peer_ip_address = "169.254.0.2"
+
+  advertised_route_groups = ["ALL_SUBNETS"]
+  advertised_route_priority = 100
+}
+
+# Router Interface
+resource "google_compute_router_interface" "interface" {
+  name       = "interface-0"
+  router     = google_compute_router.router.name
+  region     = "us-central1"
+  subnetwork = google_compute_subnetwork.subnet_central.id
+  ip_address = "169.254.0.1"
+}
+```
+
+## CLI Examples
+
+```bash
+# Dedicated Interconnect
+gcloud compute interconnects create NAME --region=REG --router=ROUTER [FLAGS]
+gcloud compute interconnects list
+gcloud compute interconnects describe NAME --region=REG
+
+# VLAN Attachments
+gcloud compute interconnects attachments dedicated create NAME --region=REG --router=ROUTER --interconnect=INTERCONNECT
+gcloud compute interconnects attachments dedicated list
+gcloud compute interconnects attachments dedicated describe NAME --region=REG
+
+# Partner Interconnect
+gcloud compute interconnects attachments partner create NAME --region=REG --router=ROUTER
+gcloud compute interconnects attachments partner describe NAME --region=REG
+
+# Cloud Router
+gcloud compute routers create NAME --network=NET --region=REG --asn=ASN
+gcloud compute routers add-interface NAME --region=REG --interface=NAME [FLAGS]
+gcloud compute routers add-bgp-peer NAME --region=REG --peer-name=NAME [FLAGS]
+gcloud compute routers get-status NAME --region=REG
+```
+
+## Terraform Example
+
+```hcl
+# Complete interconnect setup
+resource "google_compute_network" "vpc" {
+  name = "vpc"
+}
+
+resource "google_compute_router" "router" {
+  name    = "router"
+  network = google_compute_network.vpc.id
+  region  = "us-central1"
+
+  bgp {
+    asn = 65001
+  }
+}
+
+resource "google_compute_interconnects_attachment" "dedicated" {
+  name           = "dedicated-attachment"
+  router         = google_compute_router.router.id
+  region         = "us-central1"
+  interconnect   = "interconnect-name"
+  vlan           = 100
+  
+  # For HA, create two attachments in different zones
+}
+
+# Enable BFD for fast failover
+resource "google_compute_router_peer" "peer" {
+  name             = "peer"
+  router           = google_compute_router.router.name
+  region           = "us-central1"
+  peer_asn         = 65002
+  interface        = google_compute_router_interface.interface.name
+  ip_address       = "169.254.0.1"
+  peer_ip_address  = "169.254.0.2"
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List interconnects | `gcloud compute interconnects list` |
+| Describe interconnect | `gcloud compute interconnects describe NAME --region=REG` |
+| Create attachment | `gcloud compute interconnects attachments dedicated create NAME --region=REG [FLAGS]` |
+| Describe attachment | `gcloud compute interconnects attachments describe NAME --region=REG` |
+| Create router | `gcloud compute routers create NAME --network=NET --region=REG --asn=ASN` |
+| Add BGP peer | `gcloud compute routers add-bgp-peer NAME --region=REG --peer-name=NAME [FLAGS]` |
+| Get router status | `gcloud compute routers get-status NAME --region=REG` |
+
+## Monitoring
+
+**Interconnect Monitoring:**
+
+| Metric | Description |
+|--------|-------------|
+| BGP session status | UP/DOWN |
+| Interconnect utilization | Current bandwidth usage |
+| Packet counts | Transmitted/received packets |
+| Error counts | CRC errors, drops |
+
+```bash
+# Check interconnect status
+gcloud compute interconnects describe my-interconnect --region=us-central1
+
+# Check router status
+gcloud compute routers get-status my-router --region=us-central1
+
+# List BGP peers
+gcloud compute routers describe my-router --region=us-central1 --format="yaml(bgpPeers)"
+
+# View interconnect logs
+gcloud logging read 'resource.type="interconnect"'
+```
+
+**Recommended Alerts:**
+- BGP session down
+- Interconnect utilization > 80%
+- High error rate
+
+## Security
+
+**Interconnect Security:**
+
+1. **MACsec encryption**: Enable layer 2 encryption
+   ```bash
+   gcloud compute interconnects attachments dedicated create attachment \
+       --region=us-central1 \
+       --router=my-router \
+       --interconnect=my-interconnect \
+       --encrypted-interconnect
+   ```
+
+2. **BGP MD5 authentication**: Protect BGP session
+   ```bash
+   gcloud compute routers add-bgp-peer my-router \
+       --region=us-central1 \
+       --peer-name=peer \
+       --interface=interface-0 \
+       --peer-asn=65002 \
+       --md5-authentication-key="secret-key"
+   ```
+
+3. **Firewall rules**: Control traffic from on-premises
+4. **Private Google Access**: Ensure on-prem can't access Google APIs directly
+
+## Cost Optimization
+
+**Interconnect Costs:**
+
+| Component | Cost |
+|-----------|------|
+| Dedicated 10 Gbps port | ~$1,625/month |
+| Dedicated 100 Gbps port | ~$12,500/month |
+| Data transfer | Included (no egress to Google) |
+| Partner Interconnect | Varies by provider |
+
+**Optimization:**
+- Right-size interconnect capacity (start small, scale up)
+- Use VPN as backup (lower cost than redundant interconnect)
+- Consider Partner Interconnect for lower bandwidth needs
+- Use Cloud CDN to reduce cross-connect traffic
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **BGP session not establishing**
+   ```bash
+   # Check BGP configuration
+   gcloud compute routers describe my-router --region=us-central1
+   
+   # Verify interconnect status
+   gcloud compute interconnects describe my-interconnect --region=us-central1
+   
+   # Check attachment status
+   gcloud compute interconnects attachments describe attachment --region=us-central1
+   
+   # Verify VLAN ID matches customer router
+   # Verify ASNs match
+   # Check MD5 key
+   ```
+
+2. **Interconnect showing as down**
+   ```bash
+   # Check cross-connect status (physical)
+   # Verify fiber cables connected
+   # Check router interfaces
+   # Review interconnect status in Console
+   ```
+
+3. **Routes not being exchanged**
+   ```bash
+   # Check advertised routes
+   gcloud compute routers describe my-router --region=us-central1
+   
+   # Verify on-premises router receives routes
+   # Check BGP community strings if used
+   # Verify route filtering on on-premises router
+   ```
+
+## Interview Questions
+
+1. **What's the difference between Dedicated Interconnect and Partner Interconnect?**
+
+2. **How does Cloud Router work with Interconnect and what BGP configuration is required?**
+
+3. **Explain the redundancy options for Interconnect. What achieves 99.99% SLA?**
+
+4. **When would you choose VPN over Interconnect for hybrid connectivity?**
+
+5. **What is VLAN tagging in the context of Interconnect and why is it important?**
+
+## Cheat Sheet
+
+```
+# Interconnect Commands
+gcloud compute interconnects list
+gcloud compute interconnects describe NAME --region=REG
+gcloud compute interconnects create NAME --region=REG --router=ROUTER [FLAGS]
+gcloud compute interconnects delete NAME --region=REG
+
+# VLAN Attachments
+gcloud compute interconnects attachments dedicated create NAME --region=REG --router=ROUTER --interconnect=INTERCONNECT
+gcloud compute interconnects attachments dedicated describe NAME --region=REG
+gcloud compute interconnects attachments partner create NAME --region=REG --router=ROUTER
+
+# Router Commands
+gcloud compute routers create NAME --network=NET --region=REG --asn=ASN
+gcloud compute routers add-bgp-peer NAME --region=REG --peer-name=NAME [FLAGS]
+gcloud compute routers get-status NAME --region=REG
+```
+
+## Labs
+
+1. **Interconnect Setup**: Create dedicated interconnect with VLAN attachments
+2. **BGP Configuration**: Configure Cloud Router BGP session
+3. **HA Setup**: Configure redundant interconnect connections
+4. **Route Advertisement**: Configure and verify route advertisement
+5. **Monitoring**: Set up alerts for interconnect status
+
+## Related Services
+
+- [VPC](./vpc)
+- [Cloud Router](https://cloud.google.com/network-connectivity/docs/cloud-router)
+- [VPN](./vpc) (for backup connectivity)
+- [Hybrid Architecture](https://cloud.google.com/solutions/hybrid-and-multi-cloud-network-patterns)

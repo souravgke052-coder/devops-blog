@@ -1,0 +1,640 @@
+# Cloud NAT
+
+## Overview
+
+Cloud NAT (Network Address Translation) provides outbound internet access for instances that don't have external IP addresses. Instead of assigning public IPs to every VM, Cloud NAT allows all instances in a subnet to share a set of external IP addresses for outbound traffic, while inbound connections from the internet are blocked by default.
+
+Cloud NAT is particularly important for private GKE clusters, instances running in private subnets, and any workload that needs internet access for updates or API calls but shouldn't be directly reachable from the internet. It provides a secure, scalable way to handle outbound connectivity without exposing instances to inbound connections.
+
+Cloud NAT is a distributed, software-defined service that runs on Google's infrastructure. It doesn't require a dedicated NAT gateway VM, scales automatically, and provides high availability across zones. Understanding Cloud NAT is essential for building secure, private network architectures in GCP.
+
+## When To Use
+
+- **Private GKE clusters**: Nodes without external IPs need NAT for Docker pulls and updates
+- **Private instances needing internet access**: Updates, package downloads, API calls
+- **Cost optimization**: Share fewer external IPs across many instances
+- **Security compliance**: Prevent direct inbound access to instances
+- **Batch processing jobs**: Periodic outbound API calls without permanent external IPs
+- **Database proxies**: Allow DB access from private instances to cloud databases
+
+## When NOT To Use
+
+- **Instances requiring direct inbound access**: Use external IPs instead
+- **High-bandwidth TCP/UDP applications**: Consider a custom NAT solution or External IP
+- **Real-time applications with strict latency requirements**: NAT adds slight latency
+- **Applications needing static source IPs**: Consider external IPs or proxy instead
+- **VPN connections that need source IP preservation**: NAT changes source IPs
+
+## Architecture
+
+**Cloud NAT Architecture:**
+```
+Private Instance (10.0.1.5, no external IP)
+    ↓
+Cloud Router (with NAT config)
+    ↓
+NAT Gateway (managed by GCP)
+    ↓
+External IP Pool
+    ↓
+Internet
+```
+
+**NAT Flow:**
+```
+Instance sends packet (src: 10.0.1.5 → dst: 8.8.8.8)
+    ↓
+Cloud Router intercepts packet
+    ↓
+NAT: translate src to external IP (src: 203.0.113.5 → dst: 8.8.8.8)
+    ↓
+Packet forwarded to internet
+    ↓
+Response returns to external IP
+    ↓
+NAT: translate back (dst: 203.0.113.5 → dst: 10.0.1.5)
+    ↓
+Packet delivered to instance
+```
+
+**Components:**
+- **Cloud Router**: Manages BGP and routes for NAT
+- **NAT Gateway**: GCP-managed translation service (no VM needed)
+- **External IP**: Either automatic (NAT IP auto-assigned) or static
+
+## Core Concepts
+
+### Creating a Cloud NAT Gateway
+
+```bash
+# Create Cloud Router
+gcloud compute routers create my-router \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --description="Router for Cloud NAT"
+
+# Create Cloud NAT gateway
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --nat-all-subnet-ip-ranges \
+    --enable-logging \
+    --log-filter=ERRORS_ONLY
+
+# Configure with specific subnet ranges
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --nat-external-ip-pool=ip-address-1,ip-address-2 \
+    --nat-subnet-name=my-subnet \
+    --enable-logging \
+    --log-filter=TRANSLATIONS_ONLY
+```
+
+### NAT Configuration Options
+
+```bash
+# Configure with static external IPs (pre-allocated)
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --nat-external-ip-pool=203.0.113.1,203.0.113.2,203.0.113.3
+
+# NAT specific subnet ranges only
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --nat-subnet-name=web-subnet,app-subnet
+
+# NAT all subnets except specific ones
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --min-ports-per-vm=256 \
+    --max-ports-per-vm=65536
+
+# Configure port allocation
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --min-ports-per-vm=64 \
+    --max-ports-per-vm=512
+```
+
+### Updating NAT Configuration
+
+```bash
+# Update NAT to enable logging
+gcloud compute routers nats update my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --enable-logging \
+    --log-filter=ALL
+
+# Change to errors only logging
+gcloud compute routers nats update my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --log-filter=ERRORS_ONLY
+
+# Update port allocation
+gcloud compute routers nats update my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --min-ports-per-vm=128 \
+    --max-ports-per-vm=4096
+
+# Add/remove NAT IP addresses
+gcloud compute routers nats update my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --nat-external-ip-pool=203.0.113.1,203.0.113.2,203.0.113.3,203.0.113.4
+```
+
+### Viewing NAT Status
+
+```bash
+# List NAT configurations
+gcloud compute routers nats list --router=my-router --region=us-central1
+
+# Describe NAT configuration
+gcloud compute routers nats describe my-nat --router=my-router --region=us-central1
+
+# Get NAT status with translation info
+gcloud compute routers get-nat-mapping-status my-router --region=us-central1
+
+# View NAT logs
+gcloud logging read 'resource.type="nat_gateway"' --limit=100
+
+# Check router status
+gcloud compute routers describe my-router --region=us-central1
+```
+
+### Port Allocation
+
+```bash
+# Port allocation affects how many concurrent connections per VM
+# More ports = more concurrent connections
+
+# Default: 64-65536 ports per VM
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --min-ports-per-vm=64
+
+# Higher port count for connection-heavy workloads
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --min-ports-per-vm=1024 \
+    --max-ports-per-vm=65536
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Cloud NAT gateways per project | 50 |
+| NAT gateways per Cloud Router | 1 |
+| External IPs per NAT | 50 |
+| Port range per VM | 64-65536 |
+| Maximum translations per gateway | Scales automatically |
+
+### Key Gotchas
+
+- **Cloud NAT is regional**—one router per region
+- **Doesn't support inbound connections**—use firewall rules for port forwarding
+- **Uses external IPs for source NAT**—not destination NAT
+- **Connections don't persist across NAT**—long-lived connections may timeout
+- **Logging can generate significant volume**—use filtering
+- **Drains connections on gateway update**—plan maintenance windows
+- **Can't use with route-based VPN**—must use BGP-based Cloud Router
+- **Some Google APIs accessible without NAT** when Private Google Access is enabled
+
+## Real Production Example
+
+Production Cloud NAT setup:
+
+```bash
+#!/bin/bash
+set -e
+
+VPC="prod-vpc"
+REGION="us-central1"
+ROUTER="prod-nat-router"
+NAT="prod-nat"
+
+# 1. Create VPC with private subnets
+gcloud compute networks create $VPC --subnet-mode=custom
+
+gcloud compute networks subnets create web-subnet \
+    --network=$VPC \
+    --region=$REGION \
+    --range=10.0.1.0/24 \
+    --enable-private-ip-google-access
+
+gcloud compute networks subnets create app-subnet \
+    --network=$VPC \
+    --region=$REGION \
+    --range=10.0.2.0/24 \
+    --enable-private-ip-google-access
+
+gcloud compute networks subnets create data-subnet \
+    --network=$VPC \
+    --region=$REGION \
+    --range=10.0.3.0/24
+
+# 2. Create firewall rules
+gcloud compute firewall-rules create allow-internal \
+    --network=$VPC \
+    --allow=tcp,udp,icmp \
+    --source-ranges=10.0.0.0/8
+
+# 3. Reserve static external IPs for NAT
+gcloud compute addresses create nat-ip-1 \
+    --region=$REGION \
+    --ip-version=IPV4
+
+gcloud compute addresses create nat-ip-2 \
+    --region=$REGION \
+    --ip-version=IPV4
+
+NAT_IP_1=$(gcloud compute addresses describe nat-ip-1 --region=$REGION --format="value(address)")
+NAT_IP_2=$(gcloud compute addresses describe nat-ip-2 --region=$REGION --format="value(address)")
+echo "NAT IPs: $NAT_IP_1, $NAT_IP_2"
+
+# 4. Create Cloud Router
+gcloud compute routers create $ROUTER \
+    --network=$VPC \
+    --region=$REGION \
+    --description="NAT Router for Production"
+
+# 5. Create Cloud NAT gateway
+gcloud compute routers nats create $NAT \
+    --router=$ROUTER \
+    --region=$REGION \
+    --nat-external-ip-pool=$NAT_IP_1,$NAT_IP_2 \
+    --nat-all-subnet-ip-ranges \
+    --enable-logging \
+    --log-filter=TRANSLATIONS_AND_ERRORS \
+    --min-ports-per-vm=256 \
+    --max-ports-per-vm=65536
+
+# 6. Create private instances
+gcloud compute instances create private-web-1 \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --subnet=web-subnet \
+    --no-address \
+    --image-family=debian-11 \
+    --image-project=debian-cloud
+
+gcloud compute instances create private-app-1 \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --subnet=app-subnet \
+    --no-address \
+    --image-family=debian-11 \
+    --image-project=debian-cloud
+
+# 7. Test NAT by SSH (via IAP)
+gcloud compute ssh private-web-1 --zone=us-central1-a --tunnel-through-iap
+
+# From the instance, verify NAT is working:
+# curl -s ifconfig.me  # Should return NAT IP address
+
+# 8. Create GKE private cluster using NAT
+gcloud container clusters create private-cluster \
+    --region=$REGION \
+    --network=$VPC \
+    --subnetwork=web-subnet \
+    --cluster-secondary-range-name=gke-pods \
+    --services-secondary-range-name=gke-services \
+    --enable-private-nodes \
+    --master-ipv4-cidr=172.16.0.0/28 \
+    --enable-ip-alias
+
+# 9. Monitor NAT gateway
+gcloud compute routers nats describe $NAT \
+    --router=$ROUTER \
+    --region=$REGION
+```
+
+```hcl
+# Terraform: Cloud NAT configuration
+resource "google_compute_network" "prod_vpc" {
+  name = "prod-vpc"
+}
+
+resource "google_compute_subnetwork" "web_subnet" {
+  name                     = "web-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.1.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+resource "google_compute_subnetwork" "app_subnet" {
+  name                     = "app-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.2.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+# Static NAT IP addresses
+resource "google_compute_address" "nat_ip" {
+  count    = 2
+  name     = "nat-ip-${count.index}"
+  region   = "us-central1"
+  ip_version = "IPV4"
+}
+
+# Cloud Router
+resource "google_compute_router" "nat_router" {
+  name    = "nat-router"
+  network = google_compute_network.prod_vpc.id
+  region  = "us-central1"
+}
+
+# Cloud NAT Gateway
+resource "google_compute_router_nat" "nat_gateway" {
+  name                               = "nat-gateway"
+  router                             = google_compute_router.nat_router.name
+  region                             = "us-central1"
+  nat_ip_allocation_option           = "MANUAL_ONLY"
+  nat_ips                            = google_compute_address.nat_ip.*.self_link
+  
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+  
+  min_ports_per_vm                   = 256
+  max_ports_per_vm                   = 65536
+  
+  enable_logging                     = true
+  log_filter                         = "TRANSLATIONS_AND_ERRORS"
+}
+
+# Instance without external IP (uses NAT)
+resource "google_compute_instance" "private_instance" {
+  name         = "private-instance"
+  machine_type = "e2-medium"
+  zone         = "us-central1-a"
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.web_subnet.name
+    # No external IP - uses NAT for outbound
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create router
+gcloud compute routers create ROUTER --network=NET --region=REG
+
+# Create NAT
+gcloud compute routers nats create NAT --router=ROUTER --region=REG [FLAGS]
+
+# Update NAT
+gcloud compute routers nats update NAT --router=ROUTER --region=REG [FLAGS]
+
+# List NATs
+gcloud compute routers nats list --router=ROUTER --region=REG
+
+# Describe NAT
+gcloud compute routers nats describe NAT --router=ROUTER --region=REG
+
+# Get NAT mapping status
+gcloud compute routers get-nat-mapping-status ROUTER --region=REG
+
+# Delete NAT
+gcloud compute routers nats delete NAT --router=ROUTER --region=REG
+```
+
+## Terraform Example
+
+```hcl
+# Complete Cloud NAT configuration
+resource "google_compute_network" "vpc" {
+  name = "vpc"
+}
+
+resource "google_compute_subnetwork" "private_subnet" {
+  name                     = "private-subnet"
+  network                  = google_compute_network.vpc.id
+  ip_cidr_range            = "10.0.1.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+resource "google_compute_router" "router" {
+  name    = "nat-router"
+  network = google_compute_network.vpc.name
+  region  = "us-central1"
+}
+
+resource "google_compute_router_nat" "nat" {
+  name    = "nat-gateway"
+  router  = google_compute_router.router.name
+  region  = "us-central1"
+
+  nat_ip_allocation_option = "AUTO_ONLY"
+  
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+
+  min_ports_per_vm = 256
+  max_ports_per_vm = 65536
+
+  enable_logging = true
+  log_filter     = "TRANSLATIONS_AND_ERRORS"
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create router | `gcloud compute routers create NAME --network=NET --region=REG` |
+| Create NAT | `gcloud compute routers nats create NAME --router=ROUTER --region=REG [FLAGS]` |
+| Update NAT | `gcloud compute routers nats update NAME --router=ROUTER --region=REG [FLAGS]` |
+| Describe NAT | `gcloud compute routers nats describe NAME --router=ROUTER --region=REG` |
+| List NATs | `gcloud compute routers nats list --router=ROUTER --region=REG` |
+| Delete NAT | `gcloud compute routers nats delete NAME --router=ROUTER --region=REG` |
+
+## Monitoring
+
+**Cloud NAT Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| nat_translations | Active NAT translations |
+| nat_sent_bytes | Outbound bytes |
+| nat_received_bytes | Inbound bytes |
+| nat_sent_packets | Outbound packets |
+| nat_received_packets | Inbound packets |
+| active_ports | Currently allocated ports |
+
+```bash
+# View NAT gateway metrics
+gcloud monitoring metrics list | grep "router.googleapis.com"
+
+# Get translation status
+gcloud compute routers get-nat-mapping-status my-router --region=us-central1
+
+# View NAT logs
+gcloud logging read 'resource.type="nat_gateway"' --limit=100
+```
+
+**Recommended Alerts:**
+- NAT translation utilization > 80%
+- Port exhaustion warning
+- High error rate
+
+## Security
+
+**Cloud NAT Security Benefits:**
+
+1. **No inbound access**: Instances are not directly reachable from internet
+2. **Outbound only**: All external connections initiated by instances
+3. **IP masking**: Internal IPs hidden behind NAT IPs
+4. **Audit logging**: Track outbound connections via Cloud Logging
+
+**Security Best Practices:**
+
+1. **Use Private Google Access** alongside NAT for Google API access
+2. **Enable NAT logging** for audit trail
+   ```bash
+   gcloud compute routers nats update my-nat \
+       --router=my-router --region=us-central1 \
+       --enable-logging --log-filter=TRANSLATIONS_AND_ERRORS
+   ```
+3. **Restrict outbound traffic** with firewall rules
+4. **Don't assign external IPs** to instances using NAT
+
+## Cost Optimization
+
+**Cloud NAT Costs:**
+
+| Component | Cost |
+|-----------|------|
+| Cloud NAT gateway | Free |
+| NAT translation | Free |
+| Static external IPs | ~$7/month per IP |
+| Egress traffic | Standard egress rates |
+
+**Optimization Tips:**
+- Use AUTO_ONLY NAT IP allocation to minimize static IP costs
+- Size port allocation appropriately (don't over-provision)
+- Consider reserved static IPs only if you need consistent source IPs
+- Use Private Google Access for Google API calls (no egress cost)
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Outbound connections failing**
+   ```bash
+   # Verify NAT gateway exists
+   gcloud compute routers nats list --router=my-router --region=us-central1
+   
+   # Check router status
+   gcloud compute routers describe my-router --region=us-central1
+   
+   # Verify instance has no external IP
+   gcloud compute instances describe instance --zone=zone | grep "networkInterfaces"
+   
+   # Check routing
+   gcloud compute routes list --filter="network:my-vpc"
+   ```
+
+2. **Port exhaustion**
+   ```bash
+   # Check current port usage
+   gcloud compute routers get-nat-mapping-status my-router --region=us-central1
+   
+   # Increase max ports per VM
+   gcloud compute routers nats update my-nat \
+       --router=my-router --region=us-central1 \
+       --max-ports-per-vm=65536
+   
+   # Add more NAT IPs
+   gcloud compute addresses create new-nat-ip --region=us-central1
+   gcloud compute routers nats update my-nat \
+       --router=my-router --region=us-central1 \
+       --nat-external-ip-pool=ip1,ip2,ip3
+   ```
+
+3. **Can't connect to Google APIs**
+   ```bash
+   # Enable Private Google Access on subnet
+   gcloud compute networks subnets update my-subnet \
+       --region=us-central1 \
+       --enable-private-ip-google-access
+   
+   # Google APIs accessible without NAT when PGI is enabled
+   ```
+
+## Interview Questions
+
+1. **How does Cloud NAT work and why would you use it instead of giving instances external IPs?**
+
+2. **What's the difference between auto-allocated and manual NAT IP allocation?**
+
+3. **How does port allocation work in Cloud NAT and how do you size it?**
+
+4. **Can Cloud NAT handle inbound connections from the internet? Why or why not?**
+
+5. **How do Cloud NAT and Private Google Access complement each other?**
+
+## Cheat Sheet
+
+```
+# Router Commands
+gcloud compute routers create NAME --network=NET --region=REG
+gcloud compute routers describe NAME --region=REG
+gcloud compute routers nats list --router=NAME --region=REG
+
+# NAT Commands
+gcloud compute routers nats create NAME --router=ROUTER --region=REG [FLAGS]
+gcloud compute routers nats update NAME --router=ROUTER --region=REG [FLAGS]
+gcloud compute routers nats describe NAME --router=ROUTER --region=REG
+gcloud compute routers nats delete NAME --router=ROUTER --region=REG
+
+# Key NAT Flags
+--auto-allocate-nat-external-ips       # GCP allocates IPs
+--nat-external-ip-pool=IP1,IP2         # Use specific IPs
+--nat-all-subnet-ip-ranges             # NAT all subnet traffic
+--nat-subnet-name=SUBNET               # NAT specific subnet
+--min-ports-per-vm=N                   # Minimum ports per VM
+--max-ports-per-vm=N                   # Maximum ports per VM
+--enable-logging                       # Enable NAT logging
+--log-filter=ERRORS_ONLY|ALL           # Logging filter
+```
+
+## Labs
+
+1. **Basic NAT Setup**: Create VPC, private instances, and Cloud NAT
+2. **GKE Private Cluster**: Configure Cloud NAT for private GKE nodes
+3. **Port Allocation**: Test different port allocations and verify connections
+4. **NAT Monitoring**: Enable logging and analyze NAT traffic patterns
+5. **Troubleshooting NAT**: Practice diagnosing and fixing NAT issues
+
+## Related Services
+
+- [VPC](./vpc)
+- [Subnets](./subnets)
+- [Cloud Router](https://cloud.google.com/network-connectivity/docs/cloud-router)
+- [GKE Private Clusters](../compute/gke)

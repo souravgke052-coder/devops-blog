@@ -1,0 +1,593 @@
+# HTTPS (HTTP over TLS)
+
+## Overview
+
+HTTPS is HTTP over TLS (Transport Layer Security), adding encryption, authentication, and integrity to HTTP. Every modern web application uses HTTPS—it's not optional. Search engines penalize non-HTTPS sites, browsers mark them insecure, and modern web features (Service Workers, WebRTC, Geolocation) require secure contexts. Yet HTTPS is often treated as a black box; understanding the TLS handshake, certificate chains, and configuration options is essential for debugging production issues and ensuring secure deployments.
+
+This page covers HTTPS from an operational perspective: how TLS termination works in production, certificate management, security configurations, and debugging tools. We assume you're familiar with HTTP and focus on the TLS layer that makes it secure.
+
+## When To Use
+
+- **All production web traffic**: HTTPS everywhere, no exceptions
+- **API endpoints**: Mobile apps, SPAs, and service-to-service calls
+- **Load balancer TLS termination**: Terminating TLS at ALB/NGINX
+- **mTLS for service-to-service**: When you need mutual authentication
+- **Certificate rotation**: Understanding how to rotate certs without downtime
+
+## When NOT To Use
+
+- **Internal-only services**: If truly isolated (VPC-private), may use plaintext
+- **Performance-critical internal paths**: TLS adds ~2ms overhead (negligible for most)
+- **Embedded devices with limited CPU**: Consider TLS session resumption, hardware offload
+
+## Core Concepts
+
+### TLS Handshake (1-RTT with TLS 1.3)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      TLS 1.3 Handshake                          │
+├─────────────────────────────────────────────────────────────────┤
+│ ClientHello                                                   │
+│   - TLS 1.3 only (or fallback to 1.2)                          │
+│   - supported_groups: x25519, secp256r1                        │
+│   - cipher_suites: TLS_AES_256_GCM_SHA384                      │
+│   - key_share: client ephemeral public key (for x25519)        │
+│   - pre_shared_key: (for 0-RTT, if PSK available)              │
+│   + extensions: SNI (server name), ALPN (http/1.1, h2)        │
+├─────────────────────────────────────────────────────────────────┤
+│ ServerHello                                                   │
+│   - selected cipher                                            │
+│   - key_share: server ephemeral public key                     │
+│   - (or pre_shared_key if 0-RTT)                               │
+│   + Certificate (server certificate chain)                     │
+│   + CertificateVerify (signature of handshake)                 │
+│   + Finished (HMAC of handshake transcript)                    │
+├─────────────────────────────────────────────────────────────────┤
+│ Client Finished                                               │
+│   - Finished (HMAC of handshake transcript)                    │
+├─────────────────────────────────────────────────────────────────┤
+│ Application Data (encrypted)                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+Total: 1 RTT before application data (0-RTT with PSK from resumption)
+```
+
+### TLS 1.2 vs 1.3 Handshake
+
+**TLS 1.2** (2 RTTs):
+- Round trip 1: ClientHello → ServerHello + Certificate + ServerHelloDone
+- Round trip 2: ClientKeyExchange + ChangeCipherSpec + Finished
+- Total: 2 RTTs before application data
+
+**TLS 1.3** (1 RTT):
+- Round trip 1: ClientHello (with key_share) → ServerHello + key_share + Certificate + Finished
+- Total: 1 RTT before application data (with key_share)
+- 0-RTT: If PSK available from previous session (session ticket)
+
+**TLS 1.3 improvements**:
+- Faster handshake (fewer round trips)
+- Removed obsolete cipher suites (3DES, CBC)
+- Removed RSA key exchange (forward secrecy required)
+- Simplified configuration (fewer options)
+
+### Certificate Types
+
+**DV (Domain Validation)**: Domain ownership verified via email/DNS/HTTP challenge. Fast (minutes), cheap ($5-20/year). Appropriate for most services.
+
+**OV (Organization Validation)**: Identity verified, includes organization name in certificate. Moderate (hours-days), moderate cost ($50-200/year). Used by enterprises.
+
+**EV (Extended Validation)**: Extended verification, green address bar in browsers (historically). Slow (days-weeks), expensive ($200-500/year). No longer supported by some browsers.
+
+```
+Certificate chain example:
+┌─────────────────────────────────────────────────────────────┐
+│  Root CA (Certificate Authority - installed in OS/browser) │
+│  Issuer: Root CA                                            │
+│  Subject: Root CA                                           │
+└─────────────────────────────────────────────────────────────┘
+          │ signed by Root CA
+          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Intermediate CA (Let's Encrypt, DigiCert, etc.)           │
+│  Issuer: Root CA                                            │
+│  Subject: Let's Encrypt Authority X3                       │
+└─────────────────────────────────────────────────────────────┘
+          │ signed by Intermediate
+          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Server Certificate (what you install on your server)      │
+│  Issuer: Let's Encrypt Authority X3                        │
+│  Subject: api.example.com                                  │
+│  Subject Alternative Names: api.example.com, *.example.com │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Server Name Indication (SNI)
+
+SNI allows multiple HTTPS sites on a single IP address. Client sends the hostname it wants in the ClientHello extension:
+
+```
+ClientHello (TLS 1.2/1.3):
+  ...
+  extension: server_name
+    server_name: api.example.com
+```
+
+Without SNI, the server would need to present a certificate before knowing which site the client wants—a chicken-and-egg problem. SNI is required for:
+- Multi-tenant TLS termination
+- CDN edge certificates
+- Cloud load balancers with multiple certificates
+
+### Certificate Chains
+
+Web servers must present the full chain (server cert + intermediates), not just the server certificate. Clients need the root CA in their trust store.
+
+```bash
+# Check certificate chain
+openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts
+
+# Verify chain completeness
+openssl storeutl -nooptions -text -verify -CAfile /etc/ssl/certs/ca-certificates.crt \
+  <(openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts </dev/null | \
+    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p')
+
+# Common error: "certificate chain incomplete"
+# Fix: cat server.crt intermediate.crt > bundle.crt
+```
+
+### OCSP (Online Certificate Status Protocol)
+
+OCSP allows clients to check if a certificate is revoked without downloading CRLs. Servers can "staple" the OCSP response, reducing client latency.
+
+```bash
+# Check OCSP staple
+openssl s_client -connect api.example.com:443 -status -servername api.example.com
+
+# OCSP Response Status: successful (contains cached OCSP response)
+# OCSP Response Data:
+#     OCSP Response Status: successful
+#     Cert Status: good
+
+# Enable OCSP stapling in nginx
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 8.8.8.8 1.1.1.1 valid=300s;
+```
+
+## Real Production Example
+
+### NGINX TLS Configuration
+
+```nginx
+# /etc/nginx/nginx.conf
+http {
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    
+    # Session resumption
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;  # TLS 1.3 uses PSK instead
+    
+    # OCSP stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 1.1.1.1 valid=300s;
+    ssl_trusted_certificate /etc/ssl/certs/ca-bundle.crt;
+    
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    
+    # Diffie-Hellman parameters (for TLS 1.2)
+    # Generate with: openssl dhparam -out /etc/ssl/private/dhparam.pem 2048
+    ssl_dhparam /etc/ssl/private/dhparam.pem;
+    
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+        
+        ssl_certificate /etc/ssl/certs/api.example.com.bundle.crt;
+        ssl_certificate_key /etc/ssl/private/api.example.com.key;
+        
+        # Modern SSL config for API
+        ssl_protocols TLSv1.2 TLSv1.3;
+        
+        location / {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+        }
+    }
+}
+```
+
+### AWS ALB HTTPS Configuration
+
+```bash
+# Create HTTPS listener
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:123456789:loadbalancer/app/api-alb/xxx \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=arn:aws:acm:us-east-1:123456789:certificate/xxx \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:.../targetgroup/api/xxx
+
+# SSL policies (TLS versions and cipher suites)
+# ELBSecurityPolicy-TLS13-1-2-2021-06: TLS 1.3 + 1.2, modern ciphers
+# ELBSecurityPolicy-2016-08: TLS 1.0+, legacy compatibility
+
+# Certificate from ACM (auto-renews)
+aws acm request-certificate \
+  --domain-name api.example.com \
+  --subject-alternative-names "*.example.com" \
+  --validation-method DNS \
+  --region us-east-1
+```
+
+### Let's Encrypt with certbot
+
+```bash
+# Install certbot
+apt install certbot python3-certbot-nginx
+
+# Obtain certificate (nginx plugin)
+certbot --nginx -d api.example.com -d *.example.com
+
+# Certificate files (in /etc/letsencrypt/live/api.example.com/)
+# cert.pem: server certificate
+# chain.pem: intermediate(s)
+# fullchain.pem: cert.pem + chain.pem (use this for most servers)
+# privkey.pem: private key
+
+# Renew (certbot auto-renews via systemd timer)
+certbot renew --dry-run
+
+# Or standalone (stop nginx first)
+certbot certonly --standalone -d api.example.com
+```
+
+## CLI Examples
+
+```bash
+# Check TLS configuration
+openssl s_client -connect api.example.com:443 -servername api.example.com
+
+# Detailed connection info
+openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts -state
+
+# Check TLS version and cipher
+openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | \
+  grep -E "Protocol|Cipher|Session-ID"
+
+# Check certificate details
+openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | \
+  openssl x509 -noout -text | head -30
+
+# Extract certificate
+openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | \
+  sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' > cert.pem
+
+# Verify certificate chain
+openssl s_client -connect api.example.com:443 -servername api.example.com -partial_chain -CAfile intermediate.pem
+
+# Check OCSP staple
+openssl s_client -connect api.example.com:443 -status -servername api.example.com 2>/dev/null | grep -A 10 "OCSP Response"
+
+# Test specific TLS version
+openssl s_client -tls1_2 -connect api.example.com:443 -servername api.example.com
+openssl s_client -tls1_3 -connect api.example.com:443 -servername api.example.com
+
+# Check DH parameters
+openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | \
+  openssl x509 -noout -text | grep -i dh
+
+# Generate DH parameters (2048-bit minimum)
+openssl dhparam -out /tmp/dhparam.pem 2048
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `openssl s_client` | Test HTTPS connection | `s_client -connect host:443` |
+| `openssl x509` | Certificate operations | `x509 -in cert.pem -text` |
+| `openssl req` | CSR operations | `req -new -key key.pem -out.csr` |
+| `openssl verify` | Verify certificate chain | `verify -CAfile ca.pem cert.pem` |
+| `certbot` | Let's Encrypt client | `certbot --nginx -d example.com` |
+| `curl` | HTTPS client | `curl -v https://example.com` |
+| `ssllabs-scan` | SSL Labs test | API for automated testing |
+
+## Monitoring
+
+### TLS Metrics
+
+```bash
+# Check certificate expiration
+echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | \
+  openssl x509 -noout -dates
+# notBefore=Jun 16 00:00:00 2025 GMT
+# notAfter=Sep 16 00:00:00 2025 GMT
+
+# Days until expiration
+date -d "$(echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | \
+  openssl x509 -noout -enddate | cut -d= -f2)" +%s
+# Compare with: date +%s
+
+# Monitor cipher suite usage
+# In access logs (NGINX): $ssl_cipher
+# Parse for weak ciphers, log warnings
+
+# Prometheus metrics for TLS (from nginx-prometheus-exporter)
+nginx_ssl_negotiated_protocol_tls_total{protocol="TLSv1.3"}
+nginx_ssl_session_reuses_total
+```
+
+### Certificate Expiry Monitoring
+
+```bash
+# Prometheus alert for cert expiry
+# - name: cert-expiry
+#   expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 30
+#   for: 1h
+#   labels:
+#     severity: warning
+#   annotations:
+#     summary: "Certificate expiring in 30 days"
+
+# Add to Prometheus scrape config:
+# - job_name: 'https'
+#   metrics_path: /probe
+#   params:
+#     module: [https_2xx]
+#   static_configs:
+#     - targets:
+#       - api.example.com
+#   relabel_configs:
+#     - source_labels: [__address__]
+#       target_label: __param_target
+```
+
+## Security
+
+### TLS Hardening Checklist
+
+1. **Disable SSLv2, SSLv3, TLS 1.0, TLS 1.1** (deprecated due to POODLE, BEAST attacks)
+2. **Use TLS 1.2 with modern ciphers or TLS 1.3**
+3. **Prefer server ciphers** (`ssl_prefer_server_ciphers off` in nginx)
+4. **Use strong cipher suites** (AES-128-GCM minimum, no 3DES, no RC4)
+5. **Enable HSTS** (`Strict-Transport-Security` header)
+6. **Enable OCSP stapling**
+7. **Use 2048-bit RSA or 256-bit ECC keys**
+8. **Generate strong DH parameters** (`openssl dhparam -out dhparam.pem 2048`)
+
+```bash
+# Recommended cipher strings
+# For TLS 1.2 (nginx):
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+
+# For TLS 1.3 (nginx):
+# Only AES-GCM and ChaCha20, all forward secret
+ssl_ciphers TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+
+# Test cipher suite at SSL Labs
+# https://www.ssllabs.com/ssltest/analyze.html?d=api.example.com
+# Target: A+ rating
+```
+
+### HSTS (HTTP Strict Transport Security)
+
+HSTS tells browsers to only connect via HTTPS for the specified duration:
+
+```
+Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+```
+
+- `max-age=31536000`: One year
+- `includeSubDomains`: Applies to all subdomains
+- `preload`: Include in browser preload lists (submit at hstspreload.org)
+
+Warning: `includeSubDomains` means all subdomains must support HTTPS before enabling.
+
+### Certificate Transparency (CT)
+
+Public CAs must submit certificates to CT logs. Browsers check for CT presence:
+
+```bash
+# Check CT logs for certificate
+# Certificate includes SCT (Signed Certificate Timestamp) extensions
+# Can verify via: https://crt.sh/?id=certificate_id
+
+# CT logs show who requested certificate
+# Useful for detecting unauthorized certificates
+```
+
+## Cost Optimization
+
+### TLS Costs
+
+**Certificate costs**:
+- Let's Encrypt: Free (DV, 90-day certs, auto-renew)
+- DV certificates: $5-20/year
+- OV certificates: $50-200/year
+- Wildcard certificates: $50-500/year ( DigiCert, GlobalSign)
+
+**Operational costs**:
+- TLS termination CPU overhead: ~2ms per handshake (negligible with session resumption)
+- ECDSA vs RSA: ECDSA 256-bit is ~40% faster than RSA 2048-bit for TLS handshakes
+- Hardware offload: Not needed for most; AES-NI makes software fast enough for 10Gbps+
+
+```bash
+# ECDSA vs RSA performance
+# ECDSA P-256 sign: ~50μs
+# RSA 2048 sign: ~300μs
+# ECDSA P-256 verify: ~100μs
+# RSA 2048 verify: ~15μs
+
+# Use ECDSA for:
+# - Performance-critical TLS termination
+# - Large volume of new connections (no session resumption)
+
+# For private CAs (internal services):
+# Use small CA (p384 or p256), not commercial CA
+# Generate with: openssl ecparam -name prime256v1 -genkey
+```
+
+### Session Resumption to Reduce CPU
+
+```bash
+# TLS session tickets (TLS 1.2)
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:50m;
+
+# For TLS 1.3, PSK with external key material
+# Configure in nginx with ssl_prefer_server_cipher_suite off (TLS 1.3 doesn't negotiate ciphers)
+
+# Session resumption allows resuming without full handshake
+# 1-RTT becomes 0-RTT for session resumption tickets
+# Reduces CPU by ~70% for repeated connections
+```
+
+## Troubleshooting
+
+### Common HTTPS Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `SSL handshake failed` | Protocol mismatch, cipher mismatch | Check TLS versions, cipher suites |
+| `certificate chain incomplete` | Missing intermediate certs | `cat cert.pem intermediate.pem > bundle.crt` |
+| `hostname mismatch` | SAN doesn't include hostname | Add SAN or use correct hostname |
+| `certificate expired` | Clock skew, forgot renewal | Renew certificate |
+| `OCSP stapling failed` | Firewall, wrong trust store | Disable OCSP or fix trust store |
+| `mixed content` | Page loads HTTP resources | Change to HTTPS or use protocol-relative |
+| `HSTS invalid` | HSTS header on HTTP | Remove, or add HSTS on HTTPS only |
+
+### Debugging TLS Issues
+
+```bash
+# 1. Check what client sees
+curl -v https://api.example.com 2>&1
+
+# 2. Check certificate chain
+openssl s_client -connect api.example.com:443 -showcerts 2>/dev/null
+
+# 3. Check TLS version negotiation
+openssl s_client -tls1_2 -connect api.example.com:443
+openssl s_client -tls1_3 -connect api.example.com:443
+
+# 4. Check cipher negotiation
+openssl s_client -connect api.example.com:443 -cipher ECDHE-RSA-AES128-GCM-SHA256
+
+# 5. Check SNI
+openssl s_client -connect api.example.com:443 -servername api.example.com
+
+# 6. Check via SSL Labs
+# https://www.ssllabs.com/ssltest/analyze.html?d=api.example.com
+
+# 7. Check certificate transparency
+# https://crt.sh/?q=api.example.com
+```
+
+### Certificate Chain Issues
+
+```bash
+# Problem: "Verify return code: 19 (self signed certificate in certificate chain)"
+
+# Solution:
+# 1. Get intermediate certificate
+curl -sS https://letsencrypt.org/certs/lets-encrypt-r3.pem > intermediate.pem
+
+# 2. Combine server + intermediate
+cat server.crt intermediate.pem > bundle.crt
+
+# 3. In nginx:
+ssl_certificate /path/to/bundle.crt;
+
+# 4. Verify
+openssl s_client -connect api.example.com:443 -CAfile /etc/ssl/certs/ca-certificates.crt
+```
+
+## Interview Questions
+
+**Q1: Walk through the TLS 1.3 handshake. Why is it faster than TLS 1.2?**
+
+A: TLS 1.3 handshake: Client sends ClientHello with client key share (ephemeral public key for X25519). Server responds with ServerHello, server key share, certificate, and Finished. One round trip, then application data. TLS 1.2 requires two round trips: ClientHello → ServerHello + Certificate + key exchange + Finished, then ClientKeyExchange + Finished. Additionally, TLS 1.3 removes RSA key exchange (requires certificates that allow forward secrecy) and simplifies cipher suite negotiation (fewer round trips for cipher selection). Result: 1 RTT vs 2 RTT, and with 0-RTT (PSK resumption), can be 0 RTT for returning clients.
+
+**Q2: What is forward secrecy and why does it matter?**
+
+A: Forward secrecy (also called perfect forward secrecy) means compromising one session key doesn't compromise past sessions. In TLS with RSA key exchange, the server's private key encrypts the premaster secret—if the private key is later compromised, all past sessions can be decrypted. With ephemeral Diffie-Hellman (DHE or ECDHE), each session uses fresh DH key pairs. Compromising the server's private key doesn't help decrypt past sessions because the premaster secret was encrypted with the session's ephemeral key, not the server's long-term key. TLS 1.3 requires DHE-based cipher suites (no RSA key exchange), ensuring forward secrecy. For sensitive applications, ensure you're using ECDHE (ECDSA + DHE) ciphers.
+
+**Q3: What is OCSP stapling and why should you enable it?**
+
+A: OCSP (Online Certificate Status Protocol) lets clients check if a certificate is revoked without downloading CRLs. Without stapling: client connects, must separately query the CA's OCSP responder to verify cert status—adds latency and privacy concerns (CA sees every site you visit). With OCSP stapling: server periodically fetches OCSP response from CA and includes it in the TLS handshake. Client verifies embedded response without extra queries. Reduces latency, improves privacy, and provides better UX (no browser warnings about OCSP servers being unreachable). Enable with `ssl_stapling on` in nginx.
+
+**Q4: How does SNI work and why was it needed?**
+
+A: Server Name Indication (SNI) is a TLS extension where the client sends the target hostname in the ClientHello message, before the server sends its certificate. Before SNI: IP addresses were scarce (each site needed its own IP), and the server had to present its certificate before knowing which site the client wanted. A server couldn't host multiple HTTPS sites on the same IP. After SNI: client sends `server_name: api.example.com` extension. Server sees which certificate to present (api.example.com vs admin.example.com). This enabled shared hosting of HTTPS sites, reduced IPv4 exhaustion pressure, and made TLS termination at CDNs/load balancers practical. SNI is now required for most HTTPS deployments.
+
+**Q5: How would you diagnose a "certificate chain incomplete" error?**
+
+A: This error means the server didn't send the intermediate certificate(s). (1) Use `openssl s_client -connect api.example.com:443 -showcerts` to see the chain. (2) Check if `Certificate chain` section shows only one certificate (the leaf). (3) For Let's Encrypt: download intermediate from `https://letsencrypt.org/certs/lets-encrypt-r3.pem`. (4) Concatenate: `cat server.crt intermediate.crt > fullchain.crt`. (5) Update server config: `ssl_certificate /path/to/fullchain.crt`. (6) Verify with `openssl s_client -connect api.example.com:443 -CAfile /etc/ssl/certs/ca-certificates.crt -verify_return_code`. (7) SSL Labs test: check "Certificate #2" and "Certification Paths" sections for chain warnings.
+
+## Cheat Sheet
+
+### TLS Versions
+
+| Version | Status | Issues |
+|---------|--------|--------|
+| SSL 2.0 | Disabled | POODLE, many vulnerabilities |
+| SSL 3.0 | Disabled | POODLE, deprecated |
+| TLS 1.0 | Deprecated | BEAST, weak ciphers |
+| TLS 1.1 | Deprecated | Same as TLS 1.0 |
+| TLS 1.2 | Current | Recommended minimum |
+| TLS 1.3 | Current | Recommended (faster, safer) |
+
+### TLS 1.3 Cipher Suites
+
+| Suite | Key Exchange | Symmetric | MAC |
+|-------|-------------|-----------|-----|
+| TLS_AES_256_GCM_SHA384 | any (DHE/ECDHE) | AES-256-GCM | SHA-384 |
+| TLS_CHACHA20_POLY1305_SHA256 | any (DHE/ECDHE) | ChaCha20 | Poly1305 |
+| TLS_AES_128_GCM_SHA256 | any (DHE/ECDHE) | AES-128-GCM | SHA-256 |
+
+### Strong Cipher Strings
+
+```bash
+# TLS 1.2 (nginx):
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+
+# TLS 1.3 (nginx, use default or specify):
+ssl_ciphers TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+ssl_prefer_server_ciphers off;
+```
+
+### Certificate Files
+
+| File | Contents | Use |
+|------|----------|-----|
+| `cert.pem` | Server certificate only | Some configs need only cert |
+| `chain.pem` | Intermediate(s) only | Add to cert for full chain |
+| `fullchain.pem` | cert + chain combined | Most servers (nginx default) |
+| `privkey.pem` | Private key | Never share, protect with 600 |
+
+### Common HTTP Security Headers
+
+| Header | Value | Purpose |
+|--------|-------|---------|
+| Strict-Transport-Security | max-age=31536000 | Force HTTPS for 1 year |
+| X-Frame-Options | DENY | Prevent clickjacking |
+| X-Content-Type-Options | nosniff | Prevent MIME sniffing |
+| X-XSS-Protection | 1; mode=block | XSS filter (legacy) |
+| Referrer-Policy | strict-origin | Control referrer info |
+| Permissions-Policy | camera=() | Feature restrictions |
+
+## Related Topics
+
+- [TLS](./tls) — TLS 1.3 deep dive
+- [HTTP](./http) — HTTP protocol
+- [Load Balancing](./load-balancing) — TLS termination at LB
+- [Reverse Proxy](./reverse-proxy) — NGINX/HAProxy config
+- [SSL](./ssl) — SSL history and migration

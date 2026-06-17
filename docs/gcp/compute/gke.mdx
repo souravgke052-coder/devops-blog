@@ -1,0 +1,660 @@
+# Google Kubernetes Engine (GKE)
+
+## Overview
+
+Google Kubernetes Engine (GKE) is Google's managed Kubernetes service that provides a powerful, scalable platform for deploying containerized applications. GKE originated from Borg, Google's internal container orchestration system, giving it deep integration with Google's infrastructure and years of production hardening. It eliminates the operational burden of managing Kubernetes control plane, automatically handling upgrades, scaling, and high availability.
+
+GKE offers multiple modes: Standard mode (user manages node pools) and Autopilot mode (Google manages nodes entirely). It integrates with GCP services like Cloud Logging, Cloud Monitoring, Cloud Build, and Artifact Registry. GKE is the foundation for cloud-native architectures, microservices, and modern CI/CD pipelines on GCP.
+
+Key features include automatic upgrading of Kubernetes and node OS, automatic repair of failed nodes, multi-zone and regional clusters for high availability, Workload Identity for secure service account access, and Anthos for hybrid/multi-cloud management.
+
+## When To Use
+
+- **Containerized microservices**: Production microservices architectures
+- **Complex orchestration**: Applications requiring sophisticated deployment strategies
+- **Hybrid workloads**: Mix of stateless and stateful applications
+- **CI/CD integration**: Automated building, testing, and deployment
+- **Service mesh**: Istio/Anthos Service Mesh for advanced traffic management
+- **Large-scale applications**: Applications requiring thousands of pods
+- **Machine learning workloads**: Distributed training with GPU node pools
+
+## When NOT To Use
+
+- **Simple single-service applications**: Cloud Run may be simpler
+- **Quick prototypes**: Cloud Run or App Engine are faster to deploy
+- **Strict serverless requirements**: Cloud Run scales to zero, GKE has minimum node count
+- **Windows containers**: Use AKS or self-managed solutions
+- **Very small teams**: Kubernetes adds operational complexity
+
+## Architecture
+
+**GKE Cluster Architecture:**
+```
+GKE Cluster (regional)
+├── Control Plane (managed by Google)
+│   ├── API Server (HA across zones)
+│   ├── etcd (HA across zones)
+│   ├── Scheduler
+│   └── Controller Manager
+└── Data Plane (Nodes)
+    ├── Node Pool: default-pool (3 nodes, e2-medium)
+    ├── Node Pool: workload-pool (5 nodes, n2-standard-8)
+    └── Node Pool: gpu-pool (2 nodes, a2-highgpu-1g)
+```
+
+**Cluster Types:**
+| Type | Control Plane | Node Distribution |
+|------|---------------|-------------------|
+| Zonal | Single zone | Single zone |
+| Regional | Multi-zone | Multi-zone |
+| Private | Isolated control plane | Configurable |
+| Autopilot | Managed nodes | Regional |
+
+**Networking Models:**
+- **Routes-based**: Traditional VPC routes for pod networking
+- **IP Alias**: Native VPC IP ranges for pods and services (recommended)
+- **Disable**: No native networking
+
+## Core Concepts
+
+### Creating Clusters
+
+```bash
+# Standard cluster (zonal)
+gcloud container clusters create my-cluster \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --num-nodes=3 \
+    --image-type=cos_containerd \
+    --enable-ip-alias
+
+# Standard cluster (regional)
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --machine-type=e2-medium \
+    --num-nodes=3 \
+    --enable-ip-alias \
+    --enable-network-policy
+
+# Private cluster
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --machine-type=e2-medium \
+    --num-nodes=3 \
+    --enable-ip-alias \
+    --enable-private-nodes \
+    --master-ipv4-cidr=172.16.0.0/28 \
+    --master-authorized-networks=10.0.0.0/8
+
+# Private cluster with public endpoint disabled
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --machine-type=e2-medium \
+    --num-nodes=3 \
+    --enable-ip-alias \
+    --enable-private-nodes \
+    --master-ipv4-cidr=172.16.0.0/28 \
+    --enable-private-endpoint \
+    --master-authorized-networks=10.0.0.0/8
+
+# Autopilot cluster (Google manages nodes)
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --enable-autopilot \
+    --enable-private-nodes
+
+# Cluster with multiple node pools
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --enable-ip-alias \
+    --node-locations=us-central1-a,us-central1-b,us-central1-c
+
+# Cluster with specific Kubernetes version
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --machine-type=e2-medium \
+    --num-nodes=3 \
+    --cluster-version=1.28.3-gke.1010000
+
+# Cluster with GKE Enterprise (Anthos)
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --enable-gke-dataplane-v2 \
+    --enable-network-policy \
+    --enable-vertical-pod-autoscaling \
+    --workload-pool=my-project.svc.id.goog
+```
+
+### Managing Clusters
+
+```bash
+# Get credentials for kubectl
+gcloud container clusters get-credentials my-cluster \
+    --region=us-central1
+
+# List clusters
+gcloud container clusters list
+
+# Describe cluster
+gcloud container clusters describe my-cluster --region=us-central1
+
+# Resize cluster (for standard mode)
+gcloud container clusters resize my-cluster \
+    --region=us-central1 \
+    --node-pool=default-pool \
+    --num-nodes=5
+
+# Upgrade cluster version
+gcloud container clusters upgrade my-cluster \
+    --region=us-central1 \
+    --master \
+    --cluster-version=1.28.3-gke.1010000
+
+# Upgrade node pool
+gcloud container clusters upgrade my-cluster \
+    --region=us-central1 \
+    --node-pool=default-pool \
+    --cluster-version=1.28.3-gke.1010000
+
+# Delete cluster
+gcloud container clusters delete my-cluster --region=us-central1
+```
+
+### Node Pools
+
+```bash
+# Create node pool
+gcloud container node-pools create workload-pool \
+    --cluster=my-cluster \
+    --region=us-central1 \
+    --machine-type=n2-standard-8 \
+    --num-nodes=3 \
+    --enable-autoscaling \
+    --min-nodes=1 \
+    --max-nodes=10 \
+    --node-labels=workload=production \
+    --enable-autorepair \
+    --enable-autoupgrade
+
+# Create GPU node pool
+gcloud container node-pools create gpu-pool \
+    --cluster=my-cluster \
+    --region=us-central1 \
+    --machine-type=a2-highgpu-1g \
+    --accelerator=type=nvidia-tesla-t4,count=1 \
+    --num-nodes=2 \
+    --disk-size=100GB \
+    --disk-type=pd-ssd
+
+# Create spot (preemptible) node pool
+gcloud container node-pools create spot-pool \
+    --cluster=my-cluster \
+    --region=us-central1 \
+    --machine-type=e2-medium \
+    --num-nodes=5 \
+    --spot
+
+# List node pools
+gcloud container node-pools list \
+    --cluster=my-cluster \
+    --region=us-central1
+
+# Delete node pool
+gcloud container node-pools delete workload-pool \
+    --cluster=my-cluster \
+    --region=us-central1
+```
+
+### Workload Identity
+
+```bash
+# Enable Workload Identity on existing cluster
+gcloud container clusters update my-cluster \
+    --region=us-central1 \
+    --workload-pool=my-project.svc.id.goog
+
+# Create Kubernetes service account
+kubectl create serviceaccount my-ksa -n default
+
+# Create GCP service account
+gcloud iam service-accounts create my-gsa \
+    --display-name="My GSA"
+
+# Grant GCP SA permissions
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:my-gsa@my-project.iam.gserviceaccount.com" \
+    --role="roles/storage.objectViewer"
+
+# Bind Kubernetes SA to GCP SA
+kubectl create serviceaccount my-ksa -n default
+gcloud iam service-accounts add-iam-policy-binding my-gsa@my-project.iam.gserviceaccount.com \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:my-project.svc.id.goog[default/my-ksa]"
+
+kubectl annotate serviceaccount my-ksa -n default \
+    iam.gke.io/gcp-service-account=my-gsa@my-project.iam.gserviceaccount.com
+```
+
+### Network Policy
+
+```bash
+# Enable network policy on cluster
+gcloud container clusters create my-cluster \
+    --region=us-central1 \
+    --enable-network-policy
+
+# Enable on existing cluster
+gcloud container clusters update my-cluster \
+    --region=us-central1 \
+    --enable-network-policy
+
+# Apply network policy to namespace
+kubectl apply -f network-policy.yaml
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Clusters per project | 100 |
+| Nodes per cluster (Standard) | 5,000 |
+| Nodes per cluster (Autopilot) | 1,000 |
+| Node pools per cluster | 100 |
+| Pods per node | 256 (default), up to 1,000 |
+| Services per cluster | 5,000 |
+
+### Key Gotchas
+
+- **Private nodes can't reach Google APIs** by default—enable Private Google Access or Cloud NAT
+- **Autopilot doesn't allow direct node access**—use kubectl, not SSH
+- **Node auto-upgrade is enabled by default**—may cause brief disruption
+- **Workload Identity is recommended** over service account keys
+- **Resource limits in Autopilot** are different from Standard mode
+- **Container runtime**: Use containerd (COS), not Docker in new clusters
+- **GKE versions**: Kubernetes version ≠ GKE version
+
+## Real Production Example
+
+Production GKE setup:
+
+```bash
+#!/bin/bash
+set -e
+
+PROJECT="my-project"
+CLUSTER="prod-cluster"
+REGION="us-central1"
+NETWORK="prod-vpc"
+SUBNET="gke-subnet"
+
+# 1. Enable required APIs
+gcloud services enable container.googleapis.com \
+    containerregistry.googleapis.com \
+    cloudbuild.googleapis.com
+
+# 2. Create VPC and subnet
+gcloud compute networks create $NETWORK --subnet-mode=custom
+
+gcloud compute networks subnets create $SUBNET \
+    --network=$NETWORK \
+    --region=$REGION \
+    --range=10.0.10.0/24 \
+    --enable-private-ip-google-access \
+    --secondary-ranges=gke-pods=10.4.0.0/16,gke-services=10.0.20.0/20
+
+# 3. Create cluster
+gcloud container clusters create $CLUSTER \
+    --region=$REGION \
+    --network=$NETWORK \
+    --subnetwork=$SUBNET \
+    --cluster-secondary-range-name=gke-pods \
+    --services-secondary-range-name=gke-services \
+    --enable-ip-alias \
+    --enable-private-nodes \
+    --master-ipv4-cidr=172.16.0.0/28 \
+    --master-authorized-networks=10.0.0.0/8 \
+    --enable-network-policy \
+    --workload-pool=${PROJECT}.svc.id.goog \
+    --enable-vertical-pod-autoscaling \
+    --enable-shielded-nodes \
+    --shielded-secure-boot \
+    --shielded-integrity-monitoring
+
+# 4. Get credentials
+gcloud container clusters get-credentials $CLUSTER --region=$REGION
+
+# 5. Create node pools
+# System node pool
+gcloud container node-pools create system-pool \
+    --cluster=$CLUSTER \
+    --region=$REGION \
+    --machine-type=e2-standard-8 \
+    --num-nodes=3 \
+    --node-labels=node-type=system \
+    --enable-autoscaling \
+    --min-nodes=2 \
+    --max-nodes=5 \
+    --enable-autoupgrade \
+    --enable-autorepair
+
+# Workload node pool
+gcloud container node-pools create workload-pool \
+    --cluster=$CLUSTER \
+    --region=$REGION \
+    --machine-type=n2-standard-16 \
+    --num-nodes=3 \
+    --node-labels=workload=application \
+    --enable-autoscaling \
+    --min-nodes=2 \
+    --max-nodes=10 \
+    --enable-autoupgrade \
+    --enable-autorepair
+
+# 6. Create service account for workloads
+gcloud iam service-accounts create app-sa \
+    --display-name="Application Service Account"
+
+gcloud projects add-iam-policy-binding $PROJECT \
+    --member="serviceAccount:app-sa@${PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/cloudsql.client"
+
+gcloud projects add-iam-policy-binding $PROJECT \
+    --member="serviceAccount:app-sa@${PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/storage.objectViewer"
+
+# 7. Deploy application
+kubectl apply -f deployment.yaml
+kubectl apply -f service.yaml
+kubectl apply -f horizontalpodautoscaler.yaml
+
+# 8. Configure ResourceQuota
+kubectl apply -f resource-quota.yaml
+
+# 9. Set up network policy
+kubectl apply -f network-policy.yaml
+
+# 10. Verify deployment
+kubectl get pods -o wide
+kubectl get services
+kubectl get hpa
+kubectl top nodes
+kubectl top pods
+```
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  labels:
+    app: my-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      serviceAccountName: my-appksa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+      - name: my-app
+        image: gcr.io/my-project/my-app:v1
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      nodeSelector:
+        workload: application
+      tolerations:
+      - key: "node-type"
+        operator: "Equal"
+        value: "application"
+        effect: "NoSchedule"
+```
+
+```hcl
+# Terraform: GKE production cluster
+resource "google_compute_network" "vpc" {
+  name = "prod-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "gke_subnet" {
+  name                     = "gke-subnet"
+  network                  = google_compute_network.vpc.id
+  ip_cidr_range            = "10.0.10.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+
+  secondary_ip_range = [
+    {
+      range_name    = "gke-pods"
+      ip_cidr_range = "10.4.0.0/16"
+    },
+    {
+      range_name    = "gke-services"
+      ip_cidr_range = "10.0.20.0/20"
+    }
+  ]
+}
+
+resource "google_container_cluster" "prod" {
+  name     = "prod-cluster"
+  location = "us-central1"
+
+  network    = google_compute_network.vpc.id
+  subnetwork = google_compute_subnetwork.gke_subnet.id
+
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "gke-pods"
+    services_secondary_range_name = "gke-services"
+  }
+
+  private_cluster_config {
+    enable_private_nodes   = true
+    enable_private_endpoint = true
+    master_ipv4_cidr_block = "172.16.0.0/28"
+  }
+
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  node_pools = [
+    {
+      name               = "system-pool"
+      machine_type       = "e2-standard-8"
+      node_count         = 3
+      enable_autoscaling = true
+      min_node_count     = 2
+      max_node_count     = 5
+    }
+  ]
+}
+```
+
+## CLI Examples
+
+```bash
+# Cluster management
+gcloud container clusters create NAME --region=REGION [FLAGS]
+gcloud container clusters list
+gcloud container clusters describe NAME --region=REGION
+gcloud container clusters resize NAME --region=REGION --node-pool=POOL --num-nodes=N
+gcloud container clusters upgrade NAME --region=REGION --master
+gcloud container clusters delete NAME --region=REGION
+
+# Credentials
+gcloud container clusters get-credentials NAME --region=REGION
+
+# Node pools
+gcloud container node-pools create NAME --cluster=CLUSTER --region=REGION [FLAGS]
+gcloud container node-pools list --cluster=CLUSTER --region=REGION
+gcloud container node-pools delete NAME --cluster=CLUSTER --region=REGION
+```
+
+## Terraform Example
+
+```hcl
+# Complete GKE cluster
+resource "google_container_cluster" "primary" {
+  name     = "my-cluster"
+  location = "us-central1"
+
+  network    = google_compute_network.vpc.id
+  subnetwork = google_compute_subnetwork.gke.id
+
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+  }
+
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = true
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+
+  node_pools {
+    name       = "default"
+    machine_type = "e2-medium"
+    node_count = 3
+  }
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create cluster | `gcloud container clusters create NAME --region=REGION` |
+| Get credentials | `gcloud container clusters get-credentials NAME --region=REGION` |
+| List clusters | `gcloud container clusters list` |
+| Resize | `gcloud container clusters resize NAME --region=REGION --node-pool=POOL --num-nodes=N` |
+| Node pools | `gcloud container node-pools create NAME --cluster=CLUSTER --region=REGION` |
+
+## Monitoring
+
+**Key Metrics:**
+- Node CPU/memory utilization
+- Pod resource usage
+- Deployment status
+- Horizontal Pod Autoscaler status
+- Network policies in effect
+
+```bash
+# View in Cloud Console
+# Kubernetes Engine > Clusters > my-cluster > Workloads
+
+# kubectl commands
+kubectl top nodes
+kubectl top pods
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+## Security
+
+- Enable Workload Identity instead of service account keys
+- Use private clusters with no public endpoints
+- Enable network policies
+- Use GKE Sandbox for untrusted workloads
+- Enable Shielded GKE nodes
+- Use Binary Authorization for container signing
+- Implement Pod Security Policies or Pod Security Standards
+
+## Cost Optimization
+
+| Strategy | Savings |
+|----------|---------|
+| Autopilot | Pay per pod resource, no idle nodes |
+| Spot instances | 60-91% vs on-demand |
+| Committed use | 57% vs on-demand |
+| Right-sizing pods | 20-40% |
+| Cluster autoscaling | Match capacity to demand |
+
+## Troubleshooting
+
+```bash
+# Check cluster status
+gcloud container clusters describe my-cluster --region=REGION
+
+# View node issues
+kubectl describe node NODE_NAME
+
+# View pod issues
+kubectl describe pod POD_NAME
+kubectl logs POD_NAME
+
+# Check events
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+## Interview Questions
+
+1. **What's the difference between GKE Standard and Autopilot?**
+2. **How does Workload Identity work and why is it preferred over service account keys?**
+3. **Explain GKE networking with IP Alias.**
+4. **How do you secure a GKE cluster?**
+5. **What is Vertical Pod Autoscaling?**
+
+## Cheat Sheet
+
+```
+# Cluster
+gcloud container clusters create NAME --region=REG [FLAGS]
+gcloud container clusters get-credentials NAME --region=REG
+gcloud container clusters list
+
+# Node Pools
+gcloud container node-pools create NAME --cluster=CLUSTER --region=REG [FLAGS]
+
+# kubectl
+kubectl get nodes|pods|services|deployments
+kubectl top nodes|pods
+kubectl describe RESOURCE NAME
+kubectl logs NAME
+```
+
+## Labs
+
+1. Create GKE cluster with multiple node pools
+2. Deploy application with kubectl
+3. Configure Workload Identity
+4. Set up horizontal pod autoscaling
+5. Implement network policies
+
+## Related Services
+
+- [Compute Engine](./compute-engine)
+- [Cloud Run](./cloud-run)
+- [Cloud SQL](https://cloud.google.com/sql)
+- [Cloud Build](https://cloud.google.com/build)

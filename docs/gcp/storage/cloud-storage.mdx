@@ -1,0 +1,656 @@
+# Cloud Storage
+
+## Overview
+
+Google Cloud Storage is an object storage service that offers unified object storage for developers and enterprises. It provides 11 nines of durability (99.999999999%) and supports various storage classes optimized for different access patterns. Cloud Storage is the foundation for many GCP services and serves as the primary blob storage solution for cloud-native applications.
+
+## When To Use
+
+- Storing images, videos, documents, and other unstructured data
+- Hosting static website assets and content delivery
+- Data lakes and data warehouses for analytics
+- Backup and disaster recovery solutions
+- Serving ML training data and model artifacts
+- Distributing software binaries and deployment packages
+- Archiving log files and compliance data
+
+## When NOT To Use
+
+- Structured data requiring complex queries (use BigQuery or Cloud SQL)
+- High-performance block storage for VMs (use Persistent Disk)
+- File shares requiring POSIX compliance (use Filestore)
+- In-memory caching (use Memorystore)
+- Real-time transactional workloads (use Cloud SQL or Spanner)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Cloud Storage                             │
+├─────────────────────────────────────────────────────────────┤
+│  Buckets (global namespace, unique names)                   │
+│  ├── objects/ (files up to 5TB)                             │
+│  ├── folders/ (prefix-based organization)                   │
+│  └── metadata (custom, system)                              │
+├─────────────────────────────────────────────────────────────┤
+│  Storage Classes:                                           │
+│  ├── Standard    (Hot, frequently accessed)                 │
+│  ├── Nearline    (30-day minimum, $0.010/GB)                │
+│  ├── Coldline    (90-day minimum, $0.004/GB)                │
+│  └── Archive     (365-day minimum, $0.0012/GB)              │
+├─────────────────────────────────────────────────────────────┤
+│  Locations:                                                 │
+│  ├── Multi-region (US, EU, Asia)                           │
+│  ├── Dual-region (US-EU, ASIA)                             │
+│  └── Single-region (specific regions)                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Bucket
+Containers that hold objects. Buckets have global unique names, belong to a project, and have a location type (multi-region, dual-region, or single-region).
+
+### Object
+Individual files stored in buckets. Objects are immutable—updating an object creates a new generation.
+
+### Object Versioning
+When enabled, maintains multiple versions of an object with unique generation numbers.
+
+### Lifecycle Policies
+Automatic rules to transition objects between storage classes or delete them based on age or conditions.
+
+### Uniform Bucket-Level Access
+Disables ACLs and uses only IAM for permissions, simplifying permission management.
+
+### Retention Policies
+Set minimum retention periods for objects in a bucket.
+
+### Encryption
+Data encrypted at rest by default using Google-managed keys. Customer-managed encryption keys (CMEK) available via Cloud KMS.
+
+### CORS Configuration
+Cross-Origin Resource Sharing settings for browser-based access.
+
+## Real Production Example
+
+**Media Streaming Platform - Video Storage Architecture**
+
+A video streaming service storing 10PB of video content:
+
+```hcl
+# Terraform configuration for multi-environment video storage
+resource "google_storage_bucket" "video_storage" {
+  name          = "prod-video-content-12345"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  lifecycle_rule {
+    condition {
+      age = 365  # Move to Nearline after 1 year
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 1825  # Move to Coldline after 5 years
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  versioning {
+    enabled = false  # Disabled for cost, using custom metadata for versions
+  }
+  
+  cors {
+    origin          = ["https://www.example.com"]
+    method          = ["GET", "HEAD"]
+    response_header = ["Content-Type"]
+    max_age_seconds = 3600
+  }
+}
+
+resource "google_storage_bucket" "video_thumbnails" {
+  name          = "prod-video-thumbnails-12345"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  lifecycle_rule {
+    condition {
+      age = 90  # Thumbnails move to Nearline faster
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+}
+
+resource "google_storage_bucket" "user_uploads" {
+  name          = "prod-user-uploads-12345"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  retention_policy = <<-EOT
+    {"retentionPeriod": 2592000}  # 30 days
+  EOT
+  
+  lifecycle_rule {
+    condition {
+      age = 30
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+# Signed URL generation for premium content
+resource "google_storage_bucket_object" "sample_video" {
+  name    = "movies/sample.mp4"
+  bucket  = google_storage_bucket.video_storage.name
+  source  = "/local/sample.mp4"
+  content_type = "video/mp4"
+}
+```
+
+## CLI Examples
+
+```bash
+# Create a bucket
+gcloud storage buckets create gs://my-unique-bucket-name \
+  --location=US \
+  --storage-class=STANDARD
+
+# Create bucket with uniform bucket-level access
+gcloud storage buckets create gs://secure-bucket \
+  --location=US-EUROPE \
+  --storage-class=STANDARD \
+  --uniform-bucket-level-access
+
+# Copy files to bucket
+gcloud storage cp ./local-folder/* gs://my-bucket/
+
+# Copy with specific storage class
+gcloud storage cp ./archive/* gs://archive-bucket/ \
+  --storage-class=COLDLINE
+
+# Download files
+gcloud storage cp gs://my-bucket/ ./local-folder/
+
+# List buckets
+gcloud storage buckets list
+
+# List objects in bucket
+gcloud storage ls gs://my-bucket/
+
+# Set lifecycle policy via JSON file
+gcloud storage buckets update gs://my-bucket \
+  --lifecycle-file=lifecycle-config.json
+
+# Enable versioning
+gcloud storage buckets update gs://my-bucket \
+  --versioning
+
+# Get bucket metadata
+gcloud storage buckets describe gs://my-bucket
+
+# Set CORS configuration
+gcloud storage buckets update gs://my-bucket \
+  --cors-file=cors-config.json
+
+# Create signed URL (7-day expiry)
+gcloud storage sign-url gs://my-bucket/private-file.pdf \
+  --member=user:developer@example.com \
+  --duration=7d
+
+# Set IAM policy
+gcloud storage buckets add-iam-policy-binding gs://my-bucket \
+  --member=user:analyst@example.com \
+  --role=roles/storage.objectViewer
+
+# Sync directories
+gcloud storage rsync ./local-dir gs://my-bucket/ \
+  --exclude="*.tmp" \
+  --dry-run
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Basic bucket with lifecycle rules
+resource "google_storage_bucket" "data_lake" {
+  name                        = "data-lake-${var.environment}"
+  location                    = var.region
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+  
+  lifecycle_rule {
+    condition {
+      age            = 30
+      created_before = "2024-01-01"
+    }
+    action {
+      type          = "Delete"
+      storage_class = ""
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 0
+      matches_prefix = ["raw/", "staging/"]
+    }
+    action {
+      type = "AbortIncompleteMultipartUpload"
+    }
+  }
+  
+  versioning {
+    enabled = true
+  }
+  
+  website {
+    main_page_suffix = "index.html"
+    not_found_page   = "404.html"
+  }
+  
+  encryption {
+    default_kms_key_name = google_kms_crypto_key.storage_key.id
+  }
+  
+  labels = {
+    environment = var.environment
+    team        = "data-platform"
+  }
+}
+
+# Bucket with retention policy
+resource "google_storage_bucket" "compliance_storage" {
+  name          = "compliance-storage-${var.environment}"
+  location      = var.region
+  storage_class = "STANDARD"
+  
+  retention_policy {
+    period = 94608000  # 3 years in seconds
+  }
+}
+
+# Public bucket for static hosting
+resource "google_storage_bucket" "static_website" {
+  name          = "www-${var.domain}"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  website {
+    main_page_suffix = "index.html"
+    not_found_page   = "404.html"
+  }
+}
+
+resource "google_storage_bucket_iam_binding" "public_read" {
+  bucket = google_storage_bucket.static_website.name
+  role   = "roles/storage.objectViewer"
+  
+  members = [
+    "allUsers",
+  ]
+}
+```
+
+## Common Commands
+
+```bash
+# Bucket operations
+gcloud storage buckets create gs://NAME --location=LOCATION
+gcloud storage buckets update gs://NAME [flags]
+gcloud storage buckets list
+gcloud storage buckets describe gs://NAME
+
+# Object operations
+gcloud storage cp [SRC] [DST] [--storage-class=CLASS]
+gcloud storage mv [SRC] [DST]
+gcloud storage rm [TARGET]
+gcloud storage ls [URL]
+gcloud storage sync [SRC] [DST]
+
+# IAM
+gcloud storage buckets add-iam-policy-binding gs://NAME --member=MEMBER --role=ROLE
+gcloud storage buckets get-iam-policy gs://NAME
+gcloud storage buckets set-iam-policy gs://NAME POLICY_FILE
+
+# Signed URLs
+gcloud storage sign-url gs://BUCKET/OBJECT --member=MEMBER --duration=DURATION
+
+# Batch operations
+gcloud storage batch [subcommand]
+```
+
+## Monitoring
+
+### Key Metrics to Track
+- **Object count**: Number of objects per bucket
+- **Bucket size**: Total bytes stored
+- **Request count**: Total API requests by type
+- **Request latency**: Operation duration
+- **Storage class breakdown**: Bytes per storage class
+- **Bucket throughput**: bytes_uploaded/downloaded per second
+
+### Monitoring Commands
+
+```bash
+# View bucket metrics
+gcloud monitoring metrics list --filter="resource.type=gcs_bucket"
+
+# Create alerting policy for bucket size
+gcloud alpha monitoring policies create \
+  --display-name="Bucket Size Alert" \
+  --condition-display-name="Size > 1TB" \
+  --condition-threshold-value=1099511627776 \
+  --condition-threshold-comparison=COMPARISON_GT \
+  --condition-threshold-duration=300s \
+  --notification-channels=CHANNEL_ID
+```
+
+### Cloud Monitoring Integration
+```bash
+# Enable GCS monitoring dashboard
+gcloud monitoring dashboards create --config-from-file=gcs-dashboard.json
+
+# View bucket utilization
+gcloud monitoring metrics read \
+  "storage.googleapis.com/storage/object_count" \
+  --filter='resource.bucket_name="my-bucket"'
+```
+
+## Security
+
+### Encryption at Rest
+- **Google-managed keys**: Default, free
+- **Customer-managed keys (CMEK)**: Via Cloud KMS, $0.03/key/month + usage
+- **Customer-supplied keys (CSEK)**: Deprecated, avoid
+
+### IAM Best Practices
+```bash
+# Principle of least privilege
+gcloud storage buckets add-iam-policy-binding gs://my-bucket \
+  --member=serviceAccount:compute@my-project.iam.gserviceaccount.com \
+  --role=roles/storage.objectCreator  # Only upload permission
+
+# Use uniform bucket-level access
+gcloud storage buckets update gs://my-bucket --uniform-bucket-level-access
+
+# Enable uniform bucket-level access via Terraform
+resource "google_storage_bucket" "secure_bucket" {
+  uniform_bucket_level_access = true
+}
+```
+
+### Security Scanners
+```bash
+# Enable Security Command Center
+gcloud scc enable SecurityCommandCenter
+
+# Run Security Health Analytics
+gcloud scc sources list --parent=organizations/ORG_ID
+```
+
+### Access Control
+```bash
+# Disable public access
+gcloud storage buckets update gs://my-bucket \
+  --no-public-access-prevention
+
+# Require uniform bucket-level access
+gcloud storage buckets update gs://my-bucket \
+  --uniform-bucket-level-access
+
+# Enable object versioning for audit trail
+gcloud storage buckets update gs://my-bucket --versioning
+```
+
+## Cost Optimization
+
+### Storage Class Selection
+| Class | Best For | Price/GB/mo |
+|-------|----------|-------------|
+| Standard | Active workloads | $0.020 |
+| Nearline | Monthly access | $0.010 |
+| Coldline | Quarterly access | $0.004 |
+| Archive | Annual access | $0.0012 |
+
+### Lifecycle Policies for Cost Savings
+```bash
+# Move to cheaper storage after 90 days
+gcloud storage buckets update gs://my-bucket \
+  --lifecycle-file=lifecycle-policy.json
+```
+
+```json
+{
+  "rule": [
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "NEARLINE"},
+      "condition": {"age": 90}
+    },
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "COLDLINE"},
+      "condition": {"age": 365}
+    },
+    {
+      "action": {"type": "Delete"},
+      "condition": {"age": 2555}
+    }
+  ]
+}
+```
+
+### Request Costs
+- Class A (WRITE, LIST): $0.05/10,000 ops
+- Class B (READ): $0.004/10,000 ops
+- Data retrieval: $0.01-$0.05/GB depending on class
+
+### Cost-Saving Strategies
+```bash
+# Use Object Compose for large files instead of reuploading
+gcloud storage compose gs://bucket/[FIRST_OBJECT,NEW_OBJECT] gs://bucket/COMBINED
+
+# Enable Requester Pays for shared data
+gcloud storage buckets update gs://shared-bucket --requester-pays
+
+# Use parallel uploads for large files
+gcloud storage cp large-file.tar.gz gs://my-bucket/ \
+  --parallel
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**401 Unauthorized**
+```bash
+# Check authentication
+gcloud auth list
+gcloud auth login
+gcloud storage ls gs://bucket-name/
+```
+
+**403 Forbidden**
+```bash
+# Check IAM permissions
+gcloud storage buckets get-iam-policy gs://my-bucket
+
+# Check if uniform bucket-level access is enabled
+gcloud storage buckets describe gs://my-bucket --format="yaml(uniformBucketLevelAccess)"
+
+# For signed URLs, verify expiry
+gcloud storage sign-url gs://my-bucket/file.txt --print-url
+```
+
+**404 Bucket Not Found**
+```bash
+# Verify bucket name and project
+gcloud storage buckets list --filter="name:my-bucket"
+
+# Check if bucket exists in correct project
+gcloud config get-value project
+gcloud storage ls gs://my-bucket/ --recursive
+```
+
+**Slow Upload Speeds**
+```bash
+# Use parallel uploads for large files
+gcloud storage cp --parallel /large/file gs://my-bucket/
+
+# Check network throughput
+gcloud compute ssh instance --zone=ZONE -- \
+  "curl -o /dev/null http://storage.googleapis.com/my-bucket/file"
+```
+
+**Lifecycle Policy Not Working**
+```bash
+# Verify lifecycle configuration
+gcloud storage buckets describe gs://my-bucket --format="yaml(lifecycle)"
+
+# Check if objects match conditions
+gcloud storage ls gs://my-bucket/** --filter="age(created) > 30"
+```
+
+### Requester Pays Issues
+```bash
+# Check if bucket requires requester pays
+gcloud storage buckets describe gs://my-bucket --format="yaml(requesterPays)"
+
+# Access with requester pays flag
+gcloud storage ls gs://my-bucket/ --requester-pays
+```
+
+### Consistency Issues
+```bash
+# GCS provides eventual consistency for object listing
+# For critical reads, use generation/match conditions
+gcloud storage cp gs://my-bucket/file.txt - \
+  --generation=GENERATION_NUMBER \
+  --if-metageneration-match=METAGENERATION
+
+# For write operations, wait before reading
+# Use retry with exponential backoff
+```
+
+## Interview Questions
+
+**Q: What is the difference between GCS object versioning and object immutability?**
+A: Object versioning maintains multiple generations of an object, allowing retrieval of previous versions. Each update creates a new generation. Object immutability (in bucket policies) prevents any modification or deletion of objects once written—useful for compliance.
+
+**Q: How does GCS handle consistency?**
+A: GCS offers strong read-after-write consistency for object uploads and deletes. List operations are eventually consistent. This means newly written objects may not immediately appear in bucket listings.
+
+**Q: What are the tradeoffs between multi-region and single-region storage?**
+A: Multi-region provides higher availability (99.95% SLA vs 99.9%) and global data access but costs 2x more and has higher latency. Single-region is cheaper and lower latency but limited to specific geographic area.
+
+**Q: How do you design a data lake on GCS?**
+A: Use Medallion Architecture: Bronze layer (raw data), Silver layer (cleaned/transformed), Gold layer (curated/business-ready). Implement lifecycle policies to automatically tier data. Use partition schemas (date-based) for query efficiency.
+
+**Q: Explain GCS multipart upload lifecycle.**
+A: Parts are uploaded in parallel, stored temporarily, then assembled. Incomplete uploads after 7 days are automatically cleaned up (with lifecycle rules). You can abort incomplete multipart uploads with a lifecycle rule condition `age=0` with `AbortIncompleteMultipartUpload`.
+
+**Q: What is the maximum object size and how do you upload larger files?**
+A: Maximum object size is 5TB. For larger files, use:
+1. Multipart upload (split into 5MB-5GB parts)
+2. Parallel composite uploads (up to 32 parts, assembled server-side)
+3. Transfer Appliance for very large datasets
+
+**Q: How do you secure sensitive data in GCS?**
+A: Implement defense in depth:
+1. Use uniform bucket-level access
+2. Apply IAM policies with least privilege
+3. Enable CMEK via Cloud KMS
+4. Use signed URLs with short expiry for temporary access
+5. Implement Object Versioning for audit trail
+6. Enable V4 signature authentication for API access
+
+## Cheat Sheet
+
+```bash
+# Quick start
+gcloud storage buckets create gs://my-bucket --location=US
+gcloud storage cp file.txt gs://my-bucket/
+gcloud storage cp gs://my-bucket/file.txt ./
+
+# Lifecycle policies
+gcloud storage buckets update gs://bucket --lifecycle-file=rules.json
+
+# IAM
+gcloud storage buckets add-iam-policy-binding gs://bucket \
+  --member=user:email --role=roles/storage.objectAdmin
+
+# Signed URLs
+gcloud storage sign-url gs://bucket/file --member=user:email --duration=7d
+
+# Versioning
+gcloud storage buckets update gs://bucket --versioning
+
+# Monitoring
+gcloud storage ls gs://bucket/ --versions
+gcloud storage buckets describe gs://bucket
+```
+
+## Labs
+
+### Lab 1: Static Website Hosting
+Host a static website using Cloud Storage with custom domain and SSL.
+1. Create bucket matching domain name
+2. Upload HTML/CSS/JS assets
+3. Configure CORS and website settings
+4. Set up load balancer with managed SSL certificate
+5. Configure DNS CNAME record
+
+### Lab 2: Data Lake Implementation
+Build a multi-tier data lake with lifecycle policies.
+1. Create bronze, silver, gold buckets
+2. Implement data ingestion with partitioning
+3. Configure lifecycle rules for automatic tiering
+4. Set up CMEK encryption per bucket
+5. Create data catalog entries
+
+### Lab 3: Secure File Sharing
+Implement secure document sharing using signed URLs.
+1. Create private bucket
+2. Configure service account for signing
+3. Implement signed URL generation API
+4. Set up expiry and content-disposition headers
+5. Monitor access with Cloud Logging
+
+## Related Services
+
+- **Persistent Disk**: Block storage for VM instances
+- **Filestore**: Managed NFS file storage
+- **BigQuery**: Data warehouse for analytics
+- **Dataflow**: Stream/batch data processing
+- **Cloud KMS**: Customer-managed encryption keys
+- **Transfer Appliance**: Physical data transfer for large datasets
+- **Storage Transfer Service**: Scheduled data transfers from external sources

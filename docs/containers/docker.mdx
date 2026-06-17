@@ -1,0 +1,1111 @@
+---
+title: "Docker"
+description: "Complete guide to Docker - Docker engine, CLI, and production deployment"
+sidebar_position: 2
+---
+
+# Docker
+
+## Overview
+
+Docker is a platform for developing, shipping, and running applications in containers. The Docker Engine consists of a server (dockerd), a REST API, and a CLI client (docker). It revolutionized containerization by making containers accessible to developers and enabling the modern cloud-native development workflow.
+
+**Key Docker Components:**
+
+| Component | Description |
+|-----------|-------------|
+| **dockerd** | Docker daemon - server process managing containers, images, networks, volumes |
+| **Docker CLI** | Command-line client for interacting with dockerd |
+| **Docker Desktop** | GUI application with Docker Engine, Compose, Kubernetes |
+| **Docker Compose** | Tool for defining multi-container applications |
+| **containerd** | Container runtime (formerly part of Docker, now standalone) |
+| **runc** | Low-level container runtime (OCI specification implementation) |
+
+## When To Use
+
+- **Application packaging** for consistent deployment across environments
+- **CI/CD pipelines** requiring isolated, reproducible build environments
+- **Microservices development** where services need independent deployment
+- **Local development environments** matching production configuration
+- **Testing and QA** with clean, disposable environments
+- **Scaling applications** that need rapid horizontal scaling
+- **Multi-cloud deployment** requiring portable workloads
+- **Legacy application modernization** via containerization
+
+## When NOT To Use
+
+- **Running Windows-specific applications** (use Windows containers)
+- **Security-critical workloads** requiring kernel-level isolation
+- **High-performance computing** needing bare-metal access
+- **Applications requiring kernel modifications**
+- **Very simple, stateless scripts** where container overhead is excessive
+- **Development on resource-constrained machines** (Docker Desktop uses significant resources)
+- **Production workloads requiring orchestration** (use Kubernetes instead)
+
+## Core Concepts
+
+### Docker Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Docker Client                                │
+│                      (docker CLI)                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                │ REST API
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Docker Host                                  │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                        dockerd (Daemon)                       │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐   │  │
+│  │  │  Containers │  │   Images    │  │     Networks       │   │  │
+│  │  │  Management │  │  Management │  │    Management      │   │  │
+│  │  └─────────────┘  └─────────────┘  └────────────────────┘   │  │
+│  │  ┌─────────────┐  ┌─────────────────────────────────────┐   │  │
+│  │  │   Volumes   │  │          BuildKit (Image Builder)    │   │  │
+│  │  │  Management │  │                                        │   │  │
+│  │  └─────────────┘  └─────────────────────────────────────┘   │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    containerd (Runtime)                       │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌────────────────────┐   │  │
+│  │  │   Snapshots │  │   Containers │  │      Tasks        │   │  │
+│  │  └─────────────┘  └─────────────┘  └────────────────────┘   │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    runc (OCI Runtime)                         │  │
+│  │              Creates and runs containers                      │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Docker Object Model
+
+```
+Image (read-only template)
+    │
+    │ docker create/run
+    ▼
+Container (running instance of image)
+    │
+    ├── Network (network interface)
+    │
+    └── Volumes (persistent data)
+```
+
+### Image Layers and Storage
+
+```
+┌─────────────────────────────────────┐
+│         Container Layer (RW)         │
+├─────────────────────────────────────┤
+│  Layer 4: CMD, EXPOSE, etc.         │
+├─────────────────────────────────────┤
+│  Layer 3: COPY / ADD                │
+├─────────────────────────────────────┤
+│  Layer 2: RUN npm install           │
+├─────────────────────────────────────┤
+│  Layer 1: package.json              │
+├─────────────────────────────────────┤
+│  Base Image: ubuntu:22.04           │
+└─────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production Docker Deployment
+
+**Infrastructure:**
+- Load Balancer (nginx) distributing traffic
+- 3 application containers (auto-scaled)
+- PostgreSQL database (external, not containerized)
+- Redis for session storage
+- Health checks and monitoring
+
+```bash
+# Pull production images
+docker pull myregistry.io/api-service:v2.1.0
+docker pull myregistry.io/worker:v2.1.0
+docker pull nginx:1.25-alpine
+
+# Run application containers with health checks
+docker run -d \
+  --name api-1 \
+  --restart=unless-stopped \
+  --health-cmd="curl -f http://localhost:8080/health || exit 1" \
+  --health-interval=30s \
+  --health-timeout=3s \
+  --health-retries=3 \
+  --env-file /etc/docker/api.env \
+  --memory=512m \
+  --cpus=0.5 \
+  --log-driver=json-file \
+  --log-opt max-size=100m \
+  --log-opt max-file=3 \
+  -p 8080:8080 \
+  myregistry.io/api-service:v2.1.0
+
+# Run worker containers
+docker run -d \
+  --name worker-1 \
+  --restart=unless-stopped \
+  --memory=1g \
+  --cpus=1 \
+  --env-file /etc/docker/worker.env \
+  --log-driver=json-file \
+  --log-opt max-size=100m \
+  --log-opt max-file=3 \
+  myregistry.io/worker:v2.1.0
+
+# Run nginx reverse proxy
+docker run -d \
+  --name nginx-proxy \
+  --restart=unless-stopped \
+  -p 80:80 \
+  -p 443:443 \
+  -v /etc/nginx/conf.d:/etc/nginx/conf.d:ro \
+  -v /etc/nginx/certs:/etc/nginx/certs:ro \
+  nginx:1.25-alpine
+```
+
+### Production nginx Configuration
+
+```nginx
+upstream api_backend {
+    least_conn;
+    server 172.17.0.2:8080 max_fails=3 fail_timeout=30s;
+    server 172.17.0.3:8080 max_fails=3 fail_timeout=30s;
+    server 172.17.0.4:8080 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 80;
+    server_name api.example.com;
+
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
+
+    location / {
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+}
+```
+
+## CLI Examples
+
+### Container Lifecycle Management
+
+```bash
+# Create and start container
+docker create --name myapp nginx:alpine
+docker start myapp
+
+# Create and start in one command
+docker run -d --name myapp -p 8080:80 nginx:alpine
+
+# Run with interactive terminal
+docker run -it --rm ubuntu:22.04 bash
+
+# Run with custom hostname
+docker run -it --rm --hostname mycontainer ubuntu:22.04
+
+# Run with DNS configuration
+docker run -it --rm --dns=8.8.8.8 --dns-search=example.com ubuntu:22.04
+
+# Pause/Unpause container
+docker pause myapp
+docker unpause myapp
+
+# Stop gracefully with timeout
+docker stop -t 30 myapp
+
+# Force kill container
+docker kill myapp
+
+# Remove stopped containers
+docker container prune
+
+# Remove all stopped containers and unused images
+docker system prune -a
+```
+
+### Image Operations
+
+```bash
+# Build with tag
+docker build -t myapp:latest .
+
+# Build with build args
+docker build --build-arg VERSION=1.2.3 -t myapp:v1.2.3 .
+
+# Build with target stage (multi-stage)
+docker build --target production -t myapp:prod .
+
+# Build with no cache
+docker build --no-cache -t myapp:fresh .
+
+# Tag image
+docker tag myapp:latest myregistry.io/myapp:v1.0.0
+docker tag myapp:latest myregistry.io/myapp:latest
+
+# Pull specific version
+docker pull nginx:1.25.3-alpine
+docker pull ubuntu:22.04
+
+# Pull all tags of an image (for migration)
+docker pull -a ubuntu
+
+# Push to registry
+docker push myregistry.io/myapp:v1.0.0
+
+# Save image to tarball
+docker save -o myapp.tar myapp:latest
+
+# Load image from tarball
+docker load -i myapp.tar
+
+# Import container snapshot
+docker import myapp.tar myapp:imported
+
+# List image layers
+docker history nginx:alpine
+
+# Inspect image config
+docker image inspect nginx:alpine
+```
+
+### Networking
+
+```bash
+# List networks
+docker network ls
+
+# Create network
+docker network create --driver bridge my-network
+docker network create --driver overlay my-overlay
+
+# Create network with subnet
+docker network create \
+  --driver bridge \
+  --subnet=172.20.0.0/16 \
+  --ip-range=172.20.5.0/24 \
+  my-custom-network
+
+# Connect container to network
+docker network connect my-network myapp
+
+# Disconnect container from network
+docker network disconnect my-network myapp
+
+# Inspect network
+docker network inspect my-network
+
+# Remove unused networks
+docker network prune
+
+# Run container on specific network
+docker run --network my-network myapp
+
+# Run with host networking (bypass Docker networking)
+docker run --network host myapp
+```
+
+### Volumes
+
+```bash
+# List volumes
+docker volume ls
+
+# Create volume
+docker volume create my-data
+
+# Inspect volume
+docker volume inspect my-data
+
+# Run with volume
+docker run -v my-data:/data myapp
+docker run --mount type=volume,source=my-data,target=/data myapp
+
+# Run with bind mount
+docker run -v /host/path:/container/path myapp
+docker run --mount type=bind,source=/host/path,target=/container/path myapp
+
+# Run with read-only volume
+docker run -v my-data:/data:ro myapp
+
+# Run with tmpfs (RAM disk)
+docker run --tmpfs /tmp:rw,noexec,nosuid,size=64m myapp
+
+# Remove unused volumes
+docker volume prune
+
+# Backup volume
+docker run --rm -v my-data:/data -v $(pwd):/backup alpine tar cvf /backup/backup.tar /data
+
+# Restore volume
+docker run --rm -v my-data:/data -v $(pwd):/backup alpine tar xvf /backup/backup.tar -C /
+```
+
+### Logs and Monitoring
+
+```bash
+# View logs
+docker logs myapp
+docker logs --tail 100 myapp
+docker logs --since 1h myapp
+docker logs --timestamps myapp
+
+# Follow logs
+docker logs -f myapp
+
+# Logs with custom format
+docker logs --format "{{.ID}}: {{.Names}} - {{.Status}}"
+
+# View logs for all containers
+docker compose logs -f
+
+# Get container processes
+docker top myapp
+
+# Real-time stats
+docker stats
+docker stats --no-stream
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# Inspect container
+docker inspect myapp
+docker inspect --format='{{.State.Status}}' myapp
+docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' myapp
+```
+
+### Executing Commands
+
+```bash
+# Execute in running container
+docker exec myapp ls -la
+docker exec -it myapp bash
+docker exec -it myapp sh
+
+# Execute as specific user
+docker exec -u root myapp apt-get update
+
+# Execute with environment variables
+docker exec -e VAR=value myapp env
+
+# Execute in multiple containers
+docker exec -it myapp-1 bash
+docker exec -it myapp-2 bash
+
+# Copy files
+docker cp myapp:/app/logs ./logs
+docker cp ./config myapp:/app/config
+
+# Check filesystem changes
+docker diff myapp
+# A = Added, C = Changed, D = Deleted
+```
+
+## Dockerfile / Compose Examples
+
+### Production Multi-Stage Dockerfile
+
+```dockerfile
+# ============================================
+# Build Stage
+# ============================================
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy dependency files first for better caching
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# Copy source code
+COPY . .
+
+# Build application
+RUN npm run build
+
+# ============================================
+# Production Stage
+# ============================================
+FROM node:20-alpine AS production
+
+# Add labels
+LABEL maintainer="devops@example.com"
+LABEL version="1.0.0"
+LABEL description="Production Node.js application"
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodeapp -u 1001
+
+WORKDIR /app
+
+# Copy dependency files
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --only=production && npm cache clean --force
+
+# Copy built application from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+
+# Set ownership
+RUN chown -R nodeapp:nodejs /app
+
+# Switch to non-root user
+USER nodeapp
+
+# Expose port
+EXPOSE 3000
+
+# Environment defaults
+ENV NODE_ENV=production \
+    PORT=3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
+# Use exec form to handle signals properly
+ENTRYPOINT ["node", "dist/main.js"]
+```
+
+### Docker Compose - Full Stack Application
+
+```yaml
+version: "3.9"
+
+services:
+  # ============================================
+  # Application Services
+  # ============================================
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: production
+      args:
+        - NODE_ENV=production
+    image: myregistry.io/api:${VERSION:-latest}
+    container_name: api-service
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/myapp
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - backend
+
+  worker:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: production
+    image: myregistry.io/worker:${VERSION:-latest}
+    container_name: worker-service
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/myapp
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - backend
+
+  # ============================================
+  # Database Services
+  # ============================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=myapp
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - backend
+
+  # ============================================
+  # Nginx Reverse Proxy
+  # ============================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - frontend
+      - backend
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  nginx_cache:
+    driver: local
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+  backend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24
+```
+
+## Common Commands
+
+### Complete Command Reference
+
+| Command | Description |
+|---------|-------------|
+| `docker run` | Create and start container |
+| `docker create` | Create container without starting |
+| `docker start` | Start existing container |
+| `docker stop` | Stop running container |
+| `docker restart` | Stop and start container |
+| `docker pause` | Pause container processes |
+| `docker unpause` | Resume container processes |
+| `docker kill` | Force kill container |
+| `docker rm` | Remove container |
+| `docker ps` | List running containers |
+| `docker ps -a` | List all containers |
+| `docker inspect` | Get container/image details |
+| `docker logs` | View container logs |
+| `docker exec` | Execute command in container |
+| `docker cp` | Copy files to/from container |
+| `docker diff` | Show filesystem changes |
+| `docker top` | Show container processes |
+| `docker stats` | Show resource usage |
+| `docker build` | Build image from Dockerfile |
+| `docker pull` | Pull image from registry |
+| `docker push` | Push image to registry |
+| `docker images` | List local images |
+| `docker rmi` | Remove image |
+| `docker tag` | Tag image |
+| `docker history` | Show image layers |
+| `docker save` | Save image to tar |
+| `docker load` | Load image from tar |
+| `docker network ls` | List networks |
+| `docker network create` | Create network |
+| `docker network rm` | Remove network |
+| `docker volume ls` | List volumes |
+| `docker volume create` | Create volume |
+| `docker volume rm` | Remove volume |
+| `docker compose up` | Start compose services |
+| `docker compose down` | Stop compose services |
+| `docker compose ps` | List compose services |
+| `docker compose logs` | View compose logs |
+| `docker compose build` | Build compose images |
+| `docker system df` | Show disk usage |
+| `docker system prune` | Clean unused resources |
+
+## Monitoring
+
+### Container Metrics
+
+```bash
+# Real-time stats for all containers
+docker stats
+
+# Stats for specific containers
+docker stats container1 container2
+
+# Stats with no streaming (for scripting)
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# Format options: .ID, .Name, .CPUPerc, .MemUsage, .MemPerc, .NetIO, .BlockIO, .PIDs
+```
+
+### Logging Configuration
+
+```bash
+# Default json-file driver (configurable in daemon.json)
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+### Alternative Logging Drivers
+
+```bash
+# Syslog driver
+docker run --log-driver=syslog --log-opt syslog-address=tcp://localhost:514 myapp
+
+# Fluentd driver
+docker run --log-driver=fluentd --log-opt fluentd-address=fluentd:24224 myapp
+
+# Gelf driver (Logstash)
+docker run --log-driver=gelf --log-opt gelf-address=udp://logstash:12201 myapp
+```
+
+## Security
+
+### Security Best Practices
+
+```bash
+# Run as non-root
+docker run --user 1000:1000 myapp
+
+# Read-only root filesystem
+docker run --read-only myapp
+
+# Drop all capabilities, add only required
+docker run --cap-drop=ALL --cap-add=NET_BIND_SERVICE myapp
+
+# No new privileges
+docker run --security-opt=no-new-privileges myapp
+
+# Seccomp profile
+docker run --security-opt seccomp=/path/to/profile.json myapp
+
+# AppArmor profile
+docker run --security-opt apparmor=/path/to/profile myapp
+
+# Prevent ptrace capability abuse
+docker run --security-opt seccomp=unconfined --cap-add=SYS_PTRACE myapp
+```
+
+### Docker Daemon Security
+
+```json
+{
+  "icc": false,
+  "ip-masq": true,
+  "userland-proxy": false,
+  "live-restore": true,
+  "no-new-privileges": true,
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 64000,
+      "Soft": 64000
+    }
+  },
+  "registry-mirrors": [],
+  "insecure-registries": [],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  }
+}
+```
+
+### Content Trust
+
+```bash
+# Enable Docker Content Trust
+export DOCKER_CONTENT_TRUST=1
+
+# Disable for specific pull
+export DOCKER_CONTENT_TRUST=0
+docker pull myapp
+
+# Pull with trust verification
+docker trust pull myregistry.io/myapp:latest
+```
+
+## Cost Optimization
+
+### Image Size Reduction
+
+```dockerfile
+# Use Alpine-based images (5MB vs 77MB for Ubuntu)
+FROM node:20-alpine
+
+# Use slim variants (150MB vs 900MB for node)
+FROM python:3.12-slim
+
+# Use distroless (minimal, no shell)
+FROM gcr.io/distroless/nodejs20
+
+# Multi-stage builds to exclude build tools
+FROM golang:1.21 AS builder
+WORKDIR /build
+RUN go build -o myapp
+
+FROM scratch
+COPY --from=builder /build/myapp /myapp
+ENTRYPOINT ["/myapp"]
+```
+
+### Build Cache Optimization
+
+```dockerfile
+# Order instructions by change frequency
+FROM node:20-alpine
+WORKDIR /app
+
+# Copy dependency files first (less frequently changed)
+COPY package*.json ./
+RUN npm ci
+
+# Copy source code (more frequently changed)
+COPY . .
+
+# Build
+RUN npm run build
+```
+
+### .dockerignore
+
+```
+# Ignore version control
+.git
+.gitignore
+
+# Ignore development files
+*.md
+*.log
+.env*
+docker-compose*.yml
+
+# Ignore IDE
+.vscode
+.idea
+
+# Ignore tests
+__tests__
+tests/
+*.test.js
+coverage/
+
+# Ignore documentation
+docs/
+```
+
+## Troubleshooting
+
+### Container Exit Codes
+
+| Exit Code | Meaning | Solution |
+|-----------|---------|----------|
+| 0 | Exit without errors | Normal exit |
+| 1 | General error | Check application logs |
+| 125 | Docker run error | Check docker run command syntax |
+| 126 | Command invoked cannot execute | Check CMD/ENTRYPOINT |
+| 127 | Command not found | Verify binary exists |
+| 137 | SIGKILL (128 + 9) | Container OOM killed or manual kill |
+| 139 | SIGSEGV (128 + 11) | Segmentation fault |
+| 143 | SIGTERM (128 + 15) | Graceful shutdown |
+
+### Common Issues
+
+**Container exits immediately after start:**
+```bash
+docker logs <container>  # Check application logs
+docker inspect <container>  # Check exit code and state
+```
+
+**Port already in use:**
+```bash
+docker run -p 8080:80 myapp  # Error: port already allocated
+
+# Check what's using the port
+lsof -i :8080
+# or change port mapping
+docker run -p 8081:80 myapp
+```
+
+**Image pull failures:**
+```bash
+# Login to registry
+docker login myregistry.io
+
+# Check registry connectivity
+docker pull myregistry.io/myapp:latest
+
+# Pull with explicit auth
+docker pull --username=user myregistry.io/myapp:latest
+```
+
+**Disk space issues:**
+```bash
+docker system df  # Show disk usage
+docker system prune -a  # Remove all unused
+docker volume prune  # Remove unused volumes
+docker image prune -a  # Remove unused images
+```
+
+**Network connectivity issues:**
+```bash
+docker network inspect bridge  # Check bridge network
+docker exec <container> ping google.com  # Test DNS
+docker exec <container> curl localhost:port  # Test service
+```
+
+### Debugging Workflow
+
+```bash
+# 1. Check container status
+docker ps -a | grep <name>
+
+# 2. View logs
+docker logs <container>
+
+# 3. Inspect details
+docker inspect <container>
+
+# 4. Enter container shell
+docker exec -it <container> sh
+
+# 5. Check resource usage
+docker stats --no-stream <container>
+
+# 6. Check network connectivity
+docker exec <container> netstat -tlnp
+
+# 7. Check processes
+docker top <container>
+```
+
+## Interview Questions
+
+### Q1: Explain Docker's architecture.
+**A:** Docker uses a client-server architecture. The Docker client (CLI) communicates with the Docker daemon (dockerd) via REST API. The daemon handles building, running, and distributing containers. It uses containerd as the container runtime which manages container lifecycle, and runc as the low-level runtime that creates containers according to OCI specifications.
+
+### Q2: What is the difference between CMD and ENTRYPOINT?
+**A:** `CMD` provides defaults for executing a container (can be overridden). `ENTRYPOINT` configures a container to run as an executable (arguments append to it). Using both, `CMD` provides default arguments to `ENTRYPOINT`. The exec form `["executable", "param"]` is preferred for proper signal handling.
+
+### Q3: How do you reduce Docker image size?
+**A:** Use minimal base images (alpine, slim, distroless), multi-stage builds to separate build and runtime dependencies, layer caching optimization by ordering instructions from least to most frequently changing, .dockerignore to exclude unnecessary files, and combine RUN instructions to reduce layers.
+
+### Q4: What is the purpose of Docker volumes?
+**A:** Volumes persist data beyond the container lifecycle. They exist independently of containers and can be shared between containers. Types include named volumes (Docker-managed), bind mounts (host filesystem), and tmpfs (RAM-based). They're preferred over storage drivers for persistent data.
+
+### Q5: How does Docker networking work?
+**A:** Docker provides several network drivers. The default bridge network creates a private network for containers on the same host. Host mode removes network isolation. Overlay networks enable multi-host communication. None disables networking. Container DNS resolves container names to IP addresses on user-defined networks.
+
+### Q6: What is the difference between `docker exec` and `docker attach`?
+**A:** `docker exec` runs a new command in a running container (creates new process). `docker attach` attaches to the container's main process (same stdin/stdout/stderr). Use `docker exec` for debugging, `docker attach` to interact with the main process.
+
+### Q7: How do you troubleshoot a container that won't start?
+**A:** Check container logs (`docker logs`), inspect container state (`docker inspect`), verify image exists (`docker images`), check port conflicts, verify environment variables and volumes are correct, and ensure resource limits aren't exceeded.
+
+### Q8: What is Docker BuildKit and why use it?
+**A:** BuildKit is the new Docker builder backend with improved performance (parallel layer building), better caching, and features like automatic garbage collection of build cache, inline layer compression, and secret mounting without layer leakage.
+
+### Q9: How do you handle secrets in Docker?
+**A:** Never put secrets in Dockerfiles or images. Use Docker Secrets (for Swarm), environment variables passed at runtime (not baked into images), or secret management tools like Vault. For Kubernetes, use Kubernetes Secrets or external secret operators.
+
+### Q10: What is the container lifecycle?
+**A:** Containers are created with `docker create` or `docker run`, then started. They run until the main process exits or are stopped with `docker stop`. They can be paused, restarted, or removed. Data persists only if volumes are used. Stopped containers remain until removed.
+
+## Cheat Sheet
+
+### Essential Commands
+
+```bash
+# Container lifecycle
+docker run -d -p 8080:80 --name web --restart unless-stopped \
+  --memory=512m --cpus=0.5 nginx:alpine
+
+# View and debug
+docker ps -a
+docker logs -f web
+docker exec -it web sh
+docker stats --no-stream
+
+# Image management
+docker build -t myapp:v1 .
+docker push myregistry.io/myapp:v1
+docker pull nginx:alpine
+
+# Cleanup
+docker system prune -a
+docker volume prune
+docker network prune
+
+# Compose
+docker compose up -d
+docker compose down -v
+docker compose logs -f
+docker compose ps
+```
+
+### Dockerfile Instructions
+
+```dockerfile
+FROM          # Base image
+WORKDIR       # Working directory
+COPY          # Copy files from context
+ADD           # Copy with URL/tar support
+RUN           # Execute command during build
+ENV           # Environment variable
+EXPOSE        # Document port
+USER          # Set user/group
+VOLUME        # Create mount point
+ARG           # Build argument
+LABEL         # Metadata
+ONBUILD       # Trigger for child images
+STOPSIGNAL    # Signal to stop container
+HEALTHCHECK   # Health check command
+```
+
+### Networking
+
+```bash
+docker network create mynet
+docker network connect mynet container1
+docker run --network mynet myapp
+```
+
+### Volumes
+
+```bash
+docker volume create myvol
+docker run -v myvol:/data myapp
+docker run -v /host/path:/container/path myapp
+```
+
+## Related Topics
+
+- [Container Overview](./overview.mdx) - Container fundamentals
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Docker Compose](./docker-compose.mdx) - Multi-container applications
+- [Container Runtime](./container-runtime.mdx) - Runtime internals
+- [Image Security](./image-security.mdx) - Vulnerability scanning and hardening
+- [Registry](./registry.mdx) - Image registries
+- [Troubleshooting](./troubleshooting.mdx) - Debugging containers

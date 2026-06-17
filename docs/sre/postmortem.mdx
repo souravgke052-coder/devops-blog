@@ -1,0 +1,729 @@
+---
+sidebar_position: 9
+---
+
+# Postmortem
+
+## Overview
+
+A postmortem is a structured review conducted after an incident to understand what happened, why it happened, and what can be done to prevent recurrence. The SRE philosophy of "blameless postmortems" means focusing on systemic failures rather than individual mistakes — the goal is learning, not punishment.
+
+Blameless postmortems recognize that systems fail, but the way organizations respond to failures determines whether they improve. When people fear blame, they hide mistakes. When they feel safe, they surface root causes. The most reliable systems are built by organizations that learn from failures openly and systematically.
+
+A good postmortem is not about finding someone to blame — it's about finding the conditions that allowed a failure to occur and improving those conditions. Individual actions are less important than the system design that made those actions possible or necessary.
+
+## When To Use
+
+- **After any SEV1 or SEV2 incident** — Required for major incidents
+- **After recurring issues** — If the same problem happens multiple times
+- **Near-misses** — Situations where failure was narrowly avoided
+- **Customer-impacting outages** — Any user-visible issue
+- **Security incidents** — Especially for breach or data exposure
+
+## When NOT to Use
+
+- **Every minor issue** — Don't postmortem everything; focus on meaningful learning
+- **During active incident** — Document timeline but defer review until resolved
+- **Without enough information** — Wait for complete data before writing
+- **When no action can prevent recurrence** — Some incidents are pure bad luck
+
+## Core Concepts
+
+### Blameless Culture
+
+Blameless does not mean "blame-free" — it means the focus is on the system, not the individual. The question is not "who made a mistake?" but "what conditions led to this?"
+
+```python
+# Examples of blame vs. blameless analysis
+
+# BLAME-FOCUSED (wrong):
+"Engineer deployed without proper testing"
+"Operations team didn't follow the runbook"
+
+# BLAMELESS (right):
+"The deployment pipeline allowed production deployment without staging validation"
+"The runbook was incomplete for the edge case encountered"
+```
+
+### Postmortem Timing
+
+| Incident Severity | Postmortem Due | Author | Review |
+|-------------------|----------------|--------|--------|
+| SEV1 | 48 hours | Senior engineer + IC | All-hands review |
+| SEV2 | 72 hours | On-call engineer | Team review |
+| SEV3 | 1 week | Team | Async |
+| SEV4 | Optional | Optional | Optional |
+
+### Action Item Principles
+
+Every postmortem must result in concrete action items:
+
+1. **Actionable** — Someone can actually do it, not just "improve monitoring"
+2. **Specific** — Not "improve reliability" but "add alert when error rate > 1%"
+3. **Verifiable** — We can check if it was completed
+4. **Prioritized** — Most impactful changes first
+5. **Owned** — Single person responsible
+
+## Real Production Example
+
+### Postmortem Template
+
+```markdown
+# Postmortem: [Brief Title]
+
+**Incident Date:** YYYY-MM-DD
+**Severity:** SEV1 / SEV2 / SEV3
+**Duration:** X hours Y minutes (HH:MM - HH:MM UTC)
+**Authors:** @engineer1, @engineer2
+**Review Date:** YYYY-MM-DD
+
+## Executive Summary
+
+One paragraph summary of what happened, impact, and key learnings.
+Maximum 3 sentences.
+
+## Impact
+
+| Metric | Value |
+|--------|-------|
+| Users Affected | ~X,XXX |
+| Revenue Impact | $XX,XXX |
+| Error Rate Peak | X% |
+| Duration | X hours |
+
+## Timeline (UTC)
+
+All times in UTC on YYYY-MM-DD:
+
+| Time | Event |
+|------|-------|
+| 14:32 | Alert fires: High API error rate |
+| 14:35 | On-call acknowledges, begins investigation |
+| 14:38 | Identified elevated database connection errors |
+| 14:42 | Declared SEV2 incident |
+| 14:45 | Rollback initiated |
+| 14:52 | Rollback complete, service recovering |
+| 15:10 | Error rates normal, incident resolved |
+
+## Root Cause Analysis
+
+### What happened
+
+Detailed description of the incident sequence.
+
+### Why it happened
+
+Contributing factors and root cause (using 5 Whys or Fishbone).
+
+```
+Root Cause: Database connection pool exhausted
+
+Contributing Factors:
+1. Migration job opened connections without closing them
+2. Pool limit was set too low for migration workloads  
+3. No alerting on pool utilization
+4. Migration was not tested with production data volume
+```
+
+### 5 Whys Analysis
+
+```
+Why: Database connections exhausted
+→ Why: Connection pool hit max size
+→ Why: Migration job opened connections faster than they closed
+→ Why: Migration code had connection leak (not using context)
+→ Why: Code review didn't catch missing context usage
+→ Why: No linting rule or test for connection cleanup
+
+Root Cause: Missing context usage in migration code.
+```
+
+## Detection
+
+How was the incident detected?
+- Alert: High error rate alert fired after 5 minutes of sustained >5% error rate
+- User report: X users reported checkout failures via support
+
+What could have detected it earlier?
+- Connection pool monitoring would have caught leak 30 minutes earlier
+- Load testing would have revealed pool sizing issue
+
+## Response
+
+### What went well
+
+- On-call responded within 2 minutes
+- Rollback completed in 7 minutes
+- Communication was timely and clear
+- Team worked well together
+
+### What could have gone better
+
+- Initial investigation took 10 minutes due to unfamiliarity with migration code
+- Runbook didn't cover database connection issues
+- Status page update was delayed 8 minutes
+
+## Action Items
+
+| ID | Action | Owner | Due Date | Status |
+|----|--------|-------|----------|--------|
+| 1 | Add connection pool monitoring alerts | @sre | 2024-02-01 | Done |
+| 2 | Update migration runbook with connection handling | @backend | 2024-02-05 | Done |
+| 3 | Add lint rule for context usage in database code | @platform | 2024-02-15 | In Progress |
+| 4 | Run load tests before migration in staging | @qa | 2024-02-10 | Done |
+| 5 | Create status page automation | @sre | 2024-02-20 | Not Started |
+
+## Lessons Learned
+
+### What went well
+
+1. **Fast rollback**: The ability to rollback quickly limited impact
+2. **Clear communication**: Regular updates kept stakeholders informed
+3. **Team collaboration**: Multiple engineers worked together effectively
+
+### What we should do differently
+
+1. **Better migration testing**: Test with production-equivalent data volumes
+2. **Enhanced monitoring**: Add infrastructure-level alerts beyond application metrics
+3. **Runbook coverage**: Ensure all critical paths have documented procedures
+
+## Supporting Information
+
+- Relevant logs: [link]
+- Metrics dashboards: [link]
+- Runbook: [link]
+- Related incidents: [link to similar past incidents]
+```
+
+### Real Example Postmortem: Checkout Outage
+
+```markdown
+# Postmortem: Checkout Service Database Connection Exhaustion
+
+**Incident Date:** 2024-01-15
+**Severity:** SEV2
+**Duration:** 38 minutes (14:32 - 15:10 UTC)
+**Authors:** @sre-oncall, @backend-lead
+**Review Date:** 2024-01-17
+
+---
+
+## Executive Summary
+
+On January 15th, 2024, the checkout service experienced elevated error rates 
+(peak 7.2%) for 38 minutes due to database connection pool exhaustion caused 
+by a data migration job that did not properly release connections. The 
+migration was deployed at 14:00 and connection exhaustion began at 14:25 as 
+the pool (max 100 connections) was consumed. Service was restored after 
+rolling back the migration at 14:52.
+
+Impact: Approximately 2,340 users experienced checkout failures during the 
+incident window. Estimated revenue impact: $12,400.
+
+---
+
+## Impact
+
+| Metric | Value |
+|--------|-------|
+| Duration | 38 minutes |
+| Peak Error Rate | 7.2% (normal: <0.1%) |
+| Users Affected | ~2,340 |
+| Failed Transactions | ~340 |
+| Revenue Impact | $12,400 (estimated) |
+| SLA Breach | None (SLA is 99.9% monthly) |
+
+---
+
+## Timeline (UTC)
+
+| Time | Event |
+|------|-------|
+| 14:00 | Migration job deployed to production via CI/CD pipeline |
+| 14:15 | Alert: Connection pool at 60% |
+| 14:20 | Alert: Connection pool at 85% |
+| 14:25 | Alert: Connection pool at 100% |
+| 14:27 | First user-facing errors reported |
+| 14:32 | High error rate alert fires (SEV2 threshold exceeded) |
+| 14:34 | On-call acknowledges alert |
+| 14:38 | Identified migration job as connection leak source |
+| 14:42 | Incident declared SEV2 |
+| 14:45 | Rollback initiated |
+| 14:52 | Rollback complete, service recovering |
+| 15:05 | Error rates returning to normal |
+| 15:10 | Error rates normal, incident resolved |
+
+---
+
+## Root Cause Analysis
+
+### What Happened
+
+The data migration job (newly deployed at 14:00) opened database connections 
+but did not release them properly. The migration code:
+
+```python
+# PROBLEMATIC CODE (simplified)
+def migrate_orders():
+    db = get_db_connection()  # Opens connection
+    for batch in get_batches():
+        process_batch(batch)
+    # Missing: db.close()
+    # Missing: Using context manager
+```
+
+Without proper cleanup, each batch processing kept connections open. With 100 
+connections in the pool and the migration consuming ~5 connections per batch, 
+the pool was exhausted after processing ~20 batches (~25 minutes).
+
+### Contributing Factors
+
+1. **Code Review Gap**: PR reviewer focused on business logic, didn't catch 
+   missing connection cleanup. No linter rule for this pattern.
+
+2. **Insufficient Testing**: Migration was tested with 1,000 records but 
+   production had 500,000. Connection duration scaled with record count.
+
+3. **No Pool Monitoring**: There was no alert on connection pool utilization. 
+   Alerts existed only for application error rates.
+
+4. **Missing Context Usage**: Python database code should use `with` context 
+   manager or explicit cleanup. Migration used neither pattern.
+
+### 5 Whys
+
+```
+Why: Checkout service errors?
+→ Why: Database connection pool exhausted
+→ Why: Migration job consumed all connections
+→ Why: Migration didn't close connections
+→ Why: Developer used try/except without finally cleanup
+→ Why: Code review didn't catch pattern, no linting rule for this
+
+Root Cause: Missing connection cleanup in migration code, not caught in review.
+```
+
+---
+
+## Detection
+
+**How detected:**
+- High error rate alert fired when error rate exceeded 5% for 3 minutes
+- 7 minutes passed between connection pool exhaustion and first user errors
+
+**What could have detected earlier:**
+- Connection pool monitoring (would have caught at 80% threshold, ~10 min earlier)
+- Load testing with production data volumes (would have caught during QA)
+
+---
+
+## Response
+
+### What Went Well
+
+1. On-call response time: 2 minutes from alert to acknowledgment
+2. Root cause identified in 8 minutes
+3. Rollback decision made quickly
+4. Communication was clear and timely (updates every 15 minutes)
+
+### What Could Have Been Better
+
+1. No runbook for database connection issues
+2. Initial investigation looked at wrong component (application logs vs infrastructure)
+3. Status page update was delayed 8 minutes
+4. No escalation during first 10 minutes
+
+---
+
+## Action Items
+
+| ID | Action | Owner | Due Date | Status |
+|----|--------|-------|----------|--------|
+| 1 | Add database connection pool monitoring and alerts | @sre | 2024-01-22 | **Done** |
+| 2 | Add linting rule for database connection cleanup | @platform | 2024-01-29 | **Done** |
+| 3 | Update migration runbook with connection handling requirements | @backend | 2024-01-25 | **Done** |
+| 4 | Test migrations with production-equivalent data volumes | @qa | 2024-02-05 | **Done** |
+| 5 | Create database troubleshooting runbook | @sre | 2024-02-01 | **In Progress** |
+| 6 | Add connection pool to SRE dashboard | @sre | 2024-01-20 | **Done** |
+| 7 | Review all database migrations for similar patterns | @backend | 2024-01-30 | **Done** |
+
+---
+
+## Supporting Evidence
+
+- **Prometheus metrics**: [Dashboard link]
+- **Migration code**: [PR #1234](https://github.com/org/repo/pull/1234)
+- **Rollback verification**: [Slack thread](https://slack.com/...)
+- **Related migrations reviewed**: 4 similar patterns found and fixed
+
+---
+
+## Follow-up Verification (2024-02-01)
+
+| Action Item | Verification | Status |
+|-------------|--------------|--------|
+| Connection pool alerts | Alert tested and firing correctly | Verified |
+| Linting rule | Deployed, caught 2 issues in first week | Verified |
+| Migration runbook | Updated and reviewed | Verified |
+| Load testing | Testing now required for migrations >10k records | Verified |
+```
+
+## Metrics / Formulas / Frameworks
+
+### Postmortem Metrics
+
+```python
+def calculate_postmortem_effectiveness(incidents):
+    """
+    Measure how effectively postmortems are preventing recurrence.
+    """
+    recurrence_rate = calculate_recurrence_rate(incidents)
+    action_completion = calculate_action_item_completion(incidents)
+    mttr_trend = calculate_mttr_trend(incidents)
+    
+    return {
+        'recurrence_rate': recurrence_rate,  # Lower is better
+        'action_item_completion': action_completion,  # Higher is better
+        'mttr_trend': mttr_trend  # Lower is better (faster resolution)
+    }
+
+def calculate_recurrence_rate(incidents):
+    """
+    What percentage of incidents are recurrences of previous issues?
+    """
+    total = len(incidents)
+    if total == 0:
+        return 0
+    
+    recurring = sum(1 for i in incidents if i.is_recurrence)
+    return (recurring / total) * 100
+```
+
+### Action Item Tracking
+
+```python
+def action_item_status_summary(action_items):
+    """
+    Summarize status of all action items from postmortems.
+    """
+    status_counts = {
+        'done': 0,
+        'in_progress': 0,
+        'not_started': 0,
+        'blocked': 0
+    }
+    
+    for item in action_items:
+        status_counts[item.status] += 1
+    
+    total = len(action_items)
+    completion_rate = status_counts['done'] / total if total > 0 else 0
+    
+    return {
+        'total': total,
+        'by_status': status_counts,
+        'completion_rate': completion_rate,
+        'overdue': [i for i in action_items if i.is_overdue]
+    }
+```
+
+## Common Tools and Commands
+
+### Postmortem Workflow
+
+```bash
+# Generate incident timeline from logs
+pd-cli incidents show $INCIDENT_ID timeline > timeline.md
+
+# Export metrics for postmortem
+promtool query range \
+  --start=2024-01-15T14:00:00Z \
+  --end=2024-01-15T16:00:00Z \
+  'sum(rate(http_requests_total{job="api",status=~"5.."}[1m]))' \
+  > error_rate_data.txt
+
+# Get deployment history
+kubectl rollout history deployment/api -n production
+
+# Get events during incident
+kubectl get events -n production \
+  --since=2024-01-15T14:00:00Z \
+  --sort-by='.lastTimestamp' \
+  > incident_events.txt
+```
+
+### Blameless Questioning
+
+```markdown
+# 5 Whys Template
+
+Why did [incident] occur?
+→ Because [immediate cause]
+
+Why did [immediate cause] happen?
+→ Because [next level cause]
+
+Why did [next level cause] happen?
+→ Because [next level cause]
+
+Why did [next level cause] happen?
+→ Because [systemic cause]
+
+Why did [systemic cause] exist?
+→ Because [root cause - system design or process gap]
+
+# Example - Database Outage
+
+Why did checkout fail?
+→ Because database was unreachable
+
+Why was database unreachable?
+→ Because connection pool was exhausted
+
+Why was pool exhausted?
+→ Because migration job leaked connections
+
+Why did migration leak connections?
+→ Because code didn't use context manager
+
+Why didn't code use context manager?
+→ Because no linting rule or review checklist caught this pattern
+
+# Root Cause: Missing linting/review requirement for database connection handling
+```
+
+## Security
+
+### Postmortem Confidentiality
+
+```markdown
+# Handling sensitive information in postmortems
+
+Allowed in postmortems:
+- System behavior and failures
+- Process and tooling gaps
+- Metrics and timelines
+- Technical root causes
+
+Requires special handling:
+- Security vulnerabilities (separate security postmortem)
+- Customer PII (minimize exposure, aggregate)
+- Credentials or keys (redact, don't log in postmortem)
+- Legal/contractual details (review with legal first)
+
+Distribution:
+- Internal postmortems: Full detail within engineering
+- Customer-facing: Sanitized version with impact summary
+- Public postmortems: Generic description, no sensitive details
+```
+
+## Cost Optimization
+
+### Postmortem ROI
+
+```python
+def postmortem_roi(incident, postmortem):
+    """
+    Estimate the value of a postmortem.
+    """
+    # Cost of postmortem
+    postmortem_cost = (
+        postmortem.author_hours * 100 +  # Engineering time
+        postmortem.review_hours * 100 +
+        postmortem.action_items_hours
+    )
+    
+    # Estimated prevention value
+    recurrence_prevented = postmortem.recurrence_prevented
+    incident_cost = incident.duration_hours * incident.cost_per_hour
+    
+    prevention_value = recurrence_prevented * incident_cost
+    
+    # MTTR improvement
+    mttr_improvement = postmortem.mttr_improvement_hours * incident.frequency
+    
+    return {
+        'postmortem_cost': postmortem_cost,
+        'prevention_value': prevention_value,
+        'mttr_improvement_value': mttr_improvement,
+        'net_value': prevention_value + mttr_improvement - postmortem_cost
+    }
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Postmortem Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| Blame language | No psychological safety | Use "the system" not "the engineer" |
+| No action items | No improvement | Every postmortem needs concrete actions |
+| Vague actions | Can't verify completion | SMART actions |
+| No follow-up | Actions never get done | Track and verify monthly |
+| Too long | Won't be read | Keep under 5 pages |
+| Missing timeline | Hard to follow | Use table with timestamps |
+
+### Blameless Anti-Patterns
+
+```markdown
+# These phrases indicate blame:
+❌ "Developer forgot to add closing tag"
+❌ "Operations team didn't check the logs"
+❌ "The user made an error"
+❌ "Someone deployed without testing"
+
+# Better framing:
+✅ "The deployment process allowed code without proper resource cleanup"
+✅ "Logs weren't surfaced in the alerting channel"
+✅ "The user interface didn't prevent invalid input"
+✅ "The CI/CD pipeline didn't enforce testing gate"
+```
+
+## Interview Questions
+
+### Q1: What's the difference between a postmortem and a RCA?
+
+**A**: 
+
+**RCA (Root Cause Analysis)** focuses on identifying the root cause — the "why" behind the incident. It's analytical, focused on causation.
+
+**Postmortem** is broader — it covers what happened, how it was detected, how it was responded to, root cause, AND what we learned. It includes process and response evaluation, not just root cause.
+
+Think of RCA as part of postmortem. Postmortem asks:
+1. What happened?
+2. How did we detect it?
+3. How did we respond?
+4. Why did it happen? (RCA)
+5. What will we do differently?
+
+### Q2: How do you write a blameless postmortem?
+
+**A**:
+
+1. **Start with facts** — What actually happened? Use timestamps and data.
+2. **Focus on systems** — "The system allowed X" not "Person Y did X"
+3. **Ask "why" multiple times** — Don't stop at first cause
+4. **Identify contributing factors** — Not just root cause, but conditions
+5. **Be specific about actions** — Not "improve monitoring" but "add alert X"
+6. **Include what went well** — Balance, don't just focus on problems
+7. **Keep it actionable** — Every problem should have an action item
+
+Key phrase: "The system should have prevented X" vs "X should have done Y".
+
+### Q3: How do you ensure action items are completed?
+
+**A**:
+
+1. **One owner per action** — Clear responsibility
+2. **Due dates** — Time-bound, not "eventually"
+3. **Follow-up process** — Monthly review of all open items
+4. **Metrics** — Track action item completion rate
+5. **Escalation** — Uncompleted items escalate to management
+6. **Verification** — Confirm action actually prevents recurrence
+
+```markdown
+Example tracking:
+| Action | Owner | Due | Status | Verified |
+|--------|-------|-----|--------|----------|
+| Add alert | @sre | 2/1 | Done | Verified 2/3 |
+| Update runbook | @backend | 2/5 | In Progress | — |
+```
+
+### Q4: How do you handle a postmortem for a security incident?
+
+**A**:
+
+Security postmortems have additional considerations:
+
+1. **Legal review** — May need legal involvement before writing
+2. **Forensics preservation** — Don't destroy evidence during response
+3. **Customer notification** — If PII was exposed, notification requirements
+4. **Separate from regular postmortems** — Security has different distribution
+5. **Focus on detection** — How did the attacker get in? What signals were missed?
+
+Security postmortem template includes:
+- Attack vector analysis
+- Detection gap analysis  
+- Access control review
+- Logging/auditing gaps
+- Customer notification timeline (if applicable)
+
+### Q5: What makes a postmortem ineffective?
+
+**A**:
+
+1. **Blaming language** — Creates fear, suppresses disclosure
+2. **No action items** — Postmortem without change is just documentation
+3. **Vague actions** — "Improve monitoring" can't be verified
+4. **Missing timeline** — Can't verify or learn without sequence
+5. **Too long** — If it's 50 pages, no one reads it
+6. **No follow-up** — Actions never get done
+
+A good test: Could someone read this postmortem in 10 minutes and know exactly:
+- What happened
+- Why it happened
+- What needs to change
+- Who is responsible for each change
+
+## Cheat Sheet
+
+### Postmortem Template Structure
+
+```markdown
+1. Title & Metadata (1 section)
+   - Date, Severity, Duration, Authors
+
+2. Executive Summary (1 paragraph)
+   - What happened, impact, key learnings
+
+3. Impact (bullet points)
+   - Users affected, revenue, duration, SLA
+
+4. Timeline (table)
+   - Timestamps and events
+
+5. Root Cause Analysis
+   - What happened
+   - Why it happened (5 Whys)
+   - Contributing factors
+
+6. Detection Analysis
+   - How detected
+   - What could detect earlier
+
+7. Response Analysis
+   - What went well
+   - What could improve
+
+8. Action Items (table)
+   - ID, Action, Owner, Due, Status
+
+9. Lessons Learned (bullets)
+   - Key takeaways
+```
+
+### Action Item Quality Checklist
+
+```
+[ ] Specific - Can someone verify completion?
+[ ] Owned - Single person responsible
+[ ] Dated - Has a due date
+[ ] Tracked - In project management system
+[ ] Verified - Completion has been checked
+```
+
+### Blameless Language Guide
+
+```
+❌ "The engineer forgot to..." → ✅ "The system allowed..."
+❌ "They deployed without testing" → ✅ "The process didn't require..."
+❌ "User error" → ✅ "The interface didn't prevent..."
+❌ "Developer mistake" → ✅ "The code path wasn't covered by..."
+```
+
+## Related Topics
+
+- [Incident Management](./incident-management.mdx) — Incident response
+- [Monitoring](./monitoring.mdx) — Detection and alerting
+- [Reliability](./reliability.mdx) — Building reliable systems
+- [Alerting](./alerting.mdx) — Alert-driven detection

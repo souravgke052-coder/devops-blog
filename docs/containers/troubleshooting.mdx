@@ -1,0 +1,805 @@
+---
+title: "Container Troubleshooting"
+description: "Container debugging and troubleshooting - common issues, tools, and techniques"
+sidebar_position: 8
+---
+
+# Container Troubleshooting
+
+## Overview
+
+Container troubleshooting is the systematic process of diagnosing and resolving issues with containers, images, networks, and related infrastructure. This guide covers the tools, techniques, and workflows for identifying and fixing common container problems.
+
+**Troubleshooting Categories:**
+- Container lifecycle issues (start/stop/restart)
+- Application crashes and exit codes
+- Network connectivity problems
+- Storage and volume issues
+- Resource exhaustion (CPU, memory, disk)
+- Image pulling and authentication problems
+- Permission and security errors
+- Performance degradation
+
+## When To Use
+
+- **Application failures** in containerized environments
+- **Deployment issues** in CI/CD pipelines
+- **Debugging production incidents** in Kubernetes or Docker
+- **Performance optimization** investigations
+- **Configuration problems** with networking or storage
+- **Security incident response** involving containers
+
+## When NOT To Use
+
+- **When infrastructure is down** (fix infrastructure first)
+- **Without proper monitoring** (identify symptoms first)
+- **Without logging configured** (set up logging first)
+
+## Core Concepts
+
+### Container Lifecycle States
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Container Lifecycle States                        │
+│                                                                      │
+│    created ──────► running ──────► stopped                          │
+│        │              │               │                              │
+│        │              │               ▼                              │
+│        │              │          restarting                          │
+│        │              │               │                              │
+│        │              ▼               │                              │
+│        │         paused ◄────────────┘                              │
+│        │              │                                              │
+│        │              ▼                                              │
+│        │         (exit code)                                         │
+│        │              │                                              │
+│        └────────► (removed)                                          │
+│                                                                      │
+│  Exit Codes:                                                         │
+│  0     = Success                                                     │
+│  1     = General error                                               │
+│  125   = Docker run error                                            │
+│  126   = Command cannot invoke                                       │
+│  127   = Command not found                                           │
+│  137   = SIGKILL (OOM or manual)                                    │
+│  139   = SIGSEGV (segmentation fault)                               │
+│  143   = SIGTERM (graceful shutdown)                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Troubleshooting Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Troubleshooting Workflow                           │
+│                                                                      │
+│  1. IDENTIFY    ──► Check container status                          │
+│  │                     docker ps -a                                 │
+│  │                     docker inspect                               │
+│  │                                                                  │
+│  2. INVESTIGATE ──► Examine logs and metrics                        │
+│  │                     docker logs                                  │
+│  │                     docker stats                                 │
+│  │                                                                  │
+│  3. DIAGNOSE    ──► Debug inside container                          │
+│  │                     docker exec                                 │
+│  │                     docker diff                                 │
+│  │                                                                  │
+│  4. RESOLVE     ──► Apply fix                                      │
+│  │                     docker run (new), docker update, etc.       │
+│  │                                                                  │
+│  5. VERIFY      ──► Confirm resolution                             │
+│                        docker ps, curl, healthcheck                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Scenario: API Service Pod Restart Loop
+
+**Step 1: Identify the issue**
+
+```bash
+# Check pod status
+kubectl get pods -n production | grep api
+
+# Output shows RESTARTS count increasing
+# NAME    READY   STATUS             RESTARTS   AGE
+# api-0   0/1     CrashLoopBackOff   5          10m
+
+# Get detailed pod info
+kubectl describe pod api-0 -n production
+
+# Look at Events section for error messages
+# Last State: Terminated, Reason: OOMKilled
+```
+
+**Step 2: Investigate the logs**
+
+```bash
+# Get previous container logs (before crash)
+kubectl logs api-0 -n production --previous
+
+# Output shows:
+# FATAL: Exception: OutOfMemoryError: Java heap space
+# at com.myapp.Cache.<init>(Cache.java:45)
+
+# Check current resource usage
+kubectl top pod api-0 -n production
+
+# Output:
+# NAME    CPU(cores)   MEMORY(bytes)
+# api-0   850m        892Mi
+```
+
+**Step 3: Diagnose the root cause**
+
+```bash
+# Check pod spec for memory limits
+kubectl get pod api-0 -n production -o jsonpath='{.spec.containers[0].resources}'
+
+# Output shows limit of 512Mi, but app uses ~900Mi
+
+# Check application config
+kubectl exec api-0 -n production -- cat /app/config.yaml | grep heap
+
+# Heap size configured as -Xmx512m which matches limit
+```
+
+**Step 4: Apply the fix**
+
+```yaml
+# Update the Deployment with increased memory
+# api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: production
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            limits:
+              memory: 2Gi
+            requests:
+              memory: 1Gi
+          env:
+            - name: JAVA_OPTS
+              value: "-Xmx1g -Xms512m"
+```
+
+```bash
+# Apply the fix
+kubectl apply -f api-deployment.yaml
+
+# Verify pod is running
+kubectl get pods -n production | grep api
+
+# Output:
+# NAME    READY   STATUS    RESTARTS   AGE
+# api-0   1/1     Running   0          2m
+```
+
+### Scenario: Database Connection Failures
+
+**Debugging steps:**
+
+```bash
+# 1. Check database pod status
+kubectl get pods -n database | grep postgres
+# postgres-0   1/1     Running   0          1h
+
+# 2. Check application pod logs
+kubectl logs api-0 -n production | grep -i "connection\|database\|postgres"
+
+# Output:
+# ERROR: connection refused: postgres:5432
+# Caused by: java.net.ConnectException: Connection refused
+
+# 3. Check if database is accepting connections
+kubectl exec -it postgres-0 -n database -- psql -U postgres -c "SELECT 1"
+
+# 4. Check network policies
+kubectl get networkpolicy -n production
+kubectl describe networkpolicy allow-postgres -n production
+
+# 5. Verify DNS resolution
+kubectl exec api-0 -n production -- nslookup postgres
+kubectl exec api-0 -n production -- nc -zv postgres 5432
+
+# 6. Check service endpoints
+kubectl get endpoints postgres -n database
+
+# All looks correct, check pg_hba.conf
+kubectl exec -it postgres-0 -n database -- cat /var/lib/postgresql/data/pg_hba.conf
+
+# Found: host all all 0.0.0.0/0 reject
+# Fix: Update pg_hba.conf to allow from application network
+```
+
+## CLI Examples
+
+### Basic Container Inspection
+
+```bash
+# List all containers (running and stopped)
+docker ps -a
+docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+# Inspect container details
+docker inspect mycontainer
+docker inspect --format='{{.State.Status}}' mycontainer
+docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mycontainer
+docker inspect --format='{{.Config.Env}}' mycontainer
+
+# Show container processes
+docker top mycontainer
+
+# View filesystem changes
+docker diff mycontainer
+# A = Added, C = Changed, D = Deleted
+
+# View resource usage
+docker stats --no-stream mycontainer
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}"
+```
+
+### Log Analysis
+
+```bash
+# View container logs
+docker logs mycontainer
+docker logs --tail 100 mycontainer
+docker logs --since 1h mycontainer
+docker logs --since 2024-01-15T10:00:00 mycontainer
+docker logs --timestamps mycontainer
+
+# Follow logs in real-time
+docker logs -f mycontainer
+
+# Search logs for errors
+docker logs mycontainer 2>&1 | grep -i error
+docker logs mycontainer --since 1h | grep -E "(ERROR|FATAL|Exception)"
+
+# JSON logging driver logs
+docker logs mycontainer | jq '.log'
+
+# Show logs with specific format
+docker logs --format '{{.ID}} - {{.Names}} - {{.CreatedAt}} - {{.Status}}' mycontainer
+```
+
+### Executing Debug Commands
+
+```bash
+# Enter container shell
+docker exec -it mycontainer sh
+docker exec -it mycontainer bash
+
+# Execute single command
+docker exec mycontainer ls -la /app
+docker exec mycontainer cat /etc/resolv.conf
+docker exec mycontainer ps aux
+
+# Execute as root
+docker exec -u root mycontainer sh
+
+# Execute with environment
+docker exec -e DEBUG=1 mycontainer env
+
+# Copy files from container
+docker cp mycontainer:/app/logs /tmp/logs
+docker cp mycontainer:/app/config.yaml .
+
+# Copy files to container
+docker cp ./config.yaml mycontainer:/app/config.yaml
+```
+
+### Network Debugging
+
+```bash
+# List networks
+docker network ls
+docker network inspect bridge
+
+# Inspect container network
+docker inspect --format='{{json .NetworkSettings}}' mycontainer | jq
+
+# Test network connectivity
+docker exec mycontainer ping -c 3 google.com
+docker exec mycontainer curl -v localhost:8080/health
+docker exec mycontainer nc -zv db 5432
+
+# Check DNS resolution
+docker exec mycontainer nslookup google.com
+docker exec mycontainer getent hosts db
+
+# Show routing table
+docker exec mycontainer route -n
+
+# Check listening ports
+docker exec mycontainer netstat -tlnp
+docker exec mycontainer ss -tlnp
+
+# Capture network traffic
+docker exec mycontainer tcpdump -i eth0 -w /tmp/capture.pcap
+docker cp mycontainer:/tmp/capture.pcap .
+```
+
+### Volume and Storage Debugging
+
+```bash
+# List volumes
+docker volume ls
+docker volume inspect myvolume
+
+# Check volume mounts in container
+docker inspect --format='{{json .Mounts}}' mycontainer | jq
+
+# Check disk usage inside container
+docker exec mycontainer df -h
+docker exec mycontainer du -sh /app
+
+# Check inode usage
+docker exec mycontainer df -i
+
+# Check for disk full conditions
+docker exec mycontainer bash -c "df -h; echo '---'; docker system df"
+```
+
+### System Resource Debugging
+
+```bash
+# View container resource limits
+docker inspect --format='{{json .HostConfig.Memory}}' mycontainer
+docker inspect --format='{{json .HostConfig.CpuShares}}' mycontainer
+
+# Check cgroup limits
+docker exec mycontainer cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+docker exec mycontainer cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+
+# Check for OOM killer
+dmesg | grep -i "killed process"
+docker exec mycontainer dmesg | grep -i oom
+
+# Check process limits
+docker exec mycontainer cat /proc/self/limits
+
+# View kernel messages
+docker exec mycontainer dmesg
+```
+
+## Dockerfile / Compose Examples
+
+### Debug Container Definition
+
+```yaml
+# docker-compose.debug.yml
+
+version: "3.9"
+
+services:
+  app:
+    image: myapp:debug
+    build:
+      context: .
+      target: debug  # Multi-stage debug build
+    ports:
+      - "8080:8080"  # Debug port
+      - "9090:9090"  # Metrics
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+    volumes:
+      - ./src:/app/src:ro  # Source code mount
+      - app-cache:/root/.cache
+    command: ["npm", "run", "dev:debug"]
+    privileged: true  # Debug capabilities
+
+  # Debug utilities
+  debug-tools:
+    image: curlimages/curl:latest
+    network_mode: "service:app"
+    profiles:
+      - debug
+```
+
+### Health Check Debugging
+
+```yaml
+# Add detailed health checks for debugging
+services:
+  app:
+    image: myapp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Additional debugging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+```
+
+## Common Commands
+
+### Docker Troubleshooting Commands
+
+| Command | Purpose |
+|---------|---------|
+| `docker ps -a` | List all containers |
+| `docker logs` | View container logs |
+| `docker inspect` | Detailed container info |
+| `docker exec` | Execute commands |
+| `docker stats` | Resource usage |
+| `docker network inspect` | Network details |
+| `docker volume inspect` | Volume details |
+| `docker diff` | Filesystem changes |
+| `docker top` | Running processes |
+| `docker cp` | Copy files |
+| `docker system df` | Disk usage |
+| `docker system events` | Real-time events |
+
+### Kubernetes Troubleshooting Commands
+
+| Command | Purpose |
+|---------|---------|
+| `kubectl get pods` | List pods |
+| `kubectl describe pod` | Pod details |
+| `kubectl logs` | Container logs |
+| `kubectl exec` | Execute commands |
+| `kubectl port-forward` | Local port forward |
+| `kubectl top pod` | Resource usage |
+| `kubectl get events` | Cluster events |
+| `kubectl get all` | All resources |
+| `kubectl auth can-i` | RBAC check |
+
+## Monitoring
+
+### Real-time Monitoring
+
+```bash
+# Docker stats streaming
+docker stats
+
+# With format
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}"
+
+# Resource limits comparison
+docker stats --no-stream --format "{{.Name}}: CPU={{.CPUPerc}}, MEM={{.MemUsage}}/{{.MemLimit}}"
+
+# Container events
+docker events --since '10m'
+
+# Kubernetes metrics
+kubectl top nodes
+kubectl top pods -n production
+```
+
+### Log Aggregation
+
+```bash
+# Docker logs with structured output
+docker logs --format '{{json .}}' mycontainer | jq
+
+# Kubernetes logs aggregation
+kubectl logs -n production -l app=api --tail=100 --all-containers
+
+# Follow logs across pods
+kubectl logs -n production -l app=api -f --max-log-requests=5
+
+# Elasticsearch/Elasticsearch query example
+# Query: container.name:"myapp" AND log.level:"ERROR"
+```
+
+## Security
+
+### Secure Debugging Practices
+
+```bash
+# Never expose debug ports in production
+# Use temporary debug containers
+kubectl debug -it api-0 -n production --image=curlimages/curl -- /bin/sh
+
+# Use ephemeral debug container
+kubectl debug api-0 -n production --share-processes --copy-to=api-debug
+
+# Clean up after debugging
+kubectl delete debug api-debug
+
+# Audit debug access
+# Check who accessed what and when
+kubectl get events --field-selector reason=Exec --all-namespaces
+```
+
+### Security Considerations
+
+```bash
+# Don't run privileged containers in production
+# Check: docker inspect --format='{{.HostConfig.Privileged}}' mycontainer
+
+# Check capabilities
+docker inspect --format='{{.HostConfig.CapAdd}}' mycontainer
+docker inspect --format='{{.HostConfig.CapDrop}}' mycontainer
+
+# Check security options
+docker inspect --format='{{.HostConfig.SecurityOpt}}' mycontainer
+
+# Verify seccomp profile
+docker inspect --format='{{.HostConfig.SecurityOpt}}' mycontainer
+cat /proc/self/status | grep Seccomp
+```
+
+## Cost Optimization
+
+### Resource Leak Detection
+
+```bash
+# Check for memory leaks
+docker stats --no-stream --format "{{.Name}}: {{.MemUsage}} ({{.MemPerc}})"
+
+# Run multiple times to detect growth
+watch -n 5 'docker stats --no-stream | grep myapp'
+
+# Check disk usage growth
+docker exec mycontainer du -sh /app
+docker exec mycontainer du -sh /var/log
+
+# Identify large files
+docker exec mycontainer find / -type f -size +100M 2>/dev/null
+```
+
+## Troubleshooting
+
+### Container Won't Start
+
+| Cause | Diagnosis | Solution |
+|-------|-----------|----------|
+| Image not found | `docker images` | Pull or build image |
+| Port conflict | `docker logs` | Change port mapping |
+| Environment missing | `docker inspect` | Set required ENV |
+| Volume mount error | `docker logs` | Check host path exists |
+| Permission denied | `docker logs` | Fix file permissions |
+| OOM limit | `docker stats` | Increase memory limit |
+| Invalid CMD | `docker logs` | Fix Dockerfile CMD |
+
+### Application Crashes
+
+```bash
+# Check exit code
+docker wait mycontainer
+# or
+docker inspect --format='{{.State.ExitCode}}' mycontainer
+
+# Common exit codes:
+# 137 = SIGKILL (OOM or docker kill)
+# 139 = SIGSEGV (crash)
+# 143 = SIGTERM (graceful stop)
+
+# Get crash logs
+docker logs mycontainer --stderr
+docker logs mycontainer --tail 50
+
+# Core dump analysis
+docker exec mycontainer cat /proc/sys/kernel/core_pattern
+```
+
+### Network Connectivity Issues
+
+```bash
+# Basic connectivity
+docker exec mycontainer ping -c 3 8.8.8.8
+docker exec mycontainer ping -c 3 google.com
+
+# DNS resolution
+docker exec mycontainer nslookup google.com
+docker exec mycontainer cat /etc/resolv.conf
+
+# Port connectivity
+docker exec mycontainer nc -zv db 5432
+docker exec mycontainer telnet db 5432
+
+# HTTP endpoint
+docker exec mycontainer curl -v http://localhost:8080/health
+
+# Check network configuration
+docker network inspect myapp_default
+docker inspect mycontainer | jq '.NetworkSettings.Networks'
+
+# Test from host
+curl -v http://localhost:8080/health
+```
+
+### Volume/Persistence Issues
+
+```bash
+# Check volume exists
+docker volume ls
+docker volume inspect myvolume
+
+# Check mount point
+docker inspect --format='{{json .Mounts}}' mycontainer | jq
+
+# Test volume read/write
+docker exec mycontainer touch /data/test
+docker exec mycontainer rm /data/test
+
+# Check disk space
+docker system df
+docker system df -v
+
+# Check filesystem
+docker exec mycontainer df -h
+docker exec mycontainer mount | grep data
+
+# Fix permission issues
+docker exec mycontainer chown -R appuser:appgroup /data
+```
+
+### Resource Exhaustion
+
+```bash
+# Memory exhaustion
+docker stats --no-stream | grep mycontainer
+docker exec mycontainer free -h
+docker exec mycontainer dmesg | grep -i "oom"
+
+# CPU exhaustion
+docker stats --no-stream | grep mycontainer
+docker exec mycontainer top
+docker exec mycontainer ps aux
+
+# Disk exhaustion
+docker system df
+docker exec mycontainer df -h
+
+# Process limit
+docker exec mycontainer ps aux | wc -l
+docker exec mycontainer cat /proc/sys/kernel/pid_max
+```
+
+### Image Pull Failures
+
+```bash
+# Authentication required
+docker login myregistry.com
+gcloud auth configure-docker us-docker.pkg.dev
+aws ecr get-login-password | docker login --username AWS --password-stdin $REGISTRY
+
+# Network issues
+docker pull --dns 8.8.8.8 myimage
+
+# Rate limiting (Docker Hub)
+docker login  # Authenticated has higher limits
+
+# Wrong image name
+docker images | grep myimage
+docker manifest inspect myimage
+
+# Check registry reachability
+curl -I https://myregistry.com/v2/
+
+# Retry with verbose
+docker pull -v myimage
+```
+
+### Health Check Failures
+
+```bash
+# Check health status
+docker inspect --format='{{.State.Health}}' mycontainer
+
+# Test health command manually
+docker exec mycontainer curl -f http://localhost:8080/health
+
+# Check health check logs
+docker inspect --format='{{json .State.Health}}' mycontainer | jq
+
+# Verbose logging
+docker events --filter 'event=health_status:healthy'
+```
+
+## Interview Questions
+
+### Q1: How do you debug a container that exits immediately?
+**A:** Check the exit code with `docker ps -a` and `docker inspect`. Look at logs with `docker logs`. Common causes: invalid CMD/ENTRYPOINT, missing dependencies, application errors. Try running interactively with `docker run -it` to see the error output directly.
+
+### Q2: What is CrashLoopBackOff and how do you fix it?
+**A:** Kubernetes CrashLoopBackOff means the container keeps crashing and Kubernetes retries with increasing delays. Fix by: checking logs (`kubectl logs --previous`), verifying resource limits aren't too low, checking the application can start with required config, fixing any missing dependencies or secrets.
+
+### Q3: How do you debug network issues between containers?
+**A:** Check container is on the same network with `docker network inspect`. Test DNS resolution with `docker exec mycontainer nslookup servicename`. Test connectivity with ping/curl/nc. Check firewall rules and network policies (Kubernetes). Verify service is actually listening on expected port.
+
+### Q4: How do you handle OOM (Out of Memory) issues?
+**A:** Increase container memory limit. Optimize application memory usage. Profile the application to find leaks. Check JVM heap settings for Java apps. Review actual memory usage with `docker stats` and `docker exec free -h`. Set appropriate memory reservations.
+
+### Q5: What tools do you use for container debugging?
+**A:** `docker exec` for shell access, `docker logs` for application logs, `docker stats` for metrics, `docker inspect` for configuration, `docker network` for networking, `docker cp` for file access. In Kubernetes: `kubectl logs`, `kubectl exec`, `kubectl describe`, `kubectl debug`.
+
+### Q6: How do you debug a container that can't pull images?
+**A:** Verify authentication with `docker login` or cloud SDK. Check network connectivity to registry. Verify image name and tag exist. Check rate limits. Use `docker pull -v` for verbose output. Verify TLS certificates. Try pulling a public image to isolate the issue.
+
+### Q7: What's the difference between docker logs and docker events?
+**A:** `docker logs` shows application output (stdout/stderr). `docker events` shows Docker daemon events (container start/stop, image pull, etc.). Both are useful: logs for app debugging, events for infrastructure debugging.
+
+### Q8: How do you debug permission issues in containers?
+**A:** Check user with `docker exec whoami`. Verify volume ownership with `docker exec ls -la`. Use `docker exec chown` to fix. Set USER in Dockerfile. Use `docker run --user` flag. Check SELinux/AppArmor labels. Use `--privileged` for testing (not production).
+
+### Q9: What is the debugging workflow in Kubernetes?
+**A:** 1) `kubectl get pods` to see status. 2) `kubectl describe pod` for events. 3) `kubectl logs` for application logs. 4) `kubectl exec` for debugging commands. 5) `kubectl port-forward` for service testing. 6) `kubectl debug` for ephemeral debugging. 7) `kubectl top` for resource analysis.
+
+### Q10: How do you investigate slow container performance?
+**A:** Check resource limits vs usage with `docker stats`. Look for CPU throttling with `docker exec cat /sys/fs/cgroup/cpu/cpu.stat`. Check I/O with `docker exec iostat`. Profile the application. Look for network latency. Check for disk full conditions. Review application logs for slow queries/operations.
+
+## Cheat Sheet
+
+### Debug Commands
+
+```bash
+# Quick diagnostics
+docker ps -a | grep myapp
+docker logs --tail 50 myapp
+docker stats --no-stream myapp
+docker inspect myapp
+
+# Deep dive
+docker exec -it myapp sh
+docker exec myapp ps aux
+docker exec myapp netstat -tlnp
+
+# Network
+docker network inspect myapp_default
+docker exec myapp nslookup db
+
+# Filesystem
+docker diff myapp
+docker exec myapp du -sh /app
+```
+
+### Kubernetes Debug
+
+```bash
+# Pod status
+kubectl get pods -n production
+kubectl describe pod myapp -n production
+
+# Logs
+kubectl logs myapp -n production
+kubectl logs --previous myapp -n production
+
+# Debug
+kubectl exec -it myapp -n production -- sh
+kubectl port-forward myapp 8080:8080 -n production
+kubectl debug myapp -n production --image=busybox
+
+# Resources
+kubectl top pod myapp -n production
+kubectl get events -n production
+```
+
+### Common Fixes
+
+| Issue | Command |
+|-------|---------|
+| Restart container | `docker restart myapp` |
+| Rebuild image | `docker build --no-cache -t myapp .` |
+| Clear cache | `docker system prune -a` |
+| Reset network | `docker network rm && docker network create` |
+| Increase memory | `docker update -m 2g myapp` |
+
+## Related Topics
+
+- [Container Overview](./overview.mdx) - Container fundamentals
+- [Docker](./docker.mdx) - Docker CLI reference
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Docker Compose](./docker-compose.mdx) - Multi-container applications
+- [Container Runtime](./container-runtime.mdx) - Runtime internals
+- [Image Security](./image-security.mdx) - Vulnerability scanning
+- [Registry](./registry.mdx) - Image registries

@@ -1,0 +1,442 @@
+---
+sidebar_position: 18
+description: Linux performance analysis and tuning — CPU, memory, I/O, network, and tooling for production infrastructure.
+---
+
+# Linux Performance
+
+## Overview
+
+Linux performance engineering is the art of finding and eliminating bottlenecks in production systems. Whether you are debugging a sluggish web server, sizing a new database host, or tuning a high-frequency trading system, the approach is the same: measure first, hypothesize, measure again, then fix.
+
+The USE method (Utilization, Saturation, Errors) provides a systematic framework. For every resource (CPU, memory, disk, network), check: is it being heavily used (high utilization)? Is there a queue of work waiting for it (saturation)? Are there errors? This prevents common mistakes like tuning the wrong resource.
+
+Performance investigation requires understanding both the tools available and what they actually measure. A number like "load average: 4" means nothing without knowing how many CPU cores you have and whether the system is I/O-bound or CPU-bound.
+
+## When To Use
+
+- Investigating slow application response times
+- Capacity planning for new infrastructure
+- Post-incident performance reviews
+- Kernel tuning for specific workloads (database, network, containers)
+- Benchmarking and regression testing
+
+## When NOT To Use
+
+- Premature optimization without measurement
+- Tuning one resource that starves another (e.g., more cache = less memory for processes)
+- Making changes without baseline measurements
+- Trusting intuition over data (the system always tells the truth)
+
+## Core Concepts
+
+### The USE Method
+
+For every resource, check:
+
+| Resource | Utilization | Saturation | Errors |
+|----------|------------|------------|--------|
+| CPU | %usr + %sys time | Run queue length, load average | Soft/hard lockups |
+| Memory | % used | Swap in/out, OOM events | ENOMEM errors |
+| Disk | %util | I/O queue depth, await time | Errors, retries |
+| Network | Throughput vs capacity | Retransmits, dropped packets | Interface errors |
+
+### Load Average Deep Dive
+
+Load average is the average number of processes in the runnable or uninterruptible state over a period. "Runnable" = ready to use CPU. "Uninterruptible" = waiting for I/O (typically disk, but also network filesystem).
+
+```
+# uptime output
+# 10:30:15 up 5 days, 2 users, load average: 4.52, 3.81, 2.90
+#                                                1min   5min  15min
+```
+
+- On 8-core system, load average of 4 means 50% CPU utilization (if all CPU-bound)
+- If load average > number of cores AND CPUs are NOT fully utilized, the system is I/O-bound or waiting on something
+- A load average of 16 on a 4-core system is severe saturation
+
+```bash
+# Interpret load average
+cores=$(nproc)
+load=$(awk '{print $1}' /proc/loadavg)
+echo "Cores: $cores, Load: $load"
+bc -l <<< "$load / $cores"  # Utilization as fraction
+```
+
+### CPU Metrics
+
+Linux CPU time breakdown (from `top`/`vmstat`/`sar`):
+- **us (user)**: Time in user-space code
+- **sy (system)**: Time in kernel
+- **ni (nice)**: Time running niced user processes
+- **id (idle)**: Idle time
+- **wa (iowait)**: Time waiting for I/O (NOT the same as idle!)
+- **hi (hardware interrupt)**: Hardware IRQ time
+- **si (softirq)**: Software interrupt time
+- **st (steal)**: (Virtual machines only) Time stolen by hypervisor
+
+**Load average vs CPU utilization**: Load average includes processes waiting for CPU AND processes waiting for I/O. A system can have 0% CPU utilization but high load average if everything is waiting for disk.
+
+### Memory Metrics
+
+Key metrics from `/proc/meminfo`:
+- **MemTotal**: Total usable RAM
+- **MemFree**: Completely unused
+- **MemAvailable**: Actually available (includes page cache) — this is what `free` reports as available
+- **Buffers**: Block device buffers (raw disk)
+- **Cached / SwapCached**: Page cache / swapped-out pages still in swap
+- **AnonHugepages**: Transparent HugePages
+- **Shmem**: Shared memory (tmpfs, shared memory segments)
+- **SReclaimable**: Reclaimable slab (can be reclaimed under pressure)
+- **SwapTotal / SwapFree**: Swap space
+
+**Understanding memory pressure:**
+```bash
+# What free shows (important to understand):
+#              total        used        free      shared  buff/cache   available
+# Mem:       32768000    24567800     1234000      124000     6966200     7000000
+# Swap:       2048000      500000     1548000
+
+# available = free + buff/cache - (not really reclaimable)
+# This is the memory available for new processes without swapping
+
+# Calculate memory pressure
+awk '/MemAvailable/ {avail=$2} /MemTotal/ {total=$2} END {printf "%.1f%% used (excluding available)\n", (total-avail)/total*100}' /proc/meminfo
+
+# Check for swap activity
+vmstat 1
+# si: swap in (KB/s from disk to RAM)
+# so: swap out (KB/s from RAM to disk)
+# If these are non-zero continuously, you need more RAM
+```
+
+### I/O Metrics
+
+Block layer metrics (from `iostat`):
+- **tps**: Transactions per second (I/O operations)
+- **kB_read/s, kB_wrtn/s**: Throughput
+- **r/s, w/s**: IOPS (operations per second)
+- **await**: Average time (ms) from request to completion (includes queue time)
+- **%util**: Device utilization — 100% means device is saturated
+
+```bash
+# NVMe vs SATA SSD vs HDD expectations:
+# HDD: 100-200 IOPS, await 5-10ms
+# SATA SSD: 50k-100k IOPS, await 0.1-0.5ms
+# NVMe: 100k-1M+ IOPS, await 0.02-0.1ms
+
+# If %util ~ 100% on an NVMe, the device is the bottleneck
+# If %util ~ 100% on a HDD, it's expected and still the bottleneck
+# If %util < 30% but await is high, something upstream is queuing
+```
+
+### I/O Schedulers
+
+```
+# List available schedulers
+cat /sys/block/sda/queue/scheduler
+# [mq-deadline] none
+
+# Set scheduler (requires kernel parameter or echo before boot for some)
+echo mq-deadline > /sys/block/sda/queue/scheduler
+
+# Schedulers:
+# mq-deadline: good for most workloads (default in RHEL 8+, Ubuntu 22.04+)
+# bfq: better for interactive/desktop, worse for sustained throughput
+# none: completely fair queuing (CFQ removed), let application manage
+# For NVMe: scheduler has minimal impact, often set to none
+# For SSDs: mq-deadline or none
+# For HDDs: mq-deadline or bfq
+```
+
+### CPU Cgroups v2
+
+```bash
+# Limit CPU usage of a process group
+# /sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/cpu.max
+# 100000 1000000  = 10% of one CPU
+
+# cpu.max = quota period
+# quota: time allowed in each period
+# period: time window (default 100ms = 100000µs)
+
+# Allow process to use max 2 full cores:
+# quota = 200000 (2 × 100000)
+# cpu.max = 200000 100000
+
+# cpu.weight (cgroup v2) vs cpu.shares (cgroup v1):
+# cgroup v2: weight 1-10000 (default 100)
+# cgroup v1: shares 2-262144 (default 1024)
+# Higher weight = more CPU time
+```
+
+## Real Production Example
+
+Investigating and resolving high load on a production web server:
+
+```bash
+# === STEP 1: ESTABLISH BASELINE ===
+# Check load and CPU
+uptime                    # Load average: 12.45, 10.23, 8.91 on 8 cores = very high
+vmstat 1 5                # us:8 sy:2 wa:45 = 45% of time waiting for I/O!
+mpstat -P ALL 1 3         # All cores similarly loaded
+
+# === STEP 2: IDENTIFY I/O TYPE ===
+iostat -xz 1 5
+# Device  r/s   w/s   rkB/s   wkB/s  await  %util
+# sda    12.45 450.23  512   18400   45.23  98.5
+# %util near 100% confirms disk saturation
+
+# Check what type of I/O
+iotop -ao 2>/dev/null | head -30
+# Most I/O from mysqld (writes), and some from kjournald
+
+# Check swap activity
+swapon -s
+free -h
+vmstat 1 | grep -E 'si|so'
+# si/so consistently non-zero = memory pressure forcing swap
+
+# === STEP 3: DEEPER INVESTIGATION ===
+# Why is there memory pressure?
+# Check what is consuming memory
+ps aux --sort=-%mem | head -10
+# Multiple Python worker processes eating RAM
+
+# Check for memory leaks (growing RSS over time)
+for pid in $(pgrep -f worker); do
+    cmd=$(ps -o cmd= -p $pid)
+    rss=$(ps -o rss= -p $pid)
+    echo "PID $pid ($cmd): RSS=${rss}KB"
+done
+
+# Check slab cache (kernel objects)
+cat /proc/meminfo | grep -E 'SReclaimable|SUnreclaim|Slab'
+# Could be dentry/inode cache from excessive file operations
+
+# === STEP 4: TEMPORARY MITIGATION ===
+# Increase swappiness slightly (was 60, too aggressive)
+sysctl -w vm.swappiness=10
+
+# Flush page cache (temporary relief)
+sync; echo 3 > /proc/sys/vm/drop_caches
+
+# Throttle the workers
+systemctl set-property worker.slice CPUQuota=50%
+# Or: cgroup v2:
+# echo '200000 100000' > /sys/fs/cgroup/worker.slice/cpu.max
+
+# === STEP 5: PERMANENT FIX ===
+# 1. Add more RAM (16GB → 32GB)
+# 2. Optimize application: connection pooling, memory limits
+# 3. Use faster storage for DB write-ahead log (write coalescing)
+# 4. Move page cache to faster storage (tmpfs for /var/lib/postgresql)
+# 5. Tune sysctl:
+cat >> /etc/sysctl.d/99-tuning.conf <<'EOF'
+# Reduce disk writeback frequency (reduce I/O)
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+vm.dirty_writeback_centisecs = 500
+
+# Memory
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+
+# Network buffer for app
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+EOF
+sysctl -p /etc/sysctl.d/99-tuning.conf
+
+# === STEP 6: VERIFY ===
+vmstat 1 5
+# Now: wa should be much lower (< 5%)
+# Load average should drop over time
+```
+
+## CLI Examples
+
+```bash
+# CPU
+top                        # Live CPU/process view
+htop                       # Better top with tree view
+mpstat -P ALL 1 5          # Per-core CPU breakdown
+pidstat -p <PID> 1 5       # Per-process CPU
+perf top                   # Live CPU profiler (requires perf installed)
+perf record -F 99 -a -g -- sleep 30 && perf report
+
+# Memory
+free -h                    # Human-readable summary
+cat /proc/meminfo          # Full details
+smem -s rss -r | head -20  # Memory by process
+ps aux --sort=-%mem | head
+# Check for OOM events
+dmesg | grep -i "out of memory"
+journalctl -k | grep -i oom
+
+# I/O
+iostat -xz 1               # Per-device I/O
+iotop -ao                  # Per-process I/O
+blktrace -d /dev/sda -o - | blkparse -i -
+# Latency distribution:
+cat /sys/block/sda/stat    # sector ops, time spent
+
+# Network
+ss -tunapl                 # TCP/UDP connections with states
+ip -s link show dev eth0   # Interface stats
+ifstat 1                   # Bandwidth per interface
+nethogs                    # Per-process network usage
+
+# System-wide
+vmstat 1                   # CPU, memory, I/O summary
+sar -u 1 5                 # Historical CPU (if sysstat installed)
+sar -B 1 5                 # Paging statistics
+sar -W 1 5                 # Swap statistics
+sar -n DEV 1 5             # Network interface stats
+```
+
+## Common Commands
+
+| Tool | What It Measures |
+|------|-----------------|
+| `top/htop` | Live process and CPU overview |
+| `vmstat` | CPU, memory, I/O summary |
+| `iostat` | Disk I/O utilization |
+| `mpstat` | Per-core CPU breakdown |
+| `pidstat` | Per-process CPU, I/O, memory |
+| `free` | Memory summary |
+| `ss` / `netstat` | Network connections |
+| `perf` | CPU profiling, hardware events |
+| `bpftrace` | Dynamic kernel tracing |
+| `strace` | System call tracing |
+| `iotop` | Per-process I/O |
+| `smem` | Memory reporting with charts |
+
+## Monitoring
+
+```bash
+# Prometheus node_exporter metrics to focus on:
+# node_cpu_seconds_total{cpu="0",mode="idle"}  — CPU utilization
+# node_memory_MemAvailable_bytes  — available memory
+# node_memory_SwapFree_bytes      — swap free space
+# rate(node_cpu_seconds_total[5m]) by (mode) — CPU rate
+# node_disk_io_time_seconds_total — disk utilization
+
+# Key alerts:
+# - alert: HighLoadAverage
+#   expr: node_load1 / count(node_cpu_seconds_total{mode="idle"}) > 0.8
+#   for: 5m
+#   labels:
+#     severity: warning
+#   annotations:
+#     summary: "Load average is high"
+
+# - alert: HighMemoryPressure
+#   expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.9
+#   for: 5m
+#   labels:
+#     severity: critical
+
+# - alert: HighIOUtilization
+#   expr: rate(node_disk_io_time_seconds_total[5m]) > 0.7
+#   for: 5m
+#   labels:
+#     severity: warning
+```
+
+## Security
+
+**Performance monitoring can reveal sensitive data:**
+- `strace` can capture API keys and passwords in syscalls
+- `/proc/PID/mem` access requires same UID or CAP_SYS_PTRACE
+- `perf_event_open` restricted by kernel.perf_event_open sysctl
+
+```bash
+# Restrict perf (disable if not needed)
+sysctl kernel.perf_event_open=2  # 2=closed, 0=classic, 1=restricted
+
+# Restrict kernel pointers in logs
+sysctl kernel.kptr_restrict=2    # 2=always, 1=non-root, 0=disabled
+```
+
+## Troubleshooting
+
+**High load average, low CPU utilization:**
+The system is waiting on something — disk, network, or remote filesystem. Use `vmstat 1` to check `wa` (iowait). If high, it's disk. If low, check network. `dmesg | tail` for hardware errors.
+
+**High CPU but load is low:**
+Single-threaded application hitting a single core ceiling. Find the process: `top`, then `taskset -c 0-7 <pid>` to see which cores it uses. Consider CPU affinity pinning or horizontal scaling.
+
+**Memory constantly swapping despite having free space:**
+The "available" figure is misleading if there is heavy page cache usage. `free -m` shows buff/cache. Linux will use all "free" memory for page cache. If applications later need that memory, it is reclaimed from cache — but if reclaim can't keep up, swap kicks in. Check `si/so` in `vmstat`. Solutions: reduce swappiness, add RAM, limit process memory with cgroups.
+
+**I/O latency high but device utilization is low:**
+The bottleneck is before the device — likely the storage controller, RAID card cache, or network filesystem. Check: `/sys/block/*/stat` for queue depth, RAID card BBU write-back cache status, network filesystem mount options.
+
+## Interview Questions
+
+1. **You see a load average of 16 on an 8-core system. CPU utilization is 20%. What does this mean and how do you investigate?**
+
+Load average of 16 means 16 processes are either runnable (want CPU) or in uninterruptible state (waiting for I/O). 20% CPU utilization on 8 cores means only ~1.6 cores are in use. The gap (high load, low CPU) means most of the load is from I/O wait or other blocking. Investigation: `vmstat 1` to check `wa` column. If `wa` is high (e.g., 60+), it's disk I/O. If `wa` is low, it's network or other blocking. Follow with `iostat` for disk details, `iotop` to find the process, `dmesg` for errors.
+
+2. **What is the difference between %util from iostat and the I/O queue depth?**
+
+%util is the percentage of time the device was busy (handling requests). A device at 100% util is saturated. Queue depth is the number of I/O requests waiting to be served at any moment. High queue depth with low utilization means the application is submitting many requests but the device isn't keeping up. High utilization with low queue depth means the device is fast but consistently busy. For SSDs/NVMe, 100% utilization with queue depth of 1 is normal; for HDDs, you want higher queue depths to hide latency.
+
+3. **How does the kernel OOM killer decide which process to kill?**
+
+The kernel calculates an oom_score for each process based on: memory usage (RSS, not virtual), CPU usage, runtime, oom_score_adj (-1000 to +1000, allows manual adjustment), and whether the process is root-owned. The formula is complex and varies by kernel version, but generally: processes using more memory, running longer (accumulated badness), and not specially protected are killed first. You can tune with `/proc/PID/oom_score_adj` — lower values make a process less likely to be killed.
+
+4. **What is Transparent HugePages (THP) and why does disabling it sometimes improve performance?**
+
+THP automatically manages huge pages (2MB instead of 4KB) for anonymous memory (heap, stack) to reduce TLB pressure and improve memory access efficiency. Problems: (1) Khugepaged scans for pages to collapse, causing CPU spikes. (2) Memory fragmentation from THP can cause unexpected latencies. (3) Some databases (MySQL) recommend disabling THP because they manage their own huge pages. For database workloads with large contiguous memory regions, explicit `hugepagesz=2M hugepages=<N>` in kernel cmdline with `transparent_hugepage=never` is often better.
+
+5. **How does cgroup v2 CPU controller work, and what is the difference between cpu.max and cpu.weight?**
+
+cgroup v2 uses a weighted shares model. `cpu.max = quota period` assigns a maximum CPU time budget per period — if a cgroup uses its quota within the period, it is throttled until the next period. `cpu.weight = N` assigns relative weight — higher weight means proportionally more CPU when there is contention. cpu.max is for hard limits (you will NOT exceed), cpu.weight is for soft limits (you get more if available). For latency-sensitive workloads, cpu.max is appropriate. For batch workloads sharing resources, cpu.weight is better.
+
+## Cheat Sheet
+
+```bash
+# Quick overview
+uptime; free -h; vmstat 1 3
+
+# CPU
+top -b -n 1 | head -20     # Batch mode
+mpstat -P ALL 1 1          # Per-core
+pidstat -p <PID> 1 1       # Per-process
+
+# Memory
+free -h; cat /proc/meminfo
+ps aux --sort=-%mem | head
+smem -s rss -r | head
+
+# I/O
+iostat -xz 1 3
+iotop -ao 2>/dev/null | head
+lsblk; blkid
+
+# Network
+ss -tunapl; ip -s link
+nethogs; ifstat 1
+
+# Tracing
+strace -c -p <PID>         # Syscall summary
+perf top                   # Live profile
+bpftrace -e 'tracepoint:syscalls:sys_enter_* { @[comm] = count(); }'
+
+# Tuning
+sysctl -w vm.swappiness=10
+echo mq-deadline > /sys/block/sda/queue/scheduler
+# cgroup v2 CPU limit:
+# echo '200000 100000' > /sys/fs/cgroup/<group>/cpu.max
+```
+
+## Related Topics
+
+- [CPU](./cpu) — Detailed CPU architecture
+- [Memory](./memory) — Detailed memory management
+- [Storage](./storage) — Disk and filesystem
+- [Networking](./networking) — Network stack tuning
+- [Troubleshooting](./troubleshooting) — Deep dive debugging
+- [Monitoring](./monitoring) — Metrics collection

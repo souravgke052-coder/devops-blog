@@ -1,0 +1,628 @@
+---
+title: "Container Overview"
+description: "Complete guide to containers - Docker, containerization fundamentals, and best practices"
+sidebar_position: 1
+---
+
+# Container Overview
+
+## Overview
+
+Containers are lightweight, standalone, executable packages that include everything needed to run a piece of software: code, runtime, system tools, libraries, and settings. They isolate software from its environment, ensuring it runs consistently across development, staging, and production environments.
+
+Containerization has revolutionized software deployment by providing:
+- **Consistency**: Same environment from development through production
+- **Isolation**: Applications run in isolated user spaces
+- **Portability**: Run anywhere that supports the container runtime
+- **Efficiency**: Share the host OS kernel, unlike VMs
+- **Speed**: Containers start in seconds, not minutes
+
+## When To Use
+
+- **Microservices architectures** where services need independent deployment and scaling
+- **CI/CD pipelines** requiring fast, reproducible build and test environments
+- **Multi-cloud or hybrid deployments** needing workload portability
+- **Application modernization** (lift-and-shift or re-platforming monoliths)
+- **Scaling workloads** that need rapid horizontal scaling
+- **Development environments** ensuring parity between developer machines and production
+- **Batch processing jobs** that need isolated, disposable execution environments
+- **Service mesh implementations** with sidecar containers
+
+## When NOT To Use
+
+- **Applications requiring Windows-specific features** (use Windows containers instead)
+- **High-performance computing** where bare-metal access is critical
+- **Security-sensitive workloads** that cannot share a kernel with other containers
+- **Legacy applications** that require complex, stateful initialization
+- **Real-time systems** with strict latency requirements (containers add latency)
+- **Applications requiring kernel modifications** (containers share the host kernel)
+- **Very small, simple scripts** where container overhead is disproportionate
+
+## Core Concepts
+
+### Container vs Virtual Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Virtual Machine                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   App A      │  │   App B      │  │   App C      │              │
+│  ├──────────────┤  ├──────────────┤  ├──────────────┤              │
+│  │   Bins/Libs  │  │   Bins/Libs  │  │   Bins/Libs  │              │
+│  ├──────────────┤  ├──────────────┤  ├──────────────┤              │
+│  │    Guest OS  │  │    Guest OS  │  │    Guest OS  │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+│                         Hypervisor                                   │
+│                       ┌──────────┐                                  │
+│                       │   Host   │                                  │
+│                       │    OS    │                                  │
+│                       └──────────┘                                  │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Container                                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   App A      │  │   App B      │  │   App C      │              │
+│  ├──────────────┤  ├──────────────┤  ├──────────────┤              │
+│  │   Bins/Libs  │  │   Bins/Libs  │  │   Bins/Libs  │              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+│                      Container Runtime                               │
+│                       ┌──────────┐                                  │
+│                       │   Host   │                                  │
+│                       │    OS    │                                  │
+│                       └──────────┘                                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | Description |
+|-----------|-------------|
+| **Image** | Read-only template with application code and dependencies |
+| **Container** | Runnable instance of an image |
+| **Registry** | Storage and distribution system for images (Docker Hub, GCR, ECR) |
+| **Volume** | Persistent storage that persists across container restarts |
+| **Network** | Communication通道 between containers and external systems |
+| **Dockerfile** | Script with instructions to build an image |
+
+### Container Lifecycle
+
+```
+┌─────────┐    build     ┌──────────┐    run     ┌───────────┐
+│ Dockerfile│ ──────────▶│   Image  │ ─────────▶│ Container │
+└─────────┘              └──────────┘            └───────────┘
+                                                       │
+                              ┌────────────────────────┘
+                              │
+                              ▼
+                        ┌──────────┐   stop   ┌──────────┐
+                        │ Stopped  │◀─────────│ Running  │
+                        │Container │          └──────────┘
+                        └──────────┘
+                              │
+                              ▼
+                         ┌──────────┐
+                         │  rm/rmi  │
+                         │(destroy) │
+                         └──────────┘
+```
+
+## Real Production Example
+
+### E-commerce Microservices Architecture
+
+A production e-commerce platform using containers for each microservice:
+
+```yaml
+# Production microservices architecture
+services:
+  # Frontend: React application served by Nginx
+  frontend:
+    image: myregistry.io/ecommerce/frontend:v2.3.0
+    replicas: 5
+    resources:
+      limits: { cpu: "500m", memory: "256Mi" }
+    health_check: /healthz
+    
+  # API Gateway: Kong API Gateway
+  api-gateway:
+    image: myregistry.io/ecommerce/api-gateway:v1.8.0
+    replicas: 3
+    resources:
+      limits: { cpu: "1000m", memory: "512Mi" }
+    depends_on: [user-service, product-service, order-service]
+    
+  # User Service: Python/FastAPI
+  user-service:
+    image: myregistry.io/ecommerce/user-service:v3.1.2
+    replicas: 4
+    env:
+      DATABASE_URL: postgresql://user:pass@db:5432/users
+      REDIS_URL: redis://redis:6379
+    health_check: /health
+    
+  # Product Service: Go microservice
+  product-service:
+    image: myregistry.io/ecommerce/product-service:v2.0.1
+    replicas: 4
+    resources:
+      limits: { cpu: "500m", memory: "512Mi" }
+      
+  # Order Service: Node.js
+  order-service:
+    image: myregistry.io/ecommerce/order-service:v4.2.0
+    replicas: 4
+    volumes:
+      - order-data:/data
+      
+  # Database: PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    resources:
+      limits: { cpu: "2000m", memory: "4Gi" }
+      
+  # Cache: Redis
+  redis:
+    image: redis:7-alpine
+    replicas: 3
+    volumes:
+      - redis-data:/data
+      
+  # Message Queue: RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    ports: ["15672:15672"]
+    
+volumes:
+  db-data:
+  redis-data:
+  order-data:
+```
+
+**Architecture Benefits:**
+- Independent scaling of services based on load
+- Fault isolation (one service failure doesn't cascade)
+- Technology flexibility (polyglot services)
+- Easy rollbacks per service
+- Parallel development by multiple teams
+
+## CLI Examples
+
+### Getting Started with Docker
+
+```bash
+# Run your first container
+docker run hello-world
+
+# Run an interactive container
+docker run -it ubuntu bash
+
+# Run a container in detached mode
+docker run -d nginx:alpine
+
+# Run with custom name and port mapping
+docker run -d --name my-app -p 8080:80 nginx:alpine
+
+# List running containers
+docker ps
+
+# List all containers (including stopped)
+docker ps -a
+
+# View container logs
+docker logs my-app
+docker logs -f my-app  # follow mode
+
+# Execute command in running container
+docker exec -it my-app bash
+
+# Stop and remove container
+docker stop my-app
+docker rm my-app
+
+# Pull an image without running
+docker pull nginx:1.25-alpine
+```
+
+### Image Management
+
+```bash
+# List local images
+docker images
+docker images -a
+
+# Build image from Dockerfile
+docker build -t myapp:latest .
+docker build -t myapp:v1.2.3 -f Dockerfile.prod .
+
+# Tag an image
+docker tag myapp:latest myregistry.io/myapp:v1.0
+
+# Push to registry
+docker push myregistry.io/myapp:v1.0
+
+# Remove unused images
+docker image prune
+docker image prune -a  # remove all unused
+
+# Inspect image layers
+docker history nginx:alpine
+```
+
+### Container Operations
+
+```bash
+# Run with environment variables
+docker run -e APP_ENV=production -e DB_HOST=db myapp
+
+# Run with volume mount
+docker run -v /host/path:/container/path myapp
+docker run -v $(pwd)/data:/data myapp
+
+# Run with network configuration
+docker run --network my-network myapp
+
+# Run with resource limits
+docker run --memory="512m" --cpus="0.5" myapp
+
+# Run with restart policy
+docker run --restart=unless-stopped myapp
+docker run --restart=on-failure:3 myapp
+
+# Inspect container details
+docker inspect my-app
+
+# View container processes
+docker top my-app
+
+# Copy files to/from container
+docker cp my-app:/app/logs ./logs
+docker cp ./config my-app:/app/config
+```
+
+## Dockerfile / Compose Examples
+
+### Simple Dockerfile
+
+```dockerfile
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+USER node
+
+CMD ["node", "server.js"]
+```
+
+### Docker Compose for Local Development
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      target: development
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://postgres:password@db:5432/myapp
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      db:
+        condition: service_healthy
+    command: npm run dev
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: myapp
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `docker run <image>` | Create and start a container |
+| `docker ps` | List running containers |
+| `docker ps -a` | List all containers |
+| `docker stop <container>` | Stop a running container |
+| `docker start <container>` | Start a stopped container |
+| `docker restart <container>` | Restart a container |
+| `docker rm <container>` | Remove a container |
+| `docker rmi <image>` | Remove an image |
+| `docker build -t <name> .` | Build an image from Dockerfile |
+| `docker exec -it <container> <cmd>` | Execute command in container |
+| `docker logs <container>` | View container logs |
+| `docker inspect <container>` | Get container details |
+| `docker pull <image>` | Pull an image from registry |
+| `docker push <image>` | Push an image to registry |
+| `docker images` | List local images |
+| `docker network ls` | List networks |
+| `docker volume ls` | List volumes |
+| `docker-compose up -d` | Start compose services |
+| `docker-compose down` | Stop compose services |
+| `docker-compose logs -f` | View compose logs |
+
+## Monitoring
+
+### Container Metrics
+
+```bash
+# Real-time container resource usage
+docker stats
+docker stats --no-stream container_name
+
+# Format output
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# Inspect container metadata
+docker inspect --format='{{json .State}}' container_name
+
+# Container disk usage
+docker system df
+docker system df -v
+```
+
+### Logging Best Practices
+
+```bash
+# View logs with timestamps
+docker logs -t container_name
+
+# View recent logs
+docker logs --tail 100 container_name
+
+# Follow logs in real-time
+docker logs -f container_name
+
+# Configure logging driver (json-file, syslog, fluentd, gelf)
+docker run \
+  --log-driver=json-file \
+  --log-opt max-size=10m \
+  --log-opt max-file=3 \
+  nginx:alpine
+```
+
+### Health Checks
+
+```dockerfile
+# Docker HEALTHCHECK instruction
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:3000/health || exit 1
+```
+
+## Security
+
+### Container Security Fundamentals
+
+1. **Use minimal base images** (alpine, distroless, scratch)
+2. **Run as non-root user** (USER instruction)
+3. **Read-only root filesystem** (`--read-only` flag)
+4. **No new privileges** (`--security-opt=no-new-privileges`)
+5. **Limit capabilities** (`--cap-drop=ALL --cap-add=NET_BIND_SERVICE`)
+6. **Use seccomp/AppArmor profiles**
+7. **Scan images for vulnerabilities**
+8. **Sign and verify images**
+
+### Security Hardened Run
+
+```bash
+docker run \
+  --user 1000:1000 \
+  --read-only \
+  --security-opt=no-new-privileges \
+  --cap-drop=ALL \
+  --tmpfs /tmp \
+  nginx:alpine
+```
+
+## Cost Optimization
+
+### Image Size Optimization
+
+```dockerfile
+# Use minimal base images
+FROM python:3.12-slim  # vs python:3.12
+
+# Multi-stage builds
+FROM golang:1.21 AS builder
+WORKDIR /build
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o myapp
+
+FROM scratch
+COPY --from=builder /build/myapp /myapp
+USER 1000
+ENTRYPOINT ["/myapp"]
+```
+
+### Resource Optimization
+
+```bash
+# Limit CPU and memory
+docker run --memory="256m" --cpus="0.5" myapp
+
+# Use startup script for cleanup
+docker run --rm \
+  --memory="128m" \
+  --cpus="0.25" \
+  alpine sh -c "echo 'done'"
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Container exits immediately | Application crashes | Check logs: `docker logs <container>` |
+| Permission denied | Running as root required | Check USER directive, volume permissions |
+| Image pull failure | Network/registry auth | Check `docker login`, network connectivity |
+| Port conflict | Port already in use | Change port mapping: `-p 8080:80` |
+| Out of disk space | Large images/containers | `docker system prune -a` |
+| Network unreachable | Network not created | Create network: `docker network create` |
+
+### Debugging Commands
+
+```bash
+# Check container status
+docker ps -a | grep <container_name>
+
+# View logs
+docker logs <container>
+
+# Inspect container
+docker inspect <container>
+
+# Check resource limits
+docker stats --no-stream
+
+# Enter container shell
+docker exec -it <container> sh
+
+# Test network connectivity
+docker exec <container> ping <target>
+docker exec <container> curl localhost:port
+
+# Check disk usage
+docker system df
+```
+
+## Interview Questions
+
+### Q1: What is the difference between a container and a VM?
+**A:** Containers share the host OS kernel and isolate at the application level, making them lightweight (MB vs GB) and fast to start (seconds vs minutes). VMs include a full OS and hypervisor, providing stronger isolation but with higher resource overhead and slower startup.
+
+### Q2: How does Docker build an image from a Dockerfile?
+**A:** Docker reads the Dockerfile instructions sequentially. Each instruction creates a layer. Layers are cached and reused when possible. Docker builds layers in order, committing the result of each instruction to create intermediate images until the final image is produced.
+
+### Q3: What is a container registry?
+**A:** A registry is a storage and distribution system for container images. It hosts repositories containing versioned images. Examples include Docker Hub, Google Container Registry, Amazon ECR, and self-hosted registries like Harbor.
+
+### Q4: How do containers handle networking?
+**A:** Docker provides several network drivers: bridge (default for standalone containers), host (removes network isolation), overlay (multi-host communication), and none (disables networking). Containers can communicate via container names as DNS hostnames when on the same network.
+
+### Q5: What is the difference between `COPY` and `ADD` in a Dockerfile?
+**A:** `COPY` is preferred for simplicity—it copies files from build context. `ADD` has additional features like URL support and tar extraction, but `COPY` is clearer and recommended for most cases.
+
+### Q6: How do you persist data in containers?
+**A:** Containers are ephemeral by default. Use Docker volumes (`-v` or `--mount`) to persist data. Types include named volumes (managed by Docker), bind mounts (host filesystem), and tmpfs (RAM-based). Volumes persist across container restarts and can be shared between containers.
+
+### Q7: What is a multi-stage build?
+**A:** Multi-stage builds use multiple `FROM` statements to create separate build and runtime environments. The final stage typically copies artifacts from previous stages, resulting in smaller, more secure images without build dependencies.
+
+### Q8: How do you secure a container?
+**A:** Security hardening includes: using minimal base images, running as non-root, setting read-only rootfs, dropping all capabilities, using security options (no-new-privileges), scanning for vulnerabilities, signing images, and using Secrets management for sensitive data.
+
+### Q9: What is the container lifecycle?
+**A:** The lifecycle is: create (container from image) → start → run (process executing) → stop → remove. Containers can also be paused/unpaused. If the main process exits, the container stops. Data persists only if volumes are used.
+
+### Q10: How does Docker handle resource isolation?
+**A:** Docker uses Linux namespaces (PID, network, mount, IPC, UTS) for isolation and cgroups for resource limiting (CPU, memory, I/O). Each container sees its own process tree, network stack, filesystem, and hostname while sharing the host kernel.
+
+## Cheat Sheet
+
+### Essential Docker Commands
+
+```bash
+# Container lifecycle
+docker run -d -p 8080:80 --name web nginx:alpine
+docker ps
+docker stop/start/restart web
+docker rm web
+docker logs -f web
+docker exec -it web sh
+
+# Image management
+docker build -t myapp:v1 .
+docker images
+docker rmi myapp:v1
+docker pull nginx:alpine
+
+# Compose
+docker compose up -d
+docker compose down
+docker compose logs -f
+docker compose ps
+
+# Cleanup
+docker system prune -a
+docker volume prune
+docker network prune
+```
+
+### Dockerfile Instructions Reference
+
+| Instruction | Purpose |
+|-------------|---------|
+| `FROM` | Base image |
+| `RUN` | Execute command during build |
+| `COPY` | Copy files from context |
+| `ADD` | Copy with URL/tar support |
+| `WORKDIR` | Set working directory |
+| `ENV` | Environment variables |
+| `EXPOSE` | Document ports |
+| `USER` | Set user/group |
+| `VOLUME` | Create mount point |
+| `CMD` | Default command |
+| `ENTRYPOINT` | Executable |
+| `HEALTHCHECK` | Health check |
+
+### Docker Compose Key Commands
+
+```bash
+docker compose up -d          # Start services
+docker compose down           # Stop and remove
+docker compose ps             # List services
+docker compose logs -f        # View logs
+docker compose exec app sh    # Shell into service
+docker compose build          # Build images
+docker compose restart        # Restart services
+docker compose pull           # Pull images
+docker compose config         # Validate config
+```
+
+## Related Topics
+
+- [Docker](./docker.mdx) - Docker engine deep dive
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Docker Compose](./docker-compose.mdx) - Multi-container applications
+- [Container Runtime](./container-runtime.mdx) - Runtime internals (OCI, containerd, runc)
+- [Image Security](./image-security.mdx) - Vulnerability scanning and hardening
+- [Registry](./registry.mdx) - Image registries and distribution
+- [Troubleshooting](./troubleshooting.mdx) - Debugging containers
+- [Kubernetes Overview](../kubernetes/overview.mdx) - Container orchestration

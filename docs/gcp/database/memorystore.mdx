@@ -1,0 +1,684 @@
+# Memorystore
+
+## Overview
+
+Google Cloud Memorystore is a fully managed in-memory data store service for Redis and Memcached. It provides sub-millisecond latency for caching, session management, and real-time analytics. Memorystore handles deployment, replication, failover, and patching automatically, offering 99.99% availability for the Enterprise tier.
+
+## When To Use
+
+- Application caching for database acceleration
+- Session storage for web applications
+- Real-time leaderboards and gaming leaderboards
+- Rate limiting and throttling
+- ML feature store for low-latency inference
+- Distributed locking coordination
+- Message queue for pub/sub patterns
+
+## When NOT To Use
+
+- Primary data store (data loss risk)
+- Data requiring durability guarantees
+- Full-text search (use Elasticsearch)
+- Graph data (use Neo4j)
+- Relational data (use Cloud SQL)
+- Batch processing jobs
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Memorystore                               │
+├─────────────────────────────────────────────────────────────┤
+│  Redis Tiers:                                               │
+│  ├── Basic     (Single node, $49-$6,650/month)             │
+│  ├── Standard  (Primary + replica, automatic failover)      │
+│  └── Enterprise(High availability + read replicas)          │
+├─────────────────────────────────────────────────────────────┤
+│  Memcached Tiers:                                           │
+│  ├── Basic     (Single node)                               │
+│  └── Standard  (Distributed cluster with auto-discovery)   │
+├─────────────────────────────────────────────────────────────┤
+│  Features:                                                  │
+│  ├── Automatic failover (Standard+)                        │
+│  ├── Read replicas (Enterprise)                            │
+│  ├── TLS encryption                                        │
+│  ├── VPC-native deployment                                 │
+│  └── Redis AUTH and ACL                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Instance
+A deployed Redis or Memcached server. Types: Basic (standalone), Standard (HA), Enterprise (full HA + replicas).
+
+### Node
+Individual server within a Memorystore instance. Basic has 1 node, Standard/Enterprise have 2+ nodes.
+
+### Shards
+For Memcached clusters, data is distributed across multiple shards.
+
+### Redis AUTH
+Password-based authentication for Redis instances.
+
+### Redis ACL
+Access Control Lists for fine-grained permission management (Redis 6+).
+
+### Reserved IP Range
+Memorystore instances are VPC-native and use addresses from a reserved range.
+
+## Real Production Example
+
+**Session Store and Cache for Web Application**
+
+```hcl
+# Terraform configuration for production Memorystore setup
+
+# Create VPC for Memorystore
+resource "google_compute_network" "memorystore_vpc" {
+  name = "memorystore-vpc-${var.environment}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "memorystore_subnet" {
+  name          = "memorystore-subnet-${var.environment}"
+  network       = google_compute_network.memorystore_vpc.id
+  ip_cidr_range = "10.0.2.0/28"  # /28 provides 11 IPs, enough for most uses
+  region        = var.region
+  
+  private_ip_google_access = true
+}
+
+# Create Private Service Access
+resource "google_compute_global_address" "memorystore_private_ip" {
+  name          = "memorystore-private-ip-${var.environment}"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.memorystore_vpc.id
+}
+
+resource "google_service_networking_connection" "memorystore_vpc_connection" {
+  network       = google_compute_network.memorystore_vpc.id
+  service       = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.memorystore_private_ip.name]
+}
+
+# Redis Instance for Session Storage (Standard tier for HA)
+resource "google_redis_instance" "session_store" {
+  name           = "session-redis-${var.environment}"
+  memory_size_gb = 5
+  region         = var.region
+  location_id    = "${var.region}-a"  # Primary zone
+  
+  tier = "STANDARD_HA"
+  
+  redis_version  = "redis_7_0"
+  
+  display_name   = "Session Store - ${var.environment}"
+  
+  reserved_ip_range = "10.0.2.5"
+  
+  authorized_network = google_compute_network.memorystore_vpc.id
+  
+  connectivity_settings {
+    private_service_subnet = google_compute_subnetwork.memorystore_subnet.name
+    direct_path_enabled    = true
+  }
+  
+  maintenance_policy {
+    day          = 7  # Sunday
+    start_hour   = 2   # 2 AM
+    update_mode  = "ZONE_UPDATE"
+  }
+  
+  auth_enabled      = true
+  transit_encryption_mode = "SERVER_AUTHENTICATION"
+  
+  labels = {
+    environment = var.environment
+    component   = "session-store"
+    tier        = "ha"
+  }
+}
+
+# Redis Instance for Application Cache (Basic tier)
+resource "google_redis_instance" "app_cache" {
+  name           = "cache-redis-${var.environment}"
+  memory_size_gb = 10
+  region         = var.region
+  location_id    = "${var.region}-a"
+  
+  tier = "BASIC"
+  
+  redis_version  = "redis_7_0"
+  
+  display_name   = "App Cache - ${var.environment}"
+  
+  reserved_ip_range = "10.0.2.20"
+  
+  authorized_network = google_compute_network.memorystore_vpc.id
+  
+  connectivity_settings {
+    private_service_subnet = google_compute_subnetwork.memorystore_subnet.name
+    direct_path_enabled    = true
+  }
+  
+  auth_enabled = true
+  
+  labels = {
+    environment = var.environment
+    component   = "app-cache"
+  }
+}
+
+# Redis Instance for ML Feature Store (Enterprise for replication)
+resource "google_redis_instance" "feature_store" {
+  name           = "feature-redis-${var.environment}"
+  memory_size_gb = 32
+  region         = var.region
+  location_id    = "${var.region}-a"
+  
+  tier = "ENTERPRISE_STANDALONE"
+  
+  redis_version  = "redis_7_0"
+  
+  display_name   = "ML Feature Store - ${var.environment}"
+  
+  reserved_ip_range = "10.0.2.35"
+  
+  authorized_network = google_compute_network.memorystore_vpc.id
+  
+  connectivity_settings {
+    private_service_subnet = google_compute_subnetwork.memorystore_subnet.name
+    direct_path_enabled    = true
+  }
+  
+  auth_enabled = true
+  server_ca_certs = [
+    {
+      sha256_fingerprint = ""  # Managed by Google
+    }
+  ]
+  
+  replica_count = 2  # Read replicas for ML inference
+  
+  labels = {
+    environment = var.environment
+    component   = "ml-feature-store"
+  }
+}
+
+# Memcached Cluster for Distributed Cache
+resource "google_memcache_instance" "distributed_cache" {
+  name           = "memcached-${var.environment}"
+  memory_size_gb = 5
+  node_count     = 3
+  region         = var.region
+  
+  zone_allocation_policy = "MULTI_ZONE"
+  
+  authorized_network = google_compute_network.memorystore_vpc.id
+  
+  memcache_version = "MEMCACHED_1_6"
+  
+  display_name = "Distributed Cache - ${var.environment}"
+  
+  labels = {
+    environment = var.environment
+    component   = "distributed-cache"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create Redis instance (Basic tier)
+gcloud redis instances create my-redis \
+  --size=2 \
+  --region=us-central1 \
+  --zone=us-central1-a \
+  --redis-version=redis_7_0 \
+  --tier=BASIC
+
+# Create Redis instance (Standard HA)
+gcloud redis instances create my-redis-ha \
+  --size=5 \
+  --region=us-central1 \
+  --tier=STANDARD_HA \
+  --redis-version=redis_7_0 \
+  --authorized-network=my-vpc \
+  --redis-version=redis_7_0 \
+  --auth-enabled
+
+# Create Redis instance (Enterprise with replicas)
+gcloud redis instances create my-redis-enterprise \
+  --size=32 \
+  --region=us-central1 \
+  --tier=ENTERPRISE_STANDALONE \
+  --replica-count=2 \
+  --redis-version=redis_7_0
+
+# Create Memcached cluster
+gcloud memcache instances create my-memcached \
+  --size=5 \
+  --node-count=3 \
+  --region=us-central1 \
+  --memcached-version=1.6 \
+  --authorized-network=my-vpc
+
+# List Redis instances
+gcloud redis instances list --region=us-central1
+
+# Describe Redis instance
+gcloud redis instances describe my-redis --region=us-central1
+
+# Get Redis connection info
+gcloud redis instances describe my-redis \
+  --region=us-central1 \
+  --format="yaml(host,port,tier,memorySizeGb)"
+
+# Update Redis instance
+gcloud redis instances update my-redis \
+  --region=us-central1 \
+  --size=10
+
+# Set maintenance window
+gcloud redis instances update my-redis \
+  --region=us-central1 \
+  --maintenance-window-day=sunday \
+  --maintenance-window-hour=2
+
+# Import data into Redis
+gcloud redis instances import my-redis \
+  --region=us-central1 \
+  --source=gs://my-bucket/dump.rdb
+
+# Export data from Redis
+gcloud redis instances export my-redis \
+  --region=us-central1 \
+  --destination=gs://my-bucket/dump.rdb
+
+# Connect via Redis CLI (via a GCE instance in the VPC)
+gcloud compute ssh my-bastion --zone=us-central1-a -- \
+  "redis-cli -h \$(gcloud redis instances describe my-redis --region=us-central1 --format='value(host)') -a \$AUTH_PASSWORD PING"
+
+# Failover for Standard/Enterprise tier
+gcloud redis instances failover my-redis-ha --region=us-central1
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Redis Basic tier
+resource "google_redis_instance" "basic" {
+  name           = "basic-redis"
+  memory_size_gb = 2
+  region         = "us-central1"
+  
+  tier           = "BASIC"
+  redis_version  = "redis_7_0"
+  
+  authorized_network = google_compute_network.vpc.id
+  reserved_ip_range  = "10.0.2.5"
+  
+  auth_enabled = true
+}
+
+# Redis Standard HA
+resource "google_redis_instance" "standard_ha" {
+  name           = "standard-redis"
+  memory_size_gb = 5
+  region         = "us-central1"
+  
+  tier           = "STANDARD_HA"
+  redis_version  = "redis_7_0"
+  
+  authorized_network = google_compute_network.vpc.id
+  reserved_ip_range  = "10.0.2.20"
+  
+  auth_enabled = true
+  
+  maintenance_policy {
+    day          = 0  # Sunday
+    start_hour   = 2
+    update_mode  = "ZONE_UPDATE"
+  }
+  
+  labels = {
+    tier = "ha"
+  }
+}
+
+# Redis Enterprise with read replicas
+resource "google_redis_instance" "enterprise" {
+  name           = "enterprise-redis"
+  memory_size_gb = 32
+  region         = "us-central1"
+  
+  tier           = "ENTERPRISE_STANDALONE"
+  redis_version  = "redis_7_0"
+  replica_count  = 2
+  
+  authorized_network = google_compute_network.vpc.id
+  reserved_ip_range  = "10.0.2.35"
+  
+  auth_enabled = true
+}
+
+# Memcached cluster
+resource "google_memcache_instance" "cluster" {
+  name           = "memcached-cluster"
+  memory_size_gb = 5
+  node_count     = 3
+  region         = "us-central1"
+  
+  authorized_network = google_compute_network.vpc.id
+  memcache_version   = "MEMCACHED_1_6"
+  
+  zone_allocation_policy = "MULTI_ZONE"
+}
+```
+
+## Common Commands
+
+```bash
+# Redis operations
+gcloud redis instances create NAME --size=GB --region=REGION [flags]
+gcloud redis instances list --region=REGION
+gcloud redis instances describe NAME --region=REGION
+gcloud redis instances update NAME --region=REGION --size=GB
+gcloud redis instances delete NAME --region=REGION
+
+# Failover
+gcloud redis instances failover NAME --region=REGION
+
+# Import/Export
+gcloud redis instances import NAME --region=REGION --source=GS_PATH
+gcloud redis instances export NAME --region=REGION --destination=GS_PATH
+
+# Memcached operations
+gcloud memcache instances create NAME --size=GB --node-count=N --region=REGION
+gcloud memcache instances list --region=REGION
+gcloud memcache instances update NAME --region=REGION [flags]
+```
+
+## Monitoring
+
+### Key Metrics
+- **Memory usage**: Used/peak memory vs allocated
+- **CPU utilization**: Instance CPU load
+- **Client connections**: Number of connected clients
+- **Commands/second**: Operation throughput
+- **Cache hit ratio**: Effectiveness of caching
+- **Replication lag**: For Standard/Enterprise tiers
+- **Network bytes**: Data transfer rate
+
+### Cloud Monitoring
+
+```bash
+# List Memorystore metrics
+gcloud monitoring metrics list --filter="resource.type=redis_instance"
+
+# Create alert for memory usage > 80%
+gcloud monitoring policies create \
+  --display-name="Memorystore High Memory" \
+  --condition-display-name="Memory > 80%" \
+  --condition-filter='resource.type="redis_instance" AND metric.type="redis.googleapis.com/memory/usage_ratio"' \
+  --condition-threshold-value=0.8 \
+  --notification-channels=CHANNEL_ID
+
+# Read specific metrics
+gcloud monitoring metrics read \
+  "redis.googleapis.com/stats/hits" \
+  --filter='resource.instance_id="my-instance"'
+```
+
+### Monitoring from Redis
+
+```bash
+# Redis INFO command for metrics
+redis-cli -h HOST -a PASSWORD INFO stats
+
+# Key monitoring metrics from INFO:
+# - keyspace_hits, keyspace_misses (cache effectiveness)
+# - instantaneous_ops_per_sec
+# - mem_fragmentation_ratio
+# - connected_clients
+# - used_memory_peak
+```
+
+## Security
+
+### Network Security
+```bash
+# Memorystore is VPC-native
+# Only accessible from within the VPC
+# Use VPC peering or Cloud VPN for access
+
+# Firewall rules to restrict access
+gcloud compute firewall-rules create allow-redis \
+  --network=memorystore-vpc \
+  --allow=tcp:6379,tcp:6378 \
+  --source-ranges=10.0.1.0/24 \
+  --target-tags=redis-clients
+```
+
+### Authentication
+```bash
+# AUTH enabled by default
+# Get password
+gcloud redis instances describe my-redis --region=us-central1 \
+  --format="yaml(serverCaCerts)"
+
+# Redis ACL for fine-grained access (Redis 6+)
+# Connect and run:
+redis-cli -h HOST -a PASSWORD ACL SETUSER reader ON >password ~cached:* -@read
+```
+
+### Encryption
+- In transit: TLS encryption (SERVER_AUTHENTICATION)
+- At rest: Google-managed encryption
+- CMEK: Not currently supported for Memorystore
+
+### IAM
+```bash
+# Memorystore Admin role
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:sa@project.iam.gserviceaccount.com \
+  --role=roles/redis.admin
+
+# Viewer role
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:developer@company.com \
+  --role=roles/redis.viewer
+```
+
+## Cost Optimization
+
+### Tier Selection
+| Tier | Use Case | Price Factor |
+|------|----------|--------------|
+| Basic | Dev/test, non-critical cache | 1x |
+| Standard | Production with HA | ~2x Basic |
+| Enterprise | Max HA + read replicas | ~3-5x Basic |
+
+### Sizing Guidelines
+```bash
+# Monitor memory usage
+gcloud monitoring metrics read \
+  "redis.googleapis.com/memory/usage_bytes" \
+  --filter='resource.instance_id="my-instance"'
+
+# Add 20-30% headroom for fluctuations
+# Monitor key eviction rate - if high, increase size
+redis-cli -h HOST -a PASSWORD INFO keyspace
+```
+
+### Cost-Saving Tips
+```bash
+# Use Basic tier for development
+# Scale up for production with Standard HA
+# Monitor and resize based on actual usage
+# Use smaller instance types for less critical caches
+```
+
+## Troubleshooting
+
+### Connection Issues
+```bash
+# Verify instance is running
+gcloud redis instances describe my-redis --region=us-central1
+
+# Check connectivity from VPC
+gcloud compute ssh bastion --zone=us-central1-a -- \
+  "nc -zv REDIS_HOST 6379"
+
+# Test Redis connection
+redis-cli -h REDIS_HOST -a PASSWORD PING
+
+# Check if AUTH is enabled
+gcloud redis instances describe my-redis --region=us-central1 \
+  --format="yaml(authEnabled)"
+```
+
+### High Memory Usage
+```bash
+# Check memory details
+redis-cli -h HOST -a PASSWORD INFO memory
+
+# Find large keys
+redis-cli -h HOST -a PASSWORD --bigkeys
+
+# Monitor key expiration
+redis-cli -h HOST -a PASSWORD INFO keyspace
+
+# Set maxmemory policy if needed
+redis-cli -h HOST -a PASSWORD CONFIG SET maxmemory-policy allkeys-lru
+```
+
+### Cache Inefficiency
+```bash
+# Check hit/miss ratio
+redis-cli -h HOST -a PASSWORD INFO stats | grep keyspace
+
+# Typical targets:
+# Hit ratio > 90% is good for production
+# If low, increase cache size or review cache key strategy
+
+# Monitor eviction rate
+redis-cli -h HOST -a PASSWORD INFO stats | grep evicted
+```
+
+### Replication Lag
+```bash
+# For Standard/Enterprise tiers
+# Check replication lag
+redis-cli -h HOST -a PASSWORD INFO replication
+
+# lag: 0 means in sync
+# Positive value means replica is behind (in bytes)
+
+# Monitor via Cloud Monitoring
+gcloud monitoring metrics read \
+  "redis.googleapis.com/replication/offset_diff_bytes"
+```
+
+### Failover Issues
+```bash
+# Manual failover
+gcloud redis instances failover my-redis --region=us-central1
+
+# After failover, verify
+redis-cli -h NEW_PRIMARY_HOST -a PASSWORD INFO replication
+
+# Check application reconnection logic
+# Applications should handle connection drops gracefully
+```
+
+## Interview Questions
+
+**Q: What is the difference between Memorystore Basic and Standard tiers?**
+A: Basic tier is a single-node instance with no replication. Standard tier adds automatic failover with a primary-replica setup - if the primary fails, the replica promotes automatically. Standard costs approximately 2x Basic.
+
+**Q: How does Memorystore Redis handle high availability?**
+A: Standard and Enterprise tiers use a primary-replica configuration with automatic failover. The replica continuously syncs from the primary. If the primary becomes unavailable, Memorystore automatically promotes the replica and updates DNS within seconds.
+
+**Q: When should you use Memcached over Redis in Memorystore?**
+A: Choose Memcached for simple key-value caching where you need horizontal scaling with consistent hashing and auto-discovery. Choose Redis for complex data types (lists, sets, sorted sets), pub/sub, transactions, scripting, and features like TTL on individual items.
+
+**Q: What are the Memorystore connection limits?**
+A: Redis supports up to 40,000 concurrent connections. Memcached supports up to 30,000 connections per node. Use connection pooling in applications to efficiently manage connections.
+
+**Q: How does Memorystore pricing work?**
+A: Memorystore pricing is based on memory size and tier: Basic ($0.045/GB/hour), Standard ($0.098/GB/hour), Enterprise ($0.17/GB/hour). Regional data transfer also adds cost. Reserved instances provide discounts for committed usage.
+
+**Q: Can you use Memorystore from outside GCP?**
+A: Memorystore is VPC-native and only accessible from within the VPC. For external access, you need to set up Cloud VPN or Cloud Interconnect, or use a GCE instance as a bastion to tunnel connections.
+
+## Cheat Sheet
+
+```bash
+# Create Redis
+gcloud redis instances create my-redis \
+  --size=5 --region=us-central1 --tier=STANDARD_HA \
+  --redis-version=redis_7_0 --auth-enabled
+
+# Connect (from VPC instance)
+redis-cli -h $(gcloud redis instances describe my-redis --format='value(host)') -a PASSWORD PING
+
+# Scale
+gcloud redis instances update my-redis --region=us-central1 --size=10
+
+# Failover
+gcloud redis instances failover my-redis --region=us-central1
+
+# Memcached cluster
+gcloud memcached instances create my-memcached \
+  --size=5 --node-count=3 --region=us-central1
+```
+
+## Labs
+
+### Lab 1: Session Store Implementation
+Build session management with Memorystore.
+1. Create Standard HA Redis instance
+2. Configure VPC peering
+3. Implement session storage in application
+4. Test automatic failover
+5. Monitor session metrics
+
+### Lab 2: Distributed Cache
+Implement application caching layer.
+1. Create Redis cache instance
+2. Configure cache-aside pattern
+3. Implement cache warming
+4. Add cache invalidation logic
+5. Benchmark cache effectiveness
+
+### Lab 3: ML Feature Store
+Build real-time feature serving.
+1. Create Enterprise Redis with replicas
+2. Implement feature storage and retrieval
+3. Add feature preloading for inference
+4. Configure read replicas for scaling
+5. Monitor latency at scale
+
+## Related Services
+
+- **Cloud SQL**: Primary data store
+- **Firestore**: NoSQL document database
+- **Cloud Storage**: Persistent object storage
+- **Cloud CDN**: Content delivery
+- **GKE**: Containerized applications
+- **Compute Engine**: VM instances

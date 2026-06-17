@@ -1,0 +1,785 @@
+---
+id: blue-green
+title: Blue-Green Deployments
+description: Blue-green architecture, traffic switching, DNS cutover, and load balancer integration
+sidebar_position: 9
+---
+
+# Blue-Green Deployments
+
+## Overview
+
+Blue-green deployment maintains two identical production environments (blue and green), where one serves live traffic while the other remains idle. At deployment time, the new version is deployed to the idle environment, validated, then all traffic is switched at once. This pattern enables instant rollback and zero-downtime releases.
+
+## When To Use
+
+- Applications requiring instant traffic switch
+- Environments with compliance requiring validated readiness
+- Services with database migrations requiring specific versions
+- High-stakes applications where gradual rollout is too risky
+- Services behind load balancers with weight control
+
+## When NOT To Use
+
+- Extremely resource-constrained environments (requires double capacity)
+- Stateful applications with local storage that's hard to replicate
+- Rapid hotfix scenarios where environment switch is too slow
+
+## Core Concepts
+
+### Blue-Green Architecture
+
+```
+                    Load Balancer
+                         │
+                    ┌────┴────┐
+                    │         │
+                    ▼         ▼
+              ┌─────────┐ ┌─────────┐
+              │  BLUE   │ │  GREEN  │
+              │ (Live)  │ │ (Idle)  │
+              │  v1.0   │ │  v1.1   │
+              └─────────┘ └─────────┘
+                    │         │
+                    │    Deploy to idle
+                    │    Test & validate
+                    │         │
+                    └────┬────┘
+                         │
+                    Switch selector
+                    (Instant traffic)
+                         │
+                         ▼
+                   ┌─────────┐
+                   │  GREEN  │
+                   │ (Live)  │
+                   │  v1.1   │
+                   └─────────┘
+```
+
+### Key Components
+
+| Component | Purpose |
+|-----------|---------|
+| **Blue Environment** | Currently serving production traffic |
+| **Green Environment** | Idle, receives new deployment |
+| **Load Balancer** | Routes traffic to active environment |
+| **Health Check** | Validates new deployment before switch |
+| **Connection Drain** | Graceful handling of in-flight requests |
+
+## Real Production Example
+
+### Complete Blue-Green Deployment Pipeline
+
+```yaml
+name: Blue-Green Production Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # PRE-DEPLOYMENT
+  # ============================================
+  pre-deploy:
+    name: Pre-deployment Checks
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      active_slot: ${{ steps.state.outputs.active_slot }}
+      target_slot: ${{ steps.state.outputs.target_slot }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Get current active slot
+        id: state
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          # Get current active from service selector
+          ACTIVE=$(kubectl get service api -n production -o jsonpath='{.spec.selector.slot}')
+          
+          if [ "$ACTIVE" == "blue" ]; then
+            TARGET="green"
+          else
+            TARGET="blue"
+          fi
+          
+          echo "active_slot=$ACTIVE" >> $GITHUB_OUTPUT
+          echo "target_slot=$TARGET" >> $GITHUB_OUTPUT
+          echo "Deploying to $TARGET slot, currently $ACTIVE is active"
+      
+      - name: Docker meta
+        id: meta
+        run: |
+          TAG="sha-${{ github.sha }}"
+          if [[ "${{ github.event_name }}" == "tag" ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          fi
+          echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG" >> $GITHUB_OUTPUT
+
+  # ============================================
+  # DEPLOY TO IDLE ENVIRONMENT
+  # ============================================
+  deploy-idle:
+    name: Deploy to ${{ needs.pre-deploy.outputs.target_slot }}
+    runs-on: ubuntu-latest
+    needs: pre-deploy
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Deploy to idle slot
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          DEPLOYMENT=api-${{ needs.pre-deploy.outputs.target_slot }}
+          
+          # Deploy to idle slot
+          kubectl set image deployment/$DEPLOYMENT api=${{ needs.pre-deploy.outputs.image_tag }} --namespace=production
+          
+          # Update annotation for rollback
+          kubectl annotate deployment/$DEPLOYMENT -n production \
+            previous-image=$(kubectl get deployment/$DEPLOYMENT -n production -o jsonpath='{.spec.template.spec.containers[0].image}') \
+            --overwrite
+          
+          # Wait for rollout
+          kubectl rollout status deployment/$DEPLOYMENT --namespace=production --timeout=15m
+          
+          echo "Deployed to $DEPLOYMENT: ${{ needs.pre-deploy.outputs.image_tag }}"
+
+  # ============================================
+  # VALIDATION
+  # ============================================
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: deploy-idle
+    if: ${{ !github.event.inputs.skip_tests }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run validation tests
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          TARGET=api-${{ needs.pre-deploy.outputs.target_slot }}
+          
+          echo "Validating deployment: $TARGET"
+          
+          # Get pod IP
+          POD=$(kubectl get pods -n production -l deployment=$TARGET --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+          
+          # Port forward for testing
+          kubectl port-forward -n production pod/$POD 8080:8080 &
+          PORTFORWARD_PID=$!
+          
+          sleep 5
+          
+          # Run smoke tests
+          curl -f http://localhost:8080/health || exit 1
+          curl -f http://localhost:8080/ready || exit 1
+          
+          # Run integration tests
+          curl -f http://localhost:8080/api/v1/users || exit 1
+          
+          kill $PORTFORWARD_PID 2>/dev/null || true
+          
+          echo "Validation passed"
+
+  # ============================================
+  # TRAFFIC SWITCH
+  # ============================================
+  switch-traffic:
+    name: Switch Traffic
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Switch traffic to new slot
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          TARGET=${{ needs.pre-deploy.outputs.target_slot }}
+          
+          echo "Switching traffic to $TARGET..."
+          
+          # Switch service selector
+          kubectl patch service api -n production \
+            --type='json' \
+            -p="[{\"op\":\"replace\",\"path\":\"/spec/selector/slot\",\"value\":\"$TARGET\"}]"
+          
+          # Wait for DNS propagation
+          sleep 5
+          
+          # Verify service selector
+          SELECTOR=$(kubectl get service api -n production -o jsonpath='{.spec.selector.slot}')
+          echo "Service selector now points to: $SELECTOR"
+          
+          if [ "$SELECTOR" != "$TARGET" ]; then
+            echo "Traffic switch failed!"
+            exit 1
+          fi
+      
+      - name: Verify switch
+        run: |
+          # Wait for all pods to receive traffic
+          sleep 30
+          
+          # Health check
+          curl -f https://myapp.com/health || exit 1
+          
+          # Check active pods
+          kubectl get pods -n production -l slot=${{ needs.pre-deploy.outputs.target_slot }} --field-selector=status.phase=Running
+      
+      - name: Update active slot annotation
+        run: |
+          # Store previous image for future rollback
+          PREVIOUS=$(kubectl get deployment/api-${{ needs.pre-deploy.outputs.active_slot }} -n production -o jsonpath='{.spec.template.spec.containers[0].image}')
+          kubectl annotate service api -n production last-successful-image=$PREVIOUS --overwrite
+
+  # ============================================
+  # CLEANUP OLD ENVIRONMENT
+  # ============================================
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: switch-traffic
+    if: always()
+    
+    permissions:
+      id-token: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Scale down old deployment
+        if: success()
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          OLD=api-${{ needs.pre-deploy.outputs.active_slot }}
+          
+          echo "Scaling down $OLD to 0 (keeping for rollback)"
+          kubectl scale deployment/$OLD --namespace=production --replicas=0
+          
+          echo "Cleanup complete. Old version kept at 0 replicas for emergency rollback."
+      
+      - name: Notify
+        if: always()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ needs.switch-traffic.result == 'success' && ':white_check_mark:' || ':x:' }} Blue-Green Deploy",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Blue-Green Deployment*\nStatus: ${{ needs.switch-traffic.result }}\nNew Version: ${{ needs.pre-deploy.outputs.image_tag }}\nActive Slot: ${{ needs.pre-deploy.outputs.target_slot }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### Kubernetes Blue-Green Configuration
+
+```yaml
+# blue-green-deployments.yaml
+---
+# Blue Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-blue
+  namespace: production
+  labels:
+    app: api
+    slot: blue
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app: api
+        slot: blue
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.0.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SLOT
+          value: "blue"
+        - name: SLOT_COLOR
+          value: "#3498db"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+# Green Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-green
+  namespace: production
+  labels:
+    app: api
+    slot: green
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api
+      slot: green
+  template:
+    metadata:
+      labels:
+        app: api
+        slot: green
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.0.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SLOT
+          value: "green"
+        - name: SLOT_COLOR
+          value: "#2ecc71"
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+# Service (active slot selector)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+    slot: blue  # Change to "green" to switch traffic
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+```
+
+### Cloud Load Balancer Configuration
+
+```yaml
+# GCP Load Balancer for Blue-Green
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-lb
+  namespace: production
+  annotations:
+    cloud.google.com/backend-config: '{"default": "api-backend"}'
+spec:
+  type: NodePort
+  selector:
+    app: api
+    slot: blue
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeBackendService
+metadata:
+  name: api-backend
+spec:
+  sessionAffinity: CLIENT_IP
+  timeoutSec: 60
+  healthChecks:
+    ref:
+      name: api-health-check
+  protocol: HTTP
+  portName: http
+  scope: global
+  enableCDN: false
+```
+
+### DNS-Based Blue-Green
+
+```yaml
+# DNS switch script
+- name: Switch DNS
+  run: |
+    # Update DNS record
+    gcloud dns record-sets transaction start --zone=production-zone
+    
+    gcloud dns record-sets transaction add $NEW_IP \
+      --name=api.myapp.com \
+      --ttl=60 \
+      --type=A \
+      --zone=production-zone
+    
+    gcloud dns record-sets transaction execute --zone=production-zone
+    
+    echo "DNS updated. TTL is 60 seconds."
+    echo "Run: dig +short api.myapp.com to verify"
+```
+
+## Configuration / Pipeline Examples
+
+### ArgoCD Blue-Green Strategy
+
+```yaml
+# rollout-blue-green.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: api-blue-green
+  namespace: production
+spec:
+  replicas: 5
+  strategy:
+    blueGreen:
+      # Name of the active service
+      activeService: api-active
+      # Name of the preview service
+      previewService: api-preview
+      # Auto-pause after creation
+      autoPromotionEnabled: false
+      # Scale down delay after switch
+      scaleDownDelaySeconds: 30
+      # Anti-affinity for zones
+      antiAffinity:
+        required: false
+  selector:
+    matchLabels:
+      app: api
+  template:
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:latest
+        ports:
+        - containerPort: 8080
+```
+
+### GitHub Actions with Environment Approval
+
+```yaml
+- name: Production Traffic Switch
+  environment:
+    name: production
+    url: https://myapp.com
+  # Requires manual approval before proceeding
+```
+
+## Common Commands / Steps
+
+### Blue-Green Operations
+
+```bash
+# Check current state
+kubectl get deployment -n production -l app=api
+kubectl get service api -n production -o jsonpath='{.spec.selector.slot}'
+
+# Deploy to idle slot
+kubectl set image deployment/api-green api=$IMAGE_TAG -n production
+kubectl rollout status deployment/api-green -n production
+
+# Switch traffic
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"green"}}}'
+
+# Verify switch
+kubectl get pods -n production -l slot=green
+curl -f https://myapp.com/health
+
+# Instant rollback (switch back)
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+# Scale down old deployment
+kubectl scale deployment/api-blue --replicas=0 -n production
+```
+
+### Monitoring During Switch
+
+```bash
+# Watch traffic distribution
+kubectl get pods -n production -l app=api --watch
+
+# Check error rates
+kubectl exec -n production deployment/api-green -- curl -s localhost:8080/metrics | grep http_errors
+
+# Monitor connections
+kubectl exec -n production deployment/api-green -- netstat -an | grep ESTABLISHED | wc -l
+```
+
+## Monitoring
+
+### Blue-Green Metrics
+
+| Metric | Description | Target |
+|--------|-------------|--------|
+| Traffic switch time | Time to complete DNS/LB switch | < 30 seconds |
+| Connection drop | Lost connections during switch | < 1% |
+| Validation time | Time to validate new deployment | < 5 minutes |
+| Rollback time | Time to revert if needed | < 2 minutes |
+
+### Traffic Monitoring Queries
+
+```promql
+# Traffic split (if using weighted routing)
+sum(rate(requests_total{slot="blue"}[5m])) / sum(rate(requests_total[5m])) * 100
+sum(rate(requests_total{slot="green"}[5m])) / sum(rate(requests_total[5m])) * 100
+
+# Error rate by slot
+sum(rate(requests_total{status=~"5..",slot="green"}[5m])) / sum(rate(requests_total{slot="green"}[5m])) * 100
+```
+
+## Security
+
+### Blue-Green Security Considerations
+
+| Concern | Mitigation |
+|---------|------------|
+| Double blast radius | Both environments must be secured |
+| Credentials on both | Rotate after full switch |
+| Traffic interception | Use TLS throughout |
+| Configuration drift | Sync configs, use GitOps |
+
+```yaml
+# Security context for blue-green
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+```
+
+## Cost Optimization
+
+### Resource Optimization
+
+| Strategy | Savings | Implementation |
+|----------|---------|----------------|
+| Idle slot at 0 replicas | 50% when idle | Scale to 0 when not deploying |
+| Shared PVC | Reduce storage | Single PVC per slot |
+| Spot instances | 60-70% | Use preemptible for idle slot |
+
+```yaml
+# Scale idle slot to 0 when not deploying
+spec:
+  replicas: 0  # For idle deployment
+```
+
+### Cost Monitoring
+
+```bash
+# Calculate blue-green cost
+# Active: 5 replicas x 0.5 CPU x $0.05/hour = $0.125/hour
+# Idle: 0 replicas = $0
+# Monthly: $0.125 x 24 x 30 = $90
+
+# Optimization: Scale idle to 0 between deploys
+kubectl scale deployment/api-green --replicas=0 -n production
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Traffic not switching | DNS TTL too long | Lower TTL before switch, wait |
+| Pods not ready | Readiness probe failing | Check logs, increase timeout |
+| Connection drops | No graceful drain | Add connection draining |
+| Session lost | Session affinity change | Use sticky sessions |
+| Both slots active | Selector not updated | Verify service selector |
+
+### Debug Commands
+
+```bash
+# Check service selector
+kubectl get service api -n production -o yaml | grep -A5 selector
+
+# Check pod status per slot
+kubectl get pods -n production -l slot=blue
+kubectl get pods -n production -l slot=green
+
+# Verify traffic routing
+curl -v https://myapp.com/health
+
+# Check events
+kubectl get events -n production --sort-by='.lastTimestamp' | grep api
+
+# DNS check
+dig +short api.myapp.com
+nslookup api.myapp.com
+```
+
+### Emergency Procedures
+
+```bash
+# EMERGENCY: Instant rollback
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+# EMERGENCY: Scale down problematic slot
+kubectl scale deployment/api-green --replicas=0 -n production
+
+# EMERGENCY: Full traffic cut to single pod
+kubectl scale deployment/api-blue --replicas=1 -n production
+```
+
+## Interview Questions
+
+### Q1: What are the advantages of blue-green over rolling deployments?
+
+**Answer:** Blue-green offers instant traffic switch (< 1 minute) versus rolling's gradual approach. Rollback is simply switching back, while rolling requires undoing each pod update. Blue-green allows complete validation before any user impact. However, blue-green requires double the resources (two full environments running) while rolling uses the same resources.
+
+### Q2: How do you handle database migrations in blue-green deployments?
+
+**Answer:** Database migrations are the main challenge. Options: 1) Make migrations backward-compatible (expand-contract pattern), 2) Run migrations before traffic switch as a separate step, 3) Use feature flags to hide incompatible features, 4) For schema changes, run migration during the validation phase, 5) Accept that rollback may not revert schema changes.
+
+### Q3: How does DNS-based traffic switching work?
+
+**Answer:** DNS switching updates A records to point to the new environment's IP. DNS TTL determines how fast propagation occurs. For instant switch, set TTL to 60 seconds or lower before switch, wait for cache expiration, then update. Alternative: use weighted records (Route 53) for gradual shift, or pointer records (CNAME) that swap entirely.
+
+### Q4: What is connection draining and why is it important?
+
+**Answer:** Connection draining allows existing requests to complete before removing instances. Without it, in-flight requests to the old slot get terminated mid-request, causing errors. Implementation: set `terminationGracePeriodSeconds` and configure load balancer drain timeout. Most cloud load balancers have built-in connection draining.
+
+### Q5: How do you validate the idle environment before traffic switch?
+
+**Answer:** 1) Automated smoke tests against idle deployment (health, API, critical paths), 2) Load testing to ensure handles expected traffic, 3) Manual QA verification, 4) Staging environment mirroring production, 5) Synthetic monitoring checks, 6) Database connectivity verification, 7) Downstream dependency validation.
+
+## Cheat Sheet
+
+```bash
+# Blue-Green Operations
+kubectl get deployment,service -n production -l app=api
+kubectl get service api -n production -o jsonpath='{.spec.selector.slot}'
+
+# Deploy to idle slot
+kubectl set image deployment/api-green api=$IMAGE_TAG -n production
+kubectl rollout status deployment/api-green -n production
+
+# Switch traffic
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"green"}}}'
+
+# Verify
+curl -f https://myapp.com/health
+
+# Rollback
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+# Scale down old
+kubectl scale deployment/api-blue --replicas=0 -n production
+```
+
+## Related Topics
+
+- [Deployment Strategies](./deploy.mdx)
+- [Rollback Procedures](./rollback.mdx)
+- [Canary Deployments](./canary.mdx)
+- [GitOps & Automation](./automation.mdx)

@@ -1,0 +1,519 @@
+---
+sidebar_position: 14
+description: SSH configuration, key-based authentication, port forwarding, jump hosts, and security hardening.
+---
+
+# SSH
+
+## Overview
+
+SSH (Secure Shell) is the primary method for remote Linux administration. Understanding SSH configuration, key-based authentication, port forwarding, and jump hosts is essential for DevOps work. SSH provides encrypted remote access, file transfer (scp/sftp), and tunneled access to internal services.
+
+SSH configuration has two levels: system-wide (`/etc/ssh/sshd_config`) and user (`~/.ssh/config`). The user config is more flexible and takes precedence. Understanding ssh-agent for key management and ProxyJump for bastion hosts enables secure, convenient remote access.
+
+## When To Use
+
+- Remote server administration
+- Secure file transfer
+- Tunneling to internal services
+- Git operations (git@github.com)
+- Automated scripts (CI/CD)
+
+## When NOT To Use
+
+- When physical console access is available (faster)
+- When using container-based remote execution
+
+## Core Concepts
+
+### SSH Keys
+
+```bash
+# Generate key pair
+ssh-keygen -t ed25519 -C "deploy@prod-01" -f ~/.ssh/id_ed25519_prod
+ssh-keygen -t rsa -b 4096 -C "user@host" -f ~/.ssh/id_rsa_work
+
+# Key types:
+# ed25519 - modern, fast, small keys (preferred)
+# rsa - legacy, widely supported (4096+ bits recommended)
+# ecdsa - NIST curves (some concerns about backdoors)
+
+# Change passphrase
+ssh-keygen -p -f ~/.ssh/id_ed25519
+
+# Display fingerprint
+ssh-keygen -lf ~/.ssh/id_ed25519.pub
+
+# Copy public key to server
+ssh-copy-id -i ~/.ssh/id_ed25519.pub user@server
+# Or manually:
+cat ~/.ssh/id_ed25519.pub | ssh user@server "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+```
+
+### SSH Agent
+
+```bash
+# Start agent
+eval "$(ssh-agent -s)"
+
+# Add key (enter passphrase)
+ssh-add ~/.ssh/id_ed25519
+ssh-add ~/.ssh/id_rsa
+
+# List keys
+ssh-add -l
+
+# Add all keys
+ssh-add ~/.ssh/*
+
+# Remove key
+ssh-add -d ~/.ssh/old_key
+
+# Remove all
+ssh-add -D
+
+# Keychain integration (macOS/Linux)
+# Add to ~/.bashrc:
+# eval "$(keychain --eval id_ed25519)"
+```
+
+### SSH Config File
+
+```bash
+# ~/.ssh/config
+cat ~/.ssh/config
+
+# Basic host
+Host prod
+    HostName prod-server-01.internal
+    User deploy
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519_prod
+
+# Jump host (bastion)
+Host jump
+    HostName bastion.example.com
+    User admin
+    IdentityFile ~/.ssh/id_ed25519_admin
+
+Host internal-*
+    HostName %h.internal.example.com
+    User admin
+    ProxyJump jump
+
+# Specific options
+Host *.internal
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# Forward agent
+Host github
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_github
+    ForwardAgent yes
+
+# Port forwarding
+Host db-staging
+    HostName 10.0.1.15
+    LocalForward 5433 staging-db:5432
+```
+
+### Port Forwarding
+
+```bash
+# Local forward: local port -> remote host:port
+ssh -L 8080:localhost:80 user@webserver
+# Access http://localhost:8080 -> goes to webserver's localhost:80
+
+# Remote forward: remote port -> local host:port
+ssh -R 8080:localhost:80 user@public-server
+# People hitting public-server:8080 -> your local port 80
+
+# Dynamic SOCKS proxy (browse as if from remote)
+ssh -D 1080 user@gateway
+# Configure browser to use SOCKS5 proxy localhost:1080
+
+# Multiple forwards
+ssh -L 8080:web1:80 -L 8081:web2:80 user@bastion
+
+# Keep alive
+ssh -o ServerAliveInterval=60 -L 8080:localhost:80 user@host
+```
+
+### ProxyJump / Bastion Hosts
+
+```bash
+# Simple ProxyJump
+ssh -J jump-host internal-host
+
+# Config-based (cleaner)
+# Host internal-*
+#     ProxyJump bastion.example.com
+
+# Multiple hops
+ssh -J user1@bastion1,user2@bastion2 internal-host
+
+# ProxyCommand alternative
+Host internal-host
+    HostName 10.0.1.15
+    User admin
+    ProxyCommand ssh -W %h:%p jump-host
+```
+
+### SSHD Config
+
+```bash
+# /etc/ssh/sshd_config ( hardened )
+cat /etc/ssh/sshd_config
+
+# Key settings:
+Port 22
+Protocol 2
+ListenAddress 0.0.0.0
+ PermitRootLogin no
+ PubkeyAuthentication yes
+ PasswordAuthentication no
+ ChallengeResponseAuthentication no
+ PermitEmptyPasswords no
+ AuthorizedKeysFile .ssh/authorized_keys
+ MaxAuthTries 3
+ MaxSessions 10
+ ClientAliveInterval 300
+ ClientAliveCountMax 2
+ LogLevel VERBOSE
+ SyslogFacility AUTH
+ X11Forwarding no
+ AllowAgentForwarding yes
+ AllowTcpForwarding no          # Restrict if not needed
+ PermitOpen none                # If no TCP forwarding needed
+ Banner /etc/ssh/banner
+
+# Ciphers and key exchange
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+```
+
+### SFTP and SCP
+
+```bash
+# Secure copy
+scp file.txt user@host:/path/
+scp user@host:/path/file.txt ./
+scp -r directory/ user@host:/path/
+
+# SFTP interactive
+sftp user@host
+sftp> ls
+sftp> get file.txt
+sftp> put file.txt
+sftp> mget *.log
+
+# SFTP with key
+sftp -i ~/.ssh/key -o StrictHostKeyChecking=no user@host
+```
+
+## Real Production Example
+
+Setting up jump host access to private infrastructure:
+
+```bash
+#!/bin/bash
+# setup-ssh-access.sh
+
+set -euo pipefail
+
+JUMP_HOST="bastion.example.com"
+JUMP_USER="deploy"
+INTERNAL_NET="10.0.0.0/24"
+
+# 1. Generate dedicated deploy key
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_deploy \
+    -C "deploy@$(hostname)-$(date +%Y%m%d)"
+
+# 2. Add public key to jump host
+ssh ${JUMP_USER}@${JUMP_HOST} "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys" \
+    < ~/.ssh/id_ed25519_deploy.pub
+
+# 3. Create SSH config
+cat > ~/.ssh/config <<EOF
+# Jump host
+Host bastion
+    HostName ${JUMP_HOST}
+    User ${JUMP_USER}
+    IdentityFile ~/.ssh/id_ed25519_deploy
+    AddKeysToAgent yes
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+    StrictHostKeyChecking accept-new
+
+# All internal hosts via bastion
+Host internal-*
+    ProxyJump bastion
+    User deploy
+    IdentityFile ~/.ssh/id_ed25519_deploy
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# Specific hosts
+Host internal-db-primary
+    HostName 10.0.1.10
+    User postgres
+
+Host internal-web-01
+    HostName 10.0.1.20
+    User www
+
+Host internal-web-02
+    HostName 10.0.1.21
+    User www
+
+# GitHub access
+Host github
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_github
+    AddKeysToAgent yes
+EOF
+
+chmod 600 ~/.ssh/config
+
+# 4. Test connection
+ssh -v bastion "echo 'Jump host OK'"
+ssh internal-db-primary "psql --version"
+```
+
+## CLI Examples
+
+```bash
+# Basic connection
+ssh user@host
+ssh -p 2222 user@host
+
+# With specific key
+ssh -i ~/.ssh/special_key user@host
+
+# Execute command
+ssh user@host "df -h"
+
+# Debug mode
+ssh -v user@host
+ssh -vv user@host   # More verbose
+ssh -vvv user@host  # Maximum verbosity
+
+# Copy key
+ssh-copy-id user@host
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `ssh user@host` | Connect | Remote shell |
+| `ssh-copy-id` | Install key | `ssh-copy-id user@host` |
+| `ssh-keygen` | Generate keys | `ssh-keygen -t ed25519` |
+| `ssh-add` | Add to agent | `ssh-add ~/.ssh/key` |
+| `scp` | Copy files | `scp file host:/path` |
+| `sftp` | FTP over SSH | Interactive file transfer |
+| `sshfs` | Mount remote | `sshfs host:/dir /mnt` |
+
+## Monitoring
+
+```bash
+# Active sessions
+who
+w
+last
+
+# Failed attempts
+sudo lastb | head
+grep "Failed password" /var/log/auth.log | tail
+
+# Current connections
+ss -tn | grep :22
+
+# Log location
+/var/log/auth.log  (Debian/Ubuntu)
+/var/log/secure    (RHEL)
+/var/log/audit/audit.log  (if auditd enabled)
+```
+
+## Security
+
+**Hardening practices:**
+
+```bash
+# 1. Disable password auth
+# /etc/ssh/sshd_config:
+PasswordAuthentication no
+PubkeyAuthentication yes
+
+# 2. Restrict allowed users
+AllowUsers admin deploy@10.0.0.0/8
+
+# 3. Limit ciphers
+# Add to /etc/ssh/sshd_config:
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+KexAlgorithms curve25519-sha256
+MACs hmac-sha2-512-etm@openssh.com
+
+# 4. Fail2ban (automatic blocking)
+apt install fail2ban
+# /etc/fail2ban/jail.local:
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 5
+bantime = 3600
+
+# 5. Two-factor authentication
+# /etc/ssh/sshd_config:
+ChallengeResponseAuthentication yes
+# Then configure PAM for OATH, Duo, etc.
+
+# 6. Key rotation policy
+# Set expiration in authorized_keys:
+ssh-ed25519 AAAAC3Nza... expire-date=2025-01-01
+```
+
+**authorized_keys options:**
+
+```
+# No shell, specific command only
+from="10.0.0.0/8" ssh-ed25519 AAAA... command="/usr/local/bin/backup.sh"
+
+# Expiration
+ssh-ed25519 AAAA... expire-date="2024-12-31"
+
+# Forwarding only (no exec)
+ssh-ed25519 AAAA...,no-pty,no-X11-forwarding,no-agent-forwarding
+```
+
+## Troubleshooting
+
+**"Connection refused":**
+
+```bash
+# Check service
+systemctl status sshd
+sudo systemctl status ssh
+
+# Check listening
+ss -tlnp | grep :22
+netstat -tlnp | grep :22
+
+# Check firewall
+sudo iptables -L -n | grep :22
+sudo ufw status
+```
+
+**"Permission denied (publickey)":**
+
+```bash
+# Check key permissions
+ls -la ~/.ssh/
+# Should be 700 for .ssh, 600 for keys
+
+# Verify key is correct on server
+ssh user@host "cat ~/.ssh/authorized_keys"
+
+# Add key to agent
+ssh-add ~/.ssh/id_ed25519
+
+# Check sshd logs
+sudo journalctl -u ssh -n 50
+grep "not in PubkeyAcceptedAlgorithms" /var/log/auth.log
+```
+
+**"Too many authentication failures":**
+
+```bash
+# Increase MaxAuthTries in sshd_config
+# Or identify which key is failing
+ssh -v user@host
+# Shows which key is offered
+
+# Fix by specifying key
+ssh -i ~/.ssh/correct_key user@host
+```
+
+**Slow connection:**
+
+```bash
+# Check DNS resolution
+# Add to /etc/ssh/sshd_config:
+UseDNS no
+
+# Disable unused authentication methods
+# /etc/ssh/sshd_config:
+ChallengeResponseAuthentication no
+PasswordAuthentication no
+KerberosAuthentication no
+GSSAPIAuthentication no
+```
+
+## Interview Questions
+
+1. **What's the difference between SSH key types (RSA, ECDSA, Ed25519)?**
+
+RSA is the legacy standard, widely supported but requires 4096+ bit keys for security. ECDSA uses elliptic curve cryptography with smaller keys (256-521 bits) but has NIST curve controversy. Ed25519 is modern, fast, uses small keys (256 bits), and is considered most secure against side-channel attacks. Prefer Ed25519 for new keys; RSA for compatibility with very old systems.
+
+2. **How does ProxyJump work vs ProxyCommand?**
+
+ProxyJump (`-J`) is the simpler, modern approach. SSH creates a multiplexed connection through the jump host, forwarding your SSH traffic. The `-L` local forwards still work through the tunnel. ProxyCommand uses `ssh -W %h:%p` to connect through the jump host before running netcat to the target. ProxyJump is cleaner and handles port forwarding automatically.
+
+3. **What's the SSH agent and why use it?**
+
+The SSH agent holds decrypted private keys in memory, avoiding repeated passphrase entry. When you add a key (`ssh-add`), it decrypts the key and stores it. SSH client queries the agent for keys during authentication. This enables passwordless SSH after initial unlock, and agent forwarding allows remote hosts to use your local keys (with security implications).
+
+4. **How would you debug SSH connection issues?**
+
+Use `ssh -vvv` for verbose output showing each step (TCP connection, key exchange, authentication). Check `journalctl -u ssh` on the server for detailed logs. Verify key permissions (`chmod 600 ~/.ssh/*`). Check server's `sshd_config` for allowed authentication methods. Use `ssh -T` to skip pseudo-TTY if testing commands. Check firewall rules on both sides.
+
+5. **What's the security difference between local and remote port forwarding?**
+
+Local forwarding (`-L`) creates a local port that tunnels through SSH to a remote destination. The local port is only accessible from your machine. Remote forwarding (`-R`) opens a port on the SSH server that tunnels back to your local machine — potentially accessible to other users on that server. Remote forwarding is riskier and should be carefully controlled with `GatewayPorts no` (default) or explicit IP binding.
+
+## Cheat Sheet
+
+```
+# Key management
+ssh-keygen -t ed25519 -C "comment"
+ssh-copy-id user@host
+ssh-add ~/.ssh/key
+
+# Connection
+ssh user@host
+ssh -i ~/.ssh/key user@host
+ssh -J jump host internal
+
+# Config (~/.ssh/config)
+Host alias
+    HostName real.host.com
+    User admin
+    IdentityFile ~/.ssh/key
+    ProxyJump bastion
+
+# Port forwarding
+ssh -L 8080:localhost:80 host
+ssh -R 8080:localhost:80 host
+ssh -D 1080 host  # SOCKS proxy
+
+# File transfer
+scp file host:/path/
+sftp host
+```
+
+## Related Topics
+
+- [Shell](./shell) — Interactive shells
+- [Security](./security) — SSH hardening
+- [Networking](./networking) — Network stack

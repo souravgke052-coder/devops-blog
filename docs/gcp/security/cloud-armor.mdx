@@ -1,0 +1,587 @@
+# Cloud Armor
+
+## Overview
+
+Google Cloud Armor provides DDoS protection and application-level firewall rules for GCP load balancers. It secures applications against OWASP Top 10 threats, volumetric attacks, and network-layer attacks. Cloud Armor integrates with Global HTTP(S) Load Balancer and Global External Application Load Balancer.
+
+## When To Use
+
+- DDoS protection for web applications
+- WAF rules for OWASP threats
+- IP allowlist/denylist
+- Geographic-based access control
+- Rate limiting
+- Bot management
+
+## When NOT To Use
+
+- Internal service protection (use firewall rules)
+- Non-HTTP(S) services (use Cloud NAT, IAP)
+- Real-time traffic filtering without load balancer
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Cloud Armor                              │
+├─────────────────────────────────────────────────────────────┤
+│  Protects:                                                 │
+│  ├── Global HTTP(S) Load Balancer                         │
+│  ├── Global External Application LB                        │
+│  └── Classic Application LB (deprecated)                   │
+├─────────────────────────────────────────────────────────────┤
+│  Security Policies:                                        │
+│  ├── Preconfigured WAF rules                              │
+│  ├── Custom rules                                         │
+│  ├── Rate limiting                                        │
+│  └── IP-based access control                              │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  ├── $0.125/per policy per backend                        │
+│  └── $5.00/million requests (above free tier)             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Security Policy
+Container for rules attached to backend services.
+
+### Rule
+Individual match condition with action (allow/deny/allowlist).
+
+### Preconfigured WAF Rules
+Managed rules for common attack patterns (SQLi, XSS, RCE, etc.).
+
+### Adaptive Protection
+ML-based DDoS detection and mitigation.
+
+### Priority
+Rules evaluated in priority order (lower = higher priority).
+
+## Real Production Example
+
+**WAF Configuration for Production Application**
+
+```hcl
+# Terraform configuration for Cloud Armor
+
+# Create security policy
+resource "google_compute_security_policy" "production" {
+  name        = "production-waf-policy"
+  description = "WAF policy for production application"
+  
+  # Adaptive protection (DDoS)
+  adaptive_protection_config {
+    layer_7_ddos_defense_config {
+      enable = true
+      rule_visibility = "PREMIUM"
+    }
+  }
+  
+  # Rule to block known malicious IPs
+  rule {
+    action      = "deny(403)"
+    description = "Block known malicious IP ranges"
+    priority    = 100
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('sourceiplist-known-malicious-ips')"
+      }
+    }
+  }
+  
+  # SQL injection protection
+  rule {
+    action      = "deny(403)"
+    description = "Block SQL injection"
+    priority    = 200
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('sqli-v33-stable')"
+      }
+    }
+  }
+  
+  # Cross-site scripting protection
+  rule {
+    action      = "deny(403)"
+    description = "Block XSS attacks"
+    priority    = 300
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('xss-v33-stable')"
+      }
+    }
+  }
+  
+  # Remote code execution protection
+  rule {
+    action      = "deny(403)"
+    description = "Block RCE attempts"
+    priority    = 400
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('rce-v33-stable')"
+      }
+    }
+  }
+  
+  # Local file inclusion protection
+  rule {
+    action      = "deny(403)"
+    description = "Block LFI attempts"
+    priority    = 500
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('lfi-v33-stable')"
+      }
+    }
+  }
+  
+  # Block traversal attempts
+  rule {
+    action      = "deny(403)"
+    description = "Block path traversal"
+    priority    = 600
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('protocolattack-v33-stable')"
+      }
+    }
+  }
+  
+  # Rate limiting rule
+  rule {
+    action      = "throttle"
+    description = "Rate limit to 100 requests per minute per IP"
+    priority    = 1000
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      rate_limit_threshold {
+        count        = 100
+        interval_sec = 60
+      }
+      ban_duration_sec        = 300
+      enforce_on_key          = "IP"
+    }
+  }
+  
+  # Allow internal network
+  rule {
+    action      = "allow"
+    description = "Allow internal network"
+    priority    = 2000
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+      }
+    }
+  }
+  
+  # Default rule - allow all
+  rule {
+    action      = "allow"
+    description = "Default rule"
+    priority    = 2147483647
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+  }
+}
+
+# Security policy with geographic restriction
+resource "google_compute_security_policy" "geo_restricted" {
+  name        = "geo-restricted-policy"
+  description = "Restrict access by geography"
+  
+  rule {
+    action      = "deny(403)"
+    description = "Block non-US locations"
+    priority    = 100
+    match {
+      expr {
+        expression = "origin.region_code != 'US'"
+      }
+    }
+  }
+  
+  # Allow specific countries
+  rule {
+    action      = "allow"
+    description = "Allow US and Canada"
+    priority    = 200
+    match {
+      expr {
+        expression = "origin.region_code in ['US', 'CA']"
+      }
+    }
+  }
+}
+
+# Attach security policy to backend service
+resource "google_compute_backend_service" "default" {
+  name        = "production-backend"
+  protocol    = "HTTPS"
+  port_name   = "https"
+  protocol    = "HTTP"
+  health_checks = google_compute_health_check.default.id
+  
+  security_policy = google_compute_security_policy.production.id
+  
+  log_config {
+    enable      = true
+    sample_rate = 1.0
+  }
+}
+
+resource "google_compute_health_check" "default" {
+  name               = "health-check"
+  check_interval_sec = 30
+  timeout_sec        = 10
+  
+  https_health_check {
+    port         = 443
+    request_path = "/health"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create security policy
+gcloud compute security-policies create my-policy \
+  --description="My WAF policy"
+
+# Create with adaptive protection
+gcloud compute security-policies create my-policy \
+  --description="DDoS protected" \
+  --enable-layer7-ddos-defense \
+  --layer7-ddos-defense-rule-visibility=PREMIUM
+
+# Add rule for IP deny
+gcloud compute security-policies rules create 1000 \
+  --security-policy=my-policy \
+  --src-ip-ranges="192.168.1.0/24" \
+  --action=deny-403
+
+# Add SQL injection rule
+gcloud compute security-policies rules create 2000 \
+  --security-policy=my-policy \
+  --expression="evaluatePreconfiguredExpr('sqli-v33-stable')" \
+  --action=deny-403
+
+# Add XSS rule
+gcloud compute security-policies rules create 3000 \
+  --security-policy=my-policy \
+  --expression="evaluatePreconfiguredExpr('xss-v33-stable')" \
+  --action=deny-403
+
+# Add rate limiting rule
+gcloud compute security-policies rules create 4000 \
+  --security-policy=my-policy \
+  --expression="true" \
+  --action=throttle \
+  --rate-limit-threshold-count=100 \
+  --rate-limit-threshold-interval-sec=60 \
+  --conform-action=allow \
+  --exceed-action=deny-429 \
+  --enforce-on-key=SRC_IP
+
+# Add geographic restriction
+gcloud compute security-policies rules create 5000 \
+  --security-policy=my-policy \
+  --expression="origin.region_code != 'US'" \
+  --action=deny-403
+
+# List policies
+gcloud compute security-policies list
+
+# Describe policy
+gcloud compute security-policies describe my-policy
+
+# List rules
+gcloud compute security-policies rules list --security-policy=my-policy
+
+# Update rule
+gcloud compute security-policies rules update 1000 \
+  --security-policy=my-policy \
+  --action=allow
+
+# Delete rule
+gcloud compute security-policies rules delete 1000 \
+  --security-policy=my-policy
+
+# Attach to backend service
+gcloud compute backend-services update my-backend \
+  --security-policy=my-policy
+
+# Remove security policy
+gcloud compute backend-services update my-backend \
+  --no-security-policy
+
+# Enable logging
+gcloud compute security-policies update my-policy \
+  --enable-layer7-ddos-defense
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Basic security policy with WAF rules
+resource "google_compute_security_policy" "waf" {
+  name        = "waf-policy"
+  description = "WAF with common rules"
+  
+  rule {
+    action      = "deny(403)"
+    priority    = 1000
+    expression  = "evaluatePreconfiguredExpr('sqli-v33-stable')"
+    description = "Block SQLi"
+  }
+  
+  rule {
+    action      = "deny(403)"
+    priority    = 2000
+    expression  = "evaluatePreconfiguredExpr('xss-v33-stable')"
+    description = "Block XSS"
+  }
+  
+  rule {
+    action      = "allow"
+    priority    = 2147483647
+    description = "Default allow"
+  }
+}
+
+# With rate limiting
+resource "google_compute_security_policy" "rate_limited" {
+  name = "rate-limited-policy"
+  
+  rule {
+    action   = "throttle"
+    priority = 1000
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      rate_limit_threshold {
+        count        = 100
+        interval_sec = 60
+      }
+      enforce_on_key = "IP"
+    }
+  }
+}
+
+# Attach to backend service
+resource "google_compute_backend_service" "app" {
+  name            = "app-backend"
+  security_policy = google_compute_security_policy.waf.id
+}
+```
+
+## Common Commands
+
+```bash
+# Policy management
+gcloud compute security-policies create NAME [--description=DESC]
+gcloud compute security-policies list
+gcloud compute security-policies describe NAME
+gcloud compute security-policies update NAME [--enable-layer7-ddos-defense]
+gcloud compute security-policies delete NAME
+
+# Rule management
+gcloud compute security-policies rules create PRIORITY --security-policy=POLICY [flags]
+gcloud compute security-policies rules list --security-policy=POLICY
+gcloud compute security-policies rules update PRIORITY --security-policy=POLICY [flags]
+gcloud compute security-policies rules delete PRIORITY --security-policy=POLICY
+
+# Attach to backend
+gcloud compute backend-services update BACKEND --security-policy=POLICY
+```
+
+## Monitoring
+
+### Key Metrics
+- Requests allowed/denied
+- WAF rule matches
+- DDoS attacks blocked
+- Latency impact
+
+### Cloud Monitoring
+```bash
+# View Cloud Armor metrics
+gcloud monitoring metrics list --filter="resource.type=security_policy"
+
+# Create alert for high block rate
+gcloud monitoring policies create \
+  --display-name="WAF Block Alert" \
+  --condition-display-name="Block rate > 50%" \
+  --condition-filter='resource.type="compute.googleapis.com/security_policy" AND metric.type="compute.googleapis.com/security_policy/traffic_denied_count"' \
+  --condition-threshold-value=1000 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### Best Practices
+```bash
+# Start with deny-all, allow specific
+# Use lowest priority for default deny
+# Test rules in preview mode first
+# Monitor rule matches before enabling enforcement
+```
+
+### Adaptive Protection
+```bash
+# Enable ML-based DDoS protection
+gcloud compute security-policies update my-policy \
+  --enable-layer7-ddos-defense \
+  --layer7-ddos-defense-rule-visibility=STANDARD
+```
+
+## Cost Optimization
+
+### Pricing
+- $0.125 per policy per backend service per month
+- $5.00 per million requests beyond free tier
+
+### Optimization
+- Combine multiple backends in one policy
+- Use preview mode to test before enabling
+- Review rule match counts
+
+## Troubleshooting
+
+### Legitimate Traffic Blocked
+```bash
+# Check which rule is blocking
+gcloud logging read "resource.type=security_policy" --limit=50
+
+# Review rule priorities
+gcloud compute security-policies rules list --security-policy=my-policy
+
+# Add exception for affected IPs
+gcloud compute security-policies rules create 50 \
+  --security-policy=my-policy \
+  --src-ip-ranges="affected-ip/32" \
+  --action=allow
+```
+
+### Rule Not Matching
+```bash
+# Verify expression syntax
+gcloud compute security-policies rules update 1000 \
+  --security-policy=my-policy \
+  --expression="evaluatePreconfiguredExpr('xss-v33-stable')"
+
+# Test expression
+# Use Cloud Console expression tester
+```
+
+## Interview Questions
+
+**Q: What is the difference between Cloud Armor and VPC firewall rules?**
+A: VPC firewall rules operate at the network/transport layer (IP, port). Cloud Armor operates at the application layer (HTTP/S) and provides WAF capabilities, DDoS protection, and intelligent filtering based on request content.
+
+**Q: How does Cloud Armor rate limiting work?**
+A: Rate limiting thresholds can be set per IP, per region, or per session. When exceeded, the configured exceed_action (deny with code, throttle) is applied. Ban duration can temporarily block sources after repeated violations.
+
+**Q: What are preconfigured WAF rules?**
+A: Google-managed rules for common attack patterns: SQL injection (SQLi), Cross-Site Scripting (XSS), Remote Code Execution (RCE), Local File Inclusion (LFI), Scanner detection, Protocol attacks, and more. Updated automatically as new threats emerge.
+
+**Q: How does Adaptive Protection work?**
+A: ML-based system that detects DDoS attacks by analyzing traffic patterns. Can automatically generate mitigation rules or pre-emptively suggest rules. Available in Standard and Premium tiers.
+
+**Q: What is rule priority and how is it evaluated?**
+A: Rules are evaluated in order from lowest priority number to highest. First matching rule's action is applied. Default rule has priority 2147483647. Use this structure to ensure specific rules are evaluated before general rules.
+
+## Cheat Sheet
+
+```bash
+# Create policy
+gcloud compute security-policies create my-policy
+
+# Add WAF rules
+gcloud compute security-policies rules create 1000 \
+  --security-policy=my-policy \
+  --expression="evaluatePreconfiguredExpr('sqli-v33-stable')" \
+  --action=deny-403
+
+# Rate limiting
+gcloud compute security-policies rules create 2000 \
+  --security-policy=my-policy \
+  --action=throttle \
+  --rate-limit-threshold-count=100 \
+  --rate-limit-threshold-interval-sec=60
+
+# IP blocking
+gcloud compute security-policies rules create 3000 \
+  --security-policy=my-policy \
+  --src-ip-ranges="1.2.3.4/32" \
+  --action=deny-403
+
+# Attach to backend
+gcloud compute backend-services update my-backend --security-policy=my-policy
+```
+
+## Labs
+
+### Lab 1: Basic WAF Setup
+Configure WAF protection.
+1. Create security policy
+2. Add SQLi protection rule
+3. Add XSS protection rule
+4. Attach to backend service
+5. Test with simulated attacks
+
+### Lab 2: DDoS Protection
+Implement DDoS mitigation.
+1. Enable Adaptive Protection
+2. Create rate limiting rules
+3. Configure geographic restrictions
+4. Monitor attack patterns
+5. Tune rules based on traffic
+
+### Lab 3: Bot Management
+Block malicious bots.
+1. Enable bot management
+2. Create rules for known bots
+3. Implement rate limiting for scrapers
+4. Configure CAPTCHA challenges
+5. Monitor bot traffic
+
+## Related Services
+
+- **Load Balancer**: Protected resource
+- **Cloud CDN**: Caching with Cloud Armor
+- **Cloud Firewall**: Network-level protection
+- **IAP**: Application-level access control
+- **DDoS Protection**: Network-level DDoS (automatic)

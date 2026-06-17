@@ -1,0 +1,1092 @@
+---
+sidebar_position: 24
+description: Hands-on Linux labs for DevOps engineers — VM setup, networking, systemd services, log analysis, performance tuning, and security hardening.
+---
+
+# Linux Hands-On Labs
+
+## Overview
+
+These labs provide practical, hands-on experience with Linux administration tasks you will encounter in production. Each lab walks through a real-world scenario with step-by-step instructions, verification commands, and expected outcomes. Complete these in a VM or container environment — never practice destructive commands on production systems.
+
+Each lab follows the same format: objective, prerequisites, steps, verification, and challenge. Work through them in order — foundational labs build skills needed for advanced ones. Estimated times are approximate; take longer if you are learning concepts for the first time.
+
+## When To Use
+
+- Learning Linux administration fundamentals
+- Interview preparation (these cover real skills)
+- Refreshing knowledge of tools you don't use daily
+- Building muscle memory for production tasks
+
+## When NOT To Use
+
+- On production systems (labs assume experimentation)
+- If you already know the concepts (skip to challenges)
+
+## Core Concepts
+
+### Lab Environment Setup
+
+Before starting labs, set up a safe environment:
+
+```bash
+# Create a lab VM (using multipass for macOS/Linux)
+multipass launch --name linux-lab --cpus 2 --mem 2G --disk 10G
+multipass shell linux-lab
+
+# Or use Vagrant
+vagrant init ubuntu/focal64
+vagrant up
+vagrant ssh
+
+# Or Docker for container-specific labs
+docker run -it --rm --privileged ubuntu:22.04 bash
+```
+
+**Safety rules:**
+- Never run `rm -rf /` or similar destructive commands
+- Use `set -euo pipefail` in all scripts
+- Keep notes of what you changed for cleanup
+- Use separate directories for each lab's work
+
+---
+
+## Lab 1: System Information and Baseline
+
+**Objective:** Gather system information and establish a performance baseline.
+
+**Time:** 30 minutes
+
+**Steps:**
+
+1. **Document system configuration:**
+```bash
+# Collect all system info
+uname -a                          # Kernel version, architecture
+cat /etc/os-release               # Distribution details
+hostnamectl                       # Hostname, machine ID
+timedatectl                       # Timezone, NTP status
+lscpu                             # CPU model, cores, threads
+free -h                           # Total and available memory
+lsblk                             # Block devices
+df -h                             # Filesystem usage
+
+# Save to a baseline file
+{
+    echo "=== System Baseline ==="
+    echo "Date: $(date)"
+    uname -r
+    lscpu | grep -E "^Model name:|^CPU\(s\):|^Thread"
+    free -h
+    df -h /
+} > ~/system_baseline.txt
+cat ~/system_baseline.txt
+```
+
+2. **Establish performance baseline:**
+```bash
+# Load average
+uptime
+
+# Run vmstat and observe (5 samples)
+vmstat 1 5
+
+# Run iostat and observe
+iostat -xz 1 5
+
+# Monitor briefly (30 seconds of top)
+top -b -n 3 -d 10 > ~/top_baseline.txt
+cat ~/top_baseline.txt
+```
+
+3. **Check resource limits:**
+```bash
+cat /proc/sys/fs/file-max
+cat /proc/sys/net/core/somaxconn
+ulimit -a
+```
+
+**Verification:** You have a `system_baseline.txt` and `top_baseline.txt` showing current system state.
+
+**Challenge:** Write a single script that collects all system information and saves it with a timestamp. Run it twice and compare the outputs.
+
+---
+
+## Lab 2: User and Group Management
+
+**Objective:** Create users, groups, and manage permissions following least-privilege principles.
+
+**Time:** 45 minutes
+
+**Steps:**
+
+1. **Create a new user with specific settings:**
+```bash
+# Create system user for app (no login shell)
+sudo useradd -r -s /usr/sbin/nologin -M appuser
+
+# Create regular user with home directory and bash
+sudo useradd -m -s /bin/bash -G sudo,www-data developer
+
+# Set password
+sudo passwd developer
+
+# Verify
+id developer
+groups developer
+getent passwd developer
+getent shadow developer
+```
+
+2. **Create an application group and manage membership:**
+```bash
+# Create group for application administrators
+sudo groupadd appadmins
+
+# Add users to group
+sudo usermod -aG appadmins developer
+sudo usermod -aG appadmins appuser
+
+# Verify
+getent group appadmins
+groups developer
+```
+
+3. **Configure sudo access (limited):**
+```bash
+# Create sudoers file for appadmins (limited nginx management)
+sudo visudo -f /etc/sudoers.d/appadmins
+# Add:
+# %appadmins ALL=(www-data) NOPASSWD: /bin/systemctl reload nginx, /bin/systemctl status nginx
+# Defaults:requiretty  # Optional: require TTY
+
+# Verify syntax
+sudo visudo -c
+```
+
+4. **Set up directory permissions:**
+```bash
+# Create application directory
+sudo mkdir -p /opt/myapp/{bin,config,logs,data}
+sudo chown -R appuser:appadmins /opt/myapp
+sudo chmod 750 /opt/myapp/config       # rwxr-x--- (owner + group full, others none)
+sudo chmod 755 /opt/myapp/bin          # rwxr-xr-x (world execute)
+sudo chmod 770 /opt/myapp/logs         # rwxrwx--- (owner + group full)
+sudo chmod 755 /opt/myapp/data         # rwxr-xr-x
+
+# Setgid on logs (new files inherit group)
+sudo chmod 2770 /opt/myapp/logs
+ls -la /opt/myapp/
+```
+
+**Verification:**
+```bash
+# Test developer can sudo (if in sudo group)
+su - developer -c "sudo systemctl status nginx"
+
+# Test appuser cannot login
+su - appuser -c "echo test"   # Should show "This account is not available"
+
+# Test group permissions on logs directory
+su - developer -c "touch /opt/myapp/logs/test.log"
+ls -la /opt/myapp/logs/       # Should show appadmins group
+```
+
+**Challenge:** Create a script that creates a new service account with: home directory, specific shell, group membership, and a `.bashrc` that sets a custom prompt and PATH. Include verification steps.
+
+---
+
+## Lab 3: Systemd Service Management
+
+**Objective:** Create, configure, and manage systemd services for production applications.
+
+**Time:** 60 minutes
+
+**Steps:**
+
+1. **Create a simple application:**
+```bash
+# Create app directory
+sudo mkdir -p /opt/echoserver
+cat > /opt/echoserver/server.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT=${PORT:-8080}
+echo "Starting echoserver on port $PORT"
+
+while true; do
+    echo "Request at $(date)" | nc -l -p "$PORT" -q 1 || true
+done
+EOF
+
+sudo chmod +x /opt/echoserver/server.sh
+```
+
+2. **Create systemd service unit:**
+```bash
+sudo cat > /etc/systemd/system/echoserver.service <<'EOF'
+[Unit]
+Description=TCP Echo Server
+Documentation=https://example.com/echoserver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=appuser
+Group=appadmins
+WorkingDirectory=/opt/echoserver
+Environment=PORT=8080
+ExecStart=/opt/echoserver/server.sh
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/opt/echoserver/logs
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=echoserver
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+3. **Configure associated timer (for cleanup):**
+```bash
+sudo cat > /etc/systemd/system/echoserver-logclean.service <<'EOF'
+[Unit]
+Description=Clean echoserver logs
+After=echoserver.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find /opt/echoserver/logs -mtime +7 -delete
+User=appuser
+EOF
+
+sudo cat > /etc/systemd/system/echoserver-logclean.timer <<'EOF'
+[Unit]
+Description=Clean echoserver logs daily at 3am
+Requires=echoserver-logclean.service
+
+[Timer]
+OnCalendar=*-*-03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+```
+
+4. **Enable and verify:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now echoserver.service
+sudo systemctl enable --now echoserver-logclean.timer
+
+# Check status
+systemctl status echoserver.service
+systemctl status echoserver-logclean.timer
+systemctl list-timers | grep echoserver
+
+# Test the service
+curl -v http://localhost:8080/ 2>&1 | head -10
+
+# View logs via journal
+sudo journalctl -u echoserver -n 20 --no-pager
+sudo journalctl -u echoserver -f   # follow in real-time (Ctrl+C to exit)
+```
+
+**Verification:**
+```bash
+# Check service is running
+systemctl is-active echoserver
+systemctl is-enabled echoserver
+
+# Check logs
+journalctl -u echoserver --since "1 minute ago"
+
+# Test restart behavior
+sudo systemctl restart echoserver
+systemctl status echoserver
+```
+
+**Challenge:** Modify the service to use a PID file (Type=forking), add a health check endpoint, and create a corresponding `.socket` unit for socket activation.
+
+---
+
+## Lab 4: Log Analysis and Monitoring
+
+**Objective:** Analyze real log data, identify patterns, and set up log monitoring.
+
+**Time:** 45 minutes
+
+**Steps:**
+
+1. **Generate sample log data for analysis:**
+```bash
+# Create a realistic log file
+for i in {1..1000}; do
+    STATUS=$((RANDOM % 100))
+    if [[ $STATUS -lt 70 ]]; then STATUS=200; elif [[ $STATUS -lt 85 ]]; then STATUS=404; elif [[ $STATUS -lt 95 ]]; then STATUS=500; else STATUS=503; fi
+    echo "$(date '+%Y-%m-%dT%H:%M:%S') 10.0.0.$((RANDOM % 255)) \"GET /api/v1/users/$((RANDOM % 100)) HTTP/1.1\" $STATUS $((RANDOM % 5000))"
+done > /tmp/access.log
+```
+
+2. **Analyze with shell commands:**
+```bash
+# Count by status code
+awk '{print $NF}' /tmp/access.log | sort | uniq -c | sort -rn
+
+# Count errors (5xx) by minute
+awk '/ 50[0-9] / {minute=substr($1,1,16); counts[minute]++} END {for (m in counts) print m, counts[m]}' /tmp/access.log | sort
+
+# Top 10 IPs by request count
+awk '{print $3}' /tmp/access.log | sort | uniq -c | sort -rn | head -10
+
+# Slow requests (response time > 2000ms)
+awk '$NF > 2000 {print}' /tmp/access.log | head -10
+
+# 404 URLs that are being requested
+awk '/ 404 / {print $7}' /tmp/access.log | sort | uniq -c | sort -rn | head -10
+```
+
+3. **Create a log analysis script:**
+```bash
+cat > ~/analyze_logs.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOGFILE="${1:-/tmp/access.log}"
+
+echo "=== Log Analysis Report ==="
+echo "File: $LOGFILE"
+echo "Total requests: $(wc -l < "$LOGFILE")"
+echo ""
+
+echo "=== Status Codes ==="
+awk '{print $NF}' "$LOGFILE" | sort | uniq -c | sort -rn
+echo ""
+
+echo "=== Top 10 Requesters (IPs) ==="
+awk '{print $3}' "$LOGFILE" | sort | uniq -c | sort -rn | head -10
+echo ""
+
+echo "=== Error Rate ==="
+ERRORS=$(awk '/ 5[0-9][0-9] / {e++} END {print e+0}' "$LOGFILE")
+TOTAL=$(wc -l < "$LOGFILE")
+echo "5xx errors: $ERRORS / $TOTAL = $(bc -l <<< "$ERRORS/$TOTAL*100")%"
+echo ""
+
+echo "=== Slow Requests (>2000ms) ==="
+awk '$NF > 2000 {count++} END {print count+0, "requests > 2000ms"}' "$LOGFILE"
+EOF
+chmod +x ~/analyze_logs.sh
+./analyze_logs.sh /tmp/access.log
+```
+
+**Verification:** Script produces formatted output showing status codes, top IPs, error rate, and slow requests.
+
+**Challenge:** Create a script that runs via systemd timer daily, emails a summary of error rates, and rotates the processed log file.
+
+---
+
+## Lab 5: Network Configuration and Debugging
+
+**Objective:** Configure networking, debug connectivity issues, and set up firewall rules.
+
+**Time:** 60 minutes
+
+**Steps:**
+
+1. **Configure a static IP address:**
+```bash
+# Identify current interface and config
+ip addr
+ip route show
+
+# On Ubuntu (Netplan):
+# Edit /etc/netplan/01-netcfg.yaml:
+cat > /tmp/netplan.yaml <<'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      addresses:
+        - 192.168.1.100/24
+      gateway4: 192.168.1.1
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
+EOF
+# Apply: sudo netplan apply
+# Check: ip addr show eth0
+
+# On RHEL (nmcli):
+# sudo nmcli con mod "Wired connection 1" ipv4.addresses 192.168.1.100/24
+# sudo nmcli con mod "Wired connection 1" ipv4.gateway 192.168.1.1
+# sudo nmcli con mod "Wired connection 1" ipv4.dns "8.8.8.8,8.8.4.4"
+# sudo nmcli con mod "Wired connection 1" ipv4.method manual
+# sudo nmcli con up "Wired connection 1"
+```
+
+2. **Configure firewall (firewalld):**
+```bash
+# Check current status
+sudo systemctl status firewalld || sudo systemctl start firewalld
+sudo firewall-cmd --state
+sudo firewall-cmd --list-all
+
+# Configure for a web server
+sudo firewall-cmd --permanent --set-default-zone=drop
+sudo firewall-cmd --permanent --add-service=ssh
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --permanent --add-port=8080/tcp
+sudo firewall-cmd --reload
+
+# Verify
+sudo firewall-cmd --list-all
+
+# Test: try to connect to a blocked port
+nc -l 9999 &   # Start listener
+# From another terminal: nc localhost 9999 (should fail)
+sudo firewall-cmd --add-port=9999/tcp
+# Now try again (should succeed)
+sudo firewall-cmd --remove-port=9999/tcp
+```
+
+3. **Network debugging:**
+```bash
+# Capture traffic on loopback
+tcpdump -i lo -n port 8080 -c 10
+
+# Test DNS resolution
+dig +short example.com
+nslookup example.com
+
+# Check connection tracking
+sudo conntrack -L | head -10
+
+# Trace route to a host
+traceroute -I google.com
+
+# Measure latency
+ping -c 10 8.8.8.8 | tail -5
+```
+
+**Verification:** You can configure network settings, firewall blocks/allows correctly, and use tcpdump to observe traffic.
+
+**Challenge:** Set up a port forward (redirect traffic from 80 to 8080) using iptables/firewalld rich rules, and verify with netcat.
+
+---
+
+## Lab 6: Performance Profiling
+
+**Objective:** Identify and resolve a performance bottleneck using systematic profiling.
+
+**Time:** 60 minutes
+
+**Prerequisites:** Install `sysstat`, `htop`, `iotop`
+
+**Steps:**
+
+1. **Simulate a workload with bottleneck:**
+```bash
+# CPU stress
+sudo apt install stress -y  # or: yum install stress
+stress --cpu 4 --timeout 60s &
+
+# I/O stress
+stress --io 4 --timeout 60s &
+```
+
+2. **Systematic investigation:**
+```bash
+# Step 1: Check load average
+uptime    # 3 values: 1min, 5min, 15min
+
+# Step 2: Check CPU vs I/O
+vmstat 1 5
+
+# If us+sy high → CPU bound
+# If wa high → I/O bound
+
+# Step 3: Find the process
+top -b -n 1 | head -20
+# Check which process has high %CPU or %MEM
+
+# Step 4: If CPU-bound
+pidstat -p $(pgrep stress | head -1) 1 3   # per-process CPU
+perf top -a -F 99                         # CPU hot spots (Ctrl+C to exit)
+
+# Step 5: If I/O-bound
+iostat -xz 1 5
+# Identify device with high %util
+
+iotop -ao
+# Identify process doing I/O
+```
+
+3. **Profile with perf:**
+```bash
+# Record 30 seconds of CPU profiles
+sudo perf record -F 99 -a -g -- sleep 30
+
+# View results
+sudo perf report
+# Navigate: arrows to select, Enter to expand, q to quit
+
+# Save for later analysis
+sudo perf report --stdio > ~/perf_report.txt
+cat ~/perf_report.txt | head -50
+```
+
+4. **System call tracing:**
+```bash
+# Find a process
+PID=$(pgrep -f stress | head -1)
+
+# What syscalls is it making?
+sudo strace -p $PID -f -c -d 2>&1 | head -40
+# Wait 10 seconds, then Ctrl+C
+
+# What files is it opening?
+sudo strace -p $PID -f -e trace=openat 2>&1 | head -20
+```
+
+**Verification:** You can identify what subsystem (CPU, memory, disk) is the bottleneck and name the specific process and operation causing it.
+
+**Challenge:** Write a one-page incident report documenting: symptom, investigation steps, root cause, and recommended fix. Include actual numbers from your profiling session.
+
+---
+
+## Lab 7: Security Hardening
+
+**Objective:** Apply production-grade security hardening to a Linux system.
+
+**Time:** 90 minutes
+
+**Steps:**
+
+1. **SSH hardening:**
+```bash
+# Backup original config
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+
+# Configure hardened sshd
+sudo cat > /etc/ssh/sshd_config.d/hardened.conf <<'EOF'
+# Authentication
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+MaxAuthTries 3
+MaxSessions 10
+
+# Algorithms
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+
+# Session
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+AllowTcpForwarding no
+X11Forwarding no
+AllowAgentForwarding no
+
+# Logging
+SyslogFacility AUTH
+LogLevel VERBOSE
+
+# Subsystem
+Subsystem sftp /usr/lib/openssh/sftp-server -f AUTHPRIV
+EOF
+
+# Test config
+sudo sshd -t
+
+# Reload
+sudo systemctl reload sshd
+```
+
+2. **Sysctl hardening:**
+```bash
+sudo cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
+# Kernel lockdown
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.yama.ptrace_scope = 1
+
+# Network hardening
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.tcp_syncookies = 1
+
+# File limits
+fs.suid_dumpable = 0
+EOF
+
+sudo sysctl -p /etc/sysctl.d/99-hardening.conf
+
+# Verify
+sysctl kernel.dmesg_restrict
+sysctl net.ipv4.tcp_syncookies
+```
+
+3. **Fail2ban setup:**
+```bash
+sudo apt install fail2ban -y
+
+sudo cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 3
+destemail = root@localhost
+sender = fail2ban@localhost
+action = %(action_mwl)s
+
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+bantime = 86400
+maxretry = 3
+EOF
+
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status
+sudo fail2ban-client status sshd
+```
+
+4. **Audit rules:**
+```bash
+sudo apt install auditd -y
+
+sudo cat > /etc/audit/rules.d/hardening.rules <<'EOF'
+# Monitor SSH config changes
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+
+# Monitor password files
+-w /etc/passwd -p wa -k passwd_changes
+-w /etc/shadow -p wa -k shadow_changes
+-w /etc/group -p wa -k group_changes
+
+# Monitor privileged commands
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/sudo -k sudo_exec
+EOF
+
+sudo auditctl -R /etc/audit/rules.d/hardening.rules
+sudo auditctl -l
+```
+
+**Verification:**
+```bash
+# Check SSH config
+sudo sshd -t && echo "SSH config valid"
+
+# Check sysctl
+sysctl net.ipv4.tcp_syncookies
+
+# Check fail2ban
+sudo fail2ban-client status sshd
+
+# Check audit rules
+sudo auditctl -l | grep -E "sshd|passwd|shadow"
+
+# Try to log in with password (should fail)
+# Try to su to root without sudo (should fail)
+```
+
+**Challenge:** Create an Ansible playbook or shell script that applies all hardening steps idempotently (can be run multiple times safely) and includes a rollback option.
+
+---
+
+## Lab 8: Container Operations
+
+**Objective:** Run containers with proper resource limits, networking, and security configuration.
+
+**Time:** 60 minutes
+
+**Prerequisites:** Docker or Podman installed
+
+**Steps:**
+
+1. **Run containers with resource limits:**
+```bash
+# Memory limit
+docker run -d --name nginx-limited \
+    --memory 256m \
+    --memory-reservation 128m \
+    nginx:alpine
+
+# CPU limit (0.5 cores)
+docker run -d --name app-limited \
+    --cpus 0.5 \
+    nginx:alpine
+
+# CPU and memory combined
+docker run -d --name full-limited \
+    --cpus 0.5 \
+    --memory 256m \
+    --memory-reservation 128m \
+    --pids-limit 100 \
+    nginx:alpine
+
+# Verify limits
+docker stats --no-stream
+docker inspect full-limited --format '{{.HostConfig.Memory}}'
+
+# Cleanup
+docker stop nginx-limited app-limited full-limited
+docker rm nginx-limited app-limited full-limited
+```
+
+2. **Network configuration:**
+```bash
+# Create custom network
+docker network create --driver bridge --subnet 172.20.0.0/16 mynetwork
+
+# Run containers on custom network
+docker run -d --name app --network mynetwork nginx:alpine
+docker run -d --name db --network mynetwork -e MYSQL_ROOT_PASSWORD=secret mysql:8
+
+# Test connectivity
+docker exec app ping -c 3 db
+
+# Expose port externally (localhost only)
+docker run -d --name web \
+    -p 127.0.0.1:8080:80 \
+    nginx:alpine
+
+# Verify
+curl -s http://localhost:8080 | head -5
+```
+
+3. **Security hardening:**
+```bash
+# Run as non-root
+docker run -d --name secure-app \
+    --user 1000:1000 \
+    --read-only \
+    --tmpfs /tmp \
+    --cap-drop ALL \
+    --security-opt no-new-privileges=true \
+    nginx:alpine
+
+# Verify
+docker exec secure-app id          # Should show uid=1000
+docker exec secure-app cat /proc/1/status | grep Cap   # Capabilities should be empty
+
+# Image scanning (if Trivy installed)
+trivy image nginx:alpine
+```
+
+**Verification:**
+```bash
+docker stats --no-stream
+docker network ls
+docker exec app nslookup db
+```
+
+**Challenge:** Set up a Docker Compose file that defines an app container, a database container, and a backup container, with proper networking, resource limits, and health checks. Include a script to back up the database volume.
+
+---
+
+## Lab 9: LVM and Disk Management
+
+**Objective:** Create, extend, and manage LVM volumes for production storage.
+
+**Time:** 60 minutes
+
+**Steps:**
+
+1. **Create LVM volumes:**
+```bash
+# Identify a spare disk/partition
+lsblk
+# Assume /dev/sdb is a spare 5GB disk
+
+# Create physical volume
+sudo pvcreate /dev/sdb
+
+# Create volume group
+sudo vgcreate vgdata /dev/sdb
+
+# Create logical volumes
+sudo lvcreate -L 2G -n data vgdata
+sudo lvcreate -L 1G -n backup vgdata
+
+# Verify
+sudo pvs
+sudo vgs
+sudo lvs
+
+# Format and mount
+sudo mkfs.ext4 /dev/vgdata/data
+sudo mkdir -p /mnt/data
+sudo mount /dev/vgdata/data /mnt/data
+
+# Add to fstab
+echo '/dev/mapper/vgdata-data /mnt/data ext4 defaults 0 2' | sudo tee -a /etc/fstab
+```
+
+2. **Extend a logical volume:**
+```bash
+# Add new disk to volume group
+# (If using a new disk/partition)
+# sudo pvcreate /dev/sdc
+# sudo vgextend vgdata /dev/sdc
+
+# Extend logical volume
+sudo lvextend -L +1G /dev/vgdata/data
+
+# Extend filesystem (online, no unmount needed with ext4)
+sudo resize2fs /dev/vgdata/data
+
+# Verify
+df -h /mnt/data
+```
+
+3. **Create a snapshot and test restore:**
+```bash
+# Create snapshot of data volume
+sudo lvcreate -L 500M -s -n data-snap /dev/vgdata/data
+
+# Make some changes to /mnt/data
+echo "test data" | sudo tee /mnt/data/changed.txt
+
+# Unmount and restore from snapshot
+sudo umount /mnt/data
+sudo lvconvert --merge /dev/vgdata/data-snap
+
+# Remount (after merge completes)
+sudo mount /dev/vgdata/data
+cat /mnt/data/changed.txt    # Should not exist (or show old content if snapshot had it)
+
+# Clean up snapshot
+# The merge automatically removes the snapshot
+sudo lvs
+```
+
+**Verification:**
+```bash
+df -h /mnt/data
+sudo vgs
+sudo lvs
+```
+
+**Challenge:** Create a script that automates: (1) creating a snapshot, (2) running a backup of the snapshot to a tar.gz, (3) verifying the backup, (4) cleaning up old snapshots beyond a retention period.
+
+---
+
+## Lab 10: Backup and Disaster Recovery
+
+**Objective:** Implement a production backup strategy with automated verification.
+
+**Time:** 60 minutes
+
+**Steps:**
+
+1. **Create backup infrastructure:**
+```bash
+# Create backup directory
+sudo mkdir -p /backups/{config,data,verify}
+sudo chmod 700 /backups
+
+# Define backup script
+cat > /opt/backup.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_DIR="/backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+HOSTNAME=$(hostname)
+BACKUP_TYPE="${1:-full}"  # full or incremental
+
+log() { echo "[$(date -Iseconds)] $*"; }
+
+log "Starting $BACKUP_TYPE backup on $HOSTNAME"
+
+# Backup /etc (configuration)
+tar -czpf "${BACKUP_DIR}/config/config_${HOSTNAME}_${TIMESTAMP}.tar.gz" \
+    --exclude='/etc/ssh/ssh_host_*' \
+    /etc/
+
+# Backup /var/log (last 7 days only)
+tar -czpf "${BACKUP_DIR}/data/logs_${HOSTNAME}_${TIMESTAMP}.tar.gz" \
+    --newer-mtime '7 days ago' \
+    /var/log/ 2>/dev/null || true
+
+# Checksums
+sha256sum "${BACKUP_DIR}/config/config_${HOSTNAME}_${TIMESTAMP}.tar.gz" > "${BACKUP_DIR}/config/config_${HOSTNAME}_${TIMESTAMP}.sha256"
+sha256sum "${BACKUP_DIR}/data/logs_${HOSTNAME}_${TIMESTAMP}.tar.gz" > "${BACKUP_DIR}/data/logs_${HOSTNAME}_${TIMESTAMP}.sha256"
+
+# Clean up old backups (> 30 days)
+find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +30 -delete
+find "${BACKUP_DIR}" -name "*.sha256" -mtime +30 -delete
+
+# Verify most recent backup
+LATEST_CONFIG=$(ls -t "${BACKUP_DIR}"/config/config_${HOSTNAME}_*.tar.gz | head -1)
+LATEST_SHA=$(ls -t "${BACKUP_DIR}"/config/config_${HOSTNAME}_*.sha256 | head -1)
+LATEST_LOG=$(ls -t "${BACKUP_DIR}"/data/logs_${HOSTNAME}_*.tar.gz | head -1)
+
+log "Verifying backup: $(basename $LATEST_CONFIG)"
+if ! sha256sum -c "$LATEST_SHA" > /dev/null 2>&1; then
+    log "ERROR: Backup verification failed!"
+    exit 1
+fi
+
+log "Backup complete: $(du -h "$LATEST_CONFIG" | cut -f1) config, $(du -h "$LATEST_LOG" | cut -f1) logs"
+SCRIPT
+
+sudo chmod +x /opt/backup.sh
+```
+
+2. **Set up automated backup via systemd timer:**
+```bash
+sudo cat > /etc/systemd/system/backup.service <<'EOF'
+[Unit]
+Description=Backup configuration and logs
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/backup.sh
+StandardOutput=journal
+StandardError=journal
+EOF
+
+sudo cat > /etc/systemd/system/backup.timer <<'EOF'
+[Unit]
+Description=Run backup daily at 3am
+Requires=backup.service
+
+[Timer]
+OnCalendar=*-*-03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now backup.timer
+```
+
+3. **Test backup and verify:**
+```bash
+# Run backup now
+sudo /opt/backup.sh
+
+# Check results
+ls -lh /backups/config/
+ls -lh /backups/data/
+
+# Verify checksum
+sha256sum /backups/config/*.tar.gz | head -3
+```
+
+4. **Test restore:**
+```bash
+# Extract to verify
+mkdir /tmp/restore_test
+tar -xzf /backups/config/config_*.tar.gz -C /tmp/restore_test
+ls /tmp/restore_test/etc/ | head -10
+rm -rf /tmp/restore_test
+
+# Check timer
+systemctl list-timers | grep backup
+```
+
+**Verification:**
+```bash
+ls -lh /backups/config/
+ls -lh /backups/data/
+systemctl status backup.timer
+sha256sum -c /backups/config/*.sha256 | grep -v OK
+```
+
+**Challenge:** Extend the backup script to: (1) create database dumps before backing up /var/lib, (2) encrypt backups with GPG using a key from an environment variable, (3) send a summary email with backup size, verification status, and oldest backup age.
+
+---
+
+## Interview Questions
+
+1. **You run a lab and the system becomes unresponsive. How do you recover?**
+
+First, attempt to access via a different method: console (if VM), another SSH session, or serial console. If that works: check `dmesg` for OOM or kernel panics, check `df` for disk full, check `free` for memory exhaustion. If console is also frozen: if VM, try hard reset from hypervisor; if physical, power cycle. If system boots but service won't start, check `journalctl -b -1` for previous boot's logs. If you modified a critical config (like network or systemd), boot to recovery mode and revert. Always take snapshots before labs.
+
+2. **How would you adapt these labs for a team training environment?**
+
+Set up a shared lab environment (Vagrant multi-VM or Kubernetes namespace) so each trainee works in isolation. Provide pre-baked VM snapshots at key checkpoints (after Lab 3, after Lab 5, etc.) so trainees can skip to a known good state. Use Infrastructure as Code (Terraform, Ansible) to provision consistent environments. Include self-grading scripts that verify lab completion. Document common failure points and create a FAQ. Pair people who complete labs early with those struggling — peer learning is effective.
+
+3. **What safety precautions should you take when running these labs?**
+
+Always run in isolated environments (VM, container, or dedicated test cloud account). Never run destructive commands on production systems. Document changes for rollback. Use `set -euo pipefail` in all scripts. Keep terminal sessions where you can see all commands. Don't share root passwords — use sudo. Back up configs before modifying. Set billing alerts if using cloud. In container labs, use `--rm` to auto-clean and `--privileged` minimally.
+
+4. **How do you assess whether someone has mastered these labs?**
+
+Someone has mastered these labs when they can: (1) complete each lab without referring to instructions (indicates muscle memory), (2) modify labs for variations without prompting (indicates understanding, not just memorization), (3) troubleshoot issues without assistance (indicates debugging skills), (4) teach the lab to someone else (indicates deep understanding). A good assessment: have them explain what each step does and what would happen if it failed — not just run commands.
+
+## Cheat Sheet
+
+```bash
+# Lab environment
+multipass launch --name lab --cpus 2 --mem 4G
+multipass shell lab
+
+# Quick verification checks
+systemctl status <service> && echo "OK" || echo "FAILED"
+journalctl -u <service> -n 5 --no-pager
+df -h / | awk 'NR==2 {print $5 " used"}'
+free -h | awk 'NR==2 {print $3 " used"}'
+
+# Common fixes
+systemctl daemon-reload       # After editing unit files
+sysctl -p /etc/sysctl.d/*.conf   # Apply sysctl changes
+fail2ban-client reload        # After editing jail.local
+```
+
+## Related Topics
+
+- [Overview](./overview) — Linux fundamentals
+- [Processes](./processes) — Process management
+- [Storage](./storage) — Disk and LVM
+- [Networking](./networking) — Network configuration
+- [Security](./security) — Security hardening
+- [Performance](./performance) — Performance profiling
+- [Bash](./bash) — Scripting patterns
+- [Cron](./cron) — Scheduled automation

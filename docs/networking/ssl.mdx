@@ -1,0 +1,306 @@
+# SSL/TLS History and Migration
+
+## Overview
+
+SSL (Secure Sockets Layer) and its successor TLS (Transport Layer Security) have a 30-year history of cryptographic protocols, with multiple versions, numerous vulnerabilities, and ongoing evolution. Understanding this history isn't academic—it directly affects production decisions: which TLS versions to enable, which cipher suites to support, and how to handle legacy systems. The SSL/TLS ecosystem is littered with deprecated versions and attack names (POODLE, BEAST, CRIME, Heartbleed) that still haunt configurations.
+
+Today, TLS 1.2 remains common but TLS 1.3 is the standard for new deployments. The migration path is clear: disable SSL 2.0, SSL 3.0, TLS 1.0, and TLS 1.1, enable TLS 1.2 (with modern cipher suites) and TLS 1.3. This page covers the history, vulnerabilities, and practical migration steps.
+
+## When To Use
+
+- **Migrating legacy systems**: Understanding why and how to disable old TLS versions
+- **Security audits**: Knowing which vulnerabilities affect which versions
+- **Compliance requirements**: PCI DSS, HIPAA, and other frameworks mandate specific TLS versions
+- **Troubleshooting connection failures**: Understanding why older clients fail
+
+## When NOT To Use
+
+- **Greenfield deployments**: Just use TLS 1.3 and modern cipher suites
+- **Quick config reference**: See the TLS/HTTPS pages for practical configs
+
+## Core Concepts
+
+### SSL/TLS Version History
+
+| Version | Year | Status | Vulnerabilities |
+|---------|------|--------|-----------------|
+| SSL 2.0 | 1994 | Disabled everywhere | Many (MD5, RC4, no integrity) |
+| SSL 3.0 | 1995 | Disabled everywhere | POODLE, others |
+| TLS 1.0 | 1999 | Deprecated | BEAST, weak ciphers |
+| TLS 1.1 | 2006 | Deprecated | CBC vulnerabilities |
+| TLS 1.2 | 2008 | Current minimum | RC4, SHA-1 signatures |
+| TLS 1.3 | 2018 | Recommended | None (designed from scratch) |
+
+### Key Vulnerabilities
+
+**POODLE (2014)**: Padding Oracle On Downgraded Legacy Encryption. Affects SSL 3.0 and TLS 1.0-1.1 (with CBC ciphers). Attack exploits CBC mode padding validation. Mitigated by disabling SSL 3.0 (no fallback) and using TLS 1.2+ with GCM.
+
+**BEAST (2011)**: Browser Exploit Against SSL/TLS. Affects TLS 1.0 and earlier. Attack uses CBC bit-flipping on predictable IVs. Mitigated by using TLS 1.2+ or 0-RTT (which uses different IV derivation).
+
+**CRIME (2012)**: Compression Ratio Info-leak Made Easy. Affects TLS compression. Attack exploits TLS compression to steal cookies. Mitigated by disabling TLS compression (default in TLS 1.3).
+
+**Heartbleed (2014)**: OpenSSL vulnerability in heartbeat extension. Allows reading server memory. Not a protocol flaw but implementation bug. Mitigated by updating OpenSSL.
+
+**DROWN (2016)**: Decrypting RSA with Obsolete and Weakened eNcipherment. Affects servers supporting SSL 2.0 or export ciphers. Attack can decrypt TLS sessions. Mitigated by disabling SSL 2.0.
+
+**Logjam (2015)**: Weak DH group (512-bit). Allows man-in-the-middle downgrade. Mitigated by using 2048-bit DH or ECDHE.
+
+### Deprecation Timeline
+
+```bash
+# PCI DSS (Payment Card Industry):
+# - 2018: TLS 1.0 deprecated
+# - 2020: TLS 1.1 deprecated
+# - Current: TLS 1.2 minimum required
+
+# NIST:
+# - TLS 1.0/1.1 disallowed after 2020
+# - TLS 1.2 with AEAD required
+
+# Browser deprecation:
+# - Chrome/Firefox: TLS 1.0/1.1 warnings since 2020
+# - Modern browsers no longer support SSL 3.0
+```
+
+### Cipher Suite Naming
+
+OpenSSL cipher suite names encode all parameters:
+```
+TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+   │         │       │    │    │    │
+   │         │       │    │    │    └── Hash for PRF
+   │         │       │    │    └────────── Cipher (AES-128-GCM)
+   │         │       │    └──────────────── Key size
+   │         │       └──────────────────── Key exchange (RSA)
+   │         └──────────────────────────── Key exchange (EC, DHE)
+   └──────────────────────────────────── Protocol (TLS)
+```
+
+TLS 1.3 cipher suite naming is simplified:
+```
+TLS_AES_256_GCM_SHA384
+   │    │    │    └── Hash (for HKDF)
+   │    │    └────────── Cipher (AES-256-GCM)
+   │    └──────────────── Cipher type (AEAD)
+   └──────────────────── Protocol
+```
+
+## Real Production Example
+
+### Migration Configuration
+
+```bash
+# /etc/ssl/openssl.cnf (for openssl s_server, etc.)
+# Modern TLS policy
+openssl_conf = default_conf
+
+[default_conf]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = ssl_default_sect
+
+[ssl_default_sect]
+# TLS 1.2 minimum with secure ciphers
+CipherString = ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+MaxProtocol = TLSv1.3
+MinProtocol = TLSv1.2
+Options = ServerPreference,NoSessionTickets
+
+# nginx migration config
+# Phase 1: Add TLS 1.3, keep TLS 1.2 with secure ciphers
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+ssl_prefer_server_ciphers off;
+
+# Phase 2: After verification, TLS 1.3 only
+ssl_protocols TLSv1.3;
+
+# If legacy clients need TLS 1.2, create separate listener
+# Only enable for specific IPs/ranges
+```
+
+### Testing with SSL Labs
+
+```bash
+# SSL Labs Grading Criteria (A+ requires):
+# - TLS 1.2 with forward secrecy
+# - TLS 1.3
+# - Strong cipher suites
+# - HSTS with max-age >= 6 months
+# - No known vulnerabilities
+# - Good key exchange (2048-bit RSA or ECDHE P-256+)
+
+# Check via API (rate limited)
+curl -s "https://www.ssllabs.com/ssltest/analyze.html?d=api.example.com&json=1" | \
+  jq '.endpoints[0].grade'
+```
+
+## CLI Examples
+
+```bash
+# Check supported protocols
+openssl s_client -connect api.example.com:443 -tls1 -brief 2>/dev/null
+openssl s_client -connect api.example.com:443 -tls1_1 -brief 2>/dev/null
+openssl s_client -connect api.example.com:443 -tls1_2 -brief 2>/dev/null
+openssl s_client -connect api.example.com:443 -tls1_3 -brief 2>/dev/null
+
+# Check cipher suites
+openssl s_client -connect api.example.com:443 -cipher 'ECDHE-RSA-AES128-GCM-SHA256' 2>&1 | grep "Cipher is"
+openssl ciphers -v 'ECDHE-ECDSA-AES128-GCM-SHA256'
+
+# List all ciphers
+openssl ciphers -v 'ALL:!aNULL:!eNULL:!EXPORT:!SSLv2:!SSLv3:!TLSv1:!TLSv1.1'
+
+# Test for POODLE (SSL 3.0)
+openssl s_client -connect api.example.com:443 -ssl3 2>&1 | grep "error"
+
+# Test for BEAST (TLS 1.0 CBC)
+openssl s_client -connect api.example.com:443 -tls1 -cipher AES128-SHA 2>&1 | grep "Cipher"
+
+# Check DH parameters strength
+openssl s_client -connect api.example.com:443 2>&1 | openssl x509 -noout -text | grep DH
+openssl dhparam -in /etc/ssl/private/dhparam.pem -text -noout | head -5
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `openssl s_client` | TLS client | `s_client -tls1_2 -connect host:443` |
+| `openssl ciphers` | List ciphers | `ciphers -v 'EECDH+ECDSA'` |
+| `openssl dhparam` | DH parameters | `dhparam -out dhparam.pem 2048` |
+| `openssl ecparam` | EC parameters | `ecparam -name prime256v1 -genkey` |
+| `nmap --script ssl-enum-ciphers` | Cipher enumeration | `nmap -p 443 --script ssl-enum-ciphers host` |
+
+## Monitoring
+
+### TLS Version Metrics
+
+```bash
+# NGINX logs with TLS version
+log_format tls '$remote_addr - $remote_user [$time_local] '
+               '"$request" $status $body_bytes_sent '
+               '"$http_referer" "$http_user_agent" '
+               'TLSv$ssl_protocol TLSv$ssl_cipher';
+
+# Parse logs for TLS 1.0/1.1 usage
+grep "TLSv1.0\|TLSv1.1" /var/log/nginx/access.log | wc -l
+
+# Prometheus alert
+# - name: tls_legacy_version
+#   expr: sum(rate(nginx_ssl_protocol_total{protocol=~"TLSv1.0|TLSv1.1"}[5m])) > 0
+#   labels:
+#     severity: warning
+#   annotations:
+#     summary: "Legacy TLS version in use"
+```
+
+## Security
+
+### Migration Checklist
+
+1. **Inventory**: Know all TLS endpoints and their clients
+2. **Update software**: OpenSSL 1.1.1+, modern servers
+3. **Enable TLS 1.3**: `ssl_protocols TLSv1.2 TLSv1.3` initially
+4. **Modern ciphers**: Remove RC4, 3DES, MD5, SHA-1
+5. **Disable TLS 1.0/1.1**: After verifying no legacy clients
+6. **Disable SSL 2.0/3.0**: Already disabled everywhere, verify
+7. **HSTS**: Add header for automatic upgrade
+8. **Monitor**: Watch for failures, adjust as needed
+
+```bash
+# Complete hardening
+# /etc/sysctl.d/99-tls-hardening.conf
+
+# Enable TLS 1.2+ in system (example for OpenSSL 1.1.1)
+# Most systems: OpenSSL handles this automatically
+
+# For applications using GnuTLS
+# System-wide: /etc/gnutls/default priorities
+# ANON,RC4,MD5,SEED,S3DES,DHE,AES-CBC,HMAC-MD5,SSL3.0,MIN-VERS-SSL3.0:!EXPERT
+# Replace with: SECURE128:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1
+```
+
+## Troubleshooting
+
+### Legacy Client Issues
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| Java 7 can't connect | TLS 1.0 only, no AES-GCM | Update Java or enable AES-CBC ciphers (temporary) |
+| Old embedded devices | SSL 3.0 only | Replace device or isolate in DMZ |
+| .NET 3.5 can't connect | Limited TLS 1.0 | Update .NET, enable TLS 1.1/1.2 in code |
+| Mobile app from 2015 | TLS 1.0 | Update app |
+
+```bash
+# For temporary legacy support (not recommended):
+ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;  # NOT recommended
+
+# Better: isolate legacy systems, don't expose to internet
+```
+
+## Interview Questions
+
+**Q1: What is POODLE and how does it affect TLS configuration?**
+
+A: POODLE (Padding Oracle On Downgraded Legacy Encryption) exploits how CBC cipher modes handle padding validation in SSL 3.0 and TLS 1.0. The attack works by tricking the server to use SSL 3.0 (via fallback), then exploiting CBC padding to decrypt cookies. TLS 1.1+ is not vulnerable because it uses explicit IVs. To mitigate: (1) Never allow SSL 3.0—this is already disabled in modern software; (2) Remove TLS 1.0/1.1 if possible; (3) If TLS 1.0 must remain, ensure CBC cipher suites aren't the only option; (4) Modern servers already disable SSL 3.0 by default.
+
+**Q2: Why is TLS 1.0/1.1 being deprecated?**
+
+A: TLS 1.0 and 1.1 have known vulnerabilities: (1) BEAST attack against TLS 1.0—uses CBC bit-flipping to steal cookies; (2) CBC padding vulnerabilities; (3) MD5 and SHA-1 used in signatures (TLS 1.0 PRF uses MD5+SHA-1). Additionally, TLS 1.1 added explicit IVs but didn't address all issues. Modern cipher suites (AEAD like AES-GCM, ChaCha20) weren't available. The deprecation aligns with NIST guidelines and PCI DSS requirements. The practical migration is straightforward—TLS 1.2+ is available everywhere.
+
+**Q3: What cipher suites should you use today?**
+
+A: For TLS 1.3, only 5 cipher suites exist—all are secure. Use the default or prefer AES-256-GCM or ChaCha20-Poly1305. For TLS 1.2, use only ECDHE-based suites with AES-GCM or ChaCha20: `ECDHE-ECDSA-AES128-GCM-SHA256` or `ECDHE-RSA-AES128-GCM-SHA256` (prefer ECDSA certificates). Do NOT use: RC4 (broken), 3DES (weak), MD5 (broken), SHA-1 (weak), static RSA (no forward secrecy), export ciphers (broken). In nginx: `ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;`
+
+**Q4: How do you handle migration when some clients don't support TLS 1.2?**
+
+A: Strategy: (1) Identify affected clients—check logs for TLS 1.0/1.1 connections; (2) For modern clients not upgrading: investigate why (old OS, old library), help them upgrade; (3) For legacy systems you control: update software; (4) For truly legacy devices you can't update: isolate them, accept the risk, or use a proxy/relay that terminates TLS 1.2+; (5) Never just disable TLS 1.2 because some clients don't support it—that's giving in to the weakest link. Temporary workaround: maintain two endpoints—modern TLS 1.3 for most clients, TLS 1.2 with CBC ciphers for legacy only, behind a specific URL.
+
+## Cheat Sheet
+
+### Deprecated Ciphers to Remove
+
+| Cipher | Reason |
+|--------|--------|
+| RC4 | Broken (bias attacks) |
+| 3DES | 64-bit block (Sweet32 attack) |
+| MD5 | Broken for signatures |
+| SHA-1 | Weak for signatures |
+| static RSA | No forward secrecy |
+| export ciphers | Broken (40-bit keys) |
+| SSL 2.0/3.0 | Broken |
+| TLS 1.0/1.1 | Vulnerable |
+
+### Secure Configuration
+
+```bash
+# TLS 1.2+ configuration
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+
+# TLS 1.3 configuration (simpler)
+ssl_protocols TLSv1.3;
+ssl_ciphers TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+```
+
+### Vulnerability Summary
+
+| Attack | Year | Affected | Fix |
+|--------|------|----------|-----|
+| POODLE | 2014 | SSL 3.0, TLS 1.0-1.1 (CBC) | Disable SSL 3.0, use TLS 1.2+ |
+| BEAST | 2011 | TLS 1.0 and earlier | Use TLS 1.1+, 0-RTT |
+| CRIME | 2012 | TLS compression | Disable compression |
+| Heartbleed | 2014 | OpenSSL 1.0.1-1.0.1f | Update OpenSSL |
+| DROWN | 2016 | SSL 2.0 servers | Disable SSL 2.0 |
+| Logjam | 2015 | Weak DH (512-bit) | Use 2048-bit DH or ECDHE |
+
+## Related Topics
+
+- [TLS](./tls) — TLS 1.3 deep dive
+- [HTTPS](./https) — HTTPS implementation
+- [HTTP](./http) — HTTP protocol
+- [Load Balancing](./load-balancing) — TLS termination
+- [Firewall](./firewall) — Network security

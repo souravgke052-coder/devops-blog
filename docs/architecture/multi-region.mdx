@@ -1,0 +1,982 @@
+# Multi-Region Architecture
+
+sidebar_position: 6
+
+## Overview
+
+Multi-region architecture distributes application resources across multiple geographic locations to achieve high availability, reduce latency for global users, and provide disaster recovery capabilities. GCP offers various multi-region options ranging from simple load balancing to active-active deployments with data replication.
+
+## When To Use
+
+- Applications requiring 99.99%+ availability SLAs
+- Global user bases requiring low-latency access
+- Regulatory requirements for data residency
+- Disaster recovery planning for critical systems
+- High availability for stateless and stateful workloads
+
+## When NOT To Use
+
+- Applications serving primarily local users
+- When additional latency of cross-region communication is unacceptable
+- When cost of multi-region exceeds business value
+- When RPO < 1 second is required (consider synchronous replication)
+- Simple applications that don't justify operational complexity
+
+## Core Concepts
+
+### Multi-Region Deployment Models
+
+| Model | Description | RPO | RTO | Use Case |
+|-------|-------------|-----|-----|----------|
+| Active-Active | All regions serve traffic | ~0 | Minutes | Global applications |
+| Active-Passive | Primary region serves, secondary standby | Seconds-Hours | Minutes-Hours | DR-focused |
+| Pilot Light | Minimal warm resources in secondary | Minutes | Minutes-Hours | Cost-optimized DR |
+| Warm Standby | Scaled-down full stack | Seconds | Minutes | Balanced DR |
+
+### Data Replication Strategies
+
+```
+Replication Types:
+
+Synchronous (RPO=0)
+┌──────────┐ ───────► ┌──────────┐
+│  Write   │          │  Read    │
+│  Primary │ ───────► │  Replica │
+└──────────┘          └──────────┘
+   Same time ───────► (Writes wait)
+
+Asynchronous (RPO=Seconds)
+┌──────────┐          ┌──────────┐
+│  Write   │ ───────► │  Read    │
+│  Primary │          │  Replica │
+└──────────┘          └──────────┘
+   Write ───────► (Delayed)
+
+Eventual Consistency (RPO=Minutes)
+┌──────────┐          ┌──────────┐
+│  Write   │ ───────► │  Read    │
+│  Primary │ Event    │  Replica │
+└──────────┘ ───────► └──────────┘
+```
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Global Layer                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    Cloud DNS + Cloud CDN                         │   │
+│  │         Latency-based routing │ Geo-based routing                │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                               │                                          │
+│         ┌─────────────────────┼─────────────────────┐                  │
+│         │                     │                     │                   │
+│         ▼                     ▼                     ▼                   │
+│  ┌─────────────┐       ┌─────────────┐       ┌─────────────┐          │
+│  │   us-central│       │  europe-west│       │  asia-east1 │          │
+│  │     (Iowa)  │       │   (Belgium) │       │   (Taiwan)  │          │
+│  │             │       │             │       │             │          │
+│  │  ┌───────┐  │       │  ┌───────┐  │       │  ┌───────┐  │          │
+│  │  │ Cloud │  │       │  │ Cloud │  │       │  │ Cloud │  │          │
+│  │  │  Run  │  │       │  │  Run  │  │       │  │  Run  │  │          │
+│  │  └───────┘  │       │  └───────┘  │       │  └───────┘  │          │
+│  │  ┌───────┐  │       │  ┌───────┐  │       │  ┌───────┐  │          │
+│  │  │Cloud  │  │       │  │Cloud  │  │       │  │Cloud  │  │          │
+│  │  │  SQL  │◄┼───────┼─►│Memory │  │       │  │  SQL  │  │          │
+│  │  │Read   │  │       │  │store  │  │       │  │Read   │  │          │
+│  │  │Replica│  │       │  │       │  │       │  │Replica│  │          │
+│  │  └───────┘  │       │  └───────┘  │       │  └───────┘  │          │
+│  └──────┬──────┘       └──────┬──────┘       └──────┬──────┘          │
+│         │                     │                     │                   │
+│         └─────────────────────┴─────────────────────┘                  │
+│                           │                                             │
+│                           ▼                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    Cloud Spanner (Global)                        │   │
+│  │         Automatic synchronous replication across regions          │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Netflix-Style Multi-Region API Gateway
+
+```typescript
+// Multi-region Cloud Run deployment with regional affinity
+import express from 'express';
+import { CloudTrace } from '@google-cloud/trace-agent';
+
+const app = express();
+const trace = new CloudTrace();
+
+// Request tracing
+app.use((req, res, next) => {
+  const span = trace.startSpan(`request:${req.path}`);
+  span.addLabel('method', req.method);
+  span.addLabel('region', process.env.GCP_REGION || 'unknown');
+
+  res.on('finish', () => {
+    span.end();
+  });
+
+  next();
+});
+
+// Health check for load balancer
+app.get('/healthz', async (req, res) => {
+  const checks = await Promise.allSettled([
+    checkDatabase(),
+    checkCache(),
+    checkDependencies()
+  ]);
+
+  const healthy = checks.every(c => c.status === 'fulfilled');
+
+  if (healthy) {
+    res.json({
+      status: 'healthy',
+      region: process.env.GCP_REGION,
+      timestamp: new Date().toISOString(),
+      version: process.env.VERSION
+    });
+  } else {
+    res.status(503).json({
+      status: 'unhealthy',
+      region: process.env.GCP_REGION,
+      checks: checks.map((c, i) => ({
+        name: ['database', 'cache', 'dependencies'][i],
+        status: c.status
+      }))
+    });
+  }
+});
+
+// Regional API endpoint
+app.get('/api/content/:id', async (req, res) => {
+  const { id } = req.params;
+
+  // Check cache first (local Memorystore)
+  const cached = await redis.get(`content:${id}`);
+  if (cached) {
+    return res.json({ source: 'cache', data: JSON.parse(cached) });
+  }
+
+  // Fetch from primary database
+  const content = await db.query(
+    'SELECT * FROM content WHERE id = $1',
+    [id]
+  );
+
+  if (!content.rows.length) {
+    return res.status(404).json({ error: 'Content not found' });
+  }
+
+  // Store in cache with TTL
+  await redis.setex(`content:${id}`, 300, JSON.stringify(content.rows[0]));
+
+  res.json({ source: 'database', data: content.rows[0] });
+});
+
+// Geolocation-aware content
+app.get('/api/local-content', async (req, res) => {
+  const { lat, lng } = req.query;
+
+  // Get user's approximate region from headers or IP
+  const userRegion = getRegionFromLatLng(parseFloat(lat), parseFloat(lng));
+
+  // For EU users, prefer EU content sources
+  const preferredContent = userRegion.startsWith('eu')
+    ? await getEUPreferredContent()
+    : await getUSPreferredContent();
+
+  res.json({
+    userRegion,
+    content: preferredContent,
+    servedFromRegion: process.env.GCP_REGION
+  });
+});
+
+// Cross-region data sync status
+app.get('/api/sync-status', async (req, res) => {
+  const syncStatus = await checkCrossRegionSync();
+
+  res.json({
+    status: syncStatus.synced ? 'in_sync' : 'lagging',
+    lagSeconds: syncStatus.lagSeconds,
+    lastSyncTimestamp: syncStatus.lastSync,
+    regions: {
+      'us-central1': syncStatus.regions['us-central1'],
+      'europe-west1': syncStatus.regions['europe-west1'],
+      'asia-east1': syncStatus.regions['asia-east1']
+    }
+  });
+});
+
+function getRegionFromLatLng(lat: number, lng: number): string {
+  // Simplified region determination
+  if (lng < -30 && lng > -60 && lat > 35 && lat < 70) return 'eu-west';
+  if (lat > -60 && lat < 60 && lng > 100 && lng < 150) return 'asia-east';
+  return 'us-central';
+}
+```
+
+### Terraform for Multi-Region Infrastructure
+
+```hcl
+# Terraform - Multi-Region Infrastructure
+variable "project_id" {
+  type = string
+}
+
+variable "regions" {
+  type    = list(string)
+  default = ["us-central1", "europe-west1", "asia-east1"]
+}
+
+# Primary region configuration
+variable "primary_region" {
+  type    = string
+  default = "us-central1"
+}
+
+# Network - Global VPC
+resource "google_compute_network" "global_vpc" {
+  name                    = "global-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "GLOBAL"  # Global routing for multi-region
+}
+
+# Subnets per region
+resource "google_compute_subnetwork" "regional_subnet" {
+  for_each = toset(var.regions)
+
+  name          = "subnet-${each.value}"
+  network       = google_compute_network.global_vpc.id
+  ip_cidr_range = cidrsubnet("10.0.0.0/8", 8, index(var.regions, each.value))
+  region        = each.value
+
+  private_ip_google_access = true
+
+  log_config {
+    flow_sampling = 0.5
+    metadata      = "INCLUDE_ALL_METADATA"
+  }
+}
+
+# VPC Access Connectors per region
+resource "google_vpc_access_connector" "regional_connector" {
+  for_each = toset(var.regions)
+
+  name          = "vpc-connector-${each.value}"
+  region        = each.value
+  network       = google_compute_network.global_vpc.name
+  ip_cidr_range = cidrsubnet("10.8.0.0/28", 4, index(var.regions, each.value))
+  min_instances = 2
+  max_instances = 10
+}
+
+# Cloud SQL - Regional Instances with Failover
+resource "google_sql_database_instance" "regional_instances" {
+  for_each = toset(var.regions)
+
+  name             = "content-db-${each.value}"
+  database_version = "POSTGRES_15"
+  region           = each.value
+
+  deletion_protection = true
+
+  settings {
+    tier              = "db-n1-standard-4"
+    availability_type = each.value == var.primary_region ? "REGIONAL" : "ZONAL"
+    disk_autoresize   = true
+    disk_type         = "PD_SSD"
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.global_vpc.id
+      require_ssl     = true
+
+      allocated_ip_range = "sql-private-range"
+    }
+
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+      backup_retention_settings {
+        retained_backups = 7
+        retention_unit   = "COUNT"
+      }
+    }
+
+    maintenance_window {
+      day          = 7
+      hour         = 4
+      update_track = "stable"
+    }
+
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+      record_application_tags = true
+    }
+  }
+
+  # Replica configuration for non-primary regions
+  master_instance_name = each.value == var.primary_region ? null : google_sql_database_instance.regional_instances[var.primary_region].name
+}
+
+# Read replica in asia-east1 for low-latency reads
+resource "google_sql_replica_instance" "asia_read_replica" {
+  name                 = "content-db-asia-replica"
+  database_version     = "POSTGRES_15"
+  region               = "asia-east1"
+  master_instance_name = google_sql_database_instance.regional_instances["us-central1"].name
+
+  deletion_protection = false
+
+  settings {
+    tier              = "db-n1-standard-2"
+    availability_type = "ZONAL"
+    disk_autoresize   = true
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.global_vpc.id
+    }
+  }
+}
+
+# Cloud Spanner for global data
+resource "google_spanner_instance" "global_instance" {
+  name        = "global-content"
+  config      = "regional-${var.primary_region}"
+  num_nodes   = 3
+  description = "Global content database with multi-region replication"
+
+  labels = {
+    environment = "production"
+    team        = "platform"
+  }
+}
+
+resource "google_spanner_database" "content_db" {
+  instance = google_spanner_instance.global_instance.name
+  name     = "content_db"
+  dialect  = "GOOGLE_STANDARD_SQL"
+
+  deletion_protection = true
+
+  schema = file("${path.module}/schemas/content_schema.sql")
+}
+
+# Memorystore (Redis) - Regional instances
+resource "google_redis_instance" "regional_cache" {
+  for_each = toset(var.regions)
+
+  name           = "content-cache-${each.value}"
+  tier           = "STANDARD_HA"
+  memory_size_gb = 5
+  region         = each.value
+
+  authorized_network = google_compute_network.global_vpc.id
+  connect_mode       = "PRIVATE_SERVICE_ACCESS"
+
+  redis_version = "REDIS_7_0"
+
+  persistence_config {
+    persistence_mode = "RDB"
+    rdb_next_save_time = "23:00"
+    rdb_snapshot_period = "6h"
+  }
+
+  auth_enabled = true
+  transit_encryption_mode = "SERVER_AUTHENTICATION"
+
+  # Failover instance for high availability
+  replica_count = 1
+}
+
+# Cloud Run Services - Deployed to all regions
+resource "google_cloud_run_v2_service" "regional_service" {
+  for_each = toset(var.regions)
+
+  name     = "content-api-${each.value}"
+  location = each.value
+
+  ingress = "INGRESS_TRAFFIC_ALL"
+
+  template {
+    service_account = google_service_account.content_api.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/content-api:${var.image_tag}"
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "1Gi"
+        }
+        cpu_idle          = true
+        startup_cpu_boost = true
+      }
+      ports {
+        container_port = 8080
+        name           = "http1"
+      }
+      env {
+        name  = "REGION"
+        value = each.value
+      }
+      env {
+        name  = "DATABASE_HOST"
+        value = each.value == var.primary_region
+          ? google_sql_database_instance.regional_instances[each.value].private_ip_address
+          : google_sql_sql_user.replica_user[each.value].host
+      }
+      env {
+        name  = "REDIS_HOST"
+        value = google_redis_instance.regional_cache[each.value].host
+      }
+    }
+
+    scaling {
+      min_instance_count = each.value == var.primary_region ? 2 : 1
+      max_instance_count = 100
+    }
+
+    vpc_access {
+      connector = google_vpc_access_connector.regional_connector[each.value].id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
+
+    health_check {
+      failure_threshold = 3
+      success_threshold = 1
+      timeout           = "5s"
+      period           = "30s"
+      http_get {
+        path = "/healthz"
+        port = 8080
+      }
+    }
+  }
+
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+}
+
+# Global load balancer
+resource "google_compute_global_address" "global_lb" {
+  name         = "global-lb-ip"
+  ip_version   = "IPV4"
+  address_type = "EXTERNAL"
+}
+
+resource "google_compute_health_check" "multi_region_health" {
+  name               = "multi-region-health-check"
+  check_interval_sec = 10
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
+
+  https_health_check {
+    port = 443
+    request_path = "/healthz"
+  }
+}
+
+# Backend services per region
+resource "google_compute_backend_service" "regional_backend" {
+  for_each = toset(var.regions)
+
+  name        = "content-api-backend-${each.value}"
+  health_checks = [google_compute_health_check.multi_region_health.id]
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  session_affinity = "CLIENT_IP"
+
+  # Cloud Run as backend (serverless NEG)
+  backend {
+    group           = google_cloud_run_v2_service.regional_service[each.value].id
+    balancing_mode  = "UTILIZATION"
+    capacity_scaler = each.value == var.primary_region ? 1.0 : 0.5
+  }
+}
+
+# URL map with latency-based routing
+resource "google_compute_url_map" "global_url_map" {
+  name            = "content-api-url-map"
+  default_service = google_compute_backend_service.regional_backend[var.primary_region].id
+
+  # Route to closest region based on latency
+  host_rule {
+    hosts        = ["api.devops-blog.example.com"]
+    path_matcher = "content-paths"
+  }
+
+  path_matcher {
+    name            = "content-paths"
+    default_service = google_compute_backend_service.regional_backend[var.primary_region].id
+
+    path_rule {
+      paths   = ["/api/*"]
+      service = google_compute_backend_service.regional_backend[var.primary_region].id
+
+      route_action {
+        timeout {
+          seconds = 30
+          nanos   = 0
+        }
+        retry_policy {
+          num_retries = 3
+          retry_conditions = ["server_error", "reset", "connect-failure"]
+          per_try_timeout {
+            seconds = 10
+          }
+        }
+        circuit_breakers {
+          max_connections_per_instance = 1000
+          max_pending_requests         = 500
+        }
+      }
+    }
+  }
+}
+
+# SSL certificate
+resource "google_compute_managed_ssl_certificate" "global_ssl" {
+  name = "content-api-ssl-cert"
+
+  managed {
+    domains = ["api.devops-blog.example.com"]
+  }
+}
+
+# HTTPS proxy
+resource "google_compute_target_https_proxy" "global_https_proxy" {
+  name             = "content-api-https-proxy"
+  url_map          = google_compute_url_map.global_url_map.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.global_ssl.id]
+
+  # Enable QUIC for better performance
+  quic_override = "ENABLE"
+}
+
+# Global forwarding rule
+resource "google_compute_global_forwarding_rule" "https_global" {
+  name       = "content-api-https-rule"
+  target     = google_compute_target_https_proxy.global_https_proxy.id
+  port_range = "443"
+  ip_address = google_compute_global_address.global_lb.id
+}
+
+resource "google_compute_global_forwarding_rule" "http_global" {
+  name       = "content-api-http-rule"
+  target     = google_compute_target_https_proxy.global_https_proxy.id
+  port_range = "80"
+  ip_address = google_compute_global_address.global_lb.id
+}
+
+# Cloud CDN configuration
+resource "google_compute_backend_bucket" "cdn_bucket" {
+  name        = "content-cdn-bucket"
+  description = "Cloud CDN for static content"
+  bucket_name = google_storage_bucket.static_content.name
+  enable_cdn  = true
+
+  cdn_policy {
+    cache_mode        = "CACHE_ALL_STATIC"
+    client_ttl        = 3600
+    default_ttl       = 3600
+    max_ttl           = 86400
+    serve_while_stale = 3600
+
+    # Cache invalidation via Cloud Run service
+    request_coalescing = true
+    bypass_cache_on_request_headers {
+      header_name = "Authorization"
+    }
+  }
+}
+
+# Cloud Storage bucket with multi-region storage
+resource "google_storage_bucket" "static_content" {
+  name          = "${var.project_id}-static-content"
+  location      = "US"  # Multi-region for global availability
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+    condition {
+      age = 30  # Delete versions older than 30 days
+    }
+  }
+
+  # CORS configuration for CDN
+  cors {
+    origin          = ["https://devops-blog.example.com"]
+    method          = ["GET", "HEAD"]
+    response_header = ["Content-Type", "Cache-Control"]
+    max_age_seconds = 3600
+  }
+}
+
+# Replication for Cloud Storage (if using dual-region)
+resource "google_storage_bucket" "replicated_content" {
+  count  = 1
+
+  name          = "${var.project_id}-content-${var.regions[count.index]}"
+  location      = var.regions[count.index]
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true
+
+  custom_placement_config {
+    data_locations = [
+      var.regions[count.index],
+      var.regions[(count.index + 1) % length(var.regions)]
+    ]
+  }
+}
+
+# Service Accounts
+resource "google_service_account" "content_api" {
+  account_id   = "content-api-sa"
+  display_name = "Content API Service Account"
+}
+
+resource "google_project_iam_member" "content_api_roles" {
+  for_each = toset([
+    "roles/cloudsql.client",
+    "roles/storage.objectViewer",
+    "roles/memcache.client",
+    "roles/spanner.databaseUser"
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.content_api.email}"
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### RPO/RTO Targets by Service Type
+
+| Service | Typical RPO | Typical RTO | Implementation |
+|---------|-------------|-------------|----------------|
+| Static Content | 0 (CDN) | Minutes | Cloud CDN, multi-region GCS |
+| API Services | Seconds | Minutes | Cloud Run multi-region, health checks |
+| User Data | Seconds | Minutes | Cloud SQL replicas, Spanner |
+| Transaction Data | 0 | Minutes | Spanner multi-region,同步复制 |
+| Analytics | Minutes-Hours | Hours | BigQuery multi-region |
+| Session State | N/A (stateless) | N/A | Redis in each region |
+
+### Active-Active Pattern
+
+```typescript
+// Conflict resolution for active-active writes
+class ConflictResolver<T> {
+  constructor(
+    private strategy: 'last-write-wins' | 'server-wins' | 'manual-merge'
+  ) {}
+
+  resolve(local: T, remote: T, timestampLocal: Date, timestampRemote: Date): T {
+    switch (this.strategy) {
+      case 'last-write-wins':
+        return timestampLocal > timestampRemote ? local : remote;
+
+      case 'server-wins':
+        return remote; // Always prefer server data
+
+      case 'manual-merge':
+        return this.merge(local, remote); // Custom merge logic
+
+      default:
+        throw new Error(`Unknown strategy: ${this.strategy}`);
+    }
+  }
+}
+```
+
+### Anti-patterns
+
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| Synchronous cross-region calls | High latency, cascade failures | Async events, local reads |
+| Single-region writes everywhere | Write bottleneck, latency | Geographically distributed writes |
+| No conflict resolution | Data corruption | Implement CRDT or conflict resolution |
+| Inconsistent cache invalidation | Stale data | Use regional caches with appropriate TTL |
+| No regional affinity | Unnecessary cross-region traffic | Route to nearest region |
+
+## Monitoring
+
+### Multi-Region Metrics
+
+```yaml
+# Cloud Monitoring - Multi-region Dashboard
+dashboard:
+  displayName: "Multi-Region Health Dashboard"
+
+  widgets:
+    - title: "Request Latency by Region"
+      xyChart:
+        dataSets:
+          - timeSeriesQuery: |
+              fetch cloud_run_revision
+              | metric 'run.googleapis.com/request_latencies'
+              | filter resource.labels.service_name='content-api'
+              | group_by 2m, [value_latencies_mean: mean(value.latency)]
+              | every 1m
+            legendTemplate: "${location}"
+
+    - title: "Database Replication Lag"
+      xyChart:
+        dataSets:
+          - timeSeriesQuery: |
+              fetch cloudsql.googleapis.com/database/postgresql/replication/replica_lag
+              | group_by 1m, [value_lag_mean: mean(value.replica_lag_seconds)]
+
+    - title: "Active Instances by Region"
+      stackedAreaChart:
+        dataSets:
+          - timeSeriesQuery: |
+              fetch cloud_run_revision
+              | metric 'run.googleapis.com/container/instance_count'
+              | filter resource.labels.service_name='content-api'
+```
+
+### Cross-Region Health Monitoring
+
+```hcl
+resource "google_monitoring_alert_policy" "cross_region_lag" {
+  display_name = "Cross-Region Replication Lag"
+  conditions {
+    display_name = "Replication lag > 60 seconds"
+    condition_threshold {
+      filter = |
+        resource.type="cloudsql_database" AND
+        metric.type="cloudsql.googleapis.com/database/postgresql/replication/replica_lag" AND
+        metric.value > 60
+      duration = 300s
+      comparison = comparison.GT
+      threshold_value = 60
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "region_failover" {
+  display_name = "Region Failover Triggered"
+  conditions {
+    display_name = "Primary region unhealthy"
+    condition_threshold {
+      filter = |
+        resource.type="cloud_run_revision" AND
+        metric.type="run.googleapis.com/container/instance_count" AND
+        resource.labels.location="${var.primary_region}" AND
+        metric.value < 1
+      duration = 120s
+      comparison = comparison.LT
+      threshold_value = 1
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.pagerduty.id]
+}
+```
+
+## Security
+
+### Multi-Region Security Considerations
+
+```hcl
+# Regional firewall rules
+resource "google_compute_firewall" "regional_ingress" {
+  for_each = toset(var.regions)
+
+  name    = "allow-internal-${each.value}"
+  network = google_compute_network.global_vpc.name
+  direction = "INGRESS"
+  priority = 1000
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080"]
+  }
+
+  source_ranges = ["10.0.0.0/8"]
+
+  target_tags = ["cloud-run"]
+  description = "Allow internal traffic to Cloud Run services"
+}
+
+# Cloud Armor for WAF (global)
+resource "google_cloud_armor_security_policy" "global_waf" {
+  name        = "global-waf-policy"
+  description = "Global WAF policy for all regions"
+
+  adaptive_protection_config {
+    layer_7_ddos_defense_config {
+      enable = true
+    }
+  }
+
+  # Attach to backend services in all regions
+  count = length(var.regions)
+
+  attachment {
+    backend_service_id = google_compute_backend_service.regional_backend[var.regions[count.index]].id
+  }
+}
+```
+
+## Cost Optimization
+
+### Multi-Region Cost Breakdown
+
+| Component | Cost Factor | Optimization |
+|-----------|-------------|--------------|
+| Cloud Run | Per-region instances | Right-size min instances, use scaling |
+| Cloud SQL | Per-region instances | Use read replicas instead of full instances |
+| Memorystore | Per-region instances | Regional instances only for primary regions |
+| Cloud Spanner | Nodes × regions | Optimize node count, consider regional |
+| Egress | Cross-region traffic | Minimize cross-region calls |
+
+```hcl
+# Budget alert for multi-region costs
+resource "google_billing_budget" "multi_region_budget" {
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "100000"  # $100k/month limit
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.5
+  }
+  threshold_rules {
+    threshold_percent = 0.9
+  }
+
+  filter {
+    labels {
+      key   = "environment"
+      value = ["production"]
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+### Common Multi-Region Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| High latency from Europe | Traffic routing to US | Check Cloud DNS latency routing |
+| Stale data reads | Replication lag | Monitor replica lag, increase capacity |
+| Write failures | Primary region down | Verify failover configuration |
+| Cache inconsistency | Regional cache divergence | Implement cache invalidation events |
+| Intermittent 503s | Health check misconfiguration | Verify global health check setup |
+
+### Debug Commands
+
+```bash
+# Check Cloud Run service in all regions
+for region in us-central1 europe-west1 asia-east1; do
+  echo "=== $region ==="
+  gcloud run services describe content-api --region $region
+done
+
+# Test latency from different locations
+curl -w "\nTime: %{time_namelookup}s\n" https://api.devops-blog.example.com/healthz
+
+# Check Cloud SQL replication status
+gcloud sql instances describe content-db-us-central1 \
+  --format="table(replicaNames,settings.availabilityType)"
+
+# Check Spanner node status
+gcloud spanner instances describe global-content
+
+# View cross-region traffic in VPC Flow logs
+gcloud logging read '
+  resource.type="gce_subnetwork" AND
+  logName="projects/${PROJECT_ID}/logs/vpc_flows" AND
+  jsonPayload.connection.src_location.region="europe-west1"
+' --limit 100
+```
+
+## Interview Questions
+
+### Q1: What is the difference between RPO and RTO?
+**Answer**: RPO (Recovery Point Objective) is the maximum acceptable data loss measured in time - how far back in time data might need to be recovered from. RTO (Recovery Time Objective) is the maximum acceptable downtime before systems must be restored. RPO determines backup frequency; RTO determines DR infrastructure investment.
+
+### Q2: How do you handle split-brain scenarios in active-active?
+**Answer**: Use consensus-based locking for critical operations, implement fencing tokens to prevent split-brain writes, use eventual consistency with conflict resolution (CRDTs or last-write-wins), and have clear manual override procedures. For truly critical data, active-active may not be appropriate.
+
+### Q3: What are the trade-offs of Cloud Spanner vs multi-region Cloud SQL?
+**Answer**: Spanner provides strong consistency globally with automatic replication and no read replicas needed. Cloud SQL is simpler and cheaper for regional workloads with read replicas for read scaling. Spanner excels for globally distributed writes with strong consistency; Cloud SQL is better for read-heavy workloads in specific regions.
+
+### Q4: How do you test multi-region failover?
+**Answer**: Conduct regular chaos engineering exercises, test by manually failing over primary databases, verify DNS TTL settings allow quick failover, test with actual user traffic simulation, and validate RTO/RPO during tests. Use Runbook to document failover procedures and test them quarterly.
+
+### Q5: What is the minimum latency you can achieve cross-region?
+**Answer**: Physical distance determines minimum latency. Approximate round-trip times: US-East to US-West ~60-80ms, US to Europe ~80-100ms, US to Asia ~150-200ms. This is before network overhead. Design for these latencies by minimizing cross-region calls and using local reads.
+
+## Cheat Sheet
+
+```bash
+# Deploy to multiple regions
+for region in us-central1 europe-west1 asia-east1; do
+  gcloud run deploy content-api \
+    --image gcr.io/${PROJECT_ID}/content-api:v1 \
+    --region $region \
+    --no-allow-unauthenticated
+done
+
+# Set up Cloud SQL cross-region replica
+gcloud sql instances create content-db-asia-replica \
+  --master-instance-name=content-db-us-central1 \
+  --region=asia-east1 \
+  --tier=db-n1-standard-2
+
+# Check replication status
+gcloud sql instances describe content-db-us-central1 \
+  --format="get(settings.replicationType)"
+
+# Test global load balancer
+gcloud compute ssl-certificates list
+gcloud compute url-maps describe content-api-url-map
+
+# Check regional traffic distribution
+gcloud logging read '
+  resource.type="cloud_run_revision" AND
+  metric.type="run.googleapis.com/request_count"
+' --format="table(metric.labels.location, metric.value)" --limit 100
+
+# Verify Cloud CDN cache hit rate
+gcloud compute backend-buckets describe content-cdn-bucket \
+  --format="table(cdnPolicy.cacheMode, enableCdn)"
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Platform architecture introduction
+- [Disaster Recovery](./disaster-recovery.mdx) - DR planning and failover
+- [Security Architecture](./security-architecture.mdx) - Multi-region security
+- [Cost Architecture](./cost-architecture.mdx) - Multi-region cost optimization
+- [Microservices](./microservices.mdx) - Regional service deployment

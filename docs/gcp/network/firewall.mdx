@@ -1,0 +1,690 @@
+# Firewall Rules
+
+## Overview
+
+Firewall rules in GCP control inbound (ingress) and outbound (egress) traffic to/from your VPC network. They are stateful—if a connection is allowed in one direction, the response is automatically allowed regardless of egress rules. Firewall rules are applied at the VPC level but can target specific instances using network tags or service accounts.
+
+Every GCP project has default firewall rules that allow traffic within the VPC and from Google Cloud health check systems. Understanding and properly configuring firewall rules is critical for securing your cloud infrastructure. Default-deny behavior means any traffic not explicitly allowed is denied.
+
+GCP firewall rules have priority ordering (0-65535, lower = higher priority). The first matching rule wins. This allows precise control over traffic flow. VPC firewall rules are evaluated before other Google Cloud services like Cloud Armor or Cloud Load Balancing, providing defense-in-depth.
+
+## When To Use
+
+- **Controlling access to instances**: Allow/deny traffic based on source, ports, protocols
+- **Network segmentation**: Isolate tiers (web, app, database) from each other
+- **Allowing health checks**: Permit Google's health check IPs to reach load balancer backends
+- **Restricting SSH/RDP access**: Limit administrative access to specific IP ranges
+- **Service-specific access**: Allow only necessary ports (e.g., 80/443 for web servers)
+- **Egress control**: Restrict outbound traffic to specific destinations
+
+## When NOT To Use
+
+- **Application-level filtering**: Use Cloud Armor or WAF for HTTP(S) application-layer filtering
+- **Cross-cloud traffic**: Use Cloud Interconnect or Cloud VPN for hybrid cloud
+- **DNS filtering**: Use Cloud DNS policies instead
+- **Microservice-to-microservice within GKE**: Use GKE network policies instead
+
+## Architecture
+
+**Firewall Rule Structure:**
+```
+Firewall Rule: allow-https
+├── Network: prod-vpc
+├── Priority: 1000 (default)
+├── Direction: INGRESS
+├── Action: ALLOW
+├── Target: target-tags=[web-server]
+├── Source: IPv4 ranges (0.0.0.0/0)
+├── Ports: tcp:443
+├── Protocol: TCP
+└── Logs: enabled
+```
+
+**Default Firewall Rules:**
+| Rule | Direction | Action | Description |
+|------|-----------|--------|-------------|
+| default-allow-internal | INGRESS | ALLOW | Allows internal RFC 1918 traffic |
+| default-allow-icmp | INGRESS | ALLOW | Allows ICMP |
+| default-allow-rdp | INGRESS | ALLOW | Allows RDP (TCP:3389) |
+| default-allow-ssh | INGRESS | ALLOW | Allows SSH (TCP:22) |
+|-implied-deny-ingress | INGRESS | DENY | Implicitly denies all other ingress |
+| implied-deny-egress | EGRESS | DENY | Implicitly denies all other egress |
+
+**Priority Range:**
+- 0-999: High priority (reserved for Google)
+- 1000-65535: User-defined (1000 is default for user rules)
+
+## Core Concepts
+
+### Creating Firewall Rules
+
+```bash
+# Basic allow rule
+gcloud compute firewall-rules create allow-https \
+    --network=prod-vpc \
+    --allow=tcp:443 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=web-server
+
+# Allow multiple ports
+gcloud compute firewall-rules create allow-web \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443,tcp:8080 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=web-server
+
+# Allow from specific IP range
+gcloud compute firewall-rules create allow-office \
+    --network=prod-vpc \
+    --allow=tcp:22 \
+    --source-ranges=203.0.113.0/24 \
+    --description="Office network SSH access"
+
+# Allow from another firewall rule (hierarchical)
+gcloud compute firewall-rules create allow-web-to-app \
+    --network=prod-vpc \
+    --allow=tcp:8080 \
+    --source-tags=web-server \
+    --target-tags=app-server
+
+# Allow based on service account
+gcloud compute firewall-rules create allow-app-backend \
+    --network=prod-vpc \
+    --allow=tcp:5432 \
+    --source-service-accounts=app-sa@my-project.iam.gserviceaccount.com \
+    --target-service-accounts=db-sa@my-project.iam.gserviceaccount.com
+
+# Egress rule
+gcloud compute firewall-rules create allow-dns-egress \
+    --network=prod-vpc \
+    --direction=EGRESS \
+    --allow=udp:53,tcp:53 \
+    --destination-ranges=8.8.8.8/32
+
+# Deny rule (high priority)
+gcloud compute firewall-rules create block-malicious \
+    --network=prod-vpc \
+    --priority=10 \
+    --direction=INGRESS \
+    --action=deny \
+    --source-ranges=192.0.2.0/24 \
+    --description="Block known malicious range"
+```
+
+### Viewing and Managing Rules
+
+```bash
+# List all firewall rules
+gcloud compute firewall-rules list
+
+# List rules in specific network
+gcloud compute firewall-rules list --filter="network:prod-vpc"
+
+# Describe rule
+gcloud compute firewall-rules describe allow-https
+
+# Update rule (add ports)
+gcloud compute firewall-rules update allow-https \
+    --add-allow=tcp:80
+
+# Update rule (change priority)
+gcloud compute firewall-rules update allow-https \
+    --priority=500
+
+# Enable logging
+gcloud compute firewall-rules update allow-https \
+    --enable-logging
+
+# Disable logging
+gcloud compute firewall-rules update allow-https \
+    --disable-logging
+
+# Delete rule
+gcloud compute firewall-rules delete allow-https
+```
+
+### Firewall Rules for Load Balancers
+
+```bash
+# Allow Google health checks
+gcloud compute firewall-rules create allow-health-checks \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443 \
+    --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+    --target-tags=backend-server \
+    --description="Allow Google Cloud health checks"
+
+# Allow LB traffic (if using network LB)
+gcloud compute firewall-rules create allow-lb-traffic \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443,tcp:8080 \
+    --source-ranges=130.211.0.0/22 \
+    --target-tags=backend
+```
+
+### Firewall Rules for Private Clusters
+
+```bash
+# Allow control plane to nodes (GKE)
+gcloud compute firewall-rules create gke-master \
+    --network=prod-vpc \
+    --allow=tcp:10250,tcp:443 \
+    --source-tags=gke-master \
+    --target-tags=worker-nodes \
+    --description="GKE master to worker communication"
+
+# Allow node port services
+gcloud compute firewall-rules create gke-node-ports \
+    --network=prod-vpc \
+    --allow=tcp:30000-32767 \
+    --target-tags=worker-nodes \
+    --description="GKE NodePort services"
+```
+
+### Firewall Rules with Conditions
+
+```bash
+# Create rule with IAM condition (requires --condition flag)
+gcloud compute firewall-rules create allow-office-hours \
+    --network=prod-vpc \
+    --allow=tcp:22 \
+    --source-ranges=0.0.0.0/0 \
+    --condition="request.time >= '2024-01-01T09:00:00' && request.time < '2024-12-31T18:00:00'" \
+    --condition="source.ip in [203.0.113.0/24]"
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Firewall rules per project | 100 (expandable) |
+| Firewall rules per VPC | 100 |
+| Rules with logging per project | 50 |
+| Target tags per rule | 70 |
+| Service accounts per rule | 10 |
+
+### Key Gotchas
+
+- **Firewall rules are stateful**—return traffic is auto-allowed once connection is established
+- **Egress is default-deny**—must explicitly allow outbound traffic
+- **Priority matters**—lower number = higher priority, first match wins
+- **Default rules cannot be deleted**—only disabled
+- **Logging has additional quota**—only 50 rules can have logging enabled
+- **Firewall rules are not retroactive**—only affect new connections
+- **Source tags create instance-level rules**—not network level
+- **Deny rules still log** if logging is enabled
+
+## Real Production Example
+
+Production firewall configuration:
+
+```bash
+# 1. Default deny for ingress (implied)
+# Cannot create this explicitly - it's default behavior
+
+# 2. Allow internal communication
+gcloud compute firewall-rules create allow-internal \
+    --network=prod-vpc \
+    --allow=tcp,udp,icmp \
+    --source-ranges=10.0.0.0/8 \
+    --priority=65534 \
+    --description="Allow all internal traffic"
+
+# 3. Allow web traffic to web tier
+gcloud compute firewall-rules create allow-web-ingress \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443 \
+    --source-ranges=0.0.0.0/0 \
+    --target-tags=web-server \
+    --priority=1000 \
+    --enable-logging
+
+# 4. Allow web to app tier
+gcloud compute firewall-rules create allow-web-to-app \
+    --network=prod-vpc \
+    --allow=tcp:8080 \
+    --source-tags=web-server \
+    --target-tags=app-server \
+    --priority=1000
+
+# 5. Allow health checks to backends
+gcloud compute firewall-rules create allow-health-checks \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443,tcp:8080 \
+    --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+    --target-tags=backend-server \
+    --priority=1000 \
+    --enable-logging
+
+# 6. Allow app to database tier
+gcloud compute firewall-rules create allow-app-to-db \
+    --network=prod-vpc \
+    --allow=tcp:5432 \
+    --source-tags=app-server \
+    --target-tags=database \
+    --priority=1000
+
+# 7. Allow SSH from admin network only
+gcloud compute firewall-rules create allow-ssh-admin \
+    --network=prod-vpc \
+    --allow=tcp:22 \
+    --source-ranges=10.100.0.0/16 \
+    --target-tags=admin-access \
+    --priority=100 \
+    --description="SSH only from admin network"
+
+# 8. Block specific malicious IPs
+gcloud compute firewall-rules create block-bad-actors \
+    --network=prod-vpc \
+    --action=deny \
+    --direction=INGRESS \
+    --priority=10 \
+    --source-ranges=192.0.2.0/24,198.51.100.0/24 \
+    --enable-logging
+
+# 9. Allow GKE-specific traffic
+gcloud compute firewall-rules create allow-gke-master \
+    --network=prod-vpc \
+    --allow=tcp:10250,tcp:443 \
+    --source-tags=gke-master \
+    --target-tags=gke-nodes \
+    --priority=1000
+
+gcloud compute firewall-rules create allow-gke-node-ports \
+    --network=prod-vpc \
+    --allow=tcp:30000-32767 \
+    --target-tags=gke-nodes \
+    --priority=1000
+
+# 10. Allow egress to Google APIs
+gcloud compute firewall-rules create allow-google-apis \
+    --network=prod-vpc \
+    --direction=EGRESS \
+    --allow=tcp:443,tcp:80 \
+    --destination-ranges=8.8.8.8/32,8.8.4.4/32 \
+    --priority=65534
+```
+
+```hcl
+# Terraform: Production firewall rules
+resource "google_compute_network" "prod_vpc" {
+  name = "prod-vpc"
+}
+
+# Allow internal traffic
+resource "google_compute_firewall" "allow_internal" {
+  name    = "allow-internal"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.0.0.0/8"]
+  priority      = 65534
+}
+
+# Web ingress
+resource "google_compute_firewall" "allow_web" {
+  name    = "allow-web"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["web-server"]
+
+  log_config {
+    metadata = "INCLUDE_ALL_METADATA"
+  }
+}
+
+# Web to app
+resource "google_compute_firewall" "allow_web_to_app" {
+  name    = "allow-web-to-app"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080"]
+  }
+
+  source_tags = ["web-server"]
+  target_tags = ["app-server"]
+}
+
+# Health checks
+resource "google_compute_firewall" "allow_health_checks" {
+  name    = "allow-health-checks"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443", "8080"]
+  }
+
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = ["backend"]
+}
+
+# App to database
+resource "google_compute_firewall" "allow_app_to_db" {
+  name    = "allow-app-to-db"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["5432"]
+  }
+
+  source_tags = ["app-server"]
+  target_tags = ["database"]
+}
+
+# Block malicious IPs
+resource "google_compute_firewall" "block_malicious" {
+  name    = "block-malicious"
+  network = google_compute_network.prod_vpc.name
+
+  direction     = "INGRESS"
+  action        = "deny"
+  priority      = 10
+
+  deny {
+    protocol = "all"
+  }
+
+  source_ranges = ["192.0.2.0/24"]
+
+  log_config {
+    metadata = "INCLUDE_ALL_METADATA"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create firewall rule
+gcloud compute firewall-rules create RULE \
+    --network=NET \
+    --allow=PROTOCOL:PORT \
+    --source-ranges=RANGES \
+    --target-tags=TAGS
+
+# Create egress rule
+gcloud compute firewall-rules create RULE \
+    --network=NET \
+    --direction=EGRESS \
+    --allow=PROTOCOL:PORT \
+    --destination-ranges=RANGES
+
+# Create deny rule
+gcloud compute firewall-rules create RULE \
+    --network=NET \
+    --action=deny \
+    --priority=PRIORITY \
+    --allow=all
+
+# List rules
+gcloud compute firewall-rules list
+
+# List with filters
+gcloud compute firewall-rules list --filter="network:prod-vpc AND direction=INGRESS"
+
+# Describe rule
+gcloud compute firewall-rules describe RULE
+
+# Update rule
+gcloud compute firewall-rules update RULE --add-allow=tcp:8080 --priority=500
+
+# Enable logging
+gcloud compute firewall-rules update RULE --enable-logging
+
+# Delete rule
+gcloud compute firewall-rules delete RULE
+```
+
+## Terraform Example
+
+```hcl
+# Complete firewall configuration
+resource "google_compute_firewall" "web" {
+  name        = "allow-web-traffic"
+  network     = google_compute_network.vpc.name
+  description = "Allow HTTP/HTTPS from anywhere"
+
+  direction = "INGRESS"
+  priority  = 1000
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["web"]
+
+  log_config {
+    metadata = "INCLUDE_ALL_METADATA"
+  }
+}
+
+resource "google_compute_firewall" "internal" {
+  name    = "allow-internal"
+  network = google_compute_network.vpc.name
+
+  allow {
+    protocol = "tcp"
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = ["10.0.0.0/8"]
+  priority      = 65534
+}
+
+resource "google_compute_firewall" "deny_ssh" {
+  name    = "deny-ssh"
+  network = google_compute_network.vpc.name
+
+  direction = "INGRESS"
+  priority  = 100
+  action    = "deny"
+
+  deny {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create rule | `gcloud compute firewall-rules create NAME --network=NET --allow=PROTO:PORT` |
+| List rules | `gcloud compute firewall-rules list` |
+| Describe rule | `gcloud compute firewall-rules describe NAME` |
+| Update rule | `gcloud compute firewall-rules update NAME [FLAGS]` |
+| Delete rule | `gcloud compute firewall-rules delete NAME` |
+| Enable logging | `gcloud compute firewall-rules update NAME --enable-logging` |
+
+## Monitoring
+
+**Firewall Logging:**
+```bash
+# Query firewall logs in Cloud Logging
+gcloud logging read 'resource.type="gce_firewall_rule" AND jsonPayload.disposition="ALLOWED"' \
+    --limit=100
+
+# Find denied connections
+gcloud logging read 'resource.type="gce_firewall_rule" AND jsonPayload.disposition="DENIED"' \
+    --limit=100
+
+# Top blocked sources
+bq query --use_legacy_sql=false '
+  SELECT
+    jsonPayload.connection.src_ip,
+    jsonPayload.connection.dest_port,
+    COUNT(*) as blocked_count
+  FROM `firewall_logs.firewall_events`
+  WHERE jsonPayload.disposition = "DENIED"
+  GROUP BY src_ip, dest_port
+  ORDER BY blocked_count DESC
+'
+```
+
+**Recommended Alerts:**
+- Unusual spike in denied connections
+- New firewall rules created
+- High priority rules changed
+
+## Security
+
+**Firewall Security Best Practices:**
+
+1. **Principle of least privilege**: Only allow necessary traffic
+2. **Use specific source ranges**: Avoid 0.0.0.0/0 for sensitive ports
+3. **Set high priority for deny rules**: Block known bad actors
+4. **Enable logging for critical rules**: Audit traffic patterns
+5. **Restrict SSH access**: Limit to admin networks or use IAP
+6. **Use hierarchical firewall rules**: Organization-level for global policies
+
+```bash
+# Use Identity-Aware Proxy for SSH instead of opening port 22
+gcloud compute firewall-rules create allow-iap-tcp \
+    --network=prod-vpc \
+    --allow=tcp:22 \
+    --source-ranges=35.235.240.0/20 \
+    --target-tags=admin-access \
+    --description="IAP for SSH access"
+```
+
+## Cost Optimization
+
+**Firewall costs:**
+- No direct cost for firewall rules
+- Firewall logging incurs Cloud Logging costs (~$0.50/GB)
+- High-volume logging can be expensive
+
+**Optimization:**
+- Use flow sampling (0.5) for non-critical rules
+- Enable logging only for security-critical rules
+- Use target tags to reduce rule count
+- Clean up unused rules regularly
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Can't connect to instance**
+   ```bash
+   # Check applicable firewall rules
+   gcloud compute firewall-rules list --filter="network:my-vpc"
+   
+   # Test if rule is blocking
+   gcloud logging read 'resource.type="gce_firewall_rule" AND jsonPayload.connection.dest_ip="10.0.1.5"'
+   
+   # Check priority - lower number wins
+   gcloud compute firewall-rules describe blocking-rule
+   
+   # Add higher priority allow rule
+   ```
+
+2. **Health checks failing**
+   ```bash
+   # Ensure health check IPs are allowed
+   # 130.211.0.0/22 and 35.191.0.0/16
+   
+   gcloud compute firewall-rules create allow-health-checks \
+       --network=prod-vpc \
+       --allow=tcp:80,tcp:443 \
+       --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+       --target-tags=backend
+   ```
+
+3. **Egress blocked**
+   ```bash
+   # Default-deny on egress - must explicitly allow
+   # Check existing egress rules
+   gcloud compute firewall-rules list --filter="direction=EGRESS"
+   
+   # Create allow rule for needed traffic
+   ```
+
+4. **Firewall rule not applying**
+   ```bash
+   # Verify target matches instance tags
+   gcloud compute instances describe instance-name --zone=zone \
+       --format="yaml(tags)"
+   
+   # Check rule priority
+   # Higher priority (lower number) wins
+   ```
+
+## Interview Questions
+
+1. **Explain GCP firewall rule priority. What happens when two rules conflict?**
+
+2. **What's the difference between stateful and stateless firewall rules?**
+
+3. **How do you allow Google Cloud health checks through firewall rules?**
+
+4. **What's the implied deny rule for ingress and egress in GCP?**
+
+5. **How do firewall rules interact with network tags and service accounts?**
+
+## Cheat Sheet
+
+```
+# Firewall Rule Commands
+gcloud compute firewall-rules create NAME --network=NET --allow=PROTO:PORT [FLAGS]
+gcloud compute firewall-rules list
+gcloud compute firewall-rules describe NAME
+gcloud compute firewall-rules update NAME [FLAGS]
+gcloud compute firewall-rules delete NAME
+
+# Key Flags
+--network=NETWORK              # VPC network
+--allow=PROTO:PORT             # Protocols/ports to allow
+--direction=INGRESS|EGRESS     # Traffic direction
+--action=allow|deny            # Allow or deny
+--priority=NUMBER              # Lower = higher priority
+--source-ranges=RANGES         # Source IP ranges
+--target-tags=TAGS             # Target instance tags
+--source-tags=TAGS             # Source instance tags
+--enable-logging               # Enable VPC Flow Logs for rule
+--service-accounts=SA          # Filter by service account
+```
+
+## Labs
+
+1. **Basic Firewall Rules**: Create rules for web server (allow 80/443), test connectivity
+2. **Network Segmentation**: Create rules to isolate web, app, database tiers
+3. **Health Checks**: Configure firewall rules for HTTP(S) Load Balancer health checks
+4. **Logging and Monitoring**: Enable logging, query logs for denied traffic
+5. **GKE Firewall**: Configure firewall rules for GKE cluster communication
+
+## Related Services
+
+- [VPC](./vpc)
+- [Subnets](./subnets)
+- [Routes](./routes)
+- [Load Balancer](./load-balancer)
+- [GKE](../compute/gke)

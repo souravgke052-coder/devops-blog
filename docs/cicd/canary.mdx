@@ -1,0 +1,761 @@
+---
+id: canary
+title: Canary Deployments
+description: Canary analysis, metrics-based promotion, traffic splitting, and Argo Rollouts
+sidebar_position: 10
+---
+
+# Canary Deployments
+
+## Overview
+
+Canary deployment gradually shifts traffic from the stable version to a new version, starting with a small percentage and increasing based on metrics and analysis. This approach exposes the new version to real production traffic while minimizing blast radius if issues occur.
+
+## When To Use
+
+- High-risk changes requiring real-world validation
+- Services with gradual traffic acceptance requirements
+- Feature validation with A/B testing needs
+- Performance regression detection
+- ML models or recommendation systems
+
+## When NOT To Use
+
+- Emergency hotfixes requiring immediate full deployment
+- Stateful applications with hard-to-split traffic
+- Services requiring atomic feature completion
+- Low-risk changes where blue-green is simpler
+
+## Core Concepts
+
+### Canary Traffic Flow
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │              Load Balancer               │
+                    │          (Traffic Splitting)             │
+                    └──────────────────┬──────────────────────┘
+                                       │
+                     ┌─────────────────┴─────────────────┐
+                     │                                   │
+                     ▼ 10%                         ▼ 90%
+              ┌─────────────┐                   ┌─────────────┐
+              │  Canary     │                   │   Stable    │
+              │  v1.1       │                   │   v1.0      │
+              └─────────────┘                   └─────────────┘
+                     │                                   │
+                     ▼                                   ▼
+              ┌─────────────┐                   ┌─────────────┐
+              │  Metrics    │                   │  Monitor    │
+              │  Analysis   │                   │  Baseline   │
+              └─────────────┘                   └─────────────┘
+                     │                                   │
+                     └───────────────┬───────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    │     Analysis & Promotion         │
+                    │   (Auto or Manual Decision)      │
+                    └─────────────────────────────────┘
+```
+
+### Canary Strategy Types
+
+| Type | Traffic Split | Use Case |
+|------|---------------|----------|
+| **Weight-based** | Percentage of requests | General gradual rollout |
+| **Header-based** | Requests with specific header | Internal testing, QA |
+| **Cookie-based** | User session affinity | User-specific experience |
+| **Query-param** | URL parameter matching | A/B testing |
+| **Metrics-based** | Adaptive based on metrics | Automated progression |
+
+## Real Production Example
+
+### Argo Rollouts Canary Deployment
+
+```yaml
+# canary-rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: api
+  namespace: production
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      # Stable service reference
+      stableService: api-stable
+      # Canary service reference
+      canaryService: api-canary
+      
+      # Traffic split configuration
+      trafficRouting:
+        istio:
+          virtualService:
+            name: api-virtual-service
+            routes:
+            - primary
+          destinationRule:
+            name: api-destination
+            canarySubsetName: canary
+            stableSubsetName: stable
+      
+      # Analysis template reference
+      analysis:
+        templates:
+        - templateName: success-rate
+        - templateName: latency
+        startingStep: 1
+        args:
+        - name: service-name
+          value: api-canary
+        - name: namespace
+          value: production
+      
+      # Steps for progressive rollout
+      steps:
+      - setWeight: 5          # 5% to canary
+      - pause: {duration: 5m} # Wait 5 minutes
+      - analysis:
+          templates:
+          - templateName: success-rate
+      - setWeight: 20         # 20% to canary
+      - pause: {duration: 10m}
+      - analysis:
+          templates:
+          - templateName: success-rate
+          - templateName: latency
+      - setWeight: 50         # 50% to canary
+      - pause: {duration: 10m}
+      - setWeight: 100        # 100% to canary
+      
+      # Scale down delay after full rollout
+      scaleDownDelaySeconds: 30
+      maxSurge: "25%"
+      maxUnavailable: 0
+  
+  selector:
+    matchLabels:
+      app: api
+  
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.2.3
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SLOT
+          value: canary
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+```
+
+### Analysis Templates
+
+```yaml
+# analysis-templates.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: production
+spec:
+  args:
+  - name: service-name
+  - name: namespace
+    value: production
+  
+  metrics:
+  # Success rate analysis
+  - name: success-rate
+    interval: 1m
+    successCondition: result[0] >= 0.99
+    failureLimit: 3
+    provider:
+      prometheus:
+        address: http://prometheus:9090
+        query: |
+          sum(rate(http_requests_total{
+            job="{{args.service-name}}",
+            status!~"5.."
+          }[5m])) 
+          / 
+          sum(rate(http_requests_total{
+            job="{{args.service-name}}"
+          }[5m]))
+  
+  - name: error-rate
+    interval: 1m
+    failureCondition: result[0] > 0.01
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: http://prometheus:9090
+        query: |
+          sum(rate(http_requests_total{
+            job="{{args.service-name}}",
+            status=~"5.."
+          }[5m]))
+          /
+          sum(rate(http_requests_total{
+            job="{{args.service-name}}"
+          }[5m]))
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: latency
+  namespace: production
+spec:
+  args:
+  - name: service-name
+  
+  metrics:
+  # P99 latency
+  - name: latency-p99
+    interval: 2m
+    successCondition: result[0] <= 1
+    failureCondition: result[0] > 2
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: http://prometheus:9090
+        query: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{
+              job="{{args.service-name}}"
+            }[5m])) by (le)
+          )
+  
+  # Latency increase check
+  - name: latency-increase
+    interval: 2m
+   妖师:
+      prometheus:
+        address: http://prometheus:9090
+        query: |
+          # Compare canary to stable baseline
+          (
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{
+                job="{{args.service-name}}",
+                version="canary"
+              }[10m])) by (le)
+            )
+          /
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{
+                job="{{args.service-name}}",
+                version="stable"
+              }[10m])) by (le)
+            )
+          )
+```
+
+### GitHub Actions Canary Pipeline
+
+```yaml
+name: Canary Deployment with Argo Rollouts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # DEPLOY CANARY
+  # ============================================
+  deploy-canary:
+    name: Deploy Canary
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Deploy with Argo Rollouts
+        run: |
+          kubectl argo rollouts set image api \
+            api=gcr.io/myproject/api:${{ github.sha }} \
+            -n production
+          
+          echo "Canary deployment started"
+          kubectl argo rollouts get api --watch -n production &:
+          
+          # Wait for initial rollout
+          kubectl argo rollouts status api -n production --timeout=5m
+      
+      - name: Monitor initial canary
+        run: |
+          # Wait at 5% for initial validation
+          echo "Canary at 5%, monitoring..."
+          kubectl argo rollouts get api -n production -o wide
+      
+      - name: Manual promotion check
+        run: |
+          kubectl argo rollouts get api -n production -o jsonpath='{.status.phase}'
+          
+          # Wait for analysis to complete
+          kubectl argo rollouts watch api -n production
+
+  # ============================================
+  # AUTOMATED ANALYSIS
+  # ============================================
+  analyze:
+    name: Automated Analysis
+    runs-on: ubuntu-latest
+    needs: deploy-canary
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run analysis
+        run: |
+          # Check canary metrics
+          ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(http_requests_total{status=~'5..',version='canary'}[5m]) / rate(http_requests_total{version='canary'}[5m]))" | jq -r '.data.result[0].value[1] // 0')
+          
+          echo "Canary error rate: $ERROR_RATE"
+          
+          if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+            echo "Error rate too high. Aborting."
+            kubectl argo rollouts abort api -n production
+            exit 1
+          fi
+          
+          echo "Metrics look good, promoting..."
+
+  # ============================================
+  # FULL PROMOTION
+  # ============================================
+  promote:
+    name: Full Promotion
+    runs-on: ubuntu-latest
+    needs: analyze
+    
+    environment:
+      name: production
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Promote rollout
+        if: needs.analyze.result == 'success'
+        run: |
+          kubectl argo rollouts promote api -n production
+          kubectl argo rollouts status api -n production
+      
+      - name: Abort if analysis failed
+        if: needs.analyze.result == 'failure'
+        run: |
+          kubectl argo rollouts abort api -n production
+          echo "Rollback initiated"
+```
+
+### Flagger Canary (Flux)
+
+```yaml
+# canary-flagger.yaml
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: api
+  namespace: production
+spec:
+  # Target deployment
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  
+  # Strategy
+  strategy:
+    type: Metrics
+    metricsServer: http://prometheus:9090
+    
+    # Progressive delivery
+    stepWeight: 10
+    maxWeight: 100
+    metricsInterval: 1m
+    analysisInterval: 1m
+    
+    # Thresholds
+    threshold: 5           # Max number of failed checks
+    stepWeightThreshold:   # Weight can only increase if metrics pass
+      - 10
+      - 30
+      - 50
+      - 80
+      - 100
+  
+  # Metrics checks
+  metrics:
+  - name: request-success-rate
+    interval: 1m
+    # NH query
+    query: |
+      sum(rate(http_requests_total{
+        namespace="{{ namespace }}",
+        pod=~"{{ target }}-[a-z0-9]+",
+        status!~"5.."
+      }[1m]))
+      /
+      sum(rate(http_requests_total{
+        namespace="{{ namespace }}",
+        pod=~"{{ target }}-[a-z0-9]+"
+      }[1m]))
+    thresholdRange:
+      min: 0.99
+  
+  - name: request-duration
+    interval: 1m
+    thresholdRange:
+      max: 1
+    query: |
+      histogram_quantile(0.99,
+        sum(rate(http_request_duration_seconds_bucket{
+          namespace="{{ namespace }}",
+          pod=~"{{ target }}-[a-z0-9]+"
+        }[1m])) by (le)
+      )
+  
+  - name: pod-startup-duration
+    interval: 1m
+    thresholdRange:
+      max: 30
+    query: |
+      max(pod_start_time_seconds{
+        namespace="{{ namespace }}",
+        pod=~"{{ target }}-[a-z0-9]+"
+      } - pod_completion_time_seconds{
+        namespace="{{ namespace }}",
+        pod=~"{{ target }}-[a-z0-9]+"
+      })
+```
+
+## Configuration / Pipeline Examples
+
+### Header-Based Canary Routing
+
+```yaml
+# Istio VirtualService for header-based routing
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: api-virtual-service
+spec:
+  hosts:
+  - api.myapp.com
+  http:
+  - name: canary-route
+    match:
+    - headers:
+        x-canary:
+          exact: "true"
+    route:
+    - destination:
+        host: api-canary
+        port:
+          number: 8080
+  - name: stable-route
+    route:
+    - destination:
+        host: api-stable
+        port:
+          number: 8080
+      weight: 100
+```
+
+### Argo Rollouts HTTP Traffic Split
+
+```yaml
+# With nginx ingress
+spec:
+  strategy:
+    canary:
+      canaryService: api-canary
+      stableService: api-stable
+      trafficRouting:
+        nginx:
+          stableIngress: api-ingress
+          additionalIngressAnnotations:
+            canary-by-header: X-Canary
+            canary-by-header-value: "true"
+            canary-weight: "10"
+```
+
+## Common Commands / Steps
+
+### Argo Rollouts Commands
+
+```bash
+# Create rollout
+kubectl apply -f canary-rollout.yaml
+
+# Watch rollout progress
+kubectl argo rollouts get rollout api --watch
+
+# Pause rollout
+kubectl argo rollouts pause api
+
+# Resume rollout
+kubectl argo rollouts resume api
+
+# Promote (complete early)
+kubectl argo rollouts promote api
+
+# Full promotion (skip analysis)
+kubectl argo rollouts promote api --full
+
+# Abort rollout
+kubectl argo rollouts abort api
+
+# Undo (rollback to stable)
+kubectl argo rollouts undo api
+
+# Get detailed status
+kubectl argo rollouts get api -n production -o wide
+
+# Restart rollout
+kubectl argo rollouts restart api
+```
+
+### Analysis Commands
+
+```bash
+# Check analysis runs
+kubectl get analysisrun -n production
+
+# View analysis details
+kubectl describe analysisrun -n production
+
+# Trigger manual analysis
+kubectl argo rollouts retry analysis api -n production
+```
+
+### Traffic Testing
+
+```bash
+# Test canary with header
+curl -H "X-Canary: true" https://api.myapp.com/health
+
+# Weighted request distribution
+for i in {1..100}; do
+  curl -s -o /dev/null -w "%{http_code}\n" https://api.myapp.com/health
+done | sort | uniq -c
+
+# Verify traffic split
+kubectl argo rollouts get api -n production -o jsonpath='{.status.canaryWeight}'
+```
+
+## Monitoring
+
+### Canary Metrics
+
+| Metric | Target | Alert |
+|--------|--------|-------|
+| Error rate delta | < 0.5% | > 1% |
+| Latency delta | < 20% | > 50% |
+| Traffic split accuracy | ±5% | > 10% |
+| Analysis completion | < 30 min | > 60 min |
+
+### Prometheus Queries for Canary
+
+```promql
+# Canary success rate
+sum(rate(http_requests_total{version="canary",status!~"5.."}[5m])) /
+sum(rate(http_requests_total{version="canary"}[5m]))
+
+# Stable success rate (baseline)
+sum(rate(http_requests_total{version="stable",status!~"5.."}[5m])) /
+sum(rate(http_requests_total{version="stable"}[5m]))
+
+# Canary vs Stable latency
+histogram_quantile(0.99, 
+  sum(rate(http_request_duration_seconds_bucket{version="canary"}[5m])) by (le)
+) /
+histogram_quantile(0.99,
+  sum(rate(http_request_duration_seconds_bucket{version="stable"}[5m])) by (le)
+)
+
+# Canary traffic percentage
+sum(rate(http_requests_total{version="canary"}[5m])) /
+sum(rate(http_requests_total[5m])) * 100
+```
+
+## Security
+
+### Canary Security Considerations
+
+| Concern | Mitigation |
+|---------|------------|
+| Data exposure | Use anonymized test data |
+| Authentication | Canary should use same auth as stable |
+| Authorization | Ensure RBAC applies to both versions |
+| Secrets | Both versions should have equal secret access |
+
+```yaml
+# Security context
+spec:
+  canary:
+    securityContext:
+      runAsNonRoot: true
+      capabilities:
+        drop:
+        - ALL
+```
+
+## Cost Optimization
+
+### Canary Cost Strategies
+
+| Strategy | Savings | Implementation |
+|----------|---------|----------------|
+| Minimum replicas | Reduce idle canary cost | 1-2 replicas for canary |
+| Early abort | Save compute | Stop bad deployments early |
+| Analysis efficiency | Faster release | Reduce analysis intervals |
+| Shared resources | Lower infrastructure | Use same cluster resources |
+
+```yaml
+# Cost-optimized canary
+spec:
+  canaryMetadata:
+    labels:
+      tier: canary
+  canaryReplicas: 2  # Minimal canary replicas
+  stableReplicas: 8
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Analysis never completes | Metric query error | Check Prometheus connectivity |
+| Traffic not shifting | Routing config error | Verify service/backend configs |
+| Pods not ready | Readiness probe failing | Check probe config |
+| Analysis failure | Threshold too strict | Adjust thresholds for baseline |
+| Auto-promotion stuck | Missing analysis template | Check template references |
+
+### Debug Commands
+
+```bash
+# Check rollout status
+kubectl argo rollouts get api -n production -o wide
+
+# Check analysis
+kubectl get analysisrun -n production
+kubectl describe analysisrun <analysis-name> -n production
+
+# Check canary pods
+kubectl get pods -n production -l app=api,rollouts-type=canary
+
+# Check traffic
+kubectl argo rollouts status api -n production
+
+# View logs
+kubectl logs -n production -l app=api,rollouts-type=canary --tail=100
+
+# Manual promotion override
+kubectl argo rollouts promote api -n production --full
+```
+
+### Emergency Procedures
+
+```bash
+# Immediate abort
+kubectl argo rollouts abort api -n production
+
+# Immediate rollback
+kubectl argo rollouts undo api -n production
+
+# Force full traffic to stable
+kubectl argo rollouts abort api -n production
+kubectl scale deployment api-stable --replicas=10 -n production
+
+# Full promotion (if analysis is stuck but deployment is good)
+kubectl argo rollouts promote api -n production --full
+```
+
+## Interview Questions
+
+### Q1: What are the advantages of canary over blue-green deployments?
+
+**Answer:** Canary exposes the new version to real production traffic gradually, which is more realistic than isolated testing. It provides automatic rollback based on metrics analysis. Better for A/B testing and performance validation. Lower resource overhead than blue-green (doesn't need double capacity). However, more complex to set up and slower to fully deploy.
+
+### Q2: How does automated canary analysis work?
+
+**Answer:** Analysis templates define Prometheus queries that measure success rate, latency, error rate, and custom metrics. During rollout steps (5%, 20%, 50%, 100%), the rollout pauses and queries these metrics. If metrics meet success conditions, rollout progresses. If metrics breach failure thresholds, rollout aborts and reverts to stable. This provides data-driven promotion without manual intervention.
+
+### Q3: How do you choose between header-based and weight-based canary?
+
+**Answer:** Header-based is useful for internal testing (QA, PMs can opt-in), debugging specific issues, or feature flags. Weight-based is standard for production traffic splitting, gradual rollout, and A/B testing. Often used together: internal testing with headers, production rollout with weights.
+
+### Q4: What metrics should trigger canary abort?
+
+**Answer:** 1) Error rate increase > baseline + 1%, 2) Latency increase > 2x baseline p99, 3) Pod restart loop, 4) Health check failures, 5) Business metric drop (conversion, engagement). Define clear thresholds based on baseline metrics and business requirements. Too strict = false positives delaying releases, too loose = missing real issues.
+
+### Q5: How do you handle canary deployments with stateful services?
+
+**Answer:** For stateful services: 1) Use sticky sessions (cookie/header) to keep users on same version, 2) Ensure database writes are backward-compatible, 3) Consider separate database instances during transition, 4) Use feature flags to hide incompatible features, 5) Run both versions against same database during transition, 6) Implement careful connection draining before version changes.
+
+## Cheat Sheet
+
+```bash
+# Argo Rollouts
+kubectl argo rollouts get api -n production --watch
+kubectl argo rollouts pause api -n production
+kubectl argo rollouts resume api -n production
+kubectl argo rollouts promote api -n production
+kubectl argo rollouts abort api -n production
+kubectl argo rollouts undo api -n production
+
+# Analysis
+kubectl argo rollouts set image api api=gcr.io/myproject/api:v1.2.3 -n production
+
+# Testing
+curl -H "X-Canary: true" https://api.myapp.com/health
+
+# Status
+kubectl argo rollouts status api -n production -o wide
+```
+
+## Related Topics
+
+- [Deployment Strategies](./deploy.mdx)
+- [Blue-Green Deployments](./blue-green.mdx)
+- [Rollback Procedures](./rollback.mdx)
+- [GitOps & Automation](./automation.mdx)

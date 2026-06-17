@@ -1,0 +1,1001 @@
+# Terraform Overview
+
+## Overview
+
+Terraform is an open-source Infrastructure as Code (IaC) tool developed by HashiCorp. It enables you to define, provision, and manage cloud infrastructure across multiple providers using declarative configuration files.
+
+## When To Use
+
+- **Multi-cloud infrastructure**: Deploy resources across AWS, GCP, Azure simultaneously
+- **Reproducible environments**: Create identical dev/staging/prod environments
+- **Version-controlled infrastructure**: Track infrastructure changes via Git
+- **Resource orchestration**: Manage complex dependencies between cloud services
+- **Dynamic infrastructure**: Auto-scale resources based on demand
+
+## When NOT To Use
+
+- **Single cloud with native tools**: If you're only using GCP and have simple needs, `gcloud` CLI +Deployment Manager may suffice
+- **Impossible to version control**: If your infrastructure state is entirely manual
+- **Very small, static workloads**: For a single VM that rarely changes
+- **Real-time orchestration**: Terraform is not a container orchestrator (use Kubernetes for that)
+
+## Core Concepts
+
+### Providers
+Plugins that interact with cloud APIs. Official providers exist for AWS, GCP, Azure, and hundreds of others.
+
+```hcl
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+```
+
+### Resources
+The fundamental building blocks. Each resource block describes infrastructure object.
+
+```hcl
+resource "google_compute_instance" "web_server" {
+  name         = "web-server-${var.environment}"
+  machine_type = "e2-medium"
+  zone         = "${var.region}-a"
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+      size  = 50
+    }
+  }
+  
+  network_interface {
+    network = google_compute_network.vpc_network.self_link
+    access_config {
+      // Ephemeral IP
+    }
+  }
+  
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+  }
+}
+```
+
+### Data Sources
+Read-only information from existing infrastructure.
+
+```hcl
+data "google_compute_zones" "available" {
+  region = var.region
+}
+```
+
+### Variables
+Parameterize your configurations for reusability.
+
+```hcl
+variable "environment" {
+  description = "Deployment environment"
+  type        = string
+  default     = "dev"
+  
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod."
+  }
+}
+```
+
+### Outputs
+Expose resource attributes for other configurations or CLI queries.
+
+```hcl
+output "web_server_ip" {
+  description = "The external IP of the web server"
+  value       = google_compute_instance.web_server.network_interface[0].access_config[0].nat_ip
+}
+```
+
+### Modules
+Reusable, packaged collections of resources.
+
+```hcl
+module "network" {
+  source  = "./modules/networking"
+  
+  project_id = var.project_id
+  env       = var.environment
+  cidr_range = "10.0.0.0/16"
+}
+```
+
+## Real Production Example
+
+### Full Project Structure
+
+```
+production-infra/
+├── main.tf                 # Root module entry point
+├── providers.tf            # Provider configuration
+├── variables.tf            # Input variable definitions
+├── outputs.tf              # Output definitions
+├── versions.tf             # Terraform & provider version constraints
+├── terraform.tfvars        # Non-sensitive variable values
+├── backend.tf              # State backend configuration
+├── modules/
+│   ├── networking/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── compute/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── database/
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+└── environments/
+    ├── dev/
+    │   └── terraform.tfvars
+    ├── staging/
+    │   └── terraform.tfvars
+    └── prod/
+        └── terraform.tfvars
+```
+
+### versions.tf (Version Constraints)
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+  }
+  
+  # Enable remote state with state locking
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "prod"
+  }
+}
+```
+
+### providers.tf
+
+```hcl
+provider "google" {
+  project = var.project_id
+  region  = var.region
+  zone    = "${var.region}-a"
+  
+  impersonate_service_account = var.admin_service_account
+  
+  user_agent_string = "terraform/prod"
+}
+
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+  zone    = "${var.region}-a"
+}
+```
+
+### main.tf (Root Module)
+
+```hcl
+locals {
+  common_tags = {
+    project     = var.project_id
+    environment = var.environment
+    managed_by  = "terraform"
+    cost_center = var.cost_center
+  }
+  
+  service_name = "webapp-${var.environment}"
+}
+
+# Network Module
+module "vpc" {
+  source = "./modules/networking/vpc"
+  
+  project_id      = var.project_id
+  environment     = var.environment
+  vpc_cidr        = var.vpc_cidr
+  secondary_ranges = var.secondary_ranges
+  
+  private_subnets = [
+    "${var.vpc_cidr}.0/24",
+    "${var.vpc_cidr}.1/24",
+    "${var.vpc_cidr}.2/24",
+  ]
+}
+
+# Compute Module
+module "instance_template" {
+  source = "./modules/compute/instance-template"
+  
+  project_id       = var.project_id
+  environment      = var.environment
+  service_account  = module.service-accounts.service_account_email
+  subnet           = module.vpc.subnet_self_links["private"]
+  startup_script   = file("${path.module}/scripts/startup.sh")
+}
+
+module "managed_instance_group" {
+  source = "./modules/compute/mig"
+  
+  project_id           = var.project_id
+  region               = var.region
+  instance_template    = module.instance_template.self_link
+  target_size          = var.mig_target_size
+  autoscaler_enabled   = var.autoscaler_enabled
+  
+  named_port = {
+    name = "http"
+    port = 8080
+  }
+}
+
+# Database Module (Cloud SQL)
+module "cloudsql" {
+  source = "./modules/database/cloudsql"
+  
+  project_id       = var.project_id
+  environment      = var.environment
+  database_version = "POSTGRES_15"
+  db_name         = "webappdb"
+  db_user         = var.db_username
+  
+  # Master password from Secret Manager
+  db_password = var.db_password
+  
+  tier           = var.db_tier
+  disk_size      = var.db_disk_size
+  backup_enabled = true
+  backup_start_time = "03:00"
+  
+  authorized_networks = [{
+    name  = "vpc"
+    value = var.vpc_cidr
+  }]
+  
+  ip_connectivity = true
+}
+
+# Service Accounts Module
+module "service-accounts" {
+  source = "./modules/iam/service-accounts"
+  
+  project_id   = var.project_id
+  environment  = var.environment
+  service_name = local.service_name
+}
+
+# Cloud Armor (Security)
+module "cloud_armor" {
+  source = "./modules/security/cloud-armor"
+  
+  project_id      = var.project_id
+  environment     = var.environment
+  backend_service = module.load_balancer.backend_service_id
+  
+  security_rules = [
+    {
+      action   = "allow"
+      priority = 1000
+      description = "Allow health checks"
+      match {
+        versioned_expr = "SRC_IPS_V1"
+        expr {
+          expression = "inIpRange(source.ip, '35.191.0.0/16') || inIpRange(source.ip, '130.211.0.0/22')"
+        }
+      }
+    },
+  ]
+}
+
+# Load Balancer Module
+module "load_balancer" {
+  source = "./modules/networking/lb-http"
+  
+  project_id          = var.project_id
+  environment         = var.environment
+  backend_mig         = module.managed_instance_group.self_link
+  health_check_path   = "/healthz"
+  
+  ssl_certificate = var.ssl_certificate_id
+  use_ssl         = true
+}
+```
+
+## CLI Examples
+
+### Initialization and Planning
+
+```bash
+# Initialize Terraform with backend configuration
+terraform init
+
+# Initialize with backend reconfiguration
+terraform init -reconfigure
+
+# Upgrade providers to latest compatible versions
+terraform init -upgrade
+
+# Create and review execution plan
+terraform plan -out=tfplan
+
+# Plan specific environment
+terraform plan -var-file="environments/prod/terraform.tfvars"
+
+# Plan targeting specific resources
+terraform plan -target=google_compute_instance.web_server
+
+# Plan with variables
+terraform plan \
+  -var="environment=prod" \
+  -var="project_id=my-project-123" \
+  -var="mig_target_size=3"
+```
+
+### Applying Changes
+
+```bash
+# Apply changes with confirmation prompt
+terraform apply
+
+# Apply without confirmation (CI/CD use only)
+terraform apply -auto-approve
+
+# Apply with saved plan file
+terraform apply tfplan
+
+# Apply specific workspace
+terraform workspace select prod
+terraform apply
+
+# Apply with var file
+terraform apply -var-file="environments/prod/terraform.tfvars"
+```
+
+### State Management
+
+```bash
+# Show current state
+terraform show
+
+# List resources in state
+terraform state list
+
+# List resources with output
+terraform state list -id=google_compute_instance.web_server
+
+# Pull state (remote)
+terraform state pull > state.tfstate
+
+# Push state (override remote)
+terraform state push state.tfstate
+
+# Rename resource in state
+terraform state mv google_compute_instance.old google_compute_instance.new
+
+# Remove resource from state (doesn't destroy infrastructure)
+terraform state rm google_compute_instance.web_server
+
+# Show resource details
+terraform state show google_compute_instance.web_server
+```
+
+### Workspaces
+
+```bash
+# List all workspaces
+terraform workspace list
+
+# Show current workspace
+terraform workspace show
+
+# Create new workspace
+terraform workspace new staging
+
+# Select workspace
+terraform workspace select prod
+
+# Delete empty workspace
+terraform workspace delete staging
+```
+
+### Import and Graph
+
+```bash
+# Import existing infrastructure
+terraform import google_compute_instance.web_server projects/my-project-123/zones/us-central1-a/instances/web-server
+
+# Import to module
+terraform import module.vpc.google_compute_network.vpc projects/my-project-123/global/networks/vpc-network
+
+# Generate dependency graph
+terraform graph | dot -Tsvg > graph.svg
+
+# Show module tree
+terraform graph -type=plan | jq '.'
+```
+
+### Output and Validation
+
+```bash
+# List all outputs
+terraform output
+
+# Get specific output value
+terraform output -raw load_balancer_ip
+
+# Validate configuration
+terraform validate
+
+# Format configuration
+terraform fmt -recursive
+
+# Show required providers
+terraform providers
+
+# Get documentation for resource
+terraform show -json | jq '.configuration.root_module.resources'
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform init` | Initialize working directory |
+| `terraform plan` | Generate execution plan |
+| `terraform apply` | Apply changes to infrastructure |
+| `terraform destroy` | Destroy all managed resources |
+| `terraform validate` | Validate configuration syntax |
+| `terraform fmt` | Format configuration files |
+| `terraform output` | Display output values |
+| `terraform state` | Manage state operations |
+| `terraform import` | Import existing infrastructure |
+| `terraform refresh` | Update state with real infrastructure |
+| `terraform workspace` | Manage workspaces |
+| `terraform providers` | Show required providers |
+| `terraform version` | Show Terraform version |
+
+## Best Practices
+
+### 1. Module Organization
+```
+modules/
+├── compute/
+│   ├── main.tf         # Resources only
+│   ├── variables.tf    # Input definitions
+│   ├── outputs.tf      # Output definitions
+│   └── versions.tf     # Module-level version constraints
+```
+
+### 2. Remote State with Locking
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "project-terraform-state"
+    prefix = "prod"
+    
+    # Enable state file encryption
+    encryption_key = google_kms_key.terraform_state_key.id
+  }
+}
+```
+
+### 3. State File Security
+- Never store state in version control
+- Always use remote backend with encryption at rest
+- Enable state file versioning (GCS bucket versioning)
+- Restrict backend access via IAM with principle of least privilege
+- Enable audit logging on state bucket
+
+### 4. Variable Validation
+```hcl
+variable "db_tier" {
+  type        = string
+  default     = "db-n1-standard-2"
+  
+  validation {
+    condition = can(regex("^db-[a-z]+-[0-9]+$", var.db_tier))
+    error_message = "Database tier must match pattern db-[type]-[size]."
+  }
+}
+```
+
+### 5. Sensitive Variable Handling
+```hcl
+# Mark sensitive variables
+variable "db_password" {
+  description = "Database master password"
+  type        = string
+  sensitive   = true
+}
+
+# Don't echo sensitive values in outputs
+output "db_connection_string" {
+  description = "PostgreSQL connection string"
+  value       = "postgres://${var.db_username}:${var.db_password}@${module.cloudsql.private_ip}:5432/${module.cloudsql.db_name}"
+  sensitive   = true
+}
+```
+
+## Monitoring / State Management
+
+### State File Management
+
+```bash
+# Always run with remote state
+terraform init -backend-config="bucket=my-project-terraform-state"
+
+# State versioning (GCS)
+# Enable in bucket:
+gsutil versioning set on gs://my-project-terraform-state
+
+# State encryption (KMS)
+# Bucket is encrypted with CMEK, backend references the key
+
+# State locking
+# GCS backend handles this automatically
+# For other backends, use DynamoDB with proper locking
+```
+
+### State Recovery
+
+```bash
+# List state versions
+gsutil ls -a gs://my-project-terraform-state/prod/
+
+# Restore previous state version
+gsutil cp gs://my-project-terraform-state/prod/default.2024-01-15T10:30:00.0~1 terraform.tfstate
+
+# Push restored state
+terraform state push terraform.tfstate
+```
+
+### State Consistency
+
+```bash
+# Refresh state with actual infrastructure
+terraform refresh -var-file="environments/prod/terraform.tfvars"
+
+# Verify state integrity
+terraform validate
+
+# Show state differences
+terraform plan -detailed-exitcode
+```
+
+## Security
+
+### Secrets Management
+
+**NEVER** commit secrets to version control. Use one of:
+
+1. **Secret Manager Integration**
+```hcl
+data "google_secret_manager_secret_version" "db_password" {
+  secret  = "prod-db-password"
+  version = "latest"
+}
+
+# In Cloud SQL resource
+password = data.google_secret_manager_secret_version.db_password.secret_data
+```
+
+2. **Environment Variables**
+```bash
+export TF_VAR_db_password=$(gcloud secrets versions access latest --secret="prod-db-password")
+terraform apply
+```
+
+3. **Encrypted Variables File**
+```bash
+# Encrypt tfvars file
+gcloud kms encrypt \
+  --location=global \
+  --keyring=tf-keyring \
+  --key=tf-key \
+  --plaintext-file=prod.tfvars \
+  --ciphertext-file=prod.tfvars.enc
+
+# Decrypt during apply
+gcloud kms decrypt \
+  --location=global \
+  --keyring=tf-keyring \
+  --key=tf-key \
+  --plaintext-file=prod.tfvars \
+  --ciphertext-file=prod.tfvars.enc
+
+export TF_VAR_db_password=$(grep "^db_password" prod.tfvars | cut -d'=' -f2)
+```
+
+### IAM Security
+
+```hcl
+# Service account for Terraform with least privilege
+resource "google_service_account" "terraform" {
+  account_id   = "terraform-prod"
+  display_name = "Terraform Production Runner"
+}
+
+# Grant only required roles per environment
+resource "google_project_iam_member" "terraform_compute" {
+  project = var.project_id
+  role    = "roles/compute.admin"
+  member  = "serviceAccount:${google_service_account.terraform.email}"
+}
+
+resource "google_project_iam_member" "terraform_storage" {
+  project = var.project_id
+  role    = "roles/storage.admin"
+  member  = "serviceAccount:${google_service_account.terraform.email}"
+}
+```
+
+### State File Security
+
+```hcl
+# GCS backend with encryption
+terraform {
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "prod"
+    
+    # Server-side encryption with CMEK
+    encryption_key = google_kms_key.terraform_state_key.id
+  }
+}
+
+# KMS key for state encryption
+resource "google_kms_key" "terraform_state_key" {
+  name         = "terraform-state-key"
+  key_ring     = google_kms_key_ring.tf_keyring.id
+  purpose      = "ENCRYPT_DECRYPT"
+  cryptogenerate_keyspans = true
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+## Cost Optimization
+
+### Right-Sizing Resources
+
+```hcl
+# Use preemptible instances for non-critical workloads
+resource "google_compute_instance_template" "worker" {
+  name           = "worker-template"
+  machine_type   = "e2-medium"  # Right-sized
+  
+  scheduling {
+    preemptible       = true
+    automatic_restart = false
+  }
+  
+  # Use custom machine types for better pricing
+  # machine_type = "e2-custom-2-4096"  # 2 vCPU, 4GB RAM
+}
+
+# Autoscaling to match demand
+resource "google_compute_region_autoscaler" "worker_autoscaler" {
+  name   = "worker-autoscaler"
+  region = var.region
+  target = google_compute_region_instance_group_manager.worker.self_link
+  
+  autoscaling_policy {
+    min_replicas    = 2
+    max_replicas    = 10
+    cooldown_period = 90
+    
+    cpu_utilization {
+      target = 0.6
+    }
+    
+    scale_in_control {
+      fixed_replicas = 2
+    }
+  }
+}
+```
+
+### Resource Scheduling
+
+```hcl
+# Use labels for cost attribution
+resource "google_compute_instance" "batch" {
+  name = "batch-processor"
+  
+  labels = {
+    environment  = "batch"
+    cost-center  = "analytics"
+    team         = "data-engineering"
+    schedule     = "business-hours"  # For cleanup automation
+  }
+  
+  scheduling {
+    # Preemptible for batch jobs
+    preemptible = true
+  }
+}
+
+# Schedule-based instance management via Cloud Scheduler + Cloud Functions
+# Stop non-production instances after business hours
+resource "google_cloud_scheduler_job" "stop_dev_instances" {
+  name        = "stop-dev-instances-nightly"
+  description = "Stop development instances at 8 PM"
+  schedule    = "0 20 * * *"
+  time_zone   = "America/New_York"
+  region      = var.region
+  
+  http_target {
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${var.region}-a/instances/stop"
+    http_method = "POST"
+    # Uses service account with proper IAM
+  }
+}
+```
+
+### Storage Optimization
+
+```hcl
+# Use regional buckets for regional access
+resource "google_storage_bucket" "app_bucket" {
+  name          = "${var.project_id}-app-storage"
+  location      = var.region
+  storage_class = "REGIONAL"  # Lower cost for frequent access
+  
+  uniform_bucket_level_access = true
+  
+  lifecycle_rule {
+    condition {
+      age = 30  # Move to Nearline after 30 days
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+}
+
+# Enable lifecycle management
+lifecycle_rule {
+  condition {
+    age = 90  # Move to Coldline after 90 days
+  }
+  action {
+    type          = "SetStorageClass"
+    storage_class = "COLDLINE"
+  }
+}
+```
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+#### Issue: State Lock
+```
+Error: Error acquiring the state lock
+```
+**Solution:**
+```bash
+# Check who holds the lock
+terraform state pull | jq '.serial'
+
+# Force unlock (USE WITH CAUTION)
+terraform force-unlock <lock-id>
+
+# Or via GCS directly
+gsutil cat gs://bucket/prefix/.terraform.lock.info
+```
+
+#### Issue: Provider Version Conflict
+```
+Error: Provider requirement conflicts
+```
+**Solution:**
+```bash
+# List available versions
+terraform version
+terraform providers lock
+
+# Update constraints in versions.tf
+terraform init -upgrade
+```
+
+#### Issue: State Drift
+```bash
+# Identify drift
+terraform plan -detailed-exitcode
+# Exit code 2 means drift detected
+
+# Sync state with actual infrastructure
+terraform refresh
+
+# Or import missing resources
+terraform import google_compute_instance.new projects/PROJECT/zones/ZONE/instances/NAME
+```
+
+#### Issue: Circular Dependencies
+```
+Error: Cycle: resource references
+```
+**Solution:** Restructure resources to break cycles. Use `depends_on` sparingly.
+
+#### Issue: Destroy Fails with Active Resources
+```bash
+# Prevent accidental destruction
+resource "google_compute_instance" "protected" {
+  name = "protected-instance"
+  
+  # Protection against deletion
+  deletion_protection = true
+  
+  # Or at API level
+  # google_compute_instance.protected.update_protect["deletion_protection"]
+}
+
+# For Cloud SQL
+resource "google_sql_database_instance" "prod" {
+  name = "prod-db"
+  
+  deletion_protection = true  # Must be set via API after creation
+}
+```
+
+## Interview Questions
+
+### Q1: How does Terraform handle provider authentication?
+**A:** Terraform supports multiple authentication methods:
+- Application Default Credentials (ADC) for GCS
+- Service account key files (JSON)
+- Workload Identity for GKE
+- Environment variables (`GOOGLE_APPLICATION_CREDENTIALS`)
+
+```bash
+# ADC authentication
+gcloud auth application-default login
+
+# Service account
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+### Q2: Explain Terraform state file purpose and best practices.
+**A:** State file serves as source of truth for Terraform. It:
+- Maps configuration to actual resources
+- Tracks resource dependencies
+- Enables parallel operations via state locking
+- **Best practices:** Remote backend, encryption, versioning, access control
+
+### Q3: How do you manage secrets in Terraform?
+**A:** Never store secrets in state or config files. Options:
+1. Secret Manager integration (recommended)
+2. Environment variables (`TF_VAR_*`)
+3. CI/CD secrets injection
+4. Encrypted vars files with KMS
+
+### Q4: What is the difference between `terraform apply` and `terraform apply -auto-approve`?
+**A:** `-auto-approve` skips the interactive confirmation prompt. Use only in CI/CD pipelines. Always review plans before applying manually.
+
+### Q5: How do workspaces differ from directories?
+**A:** Workspaces use the same configuration with different state files. Useful for identical environments (dev/staging/prod). Directories allow different configurations per environment.
+
+### Q6: Explain `depends_on` and when to use it.
+**A:** Explicit dependency declaration for resources that Terraform can't infer. Use when:
+- Resource creation order matters but no implicit dependency
+- Data sources need ordering
+- Module dependencies
+
+### Q7: What is a data source and when would you use it?
+**A:** Read-only lookup for existing resources. Use when:
+- Referencing resources not managed by current Terraform
+- Cross-state references (remote state)
+- Getting current project/region dynamically
+
+### Q8: How do you handle Terraform in CI/CD?
+**A:** Typical pipeline:
+1. `terraform init` - setup
+2. `terraform validate` - syntax check
+3. `terraform plan` - generate plan, save to file
+4. Manual approval (or skip for auto-apply)
+5. `terraform apply` - execute plan
+
+### Q9: What is the purpose of `terraform import`?
+**A:** Bring existing infrastructure under Terraform management without destroying/recreating. Maps actual resources to configuration blocks.
+
+### Q10: How do you handle provider version upgrades safely?
+**A:** 
+1. Pin versions in `versions.tf`
+2. Test in dev/staging first
+3. Review provider changelog
+4. Use `terraform init -upgrade` incrementally
+5. Always have state backup
+
+## Cheat Sheet
+
+### Essential Commands
+```bash
+# Setup
+terraform init [-upgrade]
+terraform validate
+terraform fmt
+
+# Planning & Applying
+terraform plan [-out=tfplan] [-var-file=] [-target=]
+terraform apply [tfplan | -auto-approve]
+terraform destroy [-auto-approve]
+
+# State Management
+terraform state list
+terraform state show <resource>
+terraform state mv <old> <new>
+terraform state rm <resource>
+terraform state pull > state.tfstate
+
+# Workspaces
+terraform workspace list|new|select|delete
+
+# Outputs
+terraform output [value_name]
+terraform output -raw <value>
+```
+
+### Essential Files
+```
+versions.tf    # Terraform & provider version constraints
+providers.tf   # Provider configuration
+main.tf        # Root module entry point
+variables.tf   # Input variable definitions
+outputs.tf     # Output definitions
+backend.tf     # State backend (usually in versions.tf)
+*.tfvars       # Variable values (prod.tfvars, dev.tfvars)
+```
+
+### Variable Types
+```hcl
+string   = "value"
+number   = 42
+bool     = true
+list     = ["a", "b", "c"]
+map      = { key = "value" }
+object   = { name = "x", id = 1 }
+tuple    = ["a", 1, true]
+```
+
+### Resource Addressing
+```
+resource_type.resource_name
+module.name.resource_type.resource_name
+module.name.data.data_type.data_name
+```
+
+## Related Topics
+
+- [State Management](./state.mdx) - Deep dive into Terraform state
+- [Providers](./providers.mdx) - Provider configuration and authentication
+- [Resources](./resources.mdx) - Resource configuration patterns
+- [Variables](./variables.mdx) - Input/output variable strategies
+- [Modules](./modules.mdx) - Module development and usage
+- [Backend](./backend.mdx) - State backend configuration
+- [Remote State](./remote-state.mdx) - Cross-environment state sharing
+- [Workspaces](./workspaces.mdx) - Environment isolation
+- [Lifecycle](./lifecycle.mdx) - Resource lifecycle management
+- [Secrets](./secrets.mdx) - Secrets management patterns
+- [Testing](./testing.mdx) - Infrastructure testing strategies
+- [CI/CD](./cicd.mdx) - Terraform in pipelines
+- [GCP Automation](./gcp-automation.mdx) - GCP-specific automation

@@ -1,0 +1,506 @@
+---
+sidebar_position: 13
+description: Linux networking fundamentals, IP configuration, routing, DNS, firewall, packet capture, and network troubleshooting.
+---
+
+# Linux Networking
+
+## Overview
+
+Linux networking is the backbone of production infrastructure. Every service ultimately communicates over the network. Understanding TCP/IP stack internals, routing, DNS resolution, firewall rules, and packet capture is essential for debugging connectivity issues, configuring load balancers, and securing systems.
+
+The kernel exposes network configuration via /proc/sys/net and ip command (iproute2). Network namespaces provide isolation for containers and VRFs. Bonding and bridging enable high availability and virtualization networking. Understanding netfilter/iptables/nftables is crucial for firewall configuration.
+
+## When To Use
+
+- Configuring network interfaces and routes
+- Debugging connectivity issues
+- Setting up firewalls
+- Network monitoring
+- Container networking
+
+## When NOT To Use
+
+- When cloud provider manages networking (VPC, security groups)
+- When load balancer handles network traffic
+
+## Core Concepts
+
+### IP Addressing and Interfaces
+
+```bash
+# Show all interfaces
+ip addr
+ip link
+ip -br addr                  # Brief
+
+# Show IPv4 addresses
+ip -4 addr
+
+# Add/remove IP
+ip addr add 192.168.1.10/24 dev eth0
+ip addr del 192.168.1.10/24 dev eth0
+
+# Up/down interface
+ip link set eth0 up
+ip link set eth0 down
+
+# Show interface details
+ip -s link show eth0
+
+# MAC address
+ip link show eth0 | grep ether
+```
+
+### Routing
+
+```bash
+# Show routing table
+ip route
+ip route show
+
+# Default route
+ip route show default
+
+# Add route
+ip route add 10.0.0.0/8 via 192.168.1.1 dev eth0
+ip route add default via 192.168.1.1
+
+# Delete route
+ip route del 10.0.0.0/8
+
+# Route for specific interface
+ip route get 8.8.8.8
+
+# Policy routing
+ip rule list
+ip rule add from 192.168.1.0/24 table internal
+```
+
+### DNS Resolution
+
+```bash
+# System resolver config
+cat /etc/resolv.conf
+# nameserver 8.8.8.8
+# nameserver 8.8.4.4
+# search example.com
+
+# Test DNS
+nslookup google.com
+dig google.com
+dig +short google.com A
+dig +trace google.com
+
+# Flush DNS cache (systemd-resolved)
+systemd-resolve --flush-caches
+resolvectl flush-caches
+
+# /etc/hosts
+echo "192.168.1.10 api.internal" >> /etc/hosts
+
+# Host command
+host google.com
+```
+
+### Firewall (iptables/nftables)
+
+```bash
+# iptables legacy
+# Chains: INPUT, OUTPUT, FORWARD
+# Actions: ACCEPT, DROP, REJECT, LOG
+
+# List rules
+iptables -L
+iptables -L -n --line-numbers
+iptables -L INPUT -v
+
+# Allow SSH (port 22)
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Allow established connections
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Drop everything else
+iptables -A INPUT -j DROP
+
+# NAT (port forward)
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
+
+# Delete rule by number
+iptables -D INPUT 5
+
+# Save/restore (Debian)
+apt install iptables-persistent
+netfilter-persistent save
+
+# nftables (modern)
+nft list ruleset
+nft add table ip filter
+nft add chain ip filter input { type filter hook input priority 0 \; }
+nft add rule ip filter input tcp dport 22 accept
+```
+
+### Network Tools
+
+```bash
+# Connectivity
+ping -c 4 8.8.8.8
+ping -c 4 google.com
+
+# Path MTU discovery
+traceroute google.com
+traceroute -I google.com          # ICMP
+tracepath google.com
+
+# Port scan (install nmap)
+nmap -sT localhost
+nmap -sU -p 53 8.8.8.8
+
+# netstat vs ss
+netstat -tulpn
+ss -tulpn
+ss -tulpn state established
+
+# Connection tracking
+cat /proc/net/nf_conntrack
+conntrack -L
+
+# Bandwidth test
+iperf3 -s                     # Server
+iperf3 -c 192.168.1.10       # Client
+```
+
+### Network Namespaces
+
+```bash
+# Create namespace
+ip netns add testns
+
+# List namespaces
+ip netns list
+
+# Add interface to namespace
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns testns
+
+# Run command in namespace
+ip netns exec testns ip link
+ip netns exec testns ping 8.8.8.8
+
+# Delete namespace
+ip netns del testns
+```
+
+### Bonding
+
+```bash
+# Create bonding interface
+ip link add bond0 type bond mode 802.3ad
+ip link set eth0 master bond0
+ip link set eth1 master bond0
+
+# Modes: balance-rr, active-backup, 802.3ad, balance-tlb, balance-alb
+ip link set bond0 type bond mode 802.3ad
+ip link set bond0 type bond miimon 100
+ip link set bond0 up
+
+# Configure IP
+ip addr add 192.168.1.10/24 dev bond0
+```
+
+## Real Production Example
+
+Configuring a production web server with firewall:
+
+```bash
+#!/bin/bash
+# setup-webserver-network.sh
+
+set -euo pipefail
+
+INTERNET_IF="eth0"
+INTERNAL_IF="eth1"
+SERVER_IP="10.0.0.10"
+INTERNAL_NET="10.0.0.0/24"
+
+# Enable IP forwarding
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+# Configure eth0 (internet-facing)
+cat > /etc/network/interfaces.d/eth0 <<EOF
+auto eth0
+iface eth0 inet static
+    address $SERVER_IP
+    netmask 255.255.255.0
+    gateway 10.0.0.1
+EOF
+
+# iptables firewall script
+cat > /etc/iptables/rules.v4 <<'EOF'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+
+# Loopback
+-A INPUT -i lo -j ACCEPT
+
+# Established connections
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# SSH
+-A INPUT -p tcp --dport 22 -j ACCEPT
+
+# HTTP/HTTPS
+-A INPUT -p tcp --dport 80 -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+
+# ICMP
+-A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+
+# Internal network
+-A INPUT -s $INTERNAL_NET -j ACCEPT
+
+# Logging
+-A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: "
+
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+
+# NAT for internal network
+-A POSTROUTING -s $INTERNAL_NET -o eth0 -j MASQUERADE
+
+COMMIT
+EOF
+
+# Apply rules
+iptables-restore < /etc/iptables/rules.v4
+
+# Enable on boot
+apt install iptables-persistent
+```
+
+## CLI Examples
+
+```bash
+# Interface config
+ip addr show
+ip link set eth0 up|down
+ip addr add 10.0.0.1/24 dev eth0
+
+# Routing
+ip route show
+ip route add 10.0.0.0/24 via 192.168.1.1
+
+# DNS
+cat /etc/resolv.conf
+dig google.com
+nslookup google.com
+
+# Connectivity
+ping -c 3 8.8.8.8
+traceroute google.com
+
+# Listening ports
+ss -tulpn
+netstat -tulpn
+
+# Active connections
+ss -tan state established
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `ip addr` | IP addresses | `ip addr show` |
+| `ip route` | Routing table | `ip route show` |
+| `ip link` | Interfaces | `ip link show` |
+| `ss -tulpn` | Listening ports | See what's listening |
+| `iptables -L` | Firewall rules | `iptables -L -n` |
+| `ping` | Reachability | `ping -c 3 host` |
+| `traceroute` | Path | `traceroute host` |
+| `dig` | DNS query | `dig @8.8.8.8 host` |
+| `nslookup` | DNS lookup | `nslookup host` |
+| `tcpdump` | Packet capture | `tcpdump -i eth0` |
+
+## Monitoring
+
+```bash
+# Real-time interface stats
+ip -s link show
+watch -n 1 'ip -s link show eth0'
+
+# Network I/O per process
+nethogs
+iftop -i eth0
+
+# Connection states
+ss -s
+netstat -an | awk '/^tcp/ {s[$NF]++} END {for(k in s) print k, s[k]}'
+
+# Packet rates
+ip -s link show
+cat /proc/net/dev
+
+# Bandwidth testing
+iperf3 -s  # Server
+iperf3 -c server -R  # Client download test
+```
+
+## Security
+
+**Network hardening:**
+
+```bash
+# Disable IP forwarding if not router
+echo 0 > /proc/sys/net/ipv4/ip_forward
+
+# Disable ICMP redirects
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_redirects
+echo 0 > /proc/sys/net/ipv4/conf/default/accept_redirects
+
+# Disable source routing
+echo 0 > /proc/sys/net/ipv4/conf/all/accept_source_route
+echo 0 > /proc/sys/net/ipv4/conf/default/accept_source_route
+
+# Enable TCP SYN cookies (prevent SYN flood)
+echo 1 > /proc/sys/net/ipv4/tcp_syncookies
+
+# Kernel hardening (add to sysctl.conf)
+cat >> /etc/sysctl.conf <<'EOF'
+net.ipv4.tcp_syncookies=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+EOF
+
+# Apply
+sysctl -p
+```
+
+## Troubleshooting
+
+**Cannot reach host:**
+
+```bash
+# 1. Check link
+ip link show
+ethtool eth0
+
+# 2. Check IP
+ip addr show eth0
+
+# 3. Check routing
+ip route get <host>
+ping -c 1 $(ip route show default | awk '{print $3}')
+
+# 4. Check DNS
+nslookup host
+cat /etc/resolv.conf
+
+# 5. Check firewall
+iptables -L -n
+```
+
+**High connection count:**
+
+```bash
+# Find what's establishing connections
+ss -tan | awk '{print $4}' | sort | uniq -c | sort -rn
+ss -tan | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -rn
+
+# Check for SYN flood
+netstat -an | grep SYN_RECV | wc -l
+
+# Connection limits
+# Check /proc/sys/net/core/somaxconn
+# Check /proc/sys/net/ipv4/tcp_max_syn_backlog
+```
+
+**Slow DNS resolution:**
+
+```bash
+# Check resolver order
+cat /etc/nsswitch.conf | grep hosts
+
+# Time DNS
+time dig google.com
+
+# Check systemd-resolved
+systemd-resolve --status
+resolvectl query google.com
+
+# Try different DNS
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+```
+
+## Interview Questions
+
+1. **What's the difference between DNAT and SNAT in iptables?**
+
+DNAT (Destination NAT) changes the destination IP/port in the packet — used for port forwarding (packets from internet to internal server). SNAT (Source NAT) changes the source IP/port — used for masquerading internal networks to the internet (many-to-one NAT). Both happen in the PREROUTING/POSTROUTING chains in the NAT table.
+
+2. **How does conntrack work and why is it important?**
+
+Connection tracking (conntrack) is the stateful firewall feature in the kernel. It tracks connection state by parsing packets and maintaining a connection table in `/proc/net/nf_conntrack`. This allows rules to match on ESTABLISHED,RELATED states rather than packet fields. Without conntrack, firewall rules would need to be stateless. Conntrack tables have fixed size; overflow causes packet drops.
+
+3. **What's the difference between TCP and UDP sockets in ss output?**
+
+TCP sockets show LISTEN (waiting for connections), ESTABLISHED (connected), SYN_SENT, SYN_RECV, FIN_WAIT, CLOSE_WAIT, TIME_WAIT, CLOSED states. UDP sockets are stateless — they show UNCONN (not connected) even when used. UDP's "connected" state in applications doesn't map to kernel connection states.
+
+4. **How does IP masquerading (NAT) work?**
+
+Masquerading is a form of SNAT where the kernel automatically uses the interface's IP as source. When packets leave the NAT device, their source IP is replaced with the public IP. The kernel tracks this in conntrack so return packets are de-NATed and forwarded to the original source. This allows many internal hosts to share one public IP.
+
+5. **What is a network namespace and when would you use it?**
+
+Network namespaces create isolated network stacks with own interfaces, routes, firewall rules, and ports. Use cases: containers (Docker/Kubernetes use them), VRF routing (multiple routing tables), testing firewall rules without affecting host, network simulation. Processes can be moved between namespaces. Default namespace is the "init" namespace.
+
+## Cheat Sheet
+
+```
+# Interface management
+ip addr show                  # Show addresses
+ip link set eth0 up           # Enable interface
+ip link set eth0 down         # Disable interface
+
+# Routing
+ip route show                 # Show routes
+ip route add 10.0.0.0/24 via 192.168.1.1
+
+# DNS
+cat /etc/resolv.conf          # Resolver config
+dig google.com                # DNS query
+nslookup google.com           # DNS lookup
+
+# Firewall
+iptables -L -n                # List rules
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Connectivity
+ping -c 3 8.8.8.8             # Reachability
+traceroute google.com         # Path
+ss -tulpn                     # Listening ports
+
+# Capture
+tcpdump -i eth0 port 80
+tcpdump -i eth0 host 8.8.8.8
+```
+
+## Related Topics
+
+- [SSH](./ssh) — Remote access
+- [Logs](./logs) — Log analysis
+- [Security](./security) — Network hardening
+- [Monitoring](./monitoring) — Network monitoring

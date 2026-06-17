@@ -1,0 +1,806 @@
+---
+sidebar_position: 6
+---
+
+# Kubernetes Troubleshooting Guide
+
+## Overview
+
+Kubernetes is a complex distributed system. Troubleshooting requires understanding the interaction between multiple components: the control plane, worker nodes, networking, and workloads. This guide provides a systematic approach to diagnosing issues across all layers of a Kubernetes cluster.
+
+## When To Use
+
+- **Pod Issues**: Not scheduling, crashing, not responding
+- **Node Problems**: Not ready, under pressure, kubelet issues
+- **Networking**: DNS failures, service connectivity, network policies
+- **Control Plane**: API server unavailable, etcd issues, scheduler failures
+- **Storage**: Volume mounting issues, PVC pending, storage class problems
+- **RBAC**: Permission denied, service account issues
+
+## When NOT To Use
+
+- **Application Logic Bugs**: These require application-level debugging
+- **Infrastructure Provisioning**: Cloud/provider issues, not K8s
+- **CI/CD Pipeline Issues**: Use CI/CD troubleshooting guide
+- **Hardware Failures**: Provider-level issues
+
+## Core Concepts / Methodology
+
+### Kubernetes Architecture and Debugging Points
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              KUBERNETES ARCHITECTURE                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                   CONTROL PLANE                      │   │
+│  │  ┌─────────┐  ┌──────────┐  ┌──────────┐           │   │
+│  │  │ kube-   │  │ kube-    │  │ etcd     │           │   │
+│  │  │ apiserver│ │ scheduler│  │          │           │   │
+│  │  └─────────┘  └──────────┘  └──────────┘           │   │
+│  │  Debug: Check pod status, logs, events              │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                         │                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                      WORKER NODES                   │   │
+│  │  ┌─────────┐  ┌──────────┐  ┌──────────────┐       │   │
+│  │  │ kubelet │  │ kube-    │  │ container    │       │   │
+│  │  │         │  │ proxy    │  │ runtime      │       │   │
+│  │  └─────────┘  └──────────┘  └──────────────┘       │   │
+│  │  Debug: Node conditions, kubelet logs, crictl      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                         │                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                    WORKLOADS                        │   │
+│  │  ┌─────────┐  ┌──────────┐  ┌──────────────┐       │   │
+│  │  │ Pods    │  │Services  │  │Deployments   │       │   │
+│  │  └─────────┘  └──────────┘  └──────────────┘       │   │
+│  │  Debug: describe, logs, events, port-forward       │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Debugging Command Cheat Sheet
+
+```
+Pod not running?
+  → kubectl get pod <pod> -o wide
+  → kubectl describe pod <pod>
+  → kubectl logs <pod> --previous
+
+Node not ready?
+  → kubectl get node <node>
+  → kubectl describe node <node>
+  → ssh <node> && journalctl -u kubelet
+
+Service unreachable?
+  → kubectl get svc <svc>
+  → kubectl get endpoints <svc>
+  → kubectl describe svc <svc>
+```
+
+## Diagnostic Commands / Tools
+
+### kubectl describe
+
+`kubectl describe` provides comprehensive information about resources:
+
+```bash
+# Describe a pod
+kubectl describe pod myapp-abc123
+
+# Output:
+# Name:         myapp-abc123
+# Namespace:    production
+# Node:         node-1/10.0.1.5
+# Start Time:   Mon, 16 Jun 2026 10:00:00 +0000
+# Labels:       app=myapp
+# Status:       Running
+# ...
+# Conditions:
+#   Type           Status
+#   Initialized    True
+#   Ready          True
+#   ContainersReady True
+#   PodScheduled   True
+# ...
+# Events:
+#   Type    Reason                  Age   From             Message
+#   ----    ------                  ----  ----             -------
+#   Normal  Scheduled               2m    default-scheduler Successfully scheduled
+#   Normal  Pulling                 2m    kubelet          Pulling image "nginx:latest"
+#   Normal  Pulled                  1m    kubelet          Successfully pulled image
+#   Normal  Created                 1m    kubelet          Created container myapp
+#   Normal  Started                 1m    kubelet          Started container myapp
+```
+
+### kubectl logs
+
+```bash
+# Get logs
+kubectl logs myapp-abc123
+
+# Follow logs
+kubectl logs -f myapp-abc123
+
+# Previous logs (before crash)
+kubectl logs myapp-abc123 --previous
+
+# Specific container in multi-container pod
+kubectl logs myapp-abc123 -c sidecar
+
+# All containers
+kubectl logs myapp-abc123 --all-containers=true
+
+# Since timestamp
+kubectl logs myapp-abc123 --since=1h
+
+# Tail lines
+kubectl logs myapp-abc123 --tail=100
+```
+
+### kubectl events
+
+```bash
+# Get all events in namespace
+kubectl get events --sort-by='.lastTimestamp'
+
+# Events sorted by time (most recent first)
+kubectl get events --sort-by='.metadata.creationTimestamp'
+
+# Watch events in real-time
+kubectl get events -w
+
+# Events for specific object
+kubectl get events --field-selector involvedObject.name=myapp-abc123
+
+# Events in all namespaces
+kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -50
+```
+
+### crictl - Container Runtime Debugging
+
+```bash
+# List containers
+crictl ps
+
+# Output:
+# CONTAINER          IMAGE          CREATED         STATE      NAME                ATTEMPT
+# abc123             nginx:latest   10 minutes ago  Running    myapp               0
+
+# Inspect container
+crictl inspect abc123
+
+# Container logs (runtime level)
+crictl logs abc123
+
+# List images
+crictl images
+
+# Pull image manually
+crictl pull nginx:latest
+
+# Check pod sandbox status
+crictl pods
+```
+
+### etcd Debugging
+
+```bash
+# Check etcd pod status
+kubectl get pods -n kube-system -l component=etcd
+
+# etcd member list
+kubectl exec -n kube-system etcd-controlplane - etcdctl \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  member list
+
+# Output:
+# 1a2b3c4d5e6f, started, controlplane, https://10.0.0.5:2380, https://10.0.0.5:2379, false
+
+# Check etcd endpoint health
+kubectl exec -n kube-system etcd-controlplane - etcdctl \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  endpoint health
+
+# Watch changes in etcd
+kubectl exec -n kube-system etcd-controlplane - etcdctl \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  watch /registry/pods/
+```
+
+### CoreDNS Debugging
+
+```bash
+# Check CoreDNS pods
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100
+
+# Test DNS from a pod
+kubectl exec -it test-pod -- nslookup kubernetes.default
+
+# Sample output:
+# Server:    10.96.0.10
+# Address:   10.96.0.10#53
+#
+# Name:      kubernetes.default.svc.cluster.local
+# Address:   10.96.0.1
+
+# Check if CoreDNS is responding
+kubectl exec -it test-pod -- dig @kube-dns.kube-system.svc.cluster.local +short kubernetes.default.svc.cluster.local
+
+# CoreDNS configmap
+kubectl get configmap coredns -n kube-system -o yaml
+```
+
+### Node Debugging
+
+```bash
+# Node status
+kubectl get nodes -o wide
+
+# Node conditions
+kubectl describe node node-1 | grep -A 20 "Conditions"
+
+# Output:
+# Conditions:
+#   Type             Status
+#   MemoryPressure   False
+#   DiskPressure     False
+#   PIDPressure      False
+#   NetworkUnavailable False
+#   Ready            True
+
+# Kubelet logs (via journalctl on node)
+# ssh node-1
+sudo journalctl -u kubelet --since "1 hour ago" | grep -E "error|warning"
+
+# Node resource usage
+kubectl top node node-1
+
+# Node allocatable resources
+kubectl describe node node-1 | grep -A 10 "Allocatable"
+```
+
+## Real Production Scenarios
+
+### Scenario 1: Pod Stuck in ImagePullBackOff
+
+**Symptom:**
+- Pod stuck in `ImagePullBackOff` status
+- No new deployments worked
+- Some images worked, others didn't
+
+**Diagnostic Commands:**
+```bash
+# Check pod status
+kubectl get pod myapp-abc123
+
+# Output:
+# NAME            READY   STATUS            RESTARTS   AGE
+# myapp-abc123    0/1     ImagePullBackOff   0          5m
+
+# Describe for details
+kubectl describe pod myapp-abc123
+
+# Output:
+# Events:
+#   Type     Reason         Age                    From                Message
+#   ----     ------         ----                  ----                -------
+#   Normal   Pulling        4m41s                 kubelet            Pulling image "private-reg.io/myapp:v1.2.3"
+#   Warning  Failed         4m28s                 kubelet            Failed to pull image "private-reg.io/myapp:v1.2.3": rpc error: code = Unknown desc = Error response from daemon: pull access denied, repository does not exist or may require authorization: unauthorized: authentication required
+#   Warning  BackOff        4m28s                 kubelet            Back-off pulling image "private-reg.io/myapp:v1.2.3"
+```
+
+**Root Cause:**
+The image tag `v1.2.3` was deleted and rebuilt with a different digest. Kubernetes was trying to pull the old digest which no longer existed. Also, the imagePullSecret had expired.
+
+**Fix:**
+```bash
+# Update image to use new tag or digest
+kubectl set image deployment/myapp myapp=private-reg.io/myapp:v1.2.4
+
+# Or update the deployment with the new image
+kubectl patch deployment myapp -p '{"spec":{"template":{"spec":{"containers":[{"name":"myapp","image":"private-reg.io/myapp:v1.2.4"}]}}}}'
+
+# If secret expired, create new secret
+kubectl delete secret regcred
+kubectl create secret docker-registry regcred \
+  --docker-server=private-reg.io \
+  --docker-username=user \
+  --docker-password=new-password \
+  --docker-email=user@example.com
+
+# Update service account
+kubectl patch serviceaccount default -p '{"imagePullSecrets":[{"name":"regcred"}]}'
+```
+
+**Prevention:**
+- Use immutable tags (digest-based) or versioned tags
+- Rotate imagePullSecrets regularly
+- Add image digests in deployment manifests
+- Monitor for ImagePullBackOff with alerting
+
+---
+
+### Scenario 2: CrashLoopBackOff with Application Logs
+
+**Symptom:**
+- Pod constantly restarting
+- Application starts, processes some requests, then crashes
+- Crash interval decreasing over time
+
+**Diagnostic Commands:**
+```bash
+# Check pod status
+kubectl get pod -l app=myapp -w
+
+# Watch for crashes
+kubectl get pods --watch | grep CrashLoopBackOff
+
+# Get application logs before crash
+kubectl logs myapp-abc123 --previous
+
+# If logs are cut, check application output
+kubectl logs myapp-abc123 --previous --tail=500
+
+# Check for OOM or resource issues
+kubectl describe pod myapp-abc123
+
+# Check resource limits
+kubectl get pod myapp-abc123 -o jsonpath='{.spec.containers[0].resources}'
+
+# Check events for hints
+kubectl get events --field-selector involvedObject.name=myapp-abc123 --sort-by='.lastTimestamp'
+```
+
+**Sample crash log:**
+```
+2026-06-16 10:00:00 Application starting
+2026-06-16 10:00:01 Database connected
+2026-06-16 10:00:02 HTTP server started on :8080
+2026-06-16 10:30:15 Connection pool exhausted
+2026-06-16 10:30:15 FATAL: remaining connection slots are reserved for non-replication superuser connections
+2026-06-16 10:30:15 Application shutting down
+```
+
+**Root Cause:**
+Database connection pool was exhausted due to connection leak. The application wasn't closing database connections properly, and eventually hit PostgreSQL's `max_connections` limit, causing a fatal error.
+
+**Fix:**
+```bash
+# Increase resource limits temporarily
+kubectl patch deployment myapp -p '{"spec":{"template":{"spec":{"containers":[{"name":"myapp","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+
+# Scale down to give DB breathing room
+kubectl scale deployment myapp --replicas=0
+
+# Wait for connections to clear
+# Check DB connection count
+kubectl exec -it postgres-0 -n database -- psql -c "SELECT count(*) FROM pg_stat_activity WHERE application_name='myapp';"
+
+# Scale back up with fixed image
+kubectl set image deployment/myapp myapp=myapp:v1.2.5-fixed
+kubectl scale deployment myapp --replicas=3
+```
+
+**Prevention:**
+- Implement connection pool with proper timeout
+- Add liveness/readiness probes
+- Monitor connection pool usage
+- Set appropriate resource limits
+- Add connection leak detection in tests
+
+---
+
+### Scenario 3: Kubernetes etcd Leader Election Failure
+
+**Symptom:**
+- API server responses very slow or timing out
+- Cluster operations failing with "context deadline exceeded"
+- Kubelets reporting can't talk to API server
+
+**Diagnostic Commands:**
+```bash
+# Check etcd pod status
+kubectl get pods -n kube-system -l component=etcd
+
+# Check etcd pod logs
+kubectl logs -n kube-system etcd-controlplane --tail=100
+
+# Sample etcd error log:
+# 2026-06-16 10:00:00.000000 I | raft: 1a2b3c4d5e6f [logterm: 5, index: 10000, vote: 1a2b3c4d5e6f] ignored vote from 7f8g9h0i1j2: log term [4] < self [5]
+# 2026-06-16 10:00:05.000000 E | rafthttp: request sender retry timeout
+
+# Check etcd health
+kubectl exec -n kube-system etcd-controlplane - etcdctl endpoint health --cluster
+
+# Output:
+# https://10.0.0.5:2379 is healthy: successfully committed proposal: took = 2.5ms
+# https://10.0.0.6:2379 is healthy: successfully committed proposal: took = 1.8s  ← Slow!
+# https://10.0.0.7:2379 is unhealthy: failed to commit proposal: context deadline exceeded
+
+# Check etcd member list
+kubectl exec -n kube-system etcd-controlplane - etcdctl --write-out=table member list
+
+# Output:
+# +------------------+---------+---------------+--------------+-------------+------------+
+# |        ID        | STATUS  |     NAME      |   PEER ADDRS |  CLIENT ADDRS|  IS LEARNER|
+# +------------------+---------+---------------+--------------+-------------+------------+
+# | 1a2b3c4d5e6f     | started | controlplane  | https://10.0.0.5:2380 | https://10.0.0.5:2379 | false |
+# | 7f8g9h0i1j2     | started | controlplane2 | https://10.0.0.6:2380 | https://10.0.0.6:2379 | false |
+# | 3k4l5m6n7o8     | started | controlplane3 | https://10.0.0.7:2380 | https://10.0.0.7:2379 | false |
+```
+
+**Root Cause:**
+The etcd member on `controlplane3` had disk I/O issues (slow disk on that VM), causing heartbeats to be delayed and triggering leader election. The leader kept changing, causing instability.
+
+**Fix:**
+```bash
+# Check disk I/O on affected node
+kubectl debug node/controlplane3 -it --image=busybox -- df -h
+
+# If using cloud provider, check if disk is too slow
+# Move etcd to faster disk or node
+
+# For temporary fix, restart the affected etcd member
+kubectl exec -n kube-system etcd-controlplane -- etcdctl member remove 3k4l5m6n7o8
+
+# Add new member
+kubectl exec -n kube-system etcd-controlplane -- etcdctl member add controlplane3 --peer-urls=https://10.0.0.7:2380
+
+# Restart etcd pod on controlplane3
+kubectl delete pod -n kube-system etcd-controlplane3
+```
+
+**Prevention:**
+- Use SSD for etcd (required for production)
+- Monitor etcd disk latency in Cloud Monitoring
+- Set up alerting on etcd leader changes
+- Use consistent hardware across control plane nodes
+- Implement proper etcd backup and restore
+
+---
+
+### Scenario 4: Service Stuck in Pending (LoadBalancer)
+
+**Symptom:**
+- Service with type=LoadBalancer stuck in Pending
+- External IP never assigned
+- Cloud provider console shows no load balancer created
+
+**Diagnostic Commands:**
+```bash
+# Check service status
+kubectl get svc myapp-service
+
+# Output:
+# NAME             TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+# myapp-service    LoadBalancer   10.96.45.123    <pending>     80:30000/TCP   10m
+
+# Describe service for events
+kubectl describe svc myapp-service
+
+# Check for relevant events:
+# Events:
+#   Type     Reason                      Age    From                Message
+#   ----     ------                      ----   ----                -------
+#   Normal   EnsuredLoadBalancer         10m    service-controller  Ensured 1 target backends
+#   Warning  SyncLoadBalancerFailed      5m     service-controller  Error syncing load balancer: googleapi: Error 403: Required "compute.globalAddresses.create" permission
+
+# Check if it's an RBAC issue
+kubectl auth can-i create services LoadBalancer --namespace=production
+
+# Check cloud provider logs (GKE example)
+gcloud logging read 'resource.type="gce_backend_service" AND jsonPayload.statusDetails~"permission"' --limit=10
+```
+
+**Root Cause:**
+The service account used by the cluster didn't have the necessary `compute.globalAddresses.create` permission to create the load balancer's external IP address. This happened after a project-level IAM policy change.
+
+**Fix:**
+```bash
+# Find the service account being used
+kubectl get configmap -n kube-system cluster-info -o yaml | grep -i serviceaccount
+
+# Grant required permissions (GCP example)
+gcloud projects add-iam-policy-binding my-project \
+  --member="serviceAccount:my-gke-sa@my-project.iam.gserviceaccount.com" \
+  --role="roles/compute.networkAdmin"
+
+# If using Workload Identity, bind the KSA to GSA
+gcloud iam service-accounts add-iam-policy-binding \
+  --role="roles/compute.networkAdmin" \
+  --member="serviceAccount:my-project.svc.id.goog[production/myapp]" \
+  my-gke-sa@my-project.iam.gserviceaccount.com
+
+# Delete and recreate service to trigger LB creation
+kubectl delete svc myapp-service
+kubectl apply -f service.yaml
+```
+
+**Prevention:**
+- Document required IAM roles per service
+- Use Workload Identity instead of key files
+- Test service account permissions in staging
+- Set up IAM change alerts
+
+---
+
+### Scenario 5: Horizontal Pod Autoscaler Not Scaling
+
+**Symptom:**
+- High CPU/memory but HPA not scaling pods
+- Target shows 80% CPU but replicas stay at minimum
+- HPA status shows "ScalingActive: False"
+
+**Diagnostic Commands:**
+```bash
+# Check HPA status
+kubectl get hpa myapp -o wide
+
+# Output:
+# NAME    REFERENCE          TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+# myapp   Deployment/myapp   80%/50%   2         10        2          30m
+#
+# Status:
+# scalingActive: True
+# scalingLimited: True  ← Limited!
+
+# Describe HPA for more details
+kubectl describe hpa myapp
+
+# Output:
+# Events:
+#   Type     Reason                   Age   From                        Message
+#   ----     ------                   ----  ----                        -------
+#   Warning  ScalingNotPerformed      5m    horizontal-pod-autoscaler   unable to scale: desired replica count exceeds toleration
+#
+#   Message: The desired replica count is 10, maximum allowed is 5 due to the Pod Disruption Budget
+
+# Check Pod Disruption Budget
+kubectl get pdb myapp-pdb
+
+# Output:
+# NAME       MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED
+# myapp-pdb  3               N/A               2
+#
+# The PDB requires 3 pods always available, so with 80% CPU,
+# HPA wants to scale to 10, but can only add 2 at a time due to PDB
+
+# Check current replica count
+kubectl get deploy myapp -o jsonpath='{.spec.replicas}'
+```
+
+**Root Cause:**
+The Pod Disruption Budget (PDB) `myapp-pdb` with `minAvailable: 3` was preventing HPA from scaling beyond 5 replicas. The cluster only had 3 nodes, and HPA couldn't safely evict pods to reach the target 10 replicas.
+
+**Fix:**
+```bash
+# Option 1: Adjust PDB to allow more disruption
+kubectl patch pdb myapp-pdb -p '{"spec":{"minAvailable":1}}'
+
+# Option 2: Update HPA to respect the constraint
+kubectl patch hpa myapp -p '{"spec":{"maxReplicas":5}}'
+
+# Option 3: Increase cluster size for proper scaling
+gcloud container clusters resize cluster-1 --node-pool=default-pool --num-nodes=6
+
+# Option 4: Use maxUnavailable instead of minAvailable
+kubectl patch pdb myapp-pdb -p '{"spec":{"maxUnavailable":"50%"}}'
+```
+
+**Prevention:**
+- Review PDBs before setting HPA limits
+- Use percentage-based PDBs for flexible scaling
+- Monitor HPA status for `scalingLimited` condition
+- Test scaling behavior in staging
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Pod Not Scheduling
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: CHECK POD STATUS                                    │
+├─────────────────────────────────────────────────────────────┤
+│ $ kubectl get pod myapp-xyz -o wide                         │
+│ $ kubectl describe pod myapp-xyz                            │
+│                                                              │
+│ Common states: Pending, ContainerCreating, ImagePullBackOff │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: IF PENDING                                          │
+├─────────────────────────────────────────────────────────────┤
+│ Check events section of describe output:                    │
+│ - "No nodes available" → Node resource exhaustion          │
+│ - "Insufficient cpu/memory" → Resource limits too high     │
+│ - "node(s) had taints" → Tolerations needed                │
+│ - "0/3 nodes are available" → Pod affinity/anti-affinity   │
+│                                                              │
+│ $ kubectl describe nodes | grep -A 5 "Allocated resources"  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: IF IMAGEPULLBACKOFF                                 │
+├─────────────────────────────────────────────────────────────┤
+│ Check if image exists:                                      │
+│ $ crictl images | grep image-name                           │
+│ $ gcloud artifact registry list (GCP)                       │
+│                                                              │
+│ Check imagePullSecret if private registry:                  │
+│ $ kubectl get pod -o jsonpath='{.spec.imagePullSecrets}'    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK PVC IF PENDING (STORAGE)                      │
+├─────────────────────────────────────────────────────────────┤
+│ $ kubectl get pvc                                           │
+│ $ kubectl describe pvc <pvc-name>                           │
+│                                                              │
+│ Check for: StorageClass not found, insufficient quota      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: Service Unreachable
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: VERIFY SERVICE EXISTS AND HAS ENDPOINTS             │
+├─────────────────────────────────────────────────────────────┤
+│ $ kubectl get svc myapp                                     │
+│ $ kubectl get endpoints myapp                               │
+│                                                              │
+│ If no endpoints → No pods match service selector            │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK POD LABELS MATCH SELECTOR                     │
+├─────────────────────────────────────────────────────────────┤
+│ $ kubectl get pods -l app=myapp                             │
+│                                                              │
+│ Verify selector in service matches pod labels               │
+│ $ kubectl get svc myapp -o jsonpath='{.spec.selector}'      │
+│ $ kubectl get pod myapp-xyz -o jsonpath='{.metadata.labels}'│
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: TEST FROM INSIDE CLUSTER                            │
+├─────────────────────────────────────────────────────────────┤
+│ $ kubectl run test --rm -it --image=busybox -- sh           │
+│ $ wget -qO- http://myapp:80                                 │
+│ $ telnet myapp 80                                           │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK NETWORK POLICY                                │
+├─────────────────────────────────────────────────────────────┤
+│ $ kubectl get networkpolicies                               │
+│ $ kubectl describe networkpolicy <name>                     │
+│                                                              │
+│ Check if policies are blocking traffic                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `ImagePullBackOff` | Image not accessible | Check image name, pull secret, registry access |
+| `CrashLoopBackOff` | Application crashing | Check logs with `--previous`, fix application |
+| `ErrImagePull` | Temporary registry issue | Retry, check network policy |
+| `Evicted` | Node pressure, PDB, resource limit | Delete pod, fix resource limits |
+| `Terminating` | Graceful shutdown stuck | Force delete: `kubectl delete pod --grace-period=0` |
+| `Pending` | Scheduling issue | Check resources, node availability, PDBs |
+| `OOMKilled` | Memory limit exceeded | Increase memory limit, fix memory leak |
+| `Completed` | Job finished | Normal for Jobs, not an error |
+| `No nodes available | Cluster at capacity | Scale cluster, reduce resource requests |
+
+## Monitoring / Log Analysis
+
+### Key Kubernetes Metrics
+
+| Metric | Alert When | Tool |
+|--------|------------|------|
+| Pod restarts | > 5 in 1 hour | `kubectl get pods --watch` |
+| Node NotReady | Any occurrence | `kubectl get nodes` |
+| API server latency | P99 > 1s | Cloud Monitoring |
+| etcd latency | > 50ms | `kubectl exec etcd etcdctl endpoint health` |
+| Pod Pending | > 5 minutes | `kubectl get pods --watch` |
+| HPA scaling limited | Any occurrence | `kubectl describe hpa` |
+
+### Log Aggregation Strategy
+
+```bash
+# Aggregate logs from all pods
+kubectl logs -l app=myapp --all-namespaces=true --tail=100
+
+# Search for errors across namespace
+kubectl logs -n production -l tier=backend --since=1h | grep -E "ERROR|FATAL|Exception"
+
+# Follow logs from deployment
+kubectl logs -l app=myapp -f --tail=50 --max-log-requests=10
+```
+
+## Interview Questions
+
+### Question 1: Pod Debugging
+
+**Q:** A pod is stuck in CrashLoopBackOff. How do you investigate?
+
+**A:**
+1. Get logs from previous run: `kubectl logs --previous`
+2. Check pod events: `kubectl describe pod`
+3. Check resource limits vs actual usage
+4. Look for OOMKills in node: `dmesg | grep -i oom`
+5. Verify application configuration
+6. Check dependencies (database, external services)
+7. Test application locally or in dev environment
+
+### Question 2: Networking Debugging
+
+**Q:** A pod can't reach another service in the cluster. Walk me through debugging.
+
+**A:**
+1. Verify service exists: `kubectl get svc`
+2. Check endpoints: `kubectl get endpoints`
+3. Test DNS: `kubectl exec test nslookup service-name`
+4. Test connectivity: `kubectl exec test nc -zv service 80`
+5. Check if pods are running: `kubectl get pods -l app=service-app`
+6. Check network policies: `kubectl get networkpolicies`
+7. Verify iptables rules on node: `ssh node iptables -L -n`
+8. Check CoreDNS: `kubectl logs -n kube-system -l k8s-app=kube-dns`
+
+### Question 3: Node Issues
+
+**Q:** A node shows as "NotReady". How do you investigate and recover?
+
+**A:**
+1. Check node status: `kubectl describe node`
+2. SSH to node and check kubelet: `sudo systemctl status kubelet`
+3. Check kubelet logs: `sudo journalctl -u kubelet --since "1 hour ago"`
+4. Verify node has resources (CPU, memory, disk)
+5. Check for network issues: `ip addr`, `ip route`
+6. Check container runtime: `crictl info`, `crictl ps`
+7. If unrecoverable, cordon node, drain workloads, remediate or replace
+
+## Cheat Sheet
+
+| Command | Purpose |
+|---------|---------|
+| `kubectl get pods -o wide` | Pod status and node |
+| `kubectl describe pod` | Detailed pod info + events |
+| `kubectl logs` | Application logs |
+| `kubectl logs --previous` | Logs before crash |
+| `kubectl exec -it pod -- sh` | Shell into pod |
+| `kubectl get events --sort-by='.lastTimestamp'` | Recent events |
+| `kubectl get hpa` | Autoscaler status |
+| `kubectl top pod` | Resource usage |
+| `kubectl get endpoints` | Service backends |
+| `crictl ps` | Container runtime containers |
+| `crictl logs` | Runtime-level logs |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [Linux Troubleshooting](./linux-troubleshooting) - System-level debugging
+- [Network Troubleshooting](./network-troubleshooting) - Network debugging
+- [GCP Troubleshooting](./gcp-troubleshooting) - GCP-specific debugging
+- [Common Issues](./common-issues) - Frequently occurring problems

@@ -1,0 +1,832 @@
+---
+title: "Container Image Security"
+description: "Container image security - vulnerability scanning, signing, SBOMs, and supply chain security"
+sidebar_position: 6
+---
+
+# Container Image Security
+
+## Overview
+
+Container image security encompasses practices and tools to ensure container images are free from vulnerabilities, properly authenticated, and safely configured. With containers being the primary deployment artifact in modern cloud-native applications, securing the image supply chain is critical.
+
+**Key Security Areas:**
+- Vulnerability scanning and management
+- Image signing and verification
+- Supply chain security (SBOMs)
+- Base image hardening
+- Runtime security policies
+- Secret management
+- Access control and authentication
+
+## When To Use
+
+- **CI/CD pipelines** requiring automated security checks
+- **Production deployments** needing verified, trusted images
+- **Compliance requirements** (SOC 2, HIPAA, PCI-DSS)
+- **Multi-tenant environments** requiring strong isolation
+- **Supply chain security** requirements (SBOM generation, signing)
+- **Regulatory environments** with strict security mandates
+
+## When NOT To Use
+
+- **Development/learning environments** where overhead isn't justified
+- **Simple internal tools** with no external exposure
+- **Non-production workloads** where rapid iteration matters more than security
+
+## Core Concepts
+
+### Vulnerability Types
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Container Vulnerability Types                      │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+│  │   Critical   │  │    High      │  │   Medium     │              │
+│  │ CVSS 9.0-10  │  │  CVSS 7.0-8.9│  │  CVSS 4.0-6.9│              │
+│  └──────────────┘  └──────────────┘  └──────────────┘              │
+│                                                                      │
+│  CVSS = Common Vulnerability Scoring System                          │
+│  CVE = Common Vulnerabilities and Exposures                          │
+│  CWE = Common Weakness Enumeration                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Image Security Layers
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                   Image Security Layers                              │
+│                                                                      │
+│  1. Source Code    ───► SCA (Software Composition Analysis)         │
+│  2. Build Process  ───► Supply Chain, Secrets Scanning              │
+│  3. Base Image     ───► Scanning, Hardening                         │
+│  4. Runtime Image  ───► Signing, SBOM Generation                    │
+│  5. Deployment     ───► Policy Enforcement, Image Verification      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Vulnerability Databases
+
+| Database | Description | URL |
+|----------|-------------|-----|
+| NVD | National Vulnerability Database | nvd.nist.gov |
+| CVE | Common Vulnerabilities and Exposures | cve.mitre.org |
+| Alpine Security | Alpine Linux advisories | security.alpinelinux.org |
+| GitHub Advisory | GitHub Security Advisories | github.com/advisories |
+| Red Hat | Red Hat Security Data | access.redhat.com/security |
+
+## Real Production Example
+
+### Secure Image Pipeline
+
+**CI/CD Pipeline with Security Gates:**
+
+```yaml
+# .github/workflows/secure-build.yml
+
+name: Secure Container Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: myregistry.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # Stage 1: Build
+  # ============================================
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================
+  # Stage 2: Vulnerability Scan
+  # ============================================
+  scan:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Pull image for scanning
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
+      - name: Run Trivy scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'  # Fail on CRITICAL/HIGH
+      
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Scan for secrets
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          scan-type: 'secret'
+
+  # ============================================
+  # Stage 3: Generate SBOM
+  # ============================================
+  sbom:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Pull image
+        run: docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
+      - name: Generate SBOM with Syft
+        uses: anchore/sbft-action@main
+        with:
+          image: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: spdx-json
+          output-file: sbom.spdx.json
+      
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+  # ============================================
+  # Stage 4: Sign Image
+  # ============================================
+  sign:
+    runs-on: ubuntu-latest
+    needs: [build, scan]
+    if: github.event_name == 'push'
+    permissions:
+      id-token: write  # For OIDC
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      
+      - name: Sign image with Cosign
+        uses: sigstore/cosign-installer@v3
+      
+      - name: Sign image
+        run: |
+          cosign sign \
+            --yes \
+            --bbox-support \
+            --tlog-upload \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+
+  # ============================================
+  # Stage 5: Push and Deploy
+  # ============================================
+  push:
+    runs-on: ubuntu-latest
+    needs: sign
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+```
+
+### Kubernetes ImagePolicyWebhook Configuration
+
+```yaml
+# admission-configuration.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugin:
+- name: ImagePolicyWebhook
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: ImagePolicyWebhook
+   kubeConfigFile: /etc/kubernetes/kubeconfig
+    defaultAllow: false  # Deny by default
+    allowedMarkupHook:
+      - version: v1
+        request:
+          operation: CREATE
+          resource: pods
+        imagePatterns:
+          - pattern: 'myregistry.io/*:*'
+            optional: true
+          - pattern: 'registry.k8s.io/*:*'
+            optional: true
+```
+
+## CLI Examples
+
+### Trivy Vulnerability Scanning
+
+```bash
+# Install Trivy
+brew install trivy
+# or
+apt-get install trivy
+
+# Scan local image
+trivy image nginx:alpine
+
+# Scan with specific severity
+trivy image --severity HIGH,CRITICAL myapp:latest
+
+# Scan with policy violation
+trivy image --exit-code 1 --severity CRITICAL myapp:latest
+
+# Scan filesystem
+trivy fs --security-checks vuln,config,secret ./
+
+# Scan Docker config (for leaked credentials)
+trivy config --security-checks secret ./
+
+# Generate report in different formats
+trivy image -f json -o report.json myapp:latest
+trivy image -f sarif -o report.sarif myapp:latest
+trivy image -f table myapp:latest  # default
+
+# Scan Git repository
+trivy repo https://github.com/myorg/myrepo
+
+# Ignore unfixed vulnerabilities
+trivy image --ignore-unfixed myapp:latest
+
+# Skip specific files/directories
+trivy fs --exclude-images --exclude-dir '.git' --exclude-dir 'node_modules' ./
+
+# Clear cache
+trivy image --clear-cache myapp:latest
+trivy cache --refresh
+```
+
+### Snyk Container Scanning
+
+```bash
+# Install Snyk CLI
+npm install -g snyk
+
+# Authenticate
+snyk auth
+
+# Test container image
+snyk container test myapp:latest
+
+# Test with severity threshold
+snyk container test myapp:latest --severity-threshold=high
+
+# Monitor image for new vulnerabilities
+snyk container monitor myapp:latest
+
+# Test Dockerfile
+snyk container test --docker myapp:latest --file=Dockerfile
+
+# Output in JSON format
+snyk container test myapp:latest --json > results.json
+```
+
+### Cosign Image Signing
+
+```bash
+# Install Cosign
+brew install cosign
+# or
+go install github.com/sigstore/cosign/cmd/cosign@latest
+
+# Generate key pair
+cosign generate-key-pair
+
+# Sign image
+cosign sign myregistry.io/myapp:v1.0.0
+
+# Sign with key
+cosign sign --key cosign.key myregistry.io/myapp:v1.0.0
+
+# Sign with KMS key
+cosign sign --key kms://my-kms-url myregistry.io/myapp:v1.0.0
+
+# Sign with OIDC (keyless signing)
+COSIGN_EXPERIMENTAL=1 cosign sign myregistry.io/myapp:v1.0.0
+
+# Verify image
+cosign verify myregistry.io/myapp:v1.0.0
+
+# Verify with public key
+cosign verify --key cosign.pub myregistry.io/myapp:v1.0.0
+
+# Verify with attestation
+cosign verify --attestation-policy policy.json myregistry.io/myapp:v1.0.0
+
+# Upload SBOM
+cosign attest --predicate sbom.spdx.json myregistry.io/myapp:v1.0.0
+
+# Verify attestation
+cosign verify-attestation --type spdxjson myregistry.io/myapp:v1.0.0
+```
+
+### Syft SBOM Generation
+
+```bash
+# Install Syft
+brew install syft
+
+# Generate SBOM from image
+syft myapp:latest -o json > sbom.json
+syft myapp:latest -o spdx-json > sbom.spdx
+syft myapp:latest -o cyclonedx-json > sbom.cdx
+
+# Generate SBOM from directory
+syft . -o json > sbom.json
+
+# Generate SBOM with package catalog
+syft myapp:latest -o json | jq '.packages[].name'
+
+# Scan and compare with vulnerability database
+syft myapp:latest -o json | grype
+
+# Update catalog
+syft packages myapp:latest --catalogers +node-lockfile
+```
+
+### Grype Vulnerability Matching
+
+```bash
+# Install Grype
+brew install grype
+
+# Scan image for vulnerabilities
+grype myapp:latest
+
+# Scan with JSON output
+grype myapp:latest -o json > vulnerabilities.json
+
+# Scan and fail on critical
+grype myapp:latest --fail-on critical
+
+# Scan SBOM instead of image
+grype sbom:sbom.spdx myapp:latest
+
+# Show fixed vulnerabilities
+grype myapp:latest --show-fixed
+
+# Ignore specific CVEs
+grype myapp:latest --ignore CVE-2021-44228
+```
+
+## Dockerfile / Compose Examples
+
+### Hardened Dockerfile
+
+```dockerfile
+# Stage 1: Build
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# Stage 2: Production (Distroless)
+FROM gcr.io/distroless/nodejs20-debian11 AS production
+
+# Security: Non-root, no shell
+USER nonroot
+
+WORKDIR /app
+
+# Copy built application
+COPY --from=builder --chown=nonroot:nonroot /app/dist ./dist
+COPY --from=builder --chown=nonroot:nonroot /app/node_modules ./node_modules
+COPY --from=builder --chown=nonroot:nonroot /app/package.json ./
+
+# Security: Read-only filesystem (need /tmp for temp)
+# Note: Some apps need /tmp, add as tmpfs mount at runtime
+# RUN mkdir -p /tmp && chmod 1777 /tmp
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:3000/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
+EXPOSE 3000
+
+CMD ["node", "dist/main.js"]
+```
+
+### Chainguard Images
+
+```dockerfile
+# Using Chainguard Images (minimal, built-in security)
+FROM cgr.dev/chainguard/python:latest as builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --prefix=/install -r requirements.txt
+
+FROM cgr.dev/chainguard/python:latest
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY . .
+USER nonroot
+CMD ["python", "app.py"]
+```
+
+### Security-Scanned Dockerfile
+
+```dockerfile
+# This Dockerfile demonstrates security best practices
+# Scanning should happen in CI/CD
+
+FROM python:3.12-slim
+
+# Security: Add labels
+LABEL maintainer="security@example.com"
+LABEL security-check="required"
+
+# Security: Create non-root user
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --shell /bin/bash appuser
+
+# Security: Install minimal packages in one layer
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        # Only production deps
+        postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy with ownership
+COPY --chown=appuser:appgroup . .
+
+# Security: Switch to non-root
+USER appuser
+
+# Security: Environment hardening
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=prevent
+
+EXPOSE 8000
+
+# Run with explicit entrypoint
+ENTRYPOINT ["python", "app.py"]
+```
+
+### Docker Compose with Security Options
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    image: myapp:latest
+    # Security: Read-only root filesystem
+    read_only: true
+    
+    # Security: Temporary filesystem
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /var/run:rw,noexec,nosuid
+    
+    # Security: Drop all capabilities
+    cap_drop:
+      - ALL
+    
+    # Security: Add specific capability
+    cap_add:
+      - NET_BIND_SERVICE
+    
+    # Security: No new privileges
+    security_opt:
+      - no-new-privileges:true
+    
+    # Security: Non-root user
+    user: "1000:1000"
+    
+    # Security: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    
+    # Security: Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  db:
+    image: postgres:15-alpine
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+      - /var/run/postgresql:rw,noexec,nosuid
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+```
+
+## Common Commands
+
+### Vulnerability Scanning Commands
+
+| Tool | Command | Purpose |
+|------|---------|---------|
+| Trivy | `trivy image myapp:latest` | Scan image |
+| Trivy | `trivy fs .` | Scan filesystem |
+| Snyk | `snyk container test myapp` | Scan container |
+| Grype | `grype myapp:latest` | Scan with SBOM |
+| Dockle | `dockle myapp:latest` | Image security |
+
+### Signing Commands
+
+| Tool | Command | Purpose |
+|------|---------|---------|
+| Cosign | `cosign sign myapp:v1` | Sign image |
+| Cosign | `cosign verify myapp:v1` | Verify signature |
+| Cosign | `cosign attest` | Create attestation |
+| Docker | `docker trust sign` | Sign with Docker Content Trust |
+
+### SBOM Commands
+
+| Tool | Command | Purpose |
+|------|---------|---------|
+| Syft | `syft myapp -o json` | Generate SBOM |
+| Syft | `syft dir -o cyclonedx` | SBOM from directory |
+| Docker | `docker sbom myapp` | Built-in SBOM |
+
+## Monitoring
+
+### Continuous Scanning
+
+```bash
+# Schedule regular scans
+trivy image --severity CRITICAL,HIGH myapp:latest
+
+# Monitor for new vulnerabilities
+grype myapp:latest --fail-on critical
+
+# Watch for CVE updates
+watch -n 3600 "trivy image myapp:latest"
+```
+
+### Security Dashboard Integration
+
+```bash
+# Export to Prometheus format
+trivy image --format json myapp:latest | \
+  jq -r '.Results[].Vulnerabilities[] | "\(.VulnerabilityID) \(.Severity)"'
+
+# Export to metrics
+curl -s http://trivy-server:8080/metrics
+```
+
+## Security
+
+### Read-Only Root Filesystem
+
+```bash
+# Docker run with read-only root
+docker run --read-only myapp
+
+# With tmpfs for temporary files
+docker run --read-only --tmpfs /tmp myapp
+
+# Kubernetes
+securityContext:
+  readOnlyRootFilesystem: true
+```
+
+### User Namespace Remapping
+
+```bash
+# Enable user namespace remapping (rootless containers)
+# In /etc/docker/daemon.json
+{
+  "userns-remap": "default"
+}
+
+# Or run with specific UID range
+docker run --userns=host myapp
+```
+
+### Content Trust
+
+```bash
+# Enable Docker Content Trust
+export DOCKER_CONTENT_TRUST=1
+
+# Pull only signed images
+docker trust pull myregistry.io/myapp
+
+# View signers
+docker trust inspect --pretty myregistry.io/myapp
+```
+
+## Cost Optimization
+
+### Efficient Scanning
+
+```bash
+# Use cache
+trivy image --cache-dir /var/cache/trivy myapp:latest
+
+# Scan only changed layers
+trivy image --skip-dirs /usr/share/doc myapp:latest
+
+# Incremental scanning with SBOM
+syft myapp:latest -o json > sbom.json
+# On update, scan only delta
+```
+
+### Minimal Images
+
+| Base Image | Size | Use Case |
+|------------|------|----------|
+| `scratch` | 0 MB | Static binaries (Go, Rust) |
+| `distroless/static` | 2 MB | Minimal Linux |
+| `alpine` | 7 MB | General purpose |
+| `ubuntu` | 77 MB | Full Ubuntu |
+| `node` | 1.1 GB | Full Node.js |
+
+## Troubleshooting
+
+### Common Security Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Vulnerability scan fails | No scanner installed | Install Trivy/Snyk |
+| Signature verification fails | Wrong key | Update public key |
+| SBOM not generated | Missing tool | Install Syft |
+| Policy denies image | Blocked by admission | Whitelist registry |
+| Secrets in image | Credentials in Dockerfile | Use build secrets |
+
+### Debugging Security Issues
+
+```bash
+# Check image layers
+docker history myapp:latest
+
+# Extract and inspect
+docker save myapp:latest -o myapp.tar
+tar -xf myapp.tar -C /tmp/image
+
+# Find secrets in image
+trivy fs --security-checks secret .
+
+# Check Dockerfile for issues
+hadolint Dockerfile
+
+# Verify image signature
+cosign verify --verbose myapp:latest
+```
+
+## Interview Questions
+
+### Q1: What is an SBOM and why is it important?
+**A:** A Software Bill of Materials (SBOM) is a formal record of software components and dependencies. It's important for vulnerability management (linking CVEs to your components), license compliance, and supply chain security. It enables faster response to vulnerabilities and helps satisfy compliance requirements.
+
+### Q2: What is image signing and why use it?
+**A:** Image signing cryptographically verifies the identity of the image publisher and ensures the image hasn't been tampered with. It prevents deploying malicious or modified images. Tools like Cosign use asymmetric keys or OIDC for keyless signing.
+
+### Q3: What are the key container security best practices?
+**A:** Use minimal base images (alpine, distroless), run as non-root, use read-only root filesystem, drop all capabilities, enable security options (no-new-privileges), scan for vulnerabilities in CI/CD, sign images, use Secrets management, implement network policies, and enable audit logging.
+
+### Q4: What is Cosign and how does keyless signing work?
+**A:** Cosign is a tool for signing and verifying OCI images. Keyless signing uses OIDC (OpenID Connect) to authenticate via GitHub Actions, Google, or other identity providers. It generates short-lived certificates tied to the identity, making key management simpler and more secure.
+
+### Q5: What is the difference between Trivy, Snyk, and Grype?
+**A:** Trivy is an open-source vulnerability scanner from Aqua Security. Snyk is a commercial scanner with IDE integration and remediation advice. Grype is an open-source scanner from Anchore that can consume SBOMs for faster scanning. All scan container images for CVEs but have different feature sets.
+
+### Q6: How do admission controllers improve image security?
+**A:** ImagePolicyWebhook or OPA Gatekeeper admission controllers can enforce policies on what images can be deployed. They can require images to come from trusted registries, be signed, have recent vulnerability scans, or meet other security requirements before being admitted to the cluster.
+
+### Q7: What are distroless images and why use them?
+**A:** Distroless images from Google contain only the application runtime and its dependencies, with no shell, package manager, or other utilities. This dramatically reduces the attack surface because there are fewer components that could be exploited.
+
+### Q8: How do you handle secrets in container builds?
+**A:** Never bake secrets into images. Use BuildKit secret mounting (`--secret`) for build-time secrets, external secret managers (Vault, cloud secrets) for runtime secrets, Kubernetes Secrets for in-cluster secrets, and environment variables or volume mounts at runtime.
+
+### Q9: What is the supply chain security approach for containers?
+**A:** Supply chain security includes: signing source code commits, verifying build provenance, using dependency scanning (SCA), generating and signing SBOMs, signing built images, verifying signatures before deployment, and maintaining an audit trail of what was deployed and when.
+
+### Q10: What is Docker Content Trust?
+**A:** Docker Content Trust (DCT) enables image signing using The Update Framework (TUF). It ensures you're pulling images from the expected publisher and that the image hasn't been tampered with. When enabled, Docker only pulls and runs signed images from trusted repositories.
+
+## Cheat Sheet
+
+### Security Checklist
+
+- [ ] Use minimal base image (alpine, distroless, scratch)
+- [ ] Run as non-root user
+- [ ] Set read-only root filesystem
+- [ ] Drop all capabilities
+- [ ] Enable no-new-privileges
+- [ ] Scan images in CI/CD
+- [ ] Sign images with Cosign
+- [ ] Generate SBOM with Syft
+- [ ] Enforce policy in Kubernetes
+- [ ] Monitor for new vulnerabilities
+
+### Key Commands
+
+```bash
+# Scanning
+trivy image myapp:latest
+snyk container test myapp:latest
+grype myapp:latest
+
+# Signing
+cosign sign myapp:v1
+cosign verify myapp:v1
+
+# SBOM
+syft myapp -o json > sbom.json
+
+# Hardening
+docker run --read-only --user 1000:1000 --cap-drop=ALL myapp
+```
+
+### Security Flags
+
+```bash
+# Run securely
+docker run \
+  --read-only \
+  --user 1000:1000 \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --tmpfs /tmp \
+  myapp
+```
+
+## Related Topics
+
+- [Container Overview](./overview.mdx) - Container fundamentals
+- [Docker](./docker.mdx) - Docker CLI reference
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Container Runtime](./container-runtime.mdx) - Runtime internals
+- [Registry](./registry.mdx) - Image registries
+- [Troubleshooting](./troubleshooting.mdx) - Debugging containers

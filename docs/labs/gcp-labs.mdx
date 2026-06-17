@@ -1,0 +1,786 @@
+---
+sidebar_position: 4
+title: GCP Labs
+description: Hands-on Google Cloud Platform labs
+---
+
+# GCP Labs
+
+## Overview
+
+Master Google Cloud Platform through hands-on labs covering compute, storage, networking, and security services. These labs use real gcloud commands and console procedures.
+
+## Prerequisites
+
+- Google Cloud account with billing enabled
+- Google Cloud SDK installed and authenticated
+- Basic cloud concepts (VM, storage, networking)
+
+### Required Setup
+
+```bash
+# Authenticate and set project
+gcloud auth login
+gcloud projects list
+gcloud config set project YOUR_PROJECT_ID
+
+# Set default region and zone
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-a
+
+# Verify setup
+gcloud info
+gcloud compute instances list
+```
+
+---
+
+## Lab 1: Compute Engine VM Management
+
+**Objective**: Create, configure, and manage Compute Engine virtual machines
+**Estimated Time**: 35 minutes
+**Prerequisites**: GCP project with billing enabled
+
+### Step-by-Step
+
+#### 1. Create a VM Instance
+
+```bash
+# Create a basic VM instance
+gcloud compute instances create my-first-vm \
+    --machine-type=e2-medium \
+    --zone=us-central1-a \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --boot-disk-size=20GB \
+    --boot-disk-type=pd-standard
+
+# Create VM with custom configuration
+gcloud compute instances create production-vm \
+    --machine-type=e2-standard-2 \
+    --zone=us-central1-a \
+    --image-family=ubuntu-2204-lts \
+    --image-project=ubuntu-os-cloud \
+    --boot-disk-size=50GB \
+    --boot-disk-type=pd-ssd \
+    --network-interface=subnet=default,network-tier=PREMIUM \
+    --metadata=startup-script='#!/bin/bash
+apt-get update
+apt-get install -y nginx' \
+    --tags=http-server,https-server \
+    --labels=environment=production
+
+# List all instances
+gcloud compute instances list
+
+# Describe a specific instance
+gcloud compute instances describe my-first-vm --zone=us-central1-a
+```
+
+#### 2. SSH and Manage VM
+
+```bash
+# SSH to instance (using OS Login)
+gcloud compute ssh my-first-vm --zone=us-central1-a
+
+# SSH with specific user
+gcloud compute ssh user@my-first-vm --zone=us-central1-a
+
+# Copy files to instance
+gcloud compute scp ./local-file.txt my-first-vm:/tmp/ --zone=us-central1-a
+
+# Copy files from instance
+gcloud compute scp my-first-vm:/var/log/syslog ./syslog-copy.txt --zone=us-central1-a
+
+# Start/Stop instance
+gcloud compute instances start my-first-vm --zone=us-central1-a
+gcloud compute instances stop my-first-vm --zone=us-central1-a
+```
+
+#### 3. Configure VM Access
+
+```bash
+# Create instance with service account
+gcloud compute instances create vm-with-sa \
+    --service-account=YOUR_SERVICE_ACCOUNT@YOUR_PROJECT.iam.gserviceaccount.com \
+    --scopes=cloud-platform
+
+# Add custom metadata
+gcloud compute instances add-metadata my-first-vm \
+    --zone=us-central1-a \
+    --metadata=environment=development,team=devops
+
+# Add startup script from Cloud Storage
+gcloud compute instances add-metadata my-first-vm \
+    --zone=us-central1-a \
+    --metadata-from-file=startup-script=./startup.sh
+
+# Set instance metadata
+gcloud compute instances set-machine-type my-first-vm \
+    --zone=us-central1-a \
+    --machine-type=e2-standard-4
+```
+
+#### 4. Instance Groups
+
+```bash
+# Create unmanaged instance group
+gcloud compute instance-groups unmanaged create my-group \
+    --zone=us-central1-a
+
+# Add instances to group
+gcloud compute instance-groups unmanaged add-instances my-group \
+    --zone=us-central1-a \
+    --instances=my-first-vm,production-vm
+
+# List instances in group
+gcloud compute instance-groups unmanaged list-instances my-group --zone=us-central1-a
+```
+
+### Validation
+
+```bash
+# Verify VM is running
+gcloud compute instances describe my-first-vm --zone=us-central1-a --format="get(status)"
+
+# SSH and verify nginx is running (for production-vm)
+gcloud compute ssh production-vm --zone=us-central1-a --command="curl -s localhost"
+
+# Check instance resources
+gcloud compute instances list --format="table(name,zone,machineType,status)"
+```
+
+### Cleanup
+
+```bash
+# Delete instances
+gcloud compute instances delete my-first-vm --zone=us-central1-a --quiet
+gcloud compute instances delete production-vm --zone=us-central1-a --quiet
+gcloud compute instances delete vm-with-sa --zone=us-central1-a --quiet
+gcloud compute instance-groups unmanaged delete my-group --zone=us-central1-a --quiet
+```
+
+---
+
+## Lab 2: Cloud Storage and Buckets
+
+**Objective**: Create and manage Cloud Storage buckets, manage access, and use lifecycle policies
+**Estimated Time**: 30 minutes
+**Prerequisites**: GCP project with billing enabled
+
+### Step-by-Step
+
+#### 1. Create and Configure Buckets
+
+```bash
+# Create a bucket (globally unique name required)
+gcloud storage buckets create gs://my-devops-bucket-12345 \
+    --location=US \
+    --uniform-bucket-level-access
+
+# Create bucket with specific settings
+gcloud storage buckets create gs://prod-data-bucket-$(date +%Y%m%d) \
+    --location=us-central1 \
+    --storage-class=STANDARD \
+    --uniform-bucket-level-access \
+    --labels=environment=production,team=devops
+
+# List buckets
+gcloud storage buckets list
+
+# Get bucket info
+gcloud storage buckets describe gs://my-devops-bucket-12345
+```
+
+#### 2. Upload and Manage Objects
+
+```bash
+# Create sample files
+echo "Log data $(date)" > app.log
+echo "Config data" > config.json
+
+# Upload files
+gcloud storage cp ./app.log gs://my-devops-bucket-12345/
+gcloud storage cp ./config.json gs://my-devops-bucket-12345/configs/
+
+# Upload directory recursively
+gcloud storage cp ./local-folder gs://my-devops-bucket-12345/backup/ --recursive
+
+# List bucket contents
+gcloud storage ls gs://my-devops-bucket-12345/
+gcloud storage ls -l gs://my-devops-bucket-12345/**
+
+# Download files
+gcloud storage cp gs://my-devops-bucket-12345/app.log ./
+
+# Delete object
+gcloud storage rm gs://my-devops-bucket-12345/app.log
+```
+
+#### 3. Configure Bucket Permissions
+
+```bash
+# Make bucket publicly readable
+gcloud storage buckets add-iam-policy-binding gs://my-devops-bucket-12345 \
+    --member=allUsers \
+    --role=roles/storage.objectViewer
+
+# Grant specific user access
+gcloud storage buckets add-iam-policy-binding gs://my-devops-bucket-12345 \
+    --member=user:developer@example.com \
+    --role=roles/storage.objectCreator
+
+# Grant service account access
+gcloud storage buckets add-iam-policy-binding gs://my-devops-bucket-12345 \
+    --member=serviceAccount:my-sa@my-project.iam.gserviceaccount.com \
+    --role=roles/storage.admin
+
+# View IAM policy
+gcloud storage buckets get-iam-policy gs://my-devops-bucket-12345
+
+# Use signed URLs for temporary access
+gcloud storage sign-url gs://my-devops-bucket-12345/secret-file.txt \
+    --expiry=2025-12-31T23:59:59Z \
+    --signing-account=my-sa@my-project.iam.gserviceaccount.com
+```
+
+#### 4. Lifecycle Policies
+
+```bash
+# Create lifecycle policy JSON
+cat > lifecycle.json << 'EOF'
+{
+  "rule": [
+    {
+      "action": {"type": "Delete"},
+      "condition": {
+        "age": 30,
+        "isLive": true
+      }
+    },
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "COLDLINE"},
+      "condition": {
+        "age": 90,
+        "isLive": true
+      }
+    }
+  ]
+}
+EOF
+
+# Apply lifecycle policy
+gcloud storage buckets update gs://my-devops-bucket-12345 \
+    --lifecycle-file=lifecycle.json
+
+# Verify lifecycle
+gcloud storage buckets describe gs://my-devops-bucket-12345 --format="get(lifecycle)"
+```
+
+### Validation
+
+```bash
+# List buckets and verify creation
+gcloud storage ls
+
+# Verify file upload
+gcloud storage ls -l gs://my-devops-bucket-12345/
+
+# Test public access (if enabled)
+curl -s "https://storage.googleapis.com/my-devops-bucket-12345/app.log"
+
+# Verify lifecycle policy
+gcloud storage buckets describe gs://my-devops-bucket-12345 | grep -A5 lifecycle
+```
+
+### Cleanup
+
+```bash
+# Delete all objects in bucket
+gcloud storage rm -r gs://my-devops-bucket-12345/**
+
+# Delete bucket
+gcloud storage buckets delete gs://my-devops-bucket-12345
+gcloud storage buckets delete gs://prod-data-bucket-$(date +%Y%m%d)
+
+# Remove lifecycle file
+rm -f lifecycle.json
+```
+
+---
+
+## Lab 3: VPC Networking
+
+**Objective**: Create custom VPC networks, subnets, firewall rules, and configure private connectivity
+**Estimated Time**: 40 minutes
+**Prerequisites**: GCP project with billing enabled, sufficient IAM permissions
+
+### Step-by-Step
+
+#### 1. Create Custom VPC
+
+```bash
+# Create custom VPC network
+gcloud compute networks create my-vpc \
+    --subnet-mode=custom \
+    --bgp-routing-mode=regional
+
+# Create subnet
+gcloud compute networks subnets create private-subnet \
+    --network=my-vpc \
+    --region=us-central1 \
+    --range=10.0.0.0/24 \
+    --enable-private-ip-google-access \
+    --secondary-range pods=10.4.0.0/16,services=10.5.0.0/20
+
+# Create additional subnet in different region
+gcloud compute networks subnets create web-subnet \
+    --network=my-vpc \
+    --region=us-east1 \
+    --range=192.168.0.0/24
+
+# List VPCs and subnets
+gcloud compute networks list
+gcloud compute networks subnets list
+```
+
+#### 2. Configure Firewall Rules
+
+```bash
+# Allow internal communication
+gcloud compute firewall-rules create allow-internal \
+    --network=my-vpc \
+    --allow=tcp,udp,icmp \
+    --source-ranges=10.0.0.0/16,192.168.0.0/16
+
+# Allow SSH from specific IP
+gcloud compute firewall-rules create allow-ssh \
+    --network=my-vpc \
+    --allow=tcp:22 \
+    --source-ranges=203.0.113.0/24 \
+    --target-tags=ssh-enabled
+
+# Allow HTTP/HTTPS
+gcloud compute firewall-rules create allow-http-https \
+    --network=my-vpc \
+    --allow=tcp:80,tcp:443 \
+    --target-tags=http-server,https-server
+
+# List firewall rules
+gcloud compute firewall-rules list --network=my-vpc
+
+# Delete firewall rule
+gcloud compute firewall-rules delete allow-ssh --quiet
+```
+
+#### 3. Cloud NAT Configuration
+
+```bash
+# Create router
+gcloud compute routers create my-router \
+    --network=my-vpc \
+    --region=us-central1
+
+# Configure NAT
+gcloud compute routers nats create my-nat \
+    --router=my-router \
+    --region=us-central1 \
+    --auto-allocate-nat-external-ips \
+    --nat-all-subnet-ip-ranges
+
+# Verify NAT configuration
+gcloud compute routers nats describe my-router --region=us-central1
+```
+
+#### 4. VPC Peering and Shared VPC
+
+```bash
+# Create VPC Peering (requires both projects to configure)
+gcloud compute networks peerings create peer-project-a-to-b \
+    --network=my-vpc \
+    --peer-network=other-vpc \
+    --export-custom-routes \
+    --import-custom-routes
+
+# Enable Private Google Access on subnet
+gcloud compute networks subnets update private-subnet \
+    --region=us-central1 \
+    --enable-private-ip-google-access
+
+# Create Private Service Access (for Cloud SQL, etc.)
+gcloud compute addresses create google-managed-services-my-vpc \
+    --global \
+    --purpose=VPC_PEERING \
+    --network=my-vpc
+
+gcloud services vpc-peerings connect \
+    --service=servicenetworking.googleapis.com \
+    --ranges=google-managed-services-my-vpc \
+    --network=my-vpc
+```
+
+### Validation
+
+```bash
+# Verify VPC creation
+gcloud compute networks describe my-vpc
+
+# Verify subnet
+gcloud compute networks subnets describe private-subnet --region=us-central1
+
+# List firewall rules
+gcloud compute firewall-rules list --filter="network:my-vpc"
+
+# Test connectivity by creating a VM
+gcloud compute instances create test-vm \
+    --zone=us-central1-a \
+    --machine-type=e2-micro \
+    --subnet=private-subnet \
+    --no-address \
+    --tags=ssh-enabled
+
+gcloud compute ssh test-vm --zone=us-central1-a --command="curl -s ifconfig.me"
+```
+
+### Cleanup
+
+```bash
+# Delete test VM
+gcloud compute instances delete test-vm --zone=us-central1-a --quiet
+
+# Delete NAT and router
+gcloud compute routers nats delete my-nat --router=my-router --region=us-central1 --quiet
+gcloud compute routers delete my-router --region=us-central1 --quiet
+
+# Delete firewall rules
+gcloud compute firewall-rules delete allow-internal --quiet
+gcloud compute firewall-rules delete allow-ssh --quiet
+gcloud compute firewall-rules delete allow-http-https --quiet
+
+# Delete subnets
+gcloud compute networks subnets delete private-subnet --region=us-central1 --quiet
+gcloud compute networks subnets delete web-subnet --region=us-east1 --quiet
+
+# Delete VPC
+gcloud compute networks delete my-vpc --quiet
+```
+
+---
+
+## Lab 4: Cloud SQL Database Setup
+
+**Objective**: Create Cloud SQL instances, configure high availability, and manage databases
+**Estimated Time**: 35 minutes
+**Prerequisites**: GCP project with billing enabled
+
+### Step-by-Step
+
+#### 1. Create Cloud SQL Instance
+
+```bash
+# Create MySQL instance
+gcloud sql instances create my-sql-instance \
+    --database-version=MYSQL_8_0 \
+    --tier=db-f1-micro \
+    --region=us-central1 \
+    --storage-type=SSD \
+    --storage-size=10GB \
+    --availability-type=ZONAL
+
+# Create PostgreSQL instance with high availability
+gcloud sql instances create my-postgres-instance \
+    --database-version=POSTGRES_14 \
+    --tier=db-custom-2-8192 \
+    --region=us-central1 \
+    --storage-type=SSD \
+    --storage-size=20GB \
+    --availability-type=REGIONAL \
+    --network=my-vpc \
+    --no-assign-ip
+
+# Create read replica
+gcloud sql instances create my-read-replica \
+    --master-instance-name=my-postgres-instance \
+    --tier=db-custom-2-8192 \
+    --region=us-east1
+
+# List instances
+gcloud sql instances list
+```
+
+#### 2. Configure Database
+
+```bash
+# Create database
+gcloud sql databases create myappdb --instance=my-postgres-instance
+
+# Create user
+gcloud sql users create appuser \
+    --instance=my-postgres-instance \
+    --password=SECURE_PASSWORD_HERE
+
+# Update user password
+gcloud sql users set-password appuser \
+    --instance=my-postgres-instance \
+    --password=NEW_PASSWORD_HERE
+
+# List databases and users
+gcloud sql databases list --instance=my-postgres-instance
+gcloud sql users list --instance=my-postgres-instance
+```
+
+#### 3. Configure SSL/TLS
+
+```bash
+# Require SSL for instance
+gcloud sql instances patch my-postgres-instance \
+    --require-ssl
+
+# Generate and download client certificate
+gcloud sql ssl client-certs create client-cert \
+    --instance=my-postgres-instance
+
+gcloud sql ssl client-certs describe client-cert \
+    --instance=my-postgres-instance \
+    --format="get(clientCert.cert)" > client.pem
+
+gcloud sql ssl client-certs describe client-cert \
+    --instance=my-postgres-instance \
+    --format="get(clientCert.key)" > client.key
+
+# List SSL certs
+gcloud sql ssl client-certs list --instance=my-postgres-instance
+```
+
+#### 4. Backup and Maintenance
+
+```bash
+# Configure automated backups
+gcloud sql instances patch my-postgres-instance \
+    --backup-start-time=02:00 \
+    --enable-bin-log
+
+# Create manual backup
+gcloud sql backups create \
+    --instance=my-postgres-instance
+
+# List backups
+gcloud sql backups list --instance=my-postgres-instance
+
+# Restore from backup
+gcloud sql instances restore my-postgres-instance \
+    --restore-backup-id=BACKUP_ID
+```
+
+### Validation
+
+```bash
+# Verify instance is running
+gcloud sql instances describe my-postgres-instance --format="get(state)"
+
+# Connect from VM (if private IP configured)
+gcloud compute ssh test-vm --zone=us-central1-a --command="
+    PGPASSWORD=SECURE_PASSWORD_HERE psql -h PRIVATE_IP -U appuser -d myappdb -c 'SELECT 1;'
+"
+
+# Check instance metrics
+gcloud sql instances describe my-postgres-instance --format="get(settings.tier)"
+gcloud sql instances describe my-postgres-instance --format="get(settings.backupConfiguration.enabled)"
+```
+
+### Cleanup
+
+```bash
+# Delete read replica first
+gcloud sql instances delete my-read-replica --quiet
+
+# Delete main instance
+gcloud sql instances delete my-postgres-instance --quiet
+gcloud sql instances delete my-sql-instance --quiet
+
+# Remove SSL files
+rm -f client.pem client.key
+```
+
+---
+
+## Lab 5: Cloud Run Deployment
+
+**Objective**: Deploy containerized applications to Cloud Run with proper configuration
+**Estimated Time**: 30 minutes
+**Prerequisites**: GCP project, Docker installed, sample application
+
+### Step-by-Step
+
+#### 1. Prepare Application
+
+```bash
+# Create sample application
+mkdir cloudrun-app && cd cloudrun-app
+
+cat > app.py << 'EOF'
+from flask import Flask
+import os
+
+app = Flask(__name__)
+
+@app.route('/')
+def hello():
+    return f"Hello from Cloud Run! Host: {os.environ.get('HOSTNAME', 'unknown')}"
+
+@app.route('/health')
+def health():
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+EOF
+
+cat > requirements.txt << 'EOF'
+flask>=2.0
+EOF
+
+cat > Dockerfile << 'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+ENV PORT=8080
+CMD ["python", "app.py"]
+EOF
+
+# Test locally
+pip install -r requirements.txt
+python app.py &
+curl localhost:8080
+pkill -f "python app.py"
+```
+
+#### 2. Build and Push Container
+
+```bash
+# Configure Docker authentication
+gcloud auth configure-docker
+
+# Build image
+docker build -t gcr.io/YOUR_PROJECT_ID/cloudrun-app:v1 .
+
+# Push to Artifact Registry
+docker push gcr.io/YOUR_PROJECT_ID/cloudrun-app:v1
+
+# Or use Cloud Build
+gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/cloudrun-app:v1
+```
+
+#### 3. Deploy to Cloud Run
+
+```bash
+# Deploy with basic settings
+gcloud run deploy cloudrun-app \
+    --image=gcr.io/YOUR_PROJECT_ID/cloudrun-app:v1 \
+    --platform=managed \
+    --region=us-central1 \
+    --allow-unauthenticated
+
+# Deploy with custom settings
+gcloud run deploy cloudrun-app \
+    --image=gcr.io/YOUR_PROJECT_ID/cloudrun-app:v1 \
+    --platform=managed \
+    --region=us-central1 \
+    --memory=512Mi \
+    --cpu=1 \
+    --min-instances=1 \
+    --max-instances=10 \
+    --concurrency=80 \
+    --timeout=60 \
+    --set-env-vars="ENVIRONMENT=production" \
+    --vpc-connector=my-vpc-connector \
+    --service-account=my-sa@my-project.iam.gserviceaccount.com
+
+# List deployed services
+gcloud run services list
+
+# Get service URL
+gcloud run services describe cloudrun-app --region=us-central1 --format="get(status.url)"
+```
+
+#### 4. Configure Traffic and Revisions
+
+```bash
+# Update service (creates new revision)
+gcloud run deploy cloudrun-app \
+    --image=gcr.io/YOUR_PROJECT_ID/cloudrun-app:v2 \
+    --region=us-central1
+
+# Split traffic between revisions
+gcloud run services update-traffic cloudrun-app \
+    --region=us-central1 \
+    --to-revisions=v1=50,v2=50
+
+# Set tag for canary testing
+gcloud run deploy cloudrun-app \
+    --image=gcr.io/YOUR_PROJECT_ID/cloudrun-app:v3 \
+    --tag=canary \
+    --region=us-central1
+
+# Get canary URL
+gcloud run services describe cloudrun-app \
+    --region=us-central1 \
+    --format="get(status.traffic[0].url)"
+```
+
+### Validation
+
+```bash
+# Test deployed service
+SERVICE_URL=$(gcloud run services describe cloudrun-app --region=us-central1 --format="get(status.url)")
+curl -s $SERVICE_URL
+
+# Test health endpoint
+curl -s ${SERVICE_URL}health
+
+# Check logs
+gcloud run services logs read cloudrun-app --region=us-central1 --limit=50
+
+# Verify scaling
+hey -z 60s -c 50 ${SERVICE_URL}
+# Watch scaling in another terminal:
+watch gcloud run services describe cloudrun-app --region=us-central1
+```
+
+### Cleanup
+
+```bash
+# Delete service
+gcloud run services delete cloudrun-app --region=us-central1 --quiet
+
+# Delete container image
+gcloud container images delete gcr.io/YOUR_PROJECT_ID/cloudrun-app:v1 --quiet
+gcloud container images delete gcr.io/YOUR_PROJECT_ID/cloudrun-app:v2 --quiet
+
+# Clean up local files
+cd .. && rm -rf cloudrun-app
+```
+
+---
+
+## Interview Prep Connections
+
+Review these common GCP interview topics:
+
+- [GCP Compute Engine](/docs/gcp/compute)
+- [GCP Networking](/docs/gcp/networking)
+- [GCP Security](/docs/gcp/security)
+
+Common interview questions:
+- "How would you design a highly available architecture on GCP?"
+- "Explain the difference between Cloud Run and GKE"
+- "How do you secure a VM instance in GCP?"
+- "Walk me through setting up a VPC with private connectivity"
+
+## Related Topics
+
+- [Kubernetes on GCP](/labs/kubernetes-labs)
+- [Terraform GCP Resources](/labs/terraform-labs)
+- [CI/CD on GCP](/labs/cicd-labs)

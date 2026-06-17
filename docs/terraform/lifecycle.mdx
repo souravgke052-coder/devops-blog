@@ -1,0 +1,934 @@
+# Terraform Lifecycle
+
+## Overview
+
+The lifecycle block in Terraform controls how resources are created, updated, and destroyed. Understanding lifecycle management is essential for zero-downtime deployments, data safety, and handling complex infrastructure changes.
+
+## When To Use
+
+- **Zero-downtime deployments**: Use `create_before_destroy` for in-place updates
+- **Prevent accidental deletion**: Protect critical resources with `prevent_destroy`
+- **Ignore external changes**: Don't reconcile changes made outside Terraform
+- **Custom update behavior**: Control how updates are applied
+
+## When NOT To Use
+
+- **Default behavior is acceptable**: Terraform's default create-before-destroy for most resources
+- **Temporary resources**: Lifecycle policies add unnecessary complexity
+
+## Core Concepts
+
+### Lifecycle Block
+
+```hcl
+resource "google_compute_instance" "example" {
+  # Resource configuration
+  
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy       = false
+    ignore_changes        = []
+  }
+}
+```
+
+### Default Behavior
+
+```
+Terraform Default Lifecycle:
+1. Create new resource
+2. Update dependencies
+3. Destroy old resource
+```
+
+### Custom Lifecycle
+
+```
+Custom Lifecycle (create_before_destroy = true):
+1. Create new resource
+2. Update dependencies to new resource
+3. Destroy old resource
+```
+
+## Real Production Example
+
+### Zero-Downtime Deployment
+
+```hcl
+# =============================================================================
+# Instance Template with Create Before Destroy
+# =============================================================================
+
+resource "google_compute_instance_template" "app" {
+  name        = "app-template-${var.environment}"
+  description = "Application instance template"
+  
+  machine_type = var.machine_type
+  
+  service_account {
+    email  = google_service_account.app.email
+    scopes = ["cloud-platform"]
+  }
+  
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+    
+    disk_size_gb = var.disk_size
+    disk_type    = "pd-ssd"
+  }
+  
+  network_interface {
+    network    = google_compute_network.vpc.id
+    subnetwork = google_compute_subnetwork.subnet.id
+    
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# =============================================================================
+# Managed Instance Group with Rolling Updates
+# =============================================================================
+
+resource "google_compute_region_instance_group_manager" "app_mig" {
+  name                  = "app-mig-${var.environment}"
+  base_instance_name    = "app"
+  region                = var.region
+  target_size           = var.target_size
+  
+  version {
+    name            = "v1"
+    instance_template = google_compute_instance_template.app.id
+  }
+  
+  # Auto-healing
+  auto_healing_policies {
+    initial_delay_sec = 60
+    health_check      = google_compute_health_check.app.id
+  }
+  
+  # Rolling update policy for zero-downtime
+  update_policy {
+    type                  = "ROLLING_TYPE_UPDATE"
+    minimal_action        = "REPLACE"
+    max_surge_fixed       = 3
+    max_unavailable_fixed = 0
+    min_ready_sec         = 60
+    
+    # For canary deployments
+    rolling_update_policy {
+      type                   = "PROACTIVE"  # PROACTIVE or OPPORTUNISTIC
+      minimal_action         = "REPLACE"
+      max_surge_fixed        = 3
+      max_unavailable_fixed  = 0
+      replacement_method     = "RECREATE"  # or "SUBSTITUTE"
+    }
+  }
+  
+  # Stateful MIG configuration
+  stateful_disks {
+    device_name = "boot"
+    source      = google_compute_instance_template.app.disks[0].source
+    mode        = "READ_ONLY"  # or READ_WRITE
+  }
+  
+  # Wait for instances to be created
+  wait_for_instances = true
+  wait_for_instances_stady = true
+}
+
+# =============================================================================
+# Cloud SQL with Create Before Destroy
+# =============================================================================
+
+resource "google_sql_database_instance" "postgres" {
+  name             = "postgres-${var.environment}"
+  database_version = "POSTGRES_15"
+  region           = var.region
+  
+  deletion_protection = true
+  
+  settings {
+    tier              = var.db_tier
+    availability_type = "REGIONAL"
+    
+    disk_size = var.db_disk_size
+    disk_type = "PD_SSD"
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+      require_ssl     = true
+    }
+  }
+  
+  # For major version upgrades
+  lifecycle {
+    create_before_destroy = true
+    
+    # Ignore automatic backups being added
+    ignore_changes = [
+      settings[0].backup_configuration[0].backup_retention_settings,
+    ]
+  }
+}
+
+# =============================================================================
+# GKE Cluster with Lifecycle
+# =============================================================================
+
+resource "google_container_cluster" "primary" {
+  name     = "gke-${var.environment}"
+  location = var.region
+  
+  # Node pool management
+  node_pool {
+    name       = "default-pool"
+    node_count = var.node_count
+    
+    node_config {
+      machine_type = "e2-medium"
+      disk_size_gb = 100
+      disk_type    = "pd-ssd"
+      
+      oauth_scopes = [
+        "https://www.googleapis.com/auth/cloud-platform"
+      ]
+    }
+    
+    management {
+      auto_repair  = true
+      auto_upgrade = true
+    }
+    
+    # Enable auto-scaling
+    autoscaling {
+      min_node_count = var.min_nodes
+      max_node_count = var.max_nodes
+    }
+  }
+  
+  # Network configuration
+  network    = google_compute_network.vpc.name
+  subnetwork = google_compute_subnetwork.subnet.name
+  
+  # Private cluster
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = true
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+  
+  # IP allocation
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+  }
+  
+  # Maintenance windows
+  maintenance_policy {
+    daily_maintenance_window {
+      start_time = "04:00"
+    }
+  }
+  
+  # Shielded nodes
+  shielded_nodes {
+    enable_secure_boot = true
+    enable_integrity_monitoring = true
+  }
+  
+  lifecycle {
+    # Allow node pool updates without cluster replacement
+    ignore_changes = [
+      node_pool,
+      node_config,
+    ]
+  }
+}
+
+# =============================================================================
+# Disk with Prevent Destroy
+# =============================================================================
+
+resource "google_compute_disk" "data" {
+  name  = "data-disk-${var.environment}"
+  zone  = "${var.region}-a"
+  size  = var.disk_size
+  type  = "pd-ssd"
+  
+  labels = {
+    environment = var.environment
+    persistent  = "true"
+  }
+  
+  lifecycle {
+    prevent_destroy = true  # Cannot delete unless explicitly set to false
+  }
+}
+
+# =============================================================================
+# Firewall Rules with Ignore Changes
+# =============================================================================
+
+resource "google_compute_firewall" "app" {
+  name        = "allow-app-${var.environment}"
+  network     = google_compute_network.vpc.name
+  direction   = "INGRESS"
+  priority    = 1000
+  
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["app"]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443", "8080"]
+  }
+  
+  # Ignore changes to enableLogging (may be modified by external processes)
+  lifecycle {
+    ignore_changes = [
+      enable_logging,
+    ]
+  }
+}
+
+# =============================================================================
+# Service Account with Lifecycle
+# =============================================================================
+
+resource "google_service_account" "app" {
+  account_id   = "app-${var.environment}"
+  display_name = "App Service Account"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# =============================================================================
+# GCS Bucket with Lifecycle Rules
+# =============================================================================
+
+resource "google_storage_bucket" "data" {
+  name          = "${var.project_id}-data-${var.environment}"
+  location      = var.region
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  versioning {
+    enabled = true
+  }
+  
+  # Object lifecycle management
+  lifecycle_rule {
+    condition {
+      age = 7  # 7 days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age             = 30
+      is_live         = false  # Noncurrent versions
+      matches_prefix  = ["archive/"]
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age             = 90
+      is_live         = false
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# =============================================================================
+# KMS Key with Prevent Destroy
+# =============================================================================
+
+resource "google_kms_key_ring" "keyring" {
+  name     = "keyring-${var.environment}"
+  location = "global"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_kms_key" "encryption_key" {
+  name         = "encryption-key-${var.environment}"
+  key_ring     = google_kms_key_ring.keyring.key_ring
+  purpose      = "ENCRYPT_DECRYPT"
+  
+  rotation_period = "7776000s"  # 90 days
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# =============================================================================
+# VPC with Prevent Destroy
+# =============================================================================
+
+resource "google_compute_network" "vpc" {
+  name                    = "vpc-${var.environment}"
+  auto_create_subnetworks = false
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# =============================================================================
+# Custom Diff Suppression for Tags
+# =============================================================================
+
+resource "google_compute_instance" "app" {
+  name         = "app-server"
+  machine_type = "e2-medium"
+  zone         = "${var.region}-a"
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+    }
+  }
+  
+  network_interface {
+    network = google_compute_network.vpc.name
+  }
+  
+  # Terraform's diff suppression for tags
+  # Custom function would be defined in provider or external
+  
+  lifecycle {
+    ignore_changes = [
+      labels,
+      metadata,
+    ]
+  }
+}
+```
+
+### Timeouts Configuration
+
+```hcl
+# Timeouts for resource operations
+resource "google_sql_database_instance" "postgres" {
+  # ...
+  
+  timeouts {
+    create = "30m"  # Default: 20m
+    update = "30m"  # Default: 20m
+    delete = "30m"  # Default: 20m
+    read   = "20m"  # Default: 20m
+  }
+}
+
+resource "google_container_cluster" "primary" {
+  # ...
+  
+  timeouts {
+    create = "30m"
+    update = "30m"
+    delete = "30m"
+  }
+}
+
+# For Google Compute resources
+resource "google_compute_instance" "app" {
+  # ...
+  
+  timeouts {
+    create = "10m"
+    update = "10m"
+    delete = "10m"
+  }
+}
+```
+
+## HCL Examples
+
+### Create Before Destroy
+
+```hcl
+# Enables zero-downtime updates
+resource "google_compute_instance_template" "app" {
+  # ...
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Use case: Database instance with attached disk
+resource "google_sql_database_instance" "db" {
+  name = "postgres-db"
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "google_sql_database_instance" "db_read" {
+  name = "postgres-db-read"
+  
+  # Read replica follows primary
+  replica_configuration {
+    failover_target = google_sql_database_instance.db.id
+  }
+}
+```
+
+### Prevent Destroy
+
+```hcl
+# Critical resources that should never be accidentally deleted
+resource "google_kms_key" "critical" {
+  name = "critical-key"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Set to false only during intentional migration
+resource "google_kms_key" "critical" {
+  name = "critical-key"
+  
+  lifecycle {
+    prevent_destroy = false  # Set to allow destruction
+  }
+}
+```
+
+### Ignore Changes
+
+```hcl
+# Ignore changes made outside Terraform
+resource "google_compute_instance" "app" {
+  # ...
+  
+  lifecycle {
+    ignore_changes = [
+      # Ignore metadata changes (may be set by external systems)
+      metadata,
+      # Ignore tags modified by other tools
+      labels,
+    ]
+  }
+}
+
+# Use with tags for GitOps scenarios
+resource "google_compute_instance" "app" {
+  name = "app-server"
+  tags = ["app"]
+  
+  lifecycle {
+    ignore_changes = [
+      tags,  # GitOps tool adds tags
+    ]
+  }
+}
+```
+
+### Combined Lifecycle
+
+```hcl
+resource "google_compute_instance_template" "app" {
+  name = "app-template"
+  
+  lifecycle {
+    create_before_destroy = true
+    # Cannot use prevent_destroy on instance templates
+    ignore_changes = [
+      metadata,
+    ]
+  }
+}
+```
+
+## CLI Examples
+
+### Plan with Lifecycle
+
+```bash
+# Plan with lifecycle preview
+terraform plan -out=tfplan
+
+# Show lifecycle changes
+terraform show -json tfplan | jq '.resource_changes[].change.lifecycle'
+
+# Plan specific resource with lifecycle
+terraform plan -target=google_compute_instance_template.app -out=tfplan
+```
+
+### Lifecycle and State
+
+```bash
+# See lifecycle in state
+terraform state show google_compute_instance_template.app
+
+# Check for create_before_destroy flag
+terraform state show google_kms_key.encryption_key | grep -A 10 lifecycle
+```
+
+### Destroy Operations
+
+```bash
+# Attempt destroy on protected resource
+terraform destroy
+# Error: Cannot destroy resource with prevent_destroy lifecycle
+
+# Force destroy (requires setting lifecycle.prevent_destroy = false)
+terraform destroy -auto-approve
+
+# Force destroy specific resource
+terraform destroy -target=google_kms_key.encryption_key -auto-approve
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform plan` | Show planned lifecycle changes |
+| `terraform apply` | Execute lifecycle changes |
+| `terraform destroy` | Destroy with lifecycle policies |
+| `terraform state show` | Show resource lifecycle config |
+| `terraform graph` | Show dependency graph |
+
+## Best Practices
+
+### 1. Use Create Before Destroy for Critical Services
+
+```hcl
+# For databases, use create_before_destroy for major version upgrades
+resource "google_sql_database_instance" "postgres" {
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+### 2. Protect Critical Resources
+
+```hcl
+# Always protect production resources
+resource "google_kms_key" "prod_key" {
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_sql_database_instance" "prod_db" {
+  deletion_protection = true
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+### 3. Use Ignore Changes for External Modifications
+
+```hcl
+# When using GitOps or external automation
+resource "google_compute_instance" "app" {
+  lifecycle {
+    # Ignore tags added by GitOps system
+    ignore_changes = [labels, metadata]
+  }
+}
+```
+
+### 4. Configure Timeouts
+
+```hcl
+# Large resources need longer timeouts
+resource "google_container_cluster" "primary" {
+  timeouts {
+    create = "45m"
+    update = "45m"
+    delete = "45m"
+  }
+}
+```
+
+### 5. State Management for Stateful Resources
+
+```hcl
+# Stateful MIG keeps instance state
+resource "google_compute_region_instance_group_manager" "stateful" {
+  # Stateful disks preserved across instance recreation
+  stateful_disks {
+    device_name = "data-disk"
+    mode        = "READ_WRITE"
+  }
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+### 6. Canary Deployments
+
+```hcl
+# Deploy to subset of instances first
+resource "google_compute_region_instance_group_manager" "mig" {
+  version {
+    instance_template = google_compute_instance_template.canary.id
+    target_size       = 1  # Only 1 canary instance
+  }
+  
+  # Then roll out to remaining
+  update_policy {
+    rolling_update_policy {
+      type                   = "PROACTIVE"
+      minimal_action         = "REPLACE"
+      max_surge_fixed        = 3
+      max_unavailable_fixed  = 0
+    }
+  }
+}
+```
+
+## Monitoring / State Management
+
+### Lifecycle State Changes
+
+```bash
+# View planned changes with lifecycle
+terraform plan -out=tfplan
+terraform show -json tfplan | jq '.resource_changes[] | select(.change.actions | contains(["delete"]))'
+
+# Check create_before_destroy ordering
+terraform graph | grep -A 5 "create_before_destroy"
+```
+
+### Lifecycle and State Lock
+
+```bash
+# Long-running operations hold state lock
+# Create before destroy: create new -> update dependencies -> delete old
+# Without: create new -> delete old -> update dependencies (breaks dependencies)
+
+terraform apply  # May take longer with create_before_destroy
+```
+
+## Security
+
+### Lifecycle for Security Resources
+
+```hcl
+# Encryption keys should never be accidentally deleted
+resource "google_kms_key" "encryption" {
+  name = "encryption-key"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Service accounts should be protected
+resource "google_service_account" "app" {
+  account_id = "app-service"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Firewalls should have controlled deletion
+resource "google_compute_firewall" "default" {
+  name = "default-allow-internal"
+  
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes  = [enable_logging]
+  }
+}
+```
+
+## Cost Optimization
+
+### Lifecycle for Cost Management
+
+```hcl
+# Schedule-based lifecycle for non-production resources
+resource "google_compute_instance" "dev_server" {
+  name = "dev-server"
+  
+  # Use preemptible for cost savings
+  scheduling {
+    preemptible = true
+  }
+  
+  lifecycle {
+    # Recreate every week to clean up
+    create_before_destroy = true
+  }
+}
+
+# Use lifecycle for spot instance handling
+resource "google_compute_instance_template" "batch" {
+  name = "batch-template"
+  
+  scheduling {
+    preemptible = true
+    automatic_restart = false
+  }
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+## Troubleshooting
+
+### Prevent Destroy Error
+
+```bash
+# Error: Cannot destroy resource
+# Solution: Set prevent_destroy to false before destroy
+# Edit resource:
+lifecycle {
+  prevent_destroy = false
+}
+
+terraform apply
+terraform destroy
+```
+
+### Create Before Destroy Loop
+
+```bash
+# Error: Cyclic dependency
+# Solution: Break the cycle
+# Use depends_on to establish explicit ordering
+resource "google_sql_database_instance" "db" {
+  depends_on = [google_service_account.app]
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+### Ignore Changes Not Working
+
+```bash
+# If ignore_changes doesn't prevent updates:
+# 1. Verify syntax is correct
+# 2. Check Terraform version supports the attribute
+# 3. Use precondition/postcondition instead
+
+# Some attributes cannot be ignored
+lifecycle {
+  ignore_changes = [
+    # Cannot ignore computed attributes
+    id,
+    self_link,
+  ]
+}
+```
+
+### Timeout Issues
+
+```bash
+# Error: Timeout during operation
+# Solution: Increase timeouts
+resource "google_container_cluster" "primary" {
+  timeouts {
+    create = "60m"
+    update = "60m"
+    delete = "60m"
+  }
+}
+```
+
+## Interview Questions
+
+### Q1: What is `create_before_destroy` lifecycle policy?
+**A:** Creates new resource before destroying old one. Enables zero-downtime updates but doubles resource count during updates.
+
+### Q2: When should you use `prevent_destroy`?
+**A:** On critical resources that should never be deleted - encryption keys, service accounts, production databases, VPCs.
+
+### Q3: What does `ignore_changes` do?
+**A:** Tells Terraform to ignore changes made to specific attributes outside of Terraform - useful for GitOps or external automation.
+
+### Q4: Can you use `prevent_destroy` on instance templates?
+**A:** No, instance templates don't have state so `prevent_destroy` has no effect. Use it on persistent resources like disks, databases, KMS keys.
+
+### Q5: How do timeouts work in Terraform?
+**A:** `timeouts` block configures duration for create/update/delete operations. If operation exceeds timeout, Terraform fails with timeout error.
+
+### Q6: What's the difference between lifecycle and timeouts?
+**A:** Lifecycle controls create/destroy ordering and behavior. Timeouts control how long operations can take before failing.
+
+### Q7: How do you do canary deployments with Terraform?
+**A:** Create new instance template with canary changes, deploy to small subset via target_size, then update policy to roll out gradually.
+
+### Q8: What happens if prevent_destroy is true and you run terraform destroy?
+**A:** Terraform will fail with error: "Cannot destroy resource." Must set to false first.
+
+## Cheat Sheet
+
+### Lifecycle Block
+```hcl
+lifecycle {
+  create_before_destroy = true   # Create before destroy
+  prevent_destroy       = true   # Block destruction
+  ignore_changes        = [...]  # Ignore external changes
+}
+```
+
+### Timeouts Block
+```hcl
+timeouts {
+  create = "30m"
+  update = "30m"
+  delete = "30m"
+  read   = "20m"
+}
+```
+
+### Common Lifecycle Patterns
+| Pattern | Use Case |
+|---------|----------|
+| `create_before_destroy` | Zero-downtime updates, databases |
+| `prevent_destroy` | Production databases, KMS keys, VPCs |
+| `ignore_changes` | Tags, labels, GitOps scenarios |
+
+## Related Topics
+
+- [Resources](./resources.mdx) - Resource configuration
+- [State](./state.mdx) - State management
+- [GCP Automation](./gcp-automation.mdx) - GCP-specific automation
+- [CI/CD](./cicd.mdx) - CI/CD integration

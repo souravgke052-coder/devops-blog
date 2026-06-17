@@ -1,0 +1,807 @@
+---
+sidebar_position: 8
+---
+
+# CI/CD Troubleshooting Guide
+
+## Overview
+
+CI/CD pipelines are the backbone of modern software delivery. When they fail, delivery stops. This guide covers systematic approaches to debugging build failures, authentication issues, artifact problems, and deployment errors across major CI/CD systems.
+
+## When To Use
+
+- **Build Failures**: Compilation errors, test failures, dependency issues
+- **Pipeline Hangs**: Jobs stuck, timeouts, deadlocks
+- **Authentication Issues**: Git access, registry login, cloud auth
+- **Artifact Problems**: Corruption, missing artifacts, version mismatches
+- **Deployment Failures**: Rollout issues, health check failures
+- **Webhook Problems**: Webhook delivery failures, signature verification
+
+## When NOT To Use
+
+- **Application Bugs**: These require application debugging
+- **Infrastructure Provisioning**: Use Terraform troubleshooting
+- **Container Runtime Issues**: Use Kubernetes troubleshooting
+- **Network Infrastructure**: Use network troubleshooting guide
+
+## Core Concepts / Methodology
+
+### CI/CD Debugging Philosophy
+
+CI/CD pipelines have multiple failure points:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              CI/CD PIPELINE STAGES                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. SOURCE                                                   │
+│     └─ Git clone, checkout, webhook triggers                │
+│     └─ Debug: Check credentials, branch, webhook logs       │
+│                                                             │
+│  2. BUILD                                                    │
+│     ├─ Dependency installation                              │
+│     ├─ Compilation/Transpilation                           │
+│     └─ Debug: Package manager logs, build tool output       │
+│                                                             │
+│  3. TEST                                                     │
+│     ├─ Unit tests                                          │
+│     ├─ Integration tests                                   │
+│     └─ Debug: Test logs, coverage reports                   │
+│                                                             │
+│  4. ARTIFACT                                                 │
+│     ├─ Package creation                                    │
+│     ├─ Image build                                         │
+│     └─ Debug: Build context, layer cache, artifact storage  │
+│                                                             │
+│  5. DEPLOY                                                   │
+│     ├─ Environment preparation                             │
+│     ├─ Actual deployment                                   │
+│     └─ Debug: Deployment logs, health checks                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Understanding Pipeline Logs
+
+Pipeline logs are your primary debugging tool:
+
+```
+Build Log Structure:
+┌─────────────────────────────────────────────────────────────┐
+│ [2026-06-16 10:00:00] Pipeline started                      │
+│ [2026-06-16 10:00:01] Checkout: Fetching main branch        │
+│ [2026-06-16 10:00:05] Install: npm ci --legacy-peer-deps   │
+│ [2026-06-16 10:02:15] Build: npm run build                 │
+│ [2026-06-16 10:04:30] Test: npm test                       │
+│ [2026-06-16 10:05:00] ERROR: Test suite failed             │
+│ [2026-06-16 10:05:01]  FAIL: src/components/Button.test.tsx│
+│ [2026-06-16 10:05:01]  Expected: "Submit"                   │
+│ [2026-06-16 10:05:01]  Received: "Save"                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Diagnostic Commands / Tools
+
+### GitHub Actions Debugging
+
+```bash
+# Enable step debugging (in workflow or secrets)
+# Add to workflow:
+# env:
+#   ACTIONS_STEP_DEBUG: true
+
+# Download logs
+gh api repos/:owner/:repo/actions/runs/:run_id/logs --field follow=true --field accept=application/zip
+
+# List workflow runs
+gh run list --workflow=pipeline.yml --limit=10
+
+# Watch run progress
+gh run watch
+
+# Rerun failed job
+gh run rerun --job=job-id
+
+# Cancel workflow
+gh run cancel run-id
+
+# View run details
+gh run view run-id --log
+```
+
+### GitLab CI Debugging
+
+```bash
+# Trigger pipeline manually
+gitlab trigger pipeline -p main --token=trigger-token
+
+# Download job logs
+gitlab runner job list --status=failed
+gitlab job trace job-id
+
+# Debug runner
+gitlab-runner verify --delete
+
+# Check runner logs
+sudo journalctl -u gitlab-runner -f
+
+# Debug runner in foreground (for testing)
+gitlab-runner run --debug
+```
+
+### Jenkins Debugging
+
+```bash
+# Get build console output
+curl -s http://jenkins:8080/job/job-name/123/consoleText | tail -100
+
+# Trigger build with parameters
+curl -X POST http://jenkins:8080/job/job-name/build \
+  --user admin:apitoken \
+  -d 'token=ghtrigger&cause=Manual+trigger'
+
+# Get build info
+curl -s http://jenkins:8080/job/job-name/123/api/json | jq '.'
+
+# List nodes
+curl -s http://jenkins:8080/computer/api/json | jq '.computer[].displayName'
+
+# Diagnose executor
+curl -s http://jenkins:8080/computer/node-name/api/json | jq '.executors'
+
+# Restart Jenkins safely
+curl -X POST http://jenkins:8080/safeRestart --user admin:apitoken
+```
+
+### Docker Build Debugging
+
+```bash
+# Build with verbose output
+DOCKER_BUILDKIT=0 docker build --progress=plain -t myapp:latest .
+
+# Build with no cache
+docker build --no-cache -t myapp:latest .
+
+# Build args debug
+docker build --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+             --build-arg VCS_REF=$(git rev-parse HEAD) \
+             -t myapp:latest .
+
+# Multi-stage build debug
+docker build --target build-stage -t myapp:build .
+
+# Inspect image layers
+docker history myapp:latest
+
+# Run container interactively from Dockerfile stage
+docker run --rm -it myapp:build /bin/sh
+```
+
+### Kubernetes Deployment Debugging
+
+```bash
+# Get deployment status
+kubectl get deployment myapp -o wide
+
+# Watch rollout status
+kubectl rollout status deployment/myapp
+
+# Check revision history
+kubectl rollout history deployment/myapp
+
+# Rollback to previous
+kubectl rollout undo deployment/myapp
+
+# Rollback to specific revision
+kubectl rollout undo deployment/myapp --to-revision=3
+
+# Debug rolling update
+kubectl describe deployment myapp | grep -A 10 Events
+
+# Check replicaset
+kubectl get rs -l app=myapp
+
+# Check pods with old labels
+kubectl get pods -l app=myapp,version=old
+```
+
+## Real Production Scenarios
+
+### Scenario 1: GitHub Actions Runner Out of Disk Space
+
+**Symptom:**
+- Build fails at `npm ci` with "ENOSPC: no space left on device"
+- Previously working builds now failing
+- Matrix builds affected more than single builds
+
+**Diagnostic Commands:**
+```bash
+# Check disk space (if you have access to runner logs)
+df -h
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/root       30G   28G    2G  93% /
+
+# Check what's consuming space (from logs)
+# Look for repeated npm ci or docker pull operations
+
+# Common space consumers:
+# - npm cache
+# - Docker layers
+# - Build artifacts not cleaned
+# - Old workflow runs
+
+# GitHub Actions runner logs (enterprise)
+# Check: /var/lib/actions-runner/_diag for runner logs
+```
+
+**Sample error from logs:**
+```
+[2026-06-16 10:00:00] npm ci --legacy-peer-deps
+npm ERR! code ENOSPC
+npm ERR! syscall write
+npm ERR! no space left on device
+npm ERR! npm ci can only install packages when your package.json and package-lock.json are in sync. Please ensure your package.json and package-lock.json are in sync before installing.
+npm WARN This failure might be because the cache is full
+```
+
+**Root Cause:**
+The GitHub Actions runner's 30GB disk was nearly full due to accumulated Docker images from previous builds. The runner had run 200+ builds without cleanup, consuming 26GB in `/var/lib/docker`.
+
+**Fix:**
+```yaml
+# Add cleanup step to workflow
+- name: Cleanup before build
+  run: |
+    docker system prune -af
+    rm -rf ~/.npm ~/.cache
+    df -h
+
+# Or create dedicated workflow
+name: Cleanup Runner
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: self-hosted
+    steps:
+      - name: Cleanup Docker
+        run: |
+          docker system prune -af
+          docker builder prune -af
+
+      - name: Cleanup caches
+        run: |
+          rm -rf ~/.npm
+          rm -rf ~/.cache/pip
+          rm -rf $(npm config get cache)
+
+      - name: Report disk usage
+        run: df -h
+```
+
+```bash
+# Manual cleanup on runner
+docker system prune -af --volumes
+rm -rf /home/actions-runner/_work/_tool/node/*/x64/node_modules
+journalctl --vacuum-size=100M
+```
+
+**Prevention:**
+- Set up disk space monitoring with alerting
+- Use ephemeral runners with fresh disk each run
+- Add cleanup steps to every workflow
+- Configure Docker cleanup in runner startup
+
+---
+
+### Scenario 2: Docker Image Push Authentication Failure
+
+**Symptom:**
+- CI pipeline fails at `docker push` with "unauthorized: authentication required"
+- Registry credentials are configured in CI/CD settings
+- Previously working pushes now failing
+
+**Diagnostic Commands:**
+```bash
+# Test login locally (if you have access)
+docker login registry.example.com --username=ci-user
+
+# Check if token expired
+# Example error:
+# 2026-06-16T10:00:00.000Z Login Succeeded
+# 2026-06-16T10:00:01.000Z docker push registry.example.com/myapp:v1.2.3
+# 2026-06-16T10:00:02.000Z unauthorized: authentication required
+
+# Verify image tag
+docker images registry.example.com/myapp
+
+# Check ECR token expiration (60 minutes default)
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username=AWS --password-stdin 123456789.dkr.ecr.us-east-1.amazonaws.com
+
+# Check GCR token
+gcloud auth print-access-token | \
+  docker login -u oauth2accesstoken https://gcr.io
+```
+
+**Sample error:**
+```
+ERROR: failed to push myapp:v1.2.3
+failed to resolve resolution for resolver with registry.example.com: no space left on device
+# Actually no, wait - real error is:
+denied: requested access to the resource is denied
+```
+
+**Root Cause:**
+The GitHub Actions secret for the Docker registry had expired and was not rotated. The secret `DOCKER_REGISTRY_PASS` contained an old password that was changed 7 days ago.
+
+**Fix:**
+```bash
+# GitHub Actions: Update secret in Settings > Secrets
+# New secret needed: DOCKER_REGISTRY_PASS
+
+# Test the new credentials
+docker logout registry.example.com
+echo $DOCKER_REGISTRY_PASS | docker login registry.example.com -u ci-user --password-stdin
+
+# For AWS ECR: Update IAM permissions and ensure token refresh
+# Add to workflow:
+- name: Login to ECR
+  uses: aws-actions/aws-ecr-login@v1
+
+# For GCR:
+- name: Authenticate to GCR
+  uses: google-github-actions/auth@v0
+  with:
+    credentials_json: ${{ secrets.GCR_CREDENTIALS_JSON }}
+```
+
+**Prevention:**
+- Implement credential rotation procedures
+- Use workload identity where possible (GKE workload identity, AWS IAM roles)
+- Set up expiration alerts for secrets
+- Use short-lived tokens when possible
+- Document credential update procedures
+
+---
+
+### Scenario 3: Jenkins Pipeline Stage Timeout
+
+**Symptom:**
+- Jenkins pipeline stuck at a stage for > 60 minutes
+- Stage was working fine before
+- Other stages complete normally
+
+**Diagnostic Commands:**
+```bash
+# Get console output for stuck build
+curl -s "http://jenkins:8080/job/my-pipeline/456/consoleText" | tail -200
+
+# Sample log showing stuck state:
+# [Pipeline] stage
+# [Pipeline] { (Build)
+# [Pipeline] sh(script: "./build.sh", returnStatus: true)
+# [Pipeline] sh(script: "./build.sh", returnStatus: true)
+# ... (stuck here, no new output for 60+ minutes)
+
+# Check executor status
+curl -s "http://jenkins:8080/computer/api/json" | jq '.computer[].executors'
+
+# Check if process is still running on executor
+# SSH to executor and check:
+ps aux | grep build.sh
+# or
+top
+
+# Check for deadlock in scripted pipeline
+# Look for 'input' step waiting for approval
+```
+
+**Root Cause:**
+The build script had an infinite loop that only exits on specific file existence. The file was supposed to be created by another process but that process had failed. The `timeout` wrapper was not used, so the stage hung indefinitely.
+
+**Fix:**
+```groovy
+// Jenkinsfile - Wrap problematic stages with timeout
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            timeout(time: 30, unit: 'MINUTES') {
+                steps {
+                    script {
+                        def result = sh(script: './build.sh', returnStatus: true)
+                        if (result != 0) {
+                            error "Build failed with exit code ${result}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    options {
+        // Global timeout
+        timeout(time: 2, unit: 'HOURS')
+    }
+}
+```
+
+```bash
+# Abort the stuck build via API
+curl -X POST "http://jenkins:8080/job/my-pipeline/456/stop" \
+  --user admin:apitoken
+
+# Or via Jenkins CLI
+java -jar jenkins-cli.jar -s http://jenkins:8080 build my-pipeline/456 -s --stop
+```
+
+**Prevention:**
+- Always wrap stages with `timeout`
+- Implement proper error handling and return status checks
+- Use `input` step timeout
+- Set up alerting for builds that run longer than expected
+- Add progress logging for long-running operations
+
+---
+
+### Scenario 4: ArgoCD Application Out-of-Sync
+
+**Symptom:**
+- ArgoCD shows application as "OutOfSync" with "DiffDetected"
+- No recent deployments, configuration hasn't changed
+- Manual sync doesn't resolve the issue
+
+**Diagnostic Commands:**
+```bash
+# Check ArgoCD application status
+argocd app get myapp
+
+# Output:
+# Name:               myapp
+# Destination:        cluster: https://kubernetes.docker.internal:6443
+# Namespace:          production
+# Status:             OutOfSync (Pruned)
+# Health:             Healthy
+#
+# GROUP  KIND         NAMESPACE  NAME          STATUS     HEALTH
+# apps   Deployment   production myapp         OutOfSync  Missing
+#       Service      production myapp          OutOfSync  Unknown
+
+# Check application details
+argocd app diff myapp
+
+# Sample diff output:
+#   app.kubernetes.io/instance: myapp
+# + app.kubernetes.io/managed-by: argocd  ← This line is the issue
+
+# Check resource status in cluster
+kubectl get all -n production -l app=myapp -o wide
+
+# Check ArgoCD controller logs
+kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller
+
+# Check Git commit ArgoCD is tracking
+argocd app history myapp
+```
+
+**Root Cause:**
+The `argocd-repo-server` was configured to ignore the `app.kubernetes.io/managed-by` label, but a new version of the application manifest included this label, causing ArgoCD to see it as an unmanaged resource (Pruned state means ArgoCD wants to delete it).
+
+**Fix:**
+```bash
+# Option 1: Sync with force (replace managed resources)
+argocd app sync myapp --force
+
+# Option 2: Update ArgoCD ignore differences
+argocd app set myapp \
+  --spec.ignoreDifferences[0].group=apps \
+  --spec.ignoreDifferences[0].kind=Deployment \
+  --spec.ignoreDifferences[0].jsonPointers="[/metadata/labels/app.kubernetes.io~1managed-by]"
+
+# Option 3: Update resource manifest to match cluster
+# Remove the conflicting label from manifest and commit
+
+# Option 4: Configure ignore differences in Application
+kubectl patch application myapp -n argocd --type=merge -p '{
+  "spec": {
+    "ignoreDifferences": [{
+      "group": "*",
+      "kind": "*",
+      "jsonPointers": ["/metadata/labels/app.kubernetes.io~1managed-by", "/metadata/annotations"]
+    }]
+  }
+}'
+```
+
+**Prevention:**
+- Set up proper ignore differences in Application spec
+- Document which labels ArgoCD should ignore
+- Run `argocd app diff` in CI to catch issues before deployment
+- Review ArgoCD release notes for breaking changes
+
+---
+
+### Scenario 5: Build Caching Causing Stale Dependency Issues
+
+**Symptom:**
+- Tests passing in CI but failing in production
+- `npm test` passes locally but fails in CI
+- Build works on one branch but fails on another
+
+**Diagnostic Commands:**
+```bash
+# Check what CI is caching
+# In GitHub Actions:
+# - uses: actions/cache@v3
+#   with:
+#     path: node_modules
+
+# Verify cache key includes dependencies hash
+# Should be: cache-key: node-modules-${{ hashFiles('package-lock.json') }}
+
+# Check what's in the cache
+# GitHub: Check Actions > Caches tab
+
+# Clear cache for debugging
+gh api repos/:owner/:repo/actions/caches \
+  --jq '.actions_caches[] | select(.key | contains("node")) | .id' | \
+  xargs -I {} gh api -X DELETE repos/:owner/:repo/actions/caches/{}
+
+# Check local vs CI node version
+node --version
+# CI might be using different version than local
+
+# Check npm ci output (shows what it installs)
+npm ci --dry-run
+```
+
+**Sample symptom from test output:**
+```
+PASS src/utils/format.test.js
+FAIL src/services/api.test.js
+  ● API › should fetch user data
+    expect(received).toEqual(expected) // Object.is equality
+    Expected: { id: 1, name: "John", role: "admin" }
+    Received: { id: 1, name: "John", role: "user" }
+```
+
+**Root Cause:**
+The CI cache contained an older version of a test fixture file (`__fixtures__/user.json`) that had `role: "admin"`, but the actual API response was `role: "user"`. The cache was restored instead of fetching fresh, and the tests in CI were testing against stale fixture data.
+
+**Fix:**
+```yaml
+# GitHub Actions: Ensure cache key includes hashFiles
+- uses: actions/cache@v3
+  with:
+    path: |
+      ${{ github.workspace }}/.jest-cache
+      ${{ github.workspace }}/node_modules
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-node-
+
+# Alternative: Don't cache node_modules for high-risk builds
+- uses: actions/cache@v3
+  with:
+    path: |
+      ${{ github.workspace }}/.jest-cache
+    key: ${{ runner.os }}-jest-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-jest-
+# node_modules downloaded fresh, but jest cache reused
+```
+
+```bash
+# Debug by clearing cache and running fresh
+# Add to workflow temporarily:
+- name: Clear cache
+  run: rm -rf node_modules .jest-cache
+
+# Then run fresh build
+npm ci
+npm test
+```
+
+**Prevention:**
+- Use `package-lock.json` hash in cache key (not `package.json`)
+- Include test fixtures in cache integrity checks
+- Set up cache invalidation on fixture file changes
+- Run the same commands locally as in CI
+- Use `npm ci` instead of `npm install` for reproducible builds
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Pipeline Build Failure
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: IDENTIFY FAILING STEP                               │
+├─────────────────────────────────────────────────────────────┤
+│ Check the error output:                                     │
+│ - Which step failed?                                        │
+│ - What was the exact error message?                         │
+│ - Was it a timeout, or actual build error?                  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: REPRODUCE LOCALLY                                   │
+├─────────────────────────────────────────────────────────────┤
+│ # Run the same command locally                              │
+│ docker run --rm -it node:18 /bin/sh                        │
+│ git clone <repo> && cd <repo>                              │
+│ npm ci                                                      │
+│ npm run build                                              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CHECK DEPENDENCIES                                  │
+├─────────────────────────────────────────────────────────────┤
+│ # Check if package.json has conflicting versions            │
+│ npm ls                                                      │
+│                                                              │
+│ # Check for peer dependency warnings                        │
+│ npm ci 2>&1 | grep WARN                                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK ENVIRONMENT                                   │
+├─────────────────────────────────────────────────────────────┤
+│ # Compare versions                                          │
+│ node --version                                              │
+│ npm --version                                               │
+│                                                              │
+│ # Check OS differences (Linux vs macOS build)              │
+│ uname -a                                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: Deployment Not Rolling Out
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: CHECK DEPLOYMENT STATUS                             │
+├─────────────────────────────────────────────────────────────┤
+│ kubectl get deployment myapp                                │
+│ kubectl describe deployment myapp | grep -A 20 Events       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK REPLICASET                                    │
+├─────────────────────────────────────────────────────────────┤
+│ kubectl get rs -l app=myapp                                │
+│ kubectl describe rs <rs-name> | grep -A 10 Events          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CHECK PODS                                          │
+├─────────────────────────────────────────────────────────────┤
+│ kubectl get pods -l app=myapp                               │
+│ kubectl logs myapp-xyz --previous                           │
+│ kubectl describe pod myapp-xyz | grep -A 5 "Warning"        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK RESOURCES                                     │
+├─────────────────────────────────────────────────────────────┤
+│ # Maybe the cluster can't schedule new pods                 │
+│ kubectl describe nodes | grep -A 5 "Allocated resources"    │
+│ kubectl top nodes                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `ENOSPC: no space left on device` | Runner disk full | Add cleanup step, use ephemeral storage |
+| `unauthorized: authentication required` | Expired credentials | Rotate credentials, check secrets |
+| `fatal: not a git repository` | Checkout action not run | Ensure checkout step is first |
+| `connection refused` | Service not ready | Add health check, use `wait-for-it` |
+| `context deadline exceeded` | Timeout too short | Increase timeout, optimize build |
+| `npm ERR! peer dep conflict` | Mismatched peer dependencies | Use `--legacy-peer-deps`, fix versions |
+| `docker: invalid reference format` | Wrong image tag | Check tag format: `name:tag` |
+| `Error: No such container` | Container not started | Check entrypoint, health checks |
+
+## Monitoring / Log Analysis
+
+### CI/CD Metrics to Track
+
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| Build Duration | > 15 min | > 30 min |
+| Failure Rate | > 5% | > 15% |
+| Queue Time | > 5 min | > 15 min |
+| MTTR | > 30 min | > 2 hours |
+| Deployment Frequency | < 1/day | < 1/week |
+
+### Log Aggregation Strategy
+
+```bash
+# Centralize CI logs
+# GitHub: Export to CloudWatch/GCP Logging
+# GitLab: Configure external logging
+# Jenkins: Use ELK stack
+
+# Search for failure patterns
+grep -E "ERROR|FAIL|CANCELLED|TIMEOUT" ci.log | \
+  awk '{print $NF}' | sort | uniq -c | sort -rn
+
+# Identify flaky tests
+grep "PASS\|FAIL" ci.log | \
+  awk '{print $NF}' | sort | uniq -c | sort -rn | head -20
+```
+
+## Interview Questions
+
+### Question 1: Build Debugging
+
+**Q:** A build is passing locally but failing in CI. How do you investigate?
+
+**A:**
+1. Check for environment differences (OS, tool versions)
+2. Verify clean build in CI (no cached artifacts)
+3. Compare node/npm versions between local and CI
+4. Run the exact same commands locally as CI does
+5. Check for timing issues (race conditions)
+6. Verify git ignore isn't excluding necessary files
+7. Check for secret/credential differences
+8. Add debug output to CI to see what's happening
+
+### Question 2: Deployment Issues
+
+**Q:** Your deployment to Kubernetes succeeds but the new version isn't receiving traffic. What's wrong?
+
+**A:**
+1. **Check rollout status**: `kubectl rollout status deployment/myapp`
+2. **Check if pods are ready**: `kubectl get pods -l app=myapp` - Ready column should match
+3. **Check service selector**: Service selector should match pod labels
+4. **Check endpoints**: `kubectl get endpoints myapp-service`
+5. **Check health checks**: Readiness probe may be failing
+6. **Check ingress**: New pods might not be healthy yet
+7. **Check version label**: Service selector might be too specific
+
+### Question 3: Pipeline Reliability
+
+**Q:** Your pipeline is flaky—sometimes passing, sometimes failing with no changes. How do you fix this?
+
+**A:**
+1. **Identify patterns**: Is it always certain jobs or times?
+2. **Add retry logic**: For transient failures
+3. **Increase timeout**: Maybe builds are close to timeout
+4. **Isolate flaky tests**: Run separately, add to quarantine
+5. **Fix timing dependencies**: Add waits, use health checks
+6. **Use fresh environment**: Ephemeral runners vs persistent
+7. **Cache properly**: Ensure cache invalidation works
+8. **Log more**: Capture state at failure points
+9. **Implement test-obsessed debugging**: Capture screenshots, logs at failure
+
+## Cheat Sheet
+
+| Command | System | Purpose |
+|---------|--------|---------|
+| `gh run view --log` | GitHub Actions | View full log |
+| `gh run rerun` | GitHub Actions | Retry failed run |
+| `gitlab runner job trace` | GitLab CI | Get job logs |
+| `curl .../consoleText` | Jenkins | Get build log |
+| `docker build --no-cache` | Docker | Build without cache |
+| `kubectl rollout status` | Kubernetes | Check deployment |
+| `argocd app diff` | ArgoCD | Compare actual vs desired |
+| `argocd app sync` | ArgoCD | Sync application |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - K8s deployment debugging
+- [Linux Troubleshooting](./linux-troubleshooting) - System-level debugging
+- [Network Troubleshooting](./network-troubleshooting) - Network debugging
+- [Common Issues](./common-issues) - Frequently occurring problems

@@ -1,0 +1,541 @@
+---
+sidebar_position: 21
+description: Linux monitoring — Prometheus node_exporter, Grafana, alerting, SLI/SLO/SLA, and observability stack setup.
+---
+
+# Linux Monitoring
+
+## Overview
+
+Monitoring is not optional in production — it is how you know your system is healthy, detect issues before they become outages, and make data-driven decisions about capacity and scaling. The observability stack for production Linux infrastructure centers on three pillars: metrics (quantitative measurements over time), logs (event records), and traces (request-level visibility). This page focuses on metrics and the monitoring infrastructure that collects them.
+
+The modern standard is Prometheus for metrics collection, Grafana for visualization, and Alertmanager for alerting. node_exporter exposes Linux kernel and system metrics in Prometheus format. The key to effective monitoring is defining SLIs (Service Level Indicators), SLOs (Service Level Objectives), and alerts that actually matter — not vanity metrics that look nice but don't prevent outages.
+
+Good monitoring follows USE (Utilization, Saturation, Errors) for resources and RED (Rate, Errors, Duration) for services. Alert on symptoms (service is down, latency is high), not causes (CPU is at 80% — this may or may not matter depending on actual user impact).
+
+## When To Use
+
+- Any production system
+- Capacity planning and trend analysis
+- Incident detection and escalation
+- Post-incident analysis and root cause
+- SLA reporting and compliance
+
+## When NOT To Use
+
+- Development environments (lightweight tooling sufficient)
+- Systems with no user impact (internal tooling with no SLO)
+- When metrics volume is so high it causes performance issues (use sampling)
+
+## Core Concepts
+
+### Prometheus Architecture
+
+```
+Exporter (node_exporter) → Prometheus Server → Alertmanager → PagerDuty/Slack/...
+        ↓
+    Grafana ← Dashboard queries Prometheus
+```
+
+Prometheus is a pull-based time-series database. It scrapes targets at regular intervals, stores the data, and evaluates alerting rules. Key concepts:
+- **Metric names**: `node_cpu_seconds_total{mode="idle", instance="server1", job="linux"}`
+- **Labels**: key-value pairs that differentiate metric series
+- ** scrape_interval**: default 15s, tunable per job
+- **Retention**: default 15 days (configurable), can use remote_write for longer
+- **Recording rules**: pre-compute expensive queries
+
+### SLI/SLO/SLA
+
+```
+SLA (Service Level Agreement):   Contractual commitment to customer
+SLO (Service Level Objective):   Internal goal (usually tighter than SLA)
+SLI (Service Level Indicator):   What you measure (the metric)
+```
+
+Example:
+- SLA: 99.9% uptime (allows 8.7 hours downtime/year)
+- SLO: 99.95% uptime (allows 4.4 hours downtime/year)
+- SLI: `sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))`
+
+**Error budget**: If SLO is 99.9%, error budget is 0.1% per month. For 1M requests/month, that's 1000 errors allowed. When error budget is exhausted, stop feature work and fix reliability.
+
+### node_exporter
+
+```bash
+# Install
+apt install prometheus-node-exporter   # Debian/Ubuntu
+yum install prometheus-node-exporter   # RHEL
+
+# Start
+systemctl enable --now prometheus-node-exporter
+
+# Check metrics
+curl localhost:9100/metrics | head -50
+
+# Key metric families:
+# node_cpu_seconds_total{mode="idle|user|system|iowait"} — CPU usage
+# node_memory_MemTotal_bytes — total memory
+# node_memory_MemAvailable_bytes — available memory
+# node_load1, node_load5, node_load15 — load average
+# node_disk_read_bytes_total{device="sda"} — disk throughput
+# node_network_receive_bytes_total{device="eth0"} — network throughput
+# node_filesystem_size_bytes{mountpoint="/"} — filesystem size
+# node_filesystem_avail_bytes{mountpoint="/"} — filesystem available
+# node_disk_io_time_seconds_total — disk utilization %
+# node_netstat_TcpExt_ListenDrops — TCP listen drops
+```
+
+### Prometheus Configuration
+
+```bash
+# /etc/prometheus/prometheus.yml
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'production'
+    environment: 'prod-us-east-1'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Linux hosts via node_exporter
+  - job_name: 'linux'
+    static_configs:
+      - targets:
+          - '10.0.1.10:9100'
+          - '10.0.1.11:9100'
+          - '10.0.1.12:9100'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '(.+):\d+'
+        replacement: '${1}'
+
+  # Docker containers via cAdvisor
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets:
+          - 'cadvisor:8080'
+
+  # Blackbox probing (HTTP/TCP/ICMP)
+  - job_name: 'blackbox'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - https://api.example.com/health
+          - https://app.example.com/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 'blackbox-exporter:9115'
+EOF
+
+# Check config
+promtool check config /etc/prometheus/prometheus.yml
+systemctl reload prometheus
+```
+
+### Alerting Rules
+
+```bash
+# /etc/prometheus/rules/linux-alerts.yml
+cat > /etc/prometheus/rules/linux-alerts.yml <<'EOF'
+groups:
+  - name: linux.system
+    interval: 30s
+    rules:
+      # CPU
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: "CPU usage is above 80% for 5 minutes (current: {{ $value | printf \"%.1f\" }}%)"
+
+      # Memory
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is above 85% (current: {{ $value | printf \"%.1f\" }}%)"
+
+      - alert: OOMKillsDetected
+        expr: increase(node_vmstat_oom_kill[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "OOM killer fired on {{ $labels.instance }}"
+          description: "The kernel OOM killer has terminated a process"
+
+      # Disk
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"} > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low on {{ $labels.instance }}"
+          description: "Disk usage is above 85% (current: {{ $value | printf \"%.1f\" }}%)"
+
+      # Load
+      - alert: HighLoadAverage
+        expr: node_load1 / count(node_cpu_seconds_total{mode="idle"}) by(instance) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High load average on {{ $labels.instance }}"
+          description: "Load average is high relative to CPU count"
+
+      # Network
+      - alert: NetworkInterfaceDown
+        expr: node_network_up{device!="lo"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Network interface down on {{ $labels.instance }}"
+
+  - name: linux.ssh
+    rules:
+      - alert: SSHAuthenticationFailures
+        expr: rate(node_systemd_units{state="failed", unit="sshd.service"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SSH authentication failures on {{ $labels.instance }}"
+EOF
+```
+
+### Alertmanager Configuration
+
+```bash
+# /etc/alertmanager/alertmanager.yml
+cat > /etc/alertmanager/alertmanager.yml <<'EOF'
+global:
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alerts@example.com'
+  smtp_auth_username: 'alerts'
+  smtp_auth_password: '${SMTP_PASSWORD}'
+
+route:
+  group_by: ['alertname', 'cluster']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'team-alerts'
+  routes:
+    - match:
+        severity: critical
+      receiver: 'pagerduty'
+      continue: true
+    - match:
+        severity: warning
+      receiver: 'slack'
+
+receivers:
+  - name: 'team-alerts'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#alerts'
+        send_resolved: true
+        title: 'Alert: {{ .GroupLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Labels.alertname }}
+          *Severity:* {{ .Labels.severity }}
+          *Summary:* {{ .Annotations.summary }}
+          *Instance:* {{ .Labels.instance }}
+          *Description:* {{ .Annotations.description }}
+          {{ end }}
+
+  - name: 'pagerduty'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_KEY}'
+        severity: critical
+        send_resolved: true
+        class: 'linux'
+        component: 'prometheus'
+EOF
+```
+
+## Real Production Example
+
+Setting up a complete observability pipeline for a web application stack:
+
+```bash
+# === 1. Install node_exporter on all hosts ===
+# Ansible playbook or cloud-init:
+ansible all -b -m yum -a "name=prometheus-node-exporter state=present"
+ansible all -b -m systemd_service -a "name=prometheus-node-exporter state=started enabled=yes"
+
+# === 2. Configure Prometheus scrape limits (prevent overload) ===
+cat >> /etc/prometheus/prometheus.yml <<'EOF'
+  - job_name: 'linux'
+    static_configs:
+      - targets: ['10.0.1.10:9100', '10.0.1.11:9100']
+    scrape_interval: 30s    # Reduce from 15s to 30s for cost efficiency
+    scrape_timeout: 20s
+    hold: true              # Only scrape if target responds
+EOF
+
+# === 3. Recording rules for fast dashboards ===
+cat >> /etc/prometheus/rules/recording.yml <<'EOF'
+groups:
+  - name: recording_rules
+    rules:
+      # Pre-compute CPU usage (expensive query)
+      - record: instance:cpu_usage:rate5m
+        expr: 100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+      # Pre-compute memory usage %
+      - record: instance:memory_usage:percent
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+
+      # Pre-compute disk IOPS
+      - record: instance:disk_iops:rate5m
+        expr: rate(node_disk_reads_completed_total[5m]) + rate(node_disk_writes_completed_total[5m])
+EOF
+
+# === 4. Grafana dashboard JSON (import via API or UI) ===
+# Dashboard ID 1 = node_exporter_full (import from Grafana.com)
+# Or create custom with PromQL:
+# - Panel: CPU Usage
+#   Query: instance:cpu_usage:rate5m{instance="$host"}
+# - Panel: Memory Usage
+#   Query: instance:memory_usage:percent{instance="$host"}
+# - Panel: Load Average
+#   Query: node_load1{instance="$host"}
+# - Panel: Disk I/O
+#   Query: rate(node_disk_read_bytes_total{instance="$host"}[5m])
+#   Query: rate(node_disk_written_bytes_total{instance="$host"}[5m])
+# - Panel: Network Traffic
+#   Query: rate(node_network_receive_bytes_total{instance="$host", device!="lo"}[5m])
+#   Query: rate(node_network_transmit_bytes_total{instance="$host", device!="lo"}[5m])
+# - Panel: Filesystem Usage
+#   Query: (node_filesystem_size_bytes{instance="$host"} - node_filesystem_avail_bytes{instance="$host"}) / node_filesystem_size_bytes{instance="$host"} * 100
+EOF
+
+# === 5. Import dashboard via API ===
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"dashboard": {...}, "overwrite": true}' \
+  http://admin:admin@grafana:3000/api/dashboards/db
+
+# === 6. Set up SLO tracking ===
+# Create SLO definition:
+# SLO: 99.9% HTTP availability
+# Error budget: 0.1% of requests
+# Burn rate alert: if error rate exceeds 10x budget for 1h, alert immediately
+# alert: SLIErrorsBudgetBurned
+#   expr: |
+#     sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.001 * 10
+#   for: 1h
+#   labels:
+#     severity: critical
+```
+
+## CLI Examples
+
+```bash
+# Prometheus
+curl localhost:9090/api/v1/query?query=node_cpu_seconds_total | jq '.data.result'
+promtool check config /etc/prometheus/prometheus.yml
+promtool check rules /etc/prometheus/rules/*.yml
+
+# node_exporter
+curl localhost:9100/metrics | grep "^node_" | head -20
+curl "localhost:9100/metrics?collect[]=meminfo"
+
+# Alertmanager
+curl -X POST http://localhost:9093/api/v1/alerts \
+  -d '{"alerts":[{"labels":{"alertname":"Test"}}]}'
+amtool check-config /etc/alertmanager/alertmanager.yml
+
+# Check Prometheus targets
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | select(.health=="up") | .labels.instance'
+
+# Grafana API
+curl -s http://admin:admin@localhost:3000/api/health | jq .
+curl -s http://admin:admin@localhost:3000/api/datasources | jq .
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `curl localhost:9100/metrics` | node_exporter metrics |
+| `promtool check config` | Validate Prometheus config |
+| `amtool check-config` | Validate Alertmanager config |
+| `curl localhost:9090/api/v1/status/config` | Current running config |
+| `curl localhost:9090/api/v1/query` | Run instant query |
+| `curl localhost:9090/api/v1/query_range` | Run range query |
+| `curl localhost:3000/api/dashboards` | List Grafana dashboards |
+
+## Monitoring
+
+```bash
+# Check metric availability
+# node_load1 should exist
+curl -s localhost:9100/metrics | grep node_load1
+
+# Query Prometheus for current state
+# Check targets
+curl -s "http://localhost:9090/api/v1/targets" | jq '.data.activeTargets[] | select(.labels.job=="linux")'
+
+# Check alerting rules loaded
+curl -s "http://localhost:9090/api/v1/rules" | jq '.data.groups[].rules[] | select(.type=="alerting")'
+
+# Simulate alert firing (test)
+curl -s "http://localhost:9090/api/v1/query?query=node_cpu_usage_rate5m > 80" | jq
+```
+
+## Security
+
+```bash
+# node_exporter is unauthenticated — bind to localhost only
+# In /etc/default/prometheus-node-exporter:
+# ARGS="--web.listen-address=127.0.0.1:9100"
+
+# Use TLS for Prometheus (optional, internal network only)
+# In prometheus.yml:
+# scheme: https
+# tls_config:
+#   ca_file: /etc/prometheus/certs/ca.crt
+#   cert_file: /etc/prometheus/certs/server.crt
+#   key_file: /etc/prometheus/certs/server.key
+
+# Protect Grafana admin
+# In grafana.ini:
+# [security]
+# admin_user = admin
+# admin_password = <use env var GF_SECURITY_ADMIN_PASSWORD>
+# Or: GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_password
+
+# Basic auth for Prometheus
+# [auth.basic]
+# enabled = true
+
+# RBAC in Prometheus (v2.37+)
+# Fine-grained access to metrics by namespace/labels
+```
+
+## Troubleshooting
+
+**node_exporter not responding:**
+```bash
+# Check service
+systemctl status prometheus-node-exporter
+journalctl -u prometheus-node-exporter -n 20 --no-pager
+
+# Check port
+ss -tulpn | grep 9100
+
+# Test metrics endpoint
+curl -v localhost:9100/metrics
+
+# Check firewall
+firewall-cmd --list-ports | grep 9100
+```
+
+**Prometheus not scraping targets:**
+```bash
+# Check target health
+curl -s "http://localhost:9090/api/v1/targets" | jq '.data.activeTargets[] | select(.health!="up")'
+
+# Check if Prometheus can reach target (from inside container/host)
+curl -s "http://10.0.1.10:9100/metrics"
+
+# Check relabel_configs (often culprit)
+# If __address__ is rewritten to empty, target disappears
+```
+
+**Alerts not firing:**
+```bash
+# Check if rule is loaded
+curl -s "http://localhost:9090/api/v1/rules" | jq '.data.groups[].rules[] | select(.name=="HighCPUUsage")'
+
+# Check alertmanager connectivity
+curl -s "http://localhost:9090/api/v1/alerts" | jq
+
+# Test alert manually
+curl -s "http://localhost:9090/api/v1/query?query=100 - (avg by(instance)(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100) > 80"
+
+# Check Alertmanager config
+amtool check-config /etc/alertmanager/alertmanager.yml
+```
+
+## Interview Questions
+
+1. **What is the difference between Prometheus pull-based model and Graphite's push-based model? When does each matter?**
+
+Prometheus scrapes (pulls) metrics from targets at regular intervals — targets don't need to know about Prometheus, and Prometheus controls scrape timing for consistent metrics. Graphite (and statsd) receive (push) metrics from clients — clients send metrics when they want. Pull is better because: targets are simpler (no SDK needed, just /metrics endpoint), Prometheus controls load (no overload from many clients pushing), easier to verify what's being monitored. Push is better for: highly dynamic targets (auto-scaling, short-lived jobs), fire-and-forget batch jobs, when targets are behind firewalls that block inbound connections. Prometheus supports pushgateway for short-lived jobs.
+
+2. **What is the difference between gauge, counter, and histogram metric types in Prometheus?**
+
+A gauge is a value that can go up or down (current temperature, memory usage). A counter is a value that only increases (total requests, total bytes received) — use `rate()` to get the rate of change. A histogram samples observations and counts them in configurable buckets (request latencies, response sizes) — use `histogram_quantile()` to calculate percentiles. Counters are monotonically increasing; applying `rate()` to a gauge is usually wrong. Histograms use bucket labels (le="0.1", le="0.5", le="1", etc.) and have `_sum` and `_count` series.
+
+3. **What is a recording rule, and when should you use one?**
+
+A recording rule pre-computes the result of an expensive PromQL query and stores it as a new time series. This reduces query time at dashboard load and prevents Prometheus overload from complex queries running every refresh. Use for: frequently-used complex queries (join across metrics, multi-step aggregations), expensive functions like `histogram_quantile`, queries that power dashboards (especially with high cardinality labels). Example: `instance:cpu_usage:rate5m = 100 - (avg by(instance)(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)` computed every 30s and stored as a simple metric.
+
+4. **What is the difference between SLO, SLI, and SLA? How do you track them?**
+
+SLI (Service Level Indicator) is the metric — e.g., request latency p99, error rate, availability %. SLO is your target for that metric — e.g., p99 < 200ms, error rate < 0.1%, 99.9% availability. SLA is the contractual obligation (often legally binding) — usually slightly looser than SLO (e.g., 99.9% SLA vs 99.95% SLO). Tracking: (1) Define SLI as a Prometheus query. (2) Calculate SLO as threshold in that query. (3) Calculate error budget (total allowed bad events over time). (4) Alert on budget burn rate (fast burn = critical, slow burn = warning). (5) Use `sum(increase(http_requests_total{status!="200"}[30d]))` / `sum(increase(http_requests_total[30d]))` for overall error rate.
+
+5. **What is the Alertmanager grouping and routing model?**
+
+Alertmanager groups alerts by labels (e.g., all alerts with same alertname=HighCPUUsage go to one notification). Within a group, alerts are batched during group_wait (default 30s), then sent as one notification. This prevents alert storms. Routes are matched top-down — first match wins. Each route has a receiver. `continue: true` makes it continue matching subsequent routes for the same alert. Integrations: Slack (per-channel routing), PagerDuty (severity-based), email, webhook (for custom integrations). Inhibition rules can suppress alerts when another alert is firing (e.g., suppress all "service X down" alerts when "entire cluster down" alert is active).
+
+## Cheat Sheet
+
+```bash
+# Prometheus
+promtool check config /etc/prometheus/prometheus.yml
+promtool check rules /etc/prometheus/rules/*.yml
+curl "http://localhost:9090/api/v1/query?query=up"
+
+# node_exporter metrics
+curl localhost:9100/metrics | grep "^node_"
+
+# Alertmanager
+amtool check-config /etc/alertmanager/alertmanager.yml
+curl -X POST http://localhost:9093/api/v1/alerts \
+  -d '{"alerts":[{"labels":{"alertname":"Test"}}]}'
+
+# PromQL
+rate(http_requests_total[5m])           # rate of counter
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))  # p99
+avg by(instance)(node_cpu_usage_rate5m) # avg by label
+
+# Grafana
+# Dashboard: import ID 1860 (node_exporter)
+# Variables: $host = label_values(node_load1, instance)
+```
+
+## Related Topics
+
+- [Performance](./performance) — Performance metrics and tools
+- [Troubleshooting](./troubleshooting) — Debugging with metrics
+- [Processes](./processes) — Process-level monitoring
+- [Networking](./networking) — Network metrics
+- [Logs](./logs) — Log-based monitoring

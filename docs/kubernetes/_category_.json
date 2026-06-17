@@ -1,0 +1,8 @@
+{
+  "label": "Kubernetes",
+  "position": 5,
+  "link": {
+    "type": "generated-index",
+    "description": "GKE cluster operations, workload scheduling, networking, autoscaling, and production debugging."
+  }
+}

@@ -1,0 +1,446 @@
+# NAT (Network Address Translation)
+
+## Overview
+
+NAT (Network Address Translation) maps private IP addresses to public IPs, enabling multiple devices to share a single public IP address. It's the primary mechanism that delayed IPv4 exhaustion—and now the source of constant operational headaches. In cloud environments, NAT appears as NAT Gateways (AWS), Cloud NAT (GCP), and in Linux as iptables/nftables NAT rules. Understanding NAT is essential because it affects source IP visibility, connection tracking, and firewall state.
+
+NAT operates at Layer 3, modifying source or destination IP addresses in packets. Source NAT (SNAT) changes the source IP (outbound traffic); Destination NAT (DNAT) changes the destination IP (inbound traffic, like port forwarding). Connection tracking (conntrack) maintains the mapping state, allowing return traffic to be properly untranslated.
+
+In production, NAT appears in multiple contexts: home/office routers, cloud NAT Gateways for private subnet egress, and DNAT for port forwarding. Each has different implications for performance, cost, and debugging.
+
+## When To Use
+
+- **Private subnet egress**: Giving private instances internet access without public IPs
+- **Port forwarding**: Exposing internal services on specific ports
+- **IPv4 conservation**: Sharing limited public IPs
+- **Load balancer DNAT**: Directing traffic to backends
+
+## When NOT To Use
+
+- **Performance-critical paths**: NAT adds latency and conntrack overhead
+- **IPv6 environments**: NAT unnecessary with abundant address space
+- **Protocols that embed IPs**: SIP, FTP, H.323 require NAT traversal
+
+## Core Concepts
+
+### NAT Types
+
+**Static NAT**: One-to-one mapping between private and public IP. Always the same translation. Used for servers that need consistent public IPs.
+
+**Dynamic NAT**: Private IP maps to pool of public IPs. Different translation each time. Harder to track for inbound connections.
+
+**PAT (Port Address Translation)**: Many private IPs map to one public IP, distinguished by source port. This is what home routers and cloud NAT Gateways do.
+
+```
+Static NAT:
+  10.0.0.5 ↔ 203.0.113.5
+  10.0.0.6 ↔ 203.0.113.6
+
+PAT (NAPT):
+  10.0.0.5:40000 → 203.0.113.1:40000 → 8.8.8.8:53
+  10.0.0.6:45000 → 203.0.113.1:45000 → 8.8.8.8:53
+  Both share 203.0.113.1, ports distinguish them
+```
+
+### Source NAT (SNAT)
+
+Outbound traffic: private IP → public IP. Return traffic is automatically un-NATed because conntrack tracks the mapping.
+
+```bash
+# Linux iptables SNAT
+iptables -t nat -A POSTROUTING -o eth0 -j SNAT --to-source 203.0.113.5
+
+# Or MASQUERADE (auto-get source IP from interface)
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# AWS NAT Gateway: Instances in private subnet use NAT Gateway for outbound
+# Outbound: Instance (10.0.1.5) → NAT Gateway (10.0.1.1) → Internet (203.0.113.1)
+# NAT Gateway SNATs to its elastic IP
+```
+
+### Destination NAT (DNAT)
+
+Inbound traffic: public IP → private IP. Used for port forwarding, load balancer backend routing.
+
+```bash
+# DNAT: Forward port 80 to internal server
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 80 \
+  -j DNAT --to-destination 10.0.0.5:8080
+
+# AWS NLB DNAT: traffic to NLB IP → target group members
+# NLB changes destination IP to target IP
+```
+
+### Connection Tracking (Conntrack)
+
+Conntrack maintains NAT state. Every NAT'd connection is tracked, enabling return traffic to be un-NATed.
+
+```bash
+# View conntrack table
+cat /proc/net/nf_conntrack | head
+
+# conntrack -L for formatted output
+conntrack -L | head
+
+# Example conntrack entry (NAT'd connection):
+# ipv4     2 tcp      6 431962 ESTABLISHED src=10.0.0.5 dst=8.8.8.8 sport=45000 dport=53 \
+#   src=203.0.113.1 dst=8.8.8.8 sport=45000 dport=53 [ASSURED]
+
+# Connection tracking timeout (TCP established)
+sysctl net.netfilter.nf_conntrack_tcp_timeout_established
+# 432000 seconds = 5 days
+
+# Check conntrack table size
+cat /proc/sys/net/netfilter/nf_conntrack_max
+wc -l /proc/net/nf_conntrack
+```
+
+### NAT and Source IP
+
+NAT obscures source IP. For inbound traffic through NAT, original source IP is preserved (only destination changes). For outbound traffic, original source IP is replaced.
+
+```bash
+# Server sees original client IP through NAT (no change to dest IP for inbound)
+# Client (203.0.113.5) → NAT Gateway → Server (10.0.0.5)
+# Server sees: Client IP = 203.0.113.5 (preserved through DNAT)
+
+# Server in private subnet → NAT Gateway → Internet
+# Server (10.0.0.5) → NAT Gateway → Internet (8.8.8.8)
+# Server 10.0.0.5 sends packet, NAT changes source to 203.0.113.1
+# Server in private subnet cannot be reached from internet
+```
+
+## Real Production Example
+
+### AWS NAT Gateway Setup
+
+```bash
+# Create Elastic IP
+EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --query 'AllocationId' --output text)
+
+# Create NAT Gateway in public subnet
+NAT_GW=$(aws ec2 create-nat-gateway \
+  --subnet-id subnet-0abcd1234efgh5678 \
+  --allocation-id $EIP_ALLOC \
+  --query 'NatGateway.NatGatewayId' --output text)
+
+# Wait for NAT Gateway to be available
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW
+
+# Update route table for private subnet
+aws ec2 replace-route \
+  --route-table-id rtb-0abc123def456 \
+  --destination-cidr-block 0.0.0.0/0 \
+  --nat-gateway-id $NAT_GW
+
+# NAT Gateway pricing: $0.045/GB processed + $0.045/GB transferred
+# Alternative: NAT Instance (t3.micro ~$10/month) for lower cost at lower performance
+```
+
+### Linux NAT with iptables
+
+```bash
+# /etc/sysconfig/iptables (RHEL/CentOS)
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+
+# DNAT: Port forwarding 2222 → 10.0.0.5:22
+-A PREROUTING -i eth0 -p tcp --dport 2222 -j DNAT --to-destination 10.0.0.5:22
+
+# SNAT: Outbound from internal network
+-A POSTROUTING -o eth0 -s 10.0.0.0/24 -j SNAT --to-source 203.0.113.5
+
+# MASQUERADE (dynamic, uses interface IP)
+# -A POSTROUTING -o eth0 -s 10.0.0.0/24 -j MASQUERADE
+
+COMMIT
+
+# Enable IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-nat.conf
+
+# Apply rules
+iptables-restore < /etc/sysconfig/iptables
+```
+
+### GCP Cloud NAT
+
+```bash
+# Create Cloud NAT gateway
+gcloud compute routers create my-router \
+  --network my-vpc \
+  --region us-central1
+
+gcloud compute routers nats create my-nat \
+  --router=my-router \
+  --region=us-central1 \
+  --auto-allocate-nat-external-ips \
+  --nat-all-subnet-ip-ranges
+
+# Or with specific external IPs
+gcloud compute addresses create nat-ip-1 nat-ip-2 --region us-central1
+NAT_IP_1=$(gcloud compute addresses describe nat-ip-1 --region us-central1 --format 'value(address)')
+gcloud compute routers nats create my-nat \
+  --router=my-router \
+  --region=us-central1 \
+  --nat-ip-addresses=$NAT_IP_1 \
+  --nat-all-subnet-ip-ranges
+```
+
+## CLI Examples
+
+```bash
+# View NAT rules
+iptables -t nat -L -v -n
+
+# View POSTROUTING (outbound NAT)
+iptables -t nat -L POSTROUTING -v -n
+
+# View PREROUTING (inbound DNAT)
+iptables -t nat -L PREROUTING -v -n
+
+# Add SNAT rule
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+
+# Add DNAT rule (port forward)
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 \
+  -j DNAT --to-destination 10.0.0.5:80
+
+# Delete NAT rules
+iptables -t nat -L POSTROUTING --line-numbers
+iptables -t nat -D POSTROUTING 1
+
+# View conntrack entries for specific IP
+conntrack -L -s 10.0.0.5
+
+# View conntrack with NAT info
+conntrack -L -L | grep NAT
+cat /proc/net/nf_conntrack | awk '/NAT/{print}'
+
+# nftables NAT
+nft add table ip nat
+nft add chain ip nat postrouting { type nat hook postrouting priority srcnat }
+nft add rule ip nat postrouting masquerade
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `iptables -t nat -L` | View NAT rules | `iptables -t nat -L -v -n` |
+| `conntrack -L` | View conntrack | `conntrack -L -s IP` |
+| `cat /proc/net/nf_conntrack` | Conntrack entries | `wc -l /proc/net/nf_conntrack` |
+| `sysctl net.ipv4.ip_forward` | Check IP forwarding | Enable for NAT |
+| `nft list ruleset -a` | nftables NAT | Show handles for deletion |
+
+## Monitoring
+
+### NAT Metrics
+
+```bash
+# Connection tracking table utilization
+cat /proc/sys/net/netfilter/nf_conntrack_max
+wc -l /proc/net/nf_conntrack
+# Alert if > 70% full
+
+# Conntrack memory pressure
+cat /proc/net/sockstat | grep ip_conntrack
+# conntrack: inuse 12345 memory 234
+
+# NAT Gateway metrics (AWS)
+# Elastic MapReduce: NatGatewayAddressAllocation.BytesIn
+# NatGatewayAddressAllocation.BytesOut
+# NatGatewayConnectionEstablished, ConnectionPort
+
+# Cloud NAT metrics (GCP)
+# nat/gce_natservice/counters/received_packets
+# nat/gce_natservice/counters/sent_packets
+```
+
+### Prometheus Alerts
+
+```promql
+# Conntrack table utilization
+(conntrack_entries / conntrack_max) > 0.7
+# Alert: Connection tracking table > 70% full
+
+# NAT Gateway errors
+rate(nat_gateway_errors[5m]) > 0
+# Alert if NAT Gateway experiencing issues
+```
+
+## Security
+
+### NAT Security Considerations
+
+```bash
+# NAT provides implicit outbound-only connectivity
+# But doesn't provide security—still need firewall
+
+# Restrict what NAT'd hosts can access
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 \
+  -p tcp --dport 443 -j ACCEPT
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 \
+  -p tcp --dport 80 -j ACCEPT
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j DROP
+
+# Anti-spoofing
+iptables -A INPUT -i eth0 -s 10.0.0.0/24 -j DROP
+
+# Prevent NAT traversal attacks (limit new conntrack entries)
+iptables -A FORWARD -m state --state NEW -j ACCEPT (with limits)
+```
+
+## Cost Optimization
+
+### NAT Gateway vs NAT Instance
+
+```bash
+# AWS NAT Gateway cost (us-east-1):
+# $0.045/GB data processed
+# $0.045/GB data transferred
+# ~$32/month for idle NAT Gateway (at 0 GB)
+
+# NAT Instance (t3.micro on-demand):
+# $0.0104/hour = $7.50/month
+# + EC2 costs for instance
+
+# Cost comparison (assuming 100GB/month):
+# NAT Gateway: $9.00 (data) + idle = ~$9/month
+# NAT Instance: $7.50 + $0.01/GB = $8.50/month
+# Slightly cheaper, but:
+# - NAT Instance needs HA setup (2 instances)
+# - NAT Instance performance limited by instance type
+# - NAT Gateway is managed, higher availability
+
+# For high traffic (>100GB/day):
+# Consider NAT Instance with larger instance (c5.xlarge = $0.17/hour)
+# Or VPC Endpoints to avoid NAT entirely
+```
+
+### VPC Endpoints to Avoid NAT Costs
+
+```bash
+# Private subnet → S3 via VPC Endpoint (no NAT, no egress)
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --vpc-endpoint-type Gateway \
+  --route-table-ids rtb-xxx
+
+# Cost: Free for gateway endpoints
+# No NAT Gateway fees for S3/DynamoDB access
+```
+
+## Troubleshooting
+
+### Common NAT Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Can't connect outbound | NAT not configured, no return route | Check POSTROUTING, routing |
+| Inbound connection fails | DNAT not configured, security group | Check PREROUTING, SG |
+| Port conflict | Another rule uses same port | Check existing rules |
+| High conntrack usage | Many connections, small table | Increase nf_conntrack_max |
+| NAT slow | Conntrack bottleneck | Increase table size, use nftables |
+
+### Debugging NAT
+
+```bash
+# 1. Verify IP forwarding enabled
+sysctl net.ipv4.ip_forward
+# Should be 1
+
+# 2. Check NAT rules
+iptables -t nat -L -n -v
+
+# 3. Check routing (can packets reach NAT device?)
+ip route get 8.8.8.8
+# Should show via correct gateway
+
+# 4. Check conntrack entry exists
+conntrack -L -s 10.0.0.5 | head
+# If no entry, connection not tracked (check protocol)
+
+# 5. Verify NAT applied (tcpdump on NAT device)
+tcpdump -i eth0 -n 'ip[16:4] = 0x0A000005'  # Packets from 10.0.0.5
+tcpdump -i eth0 -n 'ip[16:4] = 0xCB006371'  # Should show NAT IP (203.0.113.1)
+
+# 6. Check for NAT hairpinning (same subnet NAT)
+# If client and server on same subnet, NAT may not work
+# Need to redirect traffic through NAT device
+```
+
+## Interview Questions
+
+**Q1: What is the difference between SNAT and DNAT?**
+
+A: SNAT (Source NAT) changes the source IP address in outbound packets. Used when private network hosts need to communicate with internet. DNAT (Destination NAT) changes the destination IP in inbound packets. Used for port forwarding, directing traffic from public IP to private IP. Both are implemented in iptables/nftables nat tables. SNAT typically in POSTROUTING chain (after routing decision), DNAT in PREROUTING chain (before routing decision).
+
+**Q2: How does connection tracking enable NAT to work bidirectionally?**
+
+A: When a packet goes through NAT, conntrack creates an entry with original tuple and translated tuple. For SNAT: original `{src_ip, src_port}` ↔ translated `{src_ip, src_port}`. For return traffic, conntrack looks up the entry and applies reverse translation. Example: internal host (10.0.0.5:40000) sends to internet (8.8.8.8:53). NAT creates entry: original=(10.0.0.5:40000), translated=(203.0.113.1:40000). Return packet from 8.8.8.8:53 to 203.0.113.1:40000 matches conntrack entry; NAT translates destination back to 10.0.0.5:40000. Without conntrack, NAT couldn't handle bidirectional traffic.
+
+**Q3: What are the performance implications of NAT?**
+
+A: NAT adds latency per packet: (1) conntrack lookup—every packet requires hash table lookup in conntrack table; (2) checksum recalculation—IP, TCP, UDP checksums must be recalculated; (3) table size—large conntrack tables can cause cache misses. For high-throughput scenarios (10Gbps+), NAT can become bottleneck. Cloud NAT Gateways scale automatically but have bandwidth limits (5Gbps default, up to 45Gbps with aggregation). Linux software NAT handles ~1-2Gbps per core. Mitigation: increase conntrack table size to avoid eviction, use large memory pages, consider hardware offload.
+
+**Q4: What is NAT hairpinning and when is it needed?**
+
+A: Hairpinning is when source and destination are on same NAT'd network segment. Without hairpin support, traffic from 10.0.0.5 to 10.0.0.6 wouldn't go through NAT device, so 10.0.0.6 wouldn't know to send response back through NAT. Hairpin requires: (1) DNAT on incoming interface, (2) SNAT on outgoing interface, (3) routing that forces traffic through NAT device. Use case: port forwarding to internal server, where external client wants to access internal server using public IP, even from within the same network. Cloud NAT Gateways support hairpinning for port forwarding scenarios.
+
+## Cheat Sheet
+
+### NAT Table Chains
+
+| Chain | Hook | Used For |
+|-------|------|----------|
+| PREROUTING | PREROUTING | DNAT (port forwarding) |
+| OUTPUT | OUTPUT | Local process DNAT |
+| POSTROUTING | POSTROUTING | SNAT, MASQUERADE |
+
+### iptables NAT Commands
+
+```bash
+# SNAT (static IP)
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 \
+  -j SNAT --to-source 203.0.113.5
+
+# MASQUERADE (dynamic IP from interface)
+iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 \
+  -j MASQUERADE
+
+# DNAT (port forward)
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 \
+  -j DNAT --to-destination 10.0.0.5:80
+
+# Redirect (local)
+iptables -t nat -A PREROUTING -p tcp --dport 80 \
+  -j REDIRECT --to-port 8080
+```
+
+### Conntrack Configuration
+
+```bash
+# Increase conntrack table size
+sysctl -w net.netfilter.nf_conntrack_max=1048576
+
+# TCP timeout (reduce if many short connections)
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=3600
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_close_wait=30
+
+# UDP timeout (very short for DNS)
+sysctl -w net.netfilter.nf_conntrack_udp_timeout=30
+sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=60
+```
+
+## Related Topics
+
+- [VPC](./vpc) — Cloud VPC networking
+- [Firewall](./firewall) — iptables/nftables
+- [Routing](./routing) — Route tables
+- [Packet Flow](./packet-flow) — Linux packet processing

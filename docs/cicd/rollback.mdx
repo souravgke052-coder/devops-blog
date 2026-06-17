@@ -1,0 +1,699 @@
+---
+id: rollback
+title: Rollback Procedures
+description: Automated and manual rollback strategies, triggers, and recovery procedures
+sidebar_position: 8
+---
+
+# Rollback Procedures
+
+## Overview
+
+Rollback is the process of reverting to a previous known-good state when a deployment fails or causes issues. A well-designed rollback strategy minimizes downtime, reduces blast radius, and enables quick recovery. This guide covers automated rollback triggers, manual procedures, and recovery best practices.
+
+## When To Use
+
+- Failed deployment requiring immediate recovery
+- Post-deployment anomalies detected in monitoring
+- Breaking changes discovered after release
+- Security vulnerabilities in newly deployed code
+- Any production issue requiring rapid response
+
+## When NOT To Use
+
+- Minor cosmetic issues that can wait for next deploy
+- Issues that are safer to fix forward than backward
+- Database migrations that can't be easily reversed
+
+## Core Concepts
+
+### Rollback Strategies
+
+| Strategy | Speed | Complexity | Risk |
+|----------|-------|------------|------|
+| **Instant (Blue-Green)** | < 1 min | Medium | Low |
+| **Rolling (K8s)** | 2-5 min | Low | Medium |
+| **Canary Revert** | < 1 min | High | Low |
+| **Feature Flag** | < 1 min | Low | Lowest |
+| **From Image Tag** | Variable | Medium | Medium |
+
+### Key Terminology
+
+| Term | Description |
+|------|-------------|
+| **Rollback** | Revert to previous version |
+| **Roll-forward** | Fix forward, not backward |
+| **Last Known Good** | Previous working version |
+| **Progressive Rollback** | Gradual rollback across pods |
+| **Automated Rollback** | Triggered by monitoring |
+
+## Real Production Example
+
+### Automated Rollback Pipeline
+
+```yaml
+name: Deploy with Auto-Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # DEPLOY AND MONITOR
+  # ============================================
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    outputs:
+      previous_image: ${{ steps.rollback.outputs.previous_image }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Get current image before deployment
+      - name: Get current deployment
+        id: current
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          CURRENT=$(kubectl get deployment api -n production -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Deploy new version
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          # Store previous image for rollback
+          echo "${{ steps.current.outputs.current }}" > previous_image.txt
+          
+          # Update deployment
+          kubectl set image deployment/api api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }} --namespace=production
+          kubectl rollout status deployment/api --namespace=production --timeout=10m
+      
+      # ============================================
+      # SMOKE TEST
+      # ============================================
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+          sleep 30  # Wait for pods to be ready
+          
+          # Health check
+          curl -f https://myapp.com/health || exit 1
+          
+          # API smoke test
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://myapp.com/api/v1/health)
+          if [[ "$RESPONSE" != "200" ]]; then
+            echo "Smoke test failed with status: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "Smoke tests passed"
+
+  # ============================================
+  # MONITOR AND AUTO-ROLLBACK
+  # ============================================
+  monitor:
+    name: Monitor & Auto-Rollback
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    
+    environment:
+      name: production
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      
+      # Get previous image (from file committed by deploy job)
+      - name: Get previous image
+        id: rollback
+        run: |
+          # Try to get from file, fallback to git history
+          if [ -f previous_image.txt ]; then
+            PREVIOUS=$(cat previous_image.txt)
+          else
+            PREVIOUS=$(git show HEAD~1:.previous_image.txt 2>/dev/null || echo "")
+          fi
+          echo "previous=$PREVIOUS" >> $GITHUB_OUTPUT
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      # Monitor for 5 minutes
+      - name: Monitor deployment
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          # Track errors over 5 minutes
+          END_TIME=$(($(date +%s) + 300))
+          ERROR_THRESHOLD=10
+          ERROR_COUNT=0
+          
+          echo "Monitoring until $(date -r $END_TIME)"
+          
+          while [ $(date +%s) -lt $END_TIME ]; do
+            # Check error rate from metrics
+            ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(http_requests_total{status=~'5..'}[1m])" | jq -r '.data.result[0].value[1] // 0')
+            
+            # Check pod health
+            RESTART_COUNT=$(kubectl get pods -n production -l app=api --field-selector=status.phase=Running -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}' | tr ' ' '\n' | awk '{s+=$1} END {print s+0}')
+            
+            echo "Error rate: $ERROR_RATE, Restarts: $RESTART_COUNT"
+            
+            if (( $(echo "$ERROR_RATE > 0.05" | bc -l) )) || [ "$RESTART_COUNT" -gt 5 ]; then
+              echo "ALERT: Error threshold exceeded. Triggering rollback."
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+              
+              if [ "$ERROR_COUNT" -ge 2 ]; then
+                echo "Rolling back..."
+                
+                if [ -n "${{ needs.deploy.outputs.previous_image }}" ]; then
+                  kubectl set image deployment/api api=${{ needs.deploy.outputs.previous_image }} --namespace=production
+                  kubectl rollout status deployment/api --namespace=production --timeout=5m
+                  
+                  # Notify
+                  echo "Rollback completed to: ${{ needs.deploy.outputs.previous_image }}"
+                else
+                  echo "No previous image available for rollback"
+                  exit 1
+                fi
+                break
+              fi
+            fi
+            
+            sleep 30
+          done
+          
+          echo "Monitoring complete. No issues detected."
+
+      - name: Verify post-rollback state
+        if: failure()
+        run: |
+          kubectl get deployment api -n production -o jsonpath='{.spec.template.spec.containers[0].image}'
+          kubectl get pods -n production -l app=api
+```
+
+### Rollback Workflow (Standalone)
+
+```yaml
+name: Rollback Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for rollback'
+        required: true
+      target_version:
+        description: 'Target version (leave empty for previous)'
+        required: false
+
+concurrency:
+  group: rollback-production
+  cancel-in-progress: true
+
+jobs:
+  rollback:
+    name: Rollback to ${{ inputs.target_version || 'previous' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Get rollback target
+        id: target
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          if [ -n "${{ inputs.target_version }}" ]; then
+            TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.target_version }}"
+          else
+            # Get previous image from deployment
+            TARGET=$(kubectl get deployment api -n production -o jsonpath='{.metadata.annotations.rollback-image}')
+            if [ -z "$TARGET" ]; then
+              # Fall back to last successful deployment annotation
+              TARGET=$(kubectl get deployment api -n production -o jsonpath='{.metadata.annotations.last-successful-image}')
+            fi
+          fi
+          
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "Rollback reason: ${{ inputs.reason }}"
+      
+      - name: Record rollback event
+        run: |
+          # Log rollback to audit system
+          cat >> /tmp/rollback_audit.log << EOF
+          $(date -Iseconds),${{ github.sha }},${{ inputs.reason }},${{ needs.target.outputs.target }}
+          EOF
+          
+          # Store in ConfigMap for history
+          kubectl create configmap rollback-history \
+            --from-file=history=/tmp/rollback_audit.log \
+            -n production --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Execute rollback
+        run: |
+          echo "Rolling back to: ${{ steps.target.outputs.target }}"
+          
+          # Scale down to minimize impact
+          kubectl scale deployment/api --replicas=0 -n production
+          sleep 5
+          
+          # Apply rollback image
+          kubectl set image deployment/api api=${{ steps.target.outputs.target }} --namespace=production
+          
+          # Scale back up
+          kubectl scale deployment/api --replicas=5 -n production
+          
+          # Wait for rollout
+          kubectl rollout status deployment/api --namespace=production --timeout=10m
+      
+      - name: Verify rollback
+        run: |
+          # Health check
+          sleep 30
+          
+          kubectl rollout status deployment/api --namespace=production
+          curl -f https://myapp.com/health || exit 1
+          
+          # Verify version
+          CURRENT=$(kubectl get deployment api -n production -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Current image: $CURRENT"
+          
+          if [ "$CURRENT" != "${{ steps.target.outputs.target }}" ]; then
+            echo "Version mismatch after rollback!"
+            exit 1
+          fi
+      
+      - name: Notify
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": ":warning: Production Rollback",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Production Rollback*\nReason: ${{ inputs.reason }}\nTarget: ${{ steps.target.outputs.target }}\nActor: ${{ github.actor }}"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### ArgoCD Rollback
+
+```yaml
+# ArgoCD automated rollback on health failure
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-production
+spec:
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      retry:
+        limit: 3
+        backoff:
+          duration: 5s
+          factor: 2
+  # Manual rollback via CLI:
+  # argocd app rollback api-production
+```
+
+## Configuration / Pipeline Examples
+
+### Prometheus Alert-Based Rollback
+
+```yaml
+# prometheus-rollback-alert.yaml
+groups:
+- name: deployment-alerts
+  rules:
+  - alert: HighErrorRatePostDeployment
+    expr: |
+      increase(http_requests_total{status=~"5..", deployment=~"api-.*"}[5m])
+      > 100
+      and
+      timestamp(up{job="api"}) - timestamp(http_requests_total{job="api"}) < 600
+    for: 2m
+    labels:
+      severity: critical
+      team: platform
+    annotations:
+      summary: "High error rate detected post-deployment"
+      description: "Error rate exceeded threshold for {{ $labels.deployment }}"
+      runbook_url: "https://runbooks.example.com/rollback"
+    
+  - alert: PodCrashLoopPostDeployment
+    expr: |
+      increase(kube_pod_container_status_restarts_total{namespace="production"}[10m]) > 3
+      and
+      changes(kube_pod_container_status_restarts_total{namespace="production"}[10m]) > 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Pod crash loop detected - rollback may be needed"
+
+# Alertmanager config for auto-action
+route:
+  routes:
+  - match:
+      severity: critical
+    receiver: rollback-bot
+    group_by: [alertname, deployment]
+
+receivers:
+- name: rollback-bot
+  webhook_configs:
+  - url: https://api.github.com/repos/$ORG/$REPO/actions/workflows/rollback.yml/dispatch
+    headers:
+      Authorization: token $GITHUB_TOKEN
+```
+
+### Database Migration Rollback
+
+```sql
+-- migration_001_add_user_table.up.sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- migration_001_add_user_table.down.sql
+DROP TABLE IF EXISTS users;
+
+-- Safe migration pattern: Always have both up and down scripts
+```
+
+## Common Commands / Steps
+
+### Kubernetes Rollback Commands
+
+```bash
+# View rollout history
+kubectl rollout history deployment/api -n production
+
+# Rollback to previous
+kubectl rollout undo deployment/api -n production
+
+# Rollback to specific revision
+kubectl rollout undo deployment/api -n production --to-revision=3
+
+# Status during rollback
+kubectl rollout status deployment/api -n production --timeout=5m
+
+# Direct image revert
+kubectl set image deployment/api api=gcr.io/myproject/api:sha-abc123 -n production
+kubectl rollout restart deployment/api -n production
+
+# Blue-green rollback
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+# Check current image
+kubectl get deployment api -n production -o jsonpath='{.spec.template.spec.containers[0].image}'
+```
+
+### ArgoCD/Argo Rollouts Commands
+
+```bash
+# ArgoCD rollback
+argocd app rollback api-production
+argocd app rollback api-production --revision 42
+
+# Argo Rollouts abort and revert
+kubectl argo rollouts abort api -n production
+kubectl argo rollouts undo api -n production
+
+# Check rollout status
+kubectl argo rollouts get api -n production --watch
+
+# Full promote (complete despite analysis failures)
+kubectl argo rollouts promote api -n production --full
+```
+
+### Helm Rollback
+
+```bash
+# List releases
+helm list -n production
+
+# Rollback to previous
+helm rollback api -n production
+
+# Rollback to specific revision
+helm rollback api 3 -n production
+
+# Check status
+helm status api -n production
+```
+
+### Image Tag Recovery
+
+```bash
+# Get image tags from deployment history
+kubectl rollout history deployment/api -n production
+
+# Get image from specific revision
+kubectl rollout history deployment/api -n production --revision=3
+
+# List images in registry
+gcloud artifacts docker images list gcr.io/myproject/api --limit=100
+
+# Get image digest from git commit
+git log --format="%H %s" --after="2024-01-01" | head -10
+```
+
+## Monitoring
+
+### Rollback Metrics
+
+| Metric | Target | Alert |
+|--------|--------|-------|
+| Rollback frequency | < 5% of deploys | > 10% |
+| Time to detect | < 2 min | > 5 min |
+| Time to rollback | < 5 min | > 15 min |
+| Post-rollback error rate | < 1% | > 5% |
+
+### Rollback Detection Queries
+
+```promql
+# Error rate spike (potential rollback trigger)
+rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+
+# Pod restart spike
+increase(kube_pod_container_status_restarts_total{namespace="production"}[5m]) > 3
+
+# Latency spike
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) > 2
+```
+
+## Security
+
+### Rollback Security Considerations
+
+| Concern | Mitigation |
+|---------|------------|
+| Unauthorized rollback | Require approval, RBAC for deployment namespace |
+| Rollback to vulnerable version | Track CVEs in image tags, block rollback to vulnerable |
+| Audit trail | Log all rollbacks with actor, reason, timestamp |
+| Secrets exposure | Ensure secrets aren't logged in rollback |
+
+### Vulnerability-Aware Rollback
+
+```yaml
+# Block rollback to vulnerable versions
+- name: Check for vulnerabilities
+  run: |
+    TRIVY_EXIT_CODE=0
+    trivy image --severity CRITICAL,HIGH ${{ TARGET_IMAGE }} || TRIVY_EXIT_CODE=$?
+    
+    if [ $TRIVY_EXIT_CODE -eq 1 ]; then
+      echo "CRITICAL vulnerabilities found in target image"
+      echo "Manual approval required for this rollback"
+      exit 1
+    fi
+```
+
+## Cost Optimization
+
+### Rollback Cost Considerations
+
+| Factor | Impact | Optimization |
+|--------|--------|--------------|
+| Downtime during rollback | Lost revenue | Blue-green for instant switch |
+| Extra infrastructure | Resource cost | Right-size blue-green environments |
+| Monitoring period | CPU cost | Adaptive monitoring based on risk |
+| Multiple rollback attempts | Increased risk | Improve pre-deployment testing |
+
+### Efficient Rollback
+
+```bash
+# Quick rollback using existing image (no pull needed)
+kubectl rollout undo deployment/api -n production
+
+# For large images, pre-pull before rollback
+kubectl rollout undo deployment/api -n production
+# OR
+kubectl set image deployment/api api=previous@sha256:abc123 -n production
+```
+
+## Troubleshooting
+
+### Common Rollback Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Rollback fails | Missing image | Pull image first, use digest |
+| Rollback stuck | Pod won't start | Check logs, increase timeout |
+| No previous version | Lost history | Implement version tracking annotation |
+| Database incompatible | Migration not backward | Roll forward with compatible schema |
+| Stateful app | Persistent connections | Graceful shutdown, drain connections |
+
+### Debug Commands
+
+```bash
+# Check deployment
+kubectl get deployment api -n production -o wide
+kubectl describe deployment api -n production
+
+# Check pods
+kubectl get pods -n production -l app=api
+kubectl logs -n production -l app=api --tail=100
+kubectl describe pods -n production -l app=api
+
+# Check events
+kubectl get events -n production --sort-by='.lastTimestamp' | grep api
+
+# Check rollback history
+kubectl rollout history deployment/api -n production
+
+# Manual rollback verification
+curl -f https://myapp.com/health
+kubectl exec -n production deployment/api -- curl -s localhost:8080/health
+```
+
+### Emergency Procedures
+
+```bash
+# EMERGENCY: Immediate full rollback
+kubectl scale deployment/api --replicas=0 -n production
+kubectl rollout undo deployment/api -n production
+kubectl scale deployment/api --replicas=5 -n production
+
+# EMERGENCY: Use specific known good image
+kubectl set image deployment/api api=gcr.io/myproject/api:v1.0.0@sha256:abc123 -n production
+kubectl rollout status deployment/api -n production
+
+# EMERGENCY: Blue-green instant switch
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"previous-slot"}}}'
+```
+
+## Interview Questions
+
+### Q1: What's the difference between rollback and roll-forward?
+
+**Answer:** Rollback reverts to a previous known-good state, useful for immediate recovery from broken deployments. Roll-forward applies a patch or fix as a new deployment, avoiding the complexity of reverting database migrations or stateful changes. Roll-forward is preferred when the issue is in a small component, rollback is preferred when the entire deployment is broken or causing critical issues.
+
+### Q2: How do you handle database changes during rollback?
+
+**Answer:** 1) Design migrations to be backward-compatible, 2) Use expand-contract pattern for schema changes, 3) Never include destructive migrations in rollback, 4) Use feature flags for risky data changes, 5) For critical cases, have a separate rollback migration script, 6) Test rollback of migrations in staging. For databases, it's often safer to fix forward with a compensating migration.
+
+### Q3: What metrics trigger automated rollback?
+
+**Answer:** Common triggers: 1) Error rate spike (>5% 5xx errors), 2) Latency increase (>2x baseline p99), 3) Pod restart loop (3+ restarts in 5 min), 4) Health check failures, 5) Business metric anomalies (conversion rate drop). Must define baseline, thresholds, and monitoring window to avoid false positives.
+
+### Q4: How do you implement rollback for stateful applications?
+
+**Answer:** 1) Externalize state to database/volumes, 2) Ensure application can read old data format, 3) Use versioned data schemas, 4) Implement graceful shutdown to flush buffers, 5) Drain connections before switching, 6) Consider read-only mode during transition, 7) Have data migration path for both directions.
+
+### Q5: What's the difference between kubectl rollout undo and setting image directly?
+
+**Answer:** `kubectl rollout undo` reverts to the previous revision in the deployment's revision history, preserving the deployment configuration. Setting image directly only changes the container image, not the deployment's stored configuration. Rollout undo creates a new revision, giving you the ability to undo the undo. Direct image setting is faster but less controlled.
+
+## Cheat Sheet
+
+```bash
+# Kubernetes
+kubectl rollout history deploy/api -n production
+kubectl rollout undo deploy/api -n production
+kubectl rollout undo deploy/api -n production --to-revision=3
+kubectl rollout status deploy/api -n production
+kubectl set image deploy/api api=image:tag -n production
+
+# ArgoCD
+argocd app rollback api-production
+
+# Argo Rollouts
+kubectl argo rollouts abort api -n production
+kubectl argo rollouts undo api -n production
+kubectl argo rollouts promote api -n production
+
+# Helm
+helm rollback api -n production
+helm rollback api 3 -n production
+
+# Blue-green switch
+kubectl patch service api -n production -p '{"spec":{"selector":{"slot":"previous-slot"}}}'
+
+# Get current image
+kubectl get deploy api -n production -o jsonpath='{.spec.template.spec.containers[0].image}'
+```
+
+## Related Topics
+
+- [Deployment Strategies](./deploy.mdx)
+- [Blue-Green Deployments](./blue-green.mdx)
+- [Canary Deployments](./canary.mdx)
+- [Monitoring & Observability](./overview.mdx#monitoring)

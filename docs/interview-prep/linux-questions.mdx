@@ -1,0 +1,786 @@
+---
+sidebar_position: 2
+title: "Linux Interview Questions"
+description: "Senior-level Linux interview questions covering internals, debugging, and production troubleshooting"
+---
+
+# Linux Interview Questions
+
+## Overview
+
+Linux proficiency is foundational for any senior DevOps or SRE role. Interviewers probe beyond surface-level commands to understand your mental model of how Linux actually works — the kernel, system calls, scheduling, memory management, and how processes interact with hardware.
+
+The questions below are designed to test depth. A senior engineer should be able to explain not just **what** a command does, but **why** it works that way and what the kernel is doing under the hood.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Explain the difference between a process and a thread. How does the kernel handle context switching between them?**
+
+A: Processes are execution contexts with independent memory spaces (MMU-enforced isolation), while threads share the same virtual address space within a process. The kernel creates threads using the `clone()` system call with specific flags that control what gets shared (CLONE_VM for memory, CLONE_FS for filesystem, CLONE_FILES for file descriptors, etc.).
+
+When context switching between processes, the kernel must save/restore the entire CPU state including segment registers, page table base register (CR3 on x86), and process-specific kernel state. For threads within the same process, context switching is much cheaper — only CPU registers and scheduling-specific state need saving since they share address space, file descriptors, and signal handlers.
+
+**Follow-up**: Ask about thread vs process creation cost, or when you'd deliberately choose a separate process over threads.
+
+---
+
+**Q: What happens when you read from a file? Walk through the kernel layers.**
+
+A: When you call `read(fd, buf, n)`:
+
+1. **User space**: The C library (`read()` in libc) copies arguments and executes a `syscall` instruction
+2. **System call interface**: CPU transitions to kernel mode, vector table lookup dispatches to `sys_read()`
+3. **VFS layer**: `sys_read()` calls the file system's `read` method via the `struct file_operations` — this abstracts across ext4, XFS, NFS, etc.
+4. **Page cache**: Linux uses a page cache (in the VM subsystem) — the filesystem checks if data is already in memory
+5. **On cache miss**: The filesystem submits a bios request to the block layer
+6. **I/O scheduler**: The block layer queues the request, merges adjacent requests, and schedules them on the disk queue (CFQ, deadline, or MQ)
+7. **Driver**: The disk driver (SATA, NVMe) communicates with hardware via DMA, generating interrupts on completion
+8. **Interrupt handler**: The kernel's interrupt handler copies data to the page cache and marks the waiting process as runnable
+9. **Return**: Data is copied to user buffer via `copy_to_user()`, syscall returns
+
+**Why this matters**: Understanding this path helps you reason about I/O latency, caching behavior, and why certain performance optimizations work.
+
+---
+
+**Q: Explain cgroups and namespaces. How do containers use them?**
+
+A: **Namespaces** partition kernel resources so processes in different namespaces see different views:
+- `pid`: Each namespace has its own process ID sequence (PID 1 in a container is not PID 1 on the host)
+- `net`: Separate network stack (interfaces, routes, iptables rules)
+- `mnt`: Separate mount table (chroot-like behavior)
+- `user`: Separate UID/GID mapping
+- `uts`: Separate hostname and domain name
+- `ipc`: Separate System V IPC objects
+
+**cgroups** (Control Groups v2 in modern systems) limit and prioritize resource usage:
+- `cpu`, `cpuio`: CPU time limiting and I/O weight
+- `memory`: Memory limits and pressure detection
+- `pids`: Maximum number of processes
+- `blkio`: Block device I/O throttling
+- `freezer`: Suspend/resume processes (used in container checkpoint/restore)
+
+Containers use namespaces for isolation (what you see) and cgroups for resource limiting (how much you can use). The `unshare()` and `setns()` syscalls create new namespaces; `cgroupfs` or systemd cgroups manage resource limits.
+
+**Trap**: Many candidates confuse the two. Namespaces don't limit resources — a container with its own PID namespace can still fork-bomb the host if not constrained by cgroups.
+
+---
+
+**Q: Describe the Linux page cache and how write-back caching works.**
+
+A: The page cache is the kernel's main cache for file data. When you read a file, the filesystem checks the page cache first — if data is present, no disk I/O occurs. On cache miss, data is read from disk and stored in the page cache.
+
+For writes, Linux uses **write-back caching** (default for most filesystems):
+- Writes go to the page cache (marked dirty)
+- The VM subsystem has a `pdflush` (older) or `writeback` ( newer) mechanism that writes dirty pages to disk based on:
+  - Time thresholds (typically 30 seconds for goodput vs latency trade-off)
+  - Memory pressure (when memory is needed, clean pages are evicted first)
+  - `dirty_expire_centisecs` and `dirty_writeback_centisecs` sysctls
+
+You can force writeback with `sync()`, but this is a blocking operation. Filesystems also have their own flush mechanisms — ext4 uses `journalled data mode` to commit metadata and data together.
+
+**Why this matters**: This explains why `sync; echo 3 > /proc/sys/vm/drop_caches` works for testing I/O performance, why power loss can corrupt data if barriers aren't enabled, and why `dd` to an NFS mount seems fast but data isn't guaranteed on disk.
+
+---
+
+**Q: What is the OOM killer and how does it decide which process to terminate?**
+
+A: When the kernel exhausts all memory allocation attempts and cannot reclaim any more (no clean pages to free, no reclaimable slabs), the OOM killer activates.
+
+**Decision process**:
+1. The kernel scores each process using `oom_score` (visible in `/proc/PID/oom_score`)
+2. Score formula considers: resident memory size,swapped amount, oom_adj (deprecated) or oom_score_adj, CPU time used, nice value
+3. Higher score = more likely to die
+4. A root-owned process with `/proc/PID/oom_score_adj = -1000` is immune (but be careful — the kernel will still kill something if nothing is exempt)
+
+**What actually happens**: The selected process receives SIGKILL. If it's the current process, execution stops immediately; otherwise, the parent receives SIGCHLD and can wait() to collect the status.
+
+**Follow-up question**: "How would you diagnose OOM issues?" → Answer: Check `dmesg | grep -i oom` or `/var/log/messages`, examine `/proc/PID/oom_score` for suspect processes, look at `vm.overcommit_memory` settings.
+
+---
+
+**Q: Explain the relationship between systemd and the init system. What happens during boot?**
+
+A: Modern Linux uses systemd as the init system (PID 1). The boot sequence:
+
+1. Kernel spawns systemd (or equivalent init) as PID 1
+2. systemd reads `/etc/systemd/system/default.target` to determine the target (multi-user, graphical, etc.)
+3. systemd parses unit files in `/etc/systemd/system/` and `/run/systemd/` and `/usr/lib/systemd/system/`
+4. Units declare dependencies via `After=`, `Requires=`, `Wants=`
+5. systemd builds a dependency tree and starts units in parallel (respecting ordering constraints)
+6. Services that fork and exit (traditional) use `Type=forking`; services that stay running use `Type=simple`; oneshot tasks use `Type=oneshot`
+
+**Socket activation**: systemd can create sockets before starting services, enabling lazy loading and parallel service startup. This is how `sshd` and `docker` can start on-demand.
+
+**Why systemd matters**: Understanding `systemctl`, `journalctl`, service files, and dependency management is essential for debugging startup issues and configuring services properly.
+
+---
+
+**Q: What are file descriptors? How would you debug a "too many open files" error?**
+
+A: A file descriptor (FD) is a small integer that processes use to reference open files, sockets, pipes, and other resources. The kernel maintains a per-process FD table with entries pointing to:
+- The open file description (struct file) 
+- Current offset within the file
+- Access mode (read/write)
+
+**Common FD exhaustion scenarios**:
+- Logging or audit systems not closing file handles
+- Connection pools not properly released
+- Fork bombs creating unlimited processes
+- Memory-mapped files withoutmunmap
+
+**Debugging**:
+```bash
+# Check current limits
+ulimit -n           # soft limit for shell
+cat /proc/PID/limits | grep "Max open files"
+
+# Find processes with most FDs
+ls -la /proc/*/fd | awk -F'/' '{print $4}' | sort | uniq -c | sort -rn | head
+
+# For a specific process
+ls -la /proc/PID/fd | wc -l
+lsof -p PID
+
+# System-wide
+cat /proc/sys/fs/file-max         # system limit
+cat /proc/sys/fs/file-nr          # allocated/free/max
+```
+
+**Follow-up**: Ask about the difference between `ulimit` (process-level) and `/etc/security/limits.conf` (PAM-based login sessions), and systemd's `LimitNOFILE`.
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: A service is experiencing high latency. Walk me through how you'd diagnose it using standard Linux tools.**
+
+A: **Step 1: Verify the symptom exists**
+```bash
+# Check service responsiveness
+curl -w "\nTime: %{time_total}s\n" http://service/health
+
+# Check if it's the service or the network
+ping -c 10 service-host
+traceroute service-host  # or mtr
+```
+
+**Step 2: Identify which resource is saturated**
+```bash
+# CPU saturation
+top -Hp <pid>           # threads CPU usage
+perf top -p <pid>       # CPU sampling
+strace -c -p <pid>      # system call frequency
+
+# Memory pressure
+free -h
+cat /proc/meminfo       # look for Active(anon) and Inactive(file)
+vmstat 1                # si/so columns show swap in/out
+
+# I/O saturation
+iostat -xz 1            # %util near 100% = saturation
+iotop -o               # per-process I/O
+```
+
+**Step 3: Kernel-level analysis**
+```bash
+# Network issues
+ss -s                  # socket summary
+ss -tulpn             # listening sockets
+netstat -an | awk '/^tcp/ {s[$NF]++} END {for(k in s) print k, s[k]}'
+
+# eBPF for deep analysis
+bpftrace -e 'tracepoint:syscalls:sys_enter_read { @[comm] = count(); }'
+execsnoop               # from bcc tools
+opensnoop
+```
+
+**Step 4: Application-level**
+```bash
+# For Java: jstack, jmap, jcmd
+# For Go: pprof endpoint, goroutine dump
+# For any: strace -tt -T -p PID (timing analysis)
+```
+
+**The key insight**: Latency has four sources — CPU queuing, memory allocation/GC, disk I/O wait, or network latency. Tools help you narrow it down.
+
+---
+
+**Q: How do you find which process is consuming the most CPU over a 60-second window?**
+
+A: Multiple approaches:
+
+**Method 1: top with batch mode**
+```bash
+top -b -d 1 -n 60 | grep "^%Cpu" > cpu_log.txt
+# Then parse or use awk to average
+awk '/%Cpu/ {sum+=$2; n++} END {print sum/n}' cpu_log.txt
+```
+
+**Method 2: pidstat (part of sysstat)**
+```bash
+pidstat -u 1 60 | awk '$3 ~ /^[0-9]/ {sum[$7]+=$4; count[$7]++} 
+    END {for(p in sum) print p, sum[p]/count[p]}' | sort -k2 -rn | head
+```
+
+**Method 3: eBPF one-liner**
+```bash
+# Count CPU time per process using eBPF
+bpftrace -e 'profile:hz:99 { @[comm] = count(); }' -d 60
+```
+
+**Why pidstat is often best**: It shows per-process CPU% already averaged, and includes the command name in column 7, making aggregation straightforward.
+
+---
+
+**Q: Explain how you'd use `strace` to debug a hanging application.**
+
+A: **Basic hanging diagnosis**:
+```bash
+strace -p <PID>                  # attach and show ongoing calls
+strace -p <PID> -f              # follow forked children too
+strace -p <PID> -e trace=network # only network syscalls
+strace -p <PID> -e read,write   # only I/O syscalls
+```
+
+**The `-T` flag shows time spent in each syscall** — useful for finding slow calls:
+```bash
+strace -p <PID> -T 2>&1 | grep -v "<... " | tail
+```
+
+**Key patterns to look for**:
+- `read(0, ...` hanging — waiting for stdin
+- `connect(..., AF_UNIX, ...` hanging — Unix socket issues
+- `epoll_wait(..., {EPOLLIN}, 1000)` waiting — event loop working normally
+- `wait4(-1, ...` — waiting for child process
+
+**For intermittent hangs, use timing**:
+```bash
+strace -p <PID> -tt -T -f -o strace.log
+# Then analyze: which calls take longest?
+grep -E "^[0-9]{9}\.[0-9]{6}" strace.log | awk -F'<' '{print $2}' | sort -rn | head
+```
+
+**Follow-up**: Ask about `ltrace` (library calls) and when strace isn't appropriate (production systems with high throughput — strace adds significant overhead).
+
+---
+
+**Q: How would you capture all network connections on port 443 for 60 seconds and analyze them?**
+
+A: **Using tcpdump for capture**:
+```bash
+# Capture on port 443, rotate files every 100MB
+tcpdump -i any -w capture.pcap 'port 443' -C 100 -W 10 &
+
+# Or with a time limit using timeout
+timeout 60 tcpdump -i any -w capture.pcap 'port 443'
+```
+
+**Analyzing the capture**:
+```bash
+# Basic connection summary
+tcpdump -r capture.pcap -q 'port 443' | tail  # connections seen
+tcpdump -r capture.pcap -nn 'port 443' | awk '{print $3, $5}' | cut -d. -f1-4 | sort | uniq -c | sort -rn
+
+# Reassemble HTTP streams
+whireshark -r capture.pcap -Y "http"    # GUI analysis
+tshark -r capture.pcap -Y "http" -T fields -e http.request.uri   # CLI
+
+# Connection timing analysis
+tcpdump -r capture.pcap -tttt 'port 443' | awk '{print $1, $3, $5}' > connections.txt
+```
+
+**Alternative: ss for real-time analysis**:
+```bash
+# Continuous monitoring
+watch -n1 'ss -ti state established "( sport = :443 or dport = :443 )"'
+
+# Connection count and state
+ss -tan 'sport = :443 or dport = :443' state established | awk '{print $4}' | cut -d: -f2 | sort | uniq -c
+```
+
+---
+
+**Q: Explain the output of `vmstat 1 10` and what each column tells you.**
+
+A: `vmstat` output:
+```
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 16G    2.1G   340G    0    0     0     2    2    0  5  2 93  0  0
+```
+
+**Columns explained**:
+- **r**: Processes waiting for CPU (run queue). > CPU count * 4 = saturation
+- **b**: Processes blocked on I/O (uninterruptible sleep)
+- **swpd/free/buff/cache**: Memory breakdown (see vmstat(1) man page for details)
+- **si/so**: Swap in/out pages per second. Any > 0 means memory pressure
+- **bi/bo**: Blocks in/out per second from block devices
+- **in/cs**: Interrupts and context switches per second
+- **us/sy/id/wa/st**: CPU time breakdown (user, system, idle, wait I/O, stolen from VM)
+
+**Key interpretations**:
+- High `r` with low `id` = CPU bound
+- High `b` with high `wa` = I/O bound  
+- Any `so`/`si` = memory pressure (not necessarily bad on first boot)
+- High `in` + low `cs` = hardware interrupts
+- High `cs` = many context switches (could be many threads or excessive syscall rate)
+
+---
+
+**Q: How do you find which process opened a specific file, even after it's been deleted?**
+
+A: **Linux provides /proc/PID/fd that persists even after unlink**:
+```bash
+# Find by filename
+lsof +L1              # files with link count < 1 (deleted but open)
+
+# Or search all fd symlinks
+for pid in $(ls /proc | grep '^[0-9]'); do 
+    ls -la /proc/$pid/fd 2>/dev/null | grep deleted
+done
+
+# Find specific file
+lsof /var/log/syslog
+# Then check the PID's fd
+ls -la /proc/<PID>/fd/ | grep syslog
+```
+
+**Use case**: Log files that logrotate truncates while applications keep writing — the actual disk space isn't freed until the file handle closes.
+
+---
+
+### Troubleshooting Questions
+
+**Q: A server has high iowait but iostat shows low disk utilization. What's happening?**
+
+A: This is a classic misunderstanding. **iowait is time the CPU is idle while waiting for I/O**, not disk utilization.
+
+**Possible explanations**:
+
+1. **Network I/O wait**: CPU waiting for network (but shown as iowait in older kernels). Check with `sar -n DEV 1` for network traffic.
+
+2. **NFS/cifs mounted filesystem**: When NFS server is slow, the CPU waits in iowait even though local disk is idle.
+
+3. **MD software RAID**: iostat shows per-disk stats, but the array might be rebuilding or a parity calculation bottleneck.
+
+4. **Multi-queue storage**: Modern NVMe drives show in `iostat -x` but iowait may be misleading.
+
+**Diagnosis steps**:
+```bash
+# Check what processes are in D state (uninterruptible sleep, usually I/O)
+ps aux | grep -E 'D$|STAT.*D'
+
+# Check NFS mounts and their latency
+nfsiostat
+mount | grep nfs
+
+# Check if network is saturated
+sar -n DEV 1
+ss -s
+
+# Check detailed block device stats
+iostat -xhz 1
+# Look at avgqu-sz, await, and %util together
+```
+
+**The fix**: Depends on root cause — could be NFS tuning, network optimization, or storage configuration.
+
+---
+
+**Q: A container's `/var/log/app.log` is consuming excessive disk space. The application keeps writing to this file. How do you rotate it without restarting the container?**
+
+A: Several approaches, depending on what's running inside the container:
+
+**Option 1: From outside the container (if you have host access)**:
+```bash
+# Find the container's PID
+docker inspect --format '{{.State.Pid}}' <container>
+
+# Find the log file's file descriptor
+ls -la /proc/<PID>/fd/ | grep app.log
+
+# Copy and truncate (sends SIGUSR1 to application to reopen logs)
+cp /var/lib/docker/containers/<container-id>/<container-id>-json.log /backup/
+: > /var/lib/docker/containers/<container-id>/<container-id>-json.log
+```
+
+**Option 2: Signal the application (if it supports logrotate signal)**:
+```bash
+kill -USR1 $(pgrep app)
+# Or for Docker
+docker kill -s USR1 <container>
+```
+
+**Option 3: Use a logging sidecar pattern** (recommended for production):
+- Mount a shared volume for logs
+- Sidecar runs logrotate or ships logs to central logging
+- Application writes to volume, never directly to container filesystem
+
+**Option 4: Configure application logging**:
+If application supports SIGHUP for reopening logs, configure logrotate externally with `copytruncate` (can cause slight log loss) or `sharedscripts` with `postrotate`.
+
+**Why this matters**: In production, containers are often long-running. You need to manage disk space without disrupting services.
+
+---
+
+**Q: A process is consuming 100% CPU but `top` shows low overall CPU idle. How do you identify which specific process?**
+
+A: The standard `top` shows total CPU, but finding the culprit requires per-process examination:
+
+```bash
+# Method 1: top with process sorting (press P to sort by CPU)
+top -Hp <optional-pid>
+
+# Method 2: pidstat (sysstat package)
+pidstat -u 1 10   # show per-process CPU every 1 second for 10 samples
+
+# Method 3: ps with sorting
+ps aux --sort=-%cpu | head -20
+
+# Method 4: /proc directly
+for pid in $(ls /proc | grep '^[0-9]' | sort -n); do 
+    printf "%s %s\n" "$pid" "$(cat /proc/$pid/stat | awk '{print $14}')"
+done | sort -k2 -rn | head
+
+# Method 5: bpftrace for real-time
+bpftrace -e 'profile:hz:99 /pid == TARGET_PID/ { @[ustack] = count(); }'
+```
+
+**Common cause**: A runaway thread in a multi-threaded application. `top -Hp` shows thread-level CPU, revealing which thread is the culprit.
+
+---
+
+**Q: You're seeing "Too many open files" errors. Walk through the troubleshooting process.**
+
+A: **Step 1: Confirm the symptom**
+```bash
+dmesg | grep -i "too many open"
+journalctl -xe | grep -i "too many open"
+# Or reproduce the error
+```
+
+**Step 2: Check current limits**
+```bash
+# Process-level limits
+cat /proc/PID/limits | grep "Max open files"
+prlimit -n --pid PID
+
+# User-level limits (login sessions use PAM)
+ulimit -n
+cat /etc/security/limits.conf
+cat /etc/systemd/system/*.service.d/override.conf  # systemd overrides
+
+# System-level limits
+cat /proc/sys/fs/file-max
+cat /proc/sys/fs/file-nr  # allocated, free, max
+```
+
+**Step 3: Identify what's holding FDs open**
+```bash
+# All FDs system-wide
+lsof 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head
+
+# For specific PID
+lsof -p PID
+ls -la /proc/PID/fd | wc -l
+
+# Most common: sockets (network connections)
+ss -s
+netstat -an | awk '/^tcp/ {s[$NF]++} END {for(v in s) print v, s[v]}'
+```
+
+**Step 4: Root cause analysis**
+Common causes:
+- Application not closing connections properly (connection leak)
+- Too many files being opened for logging/auditing
+- Process forking excessively
+- Memory-mapped files not being unmapped
+
+**Step 5: Fix it**
+```bash
+# Temporary (doesn't persist across reboot)
+ulimit -n 65536
+
+# Permanent for systemd service:
+# Add to /etc/systemd/system/<service>.service.d/override.conf:
+[Service]
+LimitNOFILE=65536
+
+# For all users:
+# Edit /etc/security/limits.conf
+* soft nofile 65536
+* hard nofile 65536
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: Design a highly available load balancer architecture on Linux.**
+
+A: **Components and trade-offs**:
+
+**Layer 4 vs Layer 7**:
+- L4 (TCP/UDP): Faster, simpler, less awareness of HTTP semantics
+- L7 (HTTP): Can inspect headers, path-based routing, TLS termination
+
+**HA Options**:
+
+1. **Linux Virtual Server (LVS/IPVS)**
+   - Kernel-level load balancing, very high performance
+   - Modes: NAT, Direct Routing (DR), IP Tunneling
+   - Combined with Keepalived for health checking and VRRP failover
+   - Limitation: No L7 routing without LVS + patch
+
+2. **HAProxy**
+   - Most flexible, full L7 awareness
+   - Active-passive or active-active with VRRP/keepalived
+   - Can do ACL-based routing, rate limiting, circuit breaking
+   - Trade-off: Single-threaded (but multi-process in recent versions)
+
+3. **Envoy/HAProxy + Mesos/Tech-specific ingress**
+   - For container orchestration, native integrations exist
+
+**Architecture pattern**:
+```
+                ┌─────────────────────────┐
+                │   Anycast / DNS Round   │
+                │        Robin            │
+                └───────────┬─────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            │               │               │
+      ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴─────┐
+      │  LB Node  │   │  LB Node  │   │  LB Node  │
+      │  (Active) │   │ (Standby) │   │ (Standby) │
+      └─────┬─────┘   └───────────┘   └───────────┘
+            │
+            ▼
+      ┌─────────────┐
+      │   Backend   │
+      │   Servers   │
+      └─────────────┘
+```
+
+**Keepalived config for VRRP**:
+```bash
+# /etc/keepalived/keepalived.conf
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100  # higher wins
+    virtual_ipaddress {
+        10.0.0.100  # shared VIP
+    }
+}
+```
+
+**Health checking**: Critical for reliability. LB should probe backend health, remove unhealthy backends, and re-add them when recovered.
+
+---
+
+**Q: How would you design a centralized logging architecture for a 1000-server fleet?**
+
+A: **Design considerations**:
+- Log volume: 1000 servers * 1GB/day = 1TB/day
+- Search latency requirements
+- Retention and compliance
+- Cost at scale
+
+**Recommended architecture**:
+
+```
+┌────────────┐    ┌────────────┐    ┌────────────┐
+│  Servers   │───▶│  Fluentd   │───▶│   Kafka    │
+│  (source)  │    │  (agent)   │    │  (buffer)  │
+└────────────┘    └────────────┘    └─────┬──────┘
+                                          │
+                               ┌───────────┼───────────┐
+                               ▼           ▼           ▼
+                         ┌─────────┐ ┌─────────┐ ┌─────────┐
+                         │Elastic  │ │  S3 /   │ │Alerting │
+                         │Search   │ │GCS      │ │Pipeline │
+                         └─────────┘ └─────────┘ └─────────┘
+```
+
+**Agent tier**: Fluentd/Fluent Bit on each server. Lightweight, parses, filters, and forwards. Configure buffering for backpressure.
+
+**Transport tier**: Kafka or Kinesis for durability and buffering. Prevents log loss if downstream is slow.
+
+**Storage tier**:
+- Elasticsearch for search (costly but powerful)
+- S3/GCS for cheap archival (use with Parquet for analytics)
+- Separate hot/warm/cold indexes in ES
+
+**Key decisions**:
+1. **Schema**: Use structured logging (JSON), not plain text
+2. **Sampling**: Consider sampling debug logs at high volume
+3. **Sensitive data**: Scrub PII before ingestion
+4. **Retention**: Configurable per log type (security logs longer than app logs)
+
+---
+
+### Security Questions
+
+**Q: A malicious container escapes its namespace and gains host access. How does this happen and how do you prevent it?**
+
+A: **Common container escape vectors**:
+
+1. **Privileged containers**: Running with `--privileged` disables security features
+   - Can write to host devices and filesystems
+   - Can load kernel modules
+   - Prevention: Never use privileged containers in production
+
+2. **Shared namespaces**: `--pid=host --net=host` shares host namespaces
+   - Process running as PID 1 on host could signal other processes
+   - Prevention: Only share namespaces when absolutely necessary
+
+3. **Socket access**: Mounting Docker socket (`-v /var/run/docker.sock:/var/run/docker.sock`)
+   - Inside container, can create new containers with full host access
+   - Prevention: Use rootless containers, avoid socket mounts
+
+4. **Kernel exploits**: Out-of-date kernels with CVE vulnerabilities
+   - seccomp, AppArmor, SELinux limit syscalls but don't eliminate risk
+   - Prevention: Keep kernel updated, use minimal container images
+
+5. **cgroups release agent**: Exploit of cgroups v1 release agent
+   - Allow arbitrary write to host filesystem
+   - Mitigation: cgroups v2, user namespaces
+
+**Defense in depth**:
+- Run containers as non-root (UID mapping)
+- Use seccomp to block dangerous syscalls
+- AppArmor or SELinux for MAC
+- Read-only root filesystem where possible
+- Drop capabilities (`--cap-drop=ALL`)
+- Keep kernel and container runtime updated
+
+---
+
+**Q: Explain how you would audit SUID binaries and why they pose a security risk.**
+
+A: **SUID binaries and the risk**:
+When a binary has the SUID bit set, it runs with the file owner's privileges, not the caller's. If the binary can be exploited (buffer overflow, command injection), the attacker gains elevated privileges.
+
+**Finding SUID binaries**:
+```bash
+# Find all SUID binaries
+find / -perm -4000 -type f 2>/dev/null
+
+# Find SGID binaries
+find / -perm -2000 -type f 2>/dev/null
+
+# Compare against known-good baseline (snapshot)
+find / -perm -4000 -type f -exec md5sum {} \; > suid_baseline.txt
+# Later: diff <(find / -perm -4000 -type f -exec md5sum {} \;) suid_baseline.txt
+```
+
+**Security hardening approach**:
+1. Document all SUID binaries and why they need SUID
+2. Remove SUID from binaries that don't require it: `chmod -s /usr/bin/somebinary`
+3. Use capability-based security: instead of full root, grant specific capabilities like `CAP_NET_RAW` for ping
+4. Monitor for new SUID binaries via file integrity monitoring (AIDE, Tripwire)
+
+**Example**: `ping` needs raw sockets but doesn't need full root. Modern ping uses capabilities: `setcap cap_net_raw+ep /bin/ping`
+
+---
+
+### Scenario-Based Questions
+
+**Q: Your team uses a legacy application that writes logs to /var/log/legacy.log. You need to ship these logs to Elasticsearch without modifying the application. Walk through the solution.**
+
+A: **Approach**: Use a logging agent sidecar or system-level log shipper.
+
+**Solution 1: Fluent Bit as system daemon**
+```bash
+# Install fluent-bit
+# Configure /etc/fluent-bit/fluent-bit.conf
+[SERVICE]
+    Flush        5
+    Daemon       Off
+    Log_Level    info
+
+[INPUT]
+    Name        tail
+    Path        /var/log/legacy.log
+    Parser      json
+    DB          /var/lib/fluent-bit/legacy.db
+
+[OUTPUT]
+    Name        es
+    Match       *
+    Host        elasticsearch.example.com
+    Port        9200
+    Index       legacy-logs
+```
+
+**Solution 2: Using rsyslog with omelasticsearch module**
+```bash
+# /etc/rsyslog.d/legacy.conf
+input(type="imfile" file="/var/log/legacy.log" tag="legacy"
+      ruleset="remote")
+
+ruleset(name="remote") {
+    action(type="omelasticsearch"
+           server="elasticsearch.example.com"
+           searchIndex="legacy-logs"
+           searchType="logs")
+}
+```
+
+**Solution 3: Named pipe (FIFO) approach**
+```bash
+mkfifo /var/log/legacy.fifo
+# Application writes to FIFO
+# Agent reads from FIFO
+```
+
+**Key decisions**:
+- Parse format: If legacy app writes plain text, configure parser; if JSON, use JSON parser
+- Buffering: When Elasticsearch is down, how much can you buffer? Consider Kafka or local file buffer
+- Rotation: Configure logrotate with `copytruncate` or signal application to reopen logs
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Relying on memorized commands without understanding**: Interviewers probe deeper — if you can't explain why a command works, you haven't demonstrated true knowledge.
+
+2. **Ignoring the kernel**: Most candidates focus on user-space tools. Staff engineers understand the kernel's role in I/O, scheduling, and memory management.
+
+3. **Not practicing live debugging**: Being able to walk through a troubleshooting process is different from doing it. Practice on intentionally broken systems.
+
+4. **Confusing tools**: `netstat` vs `ss`, `iostat` vs `iotop`, `vmstat` vs `free` — each has specific use cases. Know when to use which.
+
+5. **Missing the "why"**: "I run `strace` to debug" is not enough. Explain what you're looking for and what specific output tells you.
+
+## How to Structure Your Answers
+
+For **conceptual questions**:
+1. Give the core answer first
+2. Provide concrete examples
+3. Explain trade-offs and alternatives
+4. Acknowledge edge cases
+
+For **troubleshooting questions**:
+1. Confirm the symptom
+2. Hypothesize the likely cause (based on what the symptom implies)
+3. Show specific commands to confirm
+4. Explain the fix
+5. Discuss how to prevent recurrence
+
+For **system design questions**:
+1. Clarify constraints and requirements
+2. Outline high-level components
+3. Discuss trade-offs
+4. Consider failure modes and monitoring
+
+## Related Topics
+
+- [Networking Questions](./networking-questions.mdx)
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [SRE Questions](./sre-questions.mdx)
+- [Architecture Questions](./architecture-questions.mdx)

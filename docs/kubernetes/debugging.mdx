@@ -1,0 +1,623 @@
+---
+title: "Kubernetes Debugging"
+description: "Complete guide to debugging Kubernetes - troubleshooting pods, services, networking, and common issues"
+sidebar_position: 21
+---
+
+# Kubernetes Debugging
+
+## Overview
+
+Debugging Kubernetes requires systematic approaches to diagnose issues across pods, services, networking, and cluster components. This guide covers common failure modes, diagnostic tools, and step-by-step troubleshooting procedures for production environments.
+
+## When to Use
+
+- **Pod failures** - CrashLoopBackOff, ImagePullBackOff, OOMKilled
+- **Network issues** - Service unreachable, DNS failures
+- **Scheduling problems** - Pods stuck in Pending
+- **Performance issues** - High latency, resource exhaustion
+- **Cluster issues** - Control plane problems, node failures
+
+## When NOT to Use
+
+- **When you need to fix** - debugging finds issues, fixing is separate
+- **Without context** - know the expected behavior first
+
+## Core Concepts
+
+### Debugging Layers
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Debugging Layers in Kubernetes                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Application Layer                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Application logs                                                 │   │
+│  │  - Process status                                                   │   │
+│  │  - Health check endpoints                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  2. Container Layer                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Container logs                                                   │   │
+│  │  - Resource limits                                                  │   │
+│  │  - Security context                                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  3. Pod Layer                                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Pod status and events                                            │   │
+│  │  - Init containers                                                  │   │
+│  │  - Probes                                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  4. Service/Network Layer                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Endpoints                                                        │   │
+│  │  - DNS resolution                                                   │   │
+│  │  - Network policies                                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  5. Node/Cluster Layer                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Node conditions                                                  │   │
+│  │  - kubelet status                                                   │   │
+│  │  - Control plane components                                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Debugging Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Debugging Decision Tree                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Pod not running?                                                            │
+│  │                                                                         │
+│  ├── Pending? ──▶ Check: resources, node selector, affinity, taints        │
+│  │                                                                         │
+│  ├── ContainerCreating? ──▶ Check: volumes, image pull, CNI                │
+│  │                                                                         │
+│  ├── ImagePullBackOff? ──▶ Check: image name, registry, credentials        │
+│  │                                                                         │
+│  ├── CrashLoopBackOff? ──▶ Check: application logs, resource limits        │
+│  │                                                                         │
+│  ├── Running but not healthy? ──▶ Check: probes, health endpoints          │
+│  │                                                                         │
+│  └── Running but not accessible? ──▶ Check: service, endpoints, network   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Comprehensive Debug Session
+
+```bash
+#!/bin/bash
+# Production debugging script
+
+NAMESPACE="production"
+DEPLOYMENT="api-service"
+
+echo "=== Starting Debug Session for $DEPLOYMENT ==="
+echo ""
+
+# 1. Check deployment status
+echo "=== Deployment Status ==="
+kubectl get deployment $DEPLOYMENT -n $NAMESPACE
+echo ""
+
+# 2. Check replica set
+echo "=== ReplicaSet Status ==="
+kubectl get rs -n $NAMESPACE -l app=$DEPLOYMENT
+echo ""
+
+# 3. Check pods
+echo "=== Pod Status ==="
+kubectl get pods -n $NAMESPACE -l app=$DEPLOYMENT -o wide
+echo ""
+
+# 4. Check pod events
+echo "=== Recent Events ==="
+kubectl get events -n $NAMESPACE --field-selector involvedObject.name=$DEPLOYMENT --sort-by='.lastTimestamp'
+echo ""
+
+# 5. Check pod descriptions for issues
+echo "=== Pod Issues ==="
+for pod in $(kubectl get pods -n $NAMESPACE -l app=$DEPLOYMENT -o jsonpath='{.items[*].metadata.name}'); do
+    echo "--- Pod: $pod ---"
+    kubectl describe pod $pod -n $NAMESPACE | grep -A 5 "Events:\|Warning:\|Conditions:"
+done
+echo ""
+
+# 6. Check container logs
+echo "=== Container Logs (last 50 lines) ==="
+for pod in $(kubectl get pods -n $NAMESPACE -l app=$DEPLOYMENT -o jsonpath='{.items[*].metadata.name}'); do
+    echo "--- Pod: $pod ---"
+    kubectl logs $pod -n $NAMESPACE --tail=50
+    echo ""
+done
+echo ""
+
+# 7. Check resource usage
+echo "=== Resource Usage ==="
+kubectl top pods -n $NAMESPACE -l app=$DEPLOYMENT
+echo ""
+
+# 8. Check service endpoints
+echo "=== Service Endpoints ==="
+kubectl get endpoints $DEPLOYMENT -n $NAMESPACE -o yaml
+echo ""
+
+# 9. Check service selector
+echo "=== Service Selector ==="
+kubectl get service $DEPLOYMENT -n $NAMESPACE -o jsonpath='{.spec.selector}'
+echo ""
+
+# 10. Check network policies
+echo "=== Network Policies ==="
+kubectl get networkpolicy -n $NAMESPACE
+kubectl describe networkpolicy -n $NAMESPACE
+```
+
+### Network Debugging Commands
+
+```bash
+# Network debugging pod
+kubectl run netshoot --image=nicolaka/netshoot:latest --rm -it -- /bin/bash
+
+# Inside netshoot pod:
+# DNS debugging
+nslookup api-service.production.svc.cluster.local
+dig api-service.production.svc.cluster.local
+
+# Connection testing
+curl -v http://api-service.production.svc.cluster.local:8080/healthz
+telnet api-service.production.svc.cluster.local 8080
+
+# Route debugging
+ip route
+ip addr
+ss -tlnp
+
+# Port scanning
+nmap -p 80,443,8080 api-service
+
+# HTTP debugging
+curl -I http://api-service.production.svc.cluster.local
+wget -S http://api-service.production.svc.cluster.local
+
+# DNS resolution details
+cat /etc/resolv.conf
+nslookup kubernetes.default
+```
+
+### Application Debugging
+
+```bash
+# Create debug container
+kubectl debug mypod -it --image=busybox -- sh
+
+# Debug with specific container (multi-container pod)
+kubectl debug mypod -it --container=main -- sh
+
+# Copy pod and add debug container
+kubectl debug mypod --image=busybox --copy-to=debug-mypod
+
+# Share process namespace
+kubectl debug mypod --share-processes --copy-to=debug-mypod
+
+# Node debugging (requires node access)
+kubectl debug node/node-name -it --image=busybox -- sh
+```
+
+## YAML Examples
+
+### Debug Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: debug-deployment
+  namespace: production
+spec:
+  replicas: 1  # Single replica for debugging
+  selector:
+    matchLabels:
+      app: debug-app
+  template:
+    metadata:
+      labels:
+        app: debug-app
+    spec:
+      # Debug container with tools
+      containers:
+      - name: debug
+        image: curlimages/curl:latest
+        command: ["sleep", "3600"]  # Keep running
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+```
+
+## CLI Examples (kubectl)
+
+### Pod Debugging
+
+```bash
+# Get pod status
+kubectl get pod my-pod -n production -o wide
+
+# Describe pod (shows events, conditions)
+kubectl describe pod my-pod -n production
+
+# Get pod YAML (full spec)
+kubectl get pod my-pod -n production -o yaml
+
+# Pod logs
+kubectl logs my-pod -n production
+kubectl logs my-pod -n production --previous  # Previous container
+kubectl logs my-pod -n production --tail=100 -f  # Follow
+
+# Multi-container pod logs
+kubectl logs my-pod -n production -c container-name
+
+# Execute in pod
+kubectl exec my-pod -n production -- ls /app
+kubectl exec -it my-pod -n production -- /bin/sh
+
+# Execute in specific container
+kubectl exec -it my-pod -n production -c container-name -- /bin/sh
+
+# Port forward
+kubectl port-forward my-pod 8080:80 -n production
+
+# Copy files
+kubectl cp my-pod:/app/logs ./logs -n production
+kubectl cp ./config.yaml my-pod:/app/config.yaml -n production
+```
+
+### Service Debugging
+
+```bash
+# Get service details
+kubectl get service my-service -n production -o yaml
+kubectl describe service my-service -n production
+
+# Get endpoints
+kubectl get endpoints my-service -n production
+kubectl describe endpoints my-service -n production
+
+# Test service from within cluster
+kubectl run curl --image=curlimages/curl -it --rm -- sh
+# Then: curl http://my-service.production.svc.cluster.local
+
+# Port forward to service
+kubectl port-forward svc/my-service 8080:80 -n production
+```
+
+### Node Debugging
+
+```bash
+# Node status
+kubectl get nodes -o wide
+kubectl describe node node-name
+
+# Check node conditions
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}: {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+
+# SSH to node (GKE)
+gcloud compute ssh node-name --zone=us-central1-a
+
+# Check kubelet logs
+gcloud logging read "resource.type=gce_instance" --project=my-project | head -50
+
+# Cordon node (mark unschedulable)
+kubectl cordon node-name
+
+# Drain node (evict pods)
+kubectl drain node-name --ignore-daemonsets --delete-emptydir-data --force
+
+# Uncordon node (mark schedulable)
+kubectl uncordon node-name
+```
+
+### Event Debugging
+
+```bash
+# Get all events sorted by time
+kubectl get events --sort-by='.lastTimestamp'
+
+# Get events for specific namespace
+kubectl get events -n production --sort-by='.lastTimestamp'
+
+# Get events for specific resource
+kubectl get events --field-selector involvedObject.name=my-pod,involvedObject.kind=Pod
+
+# Get warning events
+kubectl get events --field-selector type=Warning --sort-by='.lastTimestamp'
+
+# Get events for failed pods
+kubectl get events --field-selector reason=Failed --sort-by='.lastTimestamp'
+```
+
+## Common Commands
+
+### Diagnostic Commands by Issue
+
+```bash
+# Pod stuck in Pending
+kubectl describe pod my-pod | grep -A 10 "Events:"
+kubectl get nodes -o wide
+kubectl describe node node-name | grep -A 5 "Allocated resources"
+
+# Pod stuck in ContainerCreating
+kubectl describe pod my-pod | grep -A 10 "Events:"
+kubectl get pvc  # Check volumes
+kubectl get storageclass
+
+# CrashLoopBackOff
+kubectl logs my-pod --previous
+kubectl describe pod my-pod | grep -A 10 "Events:"
+
+# ImagePullBackOff
+kubectl describe pod my-pod | grep "Image:"
+kubectl get secret -n production | grep docker  # Check image pull secret
+
+# Pod not reachable
+kubectl get endpoints my-service
+kubectl describe service my-service
+kubectl get networkpolicy -n production
+
+# High CPU/memory
+kubectl top pods -n production
+kubectl describe pod my-pod | grep -A 5 "Limits\|Requests"
+```
+
+### Log Analysis
+
+```bash
+# Application logs
+kubectl logs deployment/myapp -n production --tail=100
+kubectl logs -l app=myapp -n production --tail=100
+
+# System logs (GKE)
+gcloud logging read "resource.type=k8s_container" --project=my-project --limit=50
+
+# Search for errors
+kubectl logs -n production -l app=myapp | grep -i error
+
+# All pods in namespace
+kubectl logs -n production --all-containers=true | grep -i error
+
+# Previous logs (after crash)
+kubectl logs my-pod -n production --previous
+```
+
+## Monitoring
+
+### Key Metrics to Check
+
+```bash
+# Node metrics
+kubectl top nodes
+
+# Pod metrics
+kubectl top pods -A
+
+# Node allocatable resources
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.memory}{"\t"}{.status.allocatable.cpu}{"\n"}{end}'
+
+# Check resource requests vs limits
+kubectl get pods -n production -o json | jq '.items[] | {name: .metadata.name, containers: .spec.containers[].resources}'
+```
+
+### Status Checks
+
+```bash
+# Cluster components
+kubectl get componentstatuses
+
+# API server health
+kubectl get --raw='/healthz'
+
+# etcd health
+kubectl get --raw='/healthz/etcd'
+
+# Scheduler health
+kubectl get --raw='/healthz/scheduler'
+
+# Controller manager health
+kubectl get --raw='/healthz/controller-manager'
+```
+
+## Security
+
+### Secure Debugging Practices
+
+```bash
+# Never expose sensitive data in debug commands
+# Use read-only operations when possible
+# Clean up debug pods after use
+
+# RBAC for debugging
+kubectl auth can-i get pods --as=developer@example.com -n production
+kubectl auth can-i exec pods --as=developer@example.com -n production
+
+# Check who can perform privileged operations
+kubectl auth can-i --list --as=system:serviceaccount:production:my-sa
+```
+
+## Troubleshooting
+
+### Common Issues Matrix
+
+| Issue | Diagnosis | Solution |
+|-------|-----------|----------|
+| CrashLoopBackOff | Logs: `kubectl logs --previous` | Fix app error or resource limits |
+| ImagePullBackOff | `kubectl describe pod` | Fix image name or pull secret |
+| OOMKilled | `kubectl describe pod` | Increase memory limit |
+| Pending | Node resources | Scale down or add nodes |
+| ContainerCreating | Volumes/Secrets | Check mount configuration |
+| Terminating stuck | Finalizers | Remove finalizers or force delete |
+| Service unreachable | Endpoints missing | Check pod selector |
+| DNS not working | CoreDNS pods | Check CoreDNS status |
+
+### Systematic Debugging Process
+
+```bash
+# Step 1: Check basic status
+kubectl get pods -n production
+kubectl describe pod my-pod -n production
+
+# Step 2: Check logs
+kubectl logs my-pod -n production
+kubectl logs my-pod -n production --previous
+
+# Step 3: Check events
+kubectl get events -n production --sort-by='.lastTimestamp'
+
+# Step 4: Check resources
+kubectl top pod my-pod -n production
+kubectl describe node node-name
+
+# Step 5: Check network
+kubectl exec -it my-pod -n production -- sh
+# Then: curl, nslookup, netstat
+
+# Step 6: Check volumes
+kubectl describe pod my-pod -n production | grep -A 20 "Volumes"
+
+# Step 7: Check secrets/configmaps
+kubectl get secret my-secret -n production
+kubectl describe secret my-secret -n production
+```
+
+### Recovery Procedures
+
+```bash
+# Force delete stuck pod
+kubectl delete pod my-pod -n production --grace-period=0 --force
+
+# Recreate deployment
+kubectl scale deployment myapp --replicas=0 -n production
+kubectl scale deployment myapp --replicas=3 -n production
+
+# Restart all pods in deployment
+kubectl rollout restart deployment/myapp -n production
+
+# Clear and recreate service
+kubectl delete service my-service -n production
+kubectl apply -f service.yaml -n production
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: How do you debug a pod that's in CrashLoopBackOff?**
+A: First, check the logs with `kubectl logs --previous` to see why the container crashed. Common causes include: application errors, missing configuration, resource limits too low, or dependency failures.
+
+**Q: How do you debug a pod that's stuck in Pending?**
+A: Check `kubectl describe pod` for events. Common causes include: insufficient node resources, node selectors/affinity not matching, taints without tolerations, or PVC binding issues.
+
+**Q: How do you debug a service that's not reachable?**
+A: Check endpoints exist with `kubectl get endpoints`. Verify pod selector matches pod labels. Test from within cluster with curl. Check NetworkPolicies.
+
+### Intermediate Questions
+
+**Q: How do you debug network issues between pods?**
+A: Deploy a debug pod (netshoot) and run connectivity tests. Check CNI plugin status. Verify NetworkPolicies allow traffic. Use `ip route` and `ss` commands inside pods.
+
+**Q: How do you debug high latency in a service?**
+A: Check pod resource usage with `kubectl top`. Look at application metrics. Check for OOMKilled events. Verify readiness/liveness probe timeouts aren't causing delays.
+
+### Advanced Questions
+
+**Q: How do you debug kubelet issues?**
+A: Check kubelet logs (journalctl -u kubelet on node). Verify container runtime is running (crictl ps). Check node conditions and resources. Review kubelet configuration.
+
+**Q: How do you debug etcd issues?**
+A: Check etcd health with etcdctl. Verify disk latency (etcd is disk-sensitive). Check etcd logs. Verify quorum isn't lost. Ensure sufficient disk space.
+
+## Cheat Sheet
+
+### Essential Debug Commands
+
+```bash
+# Status checks
+kubectl get pods -n production
+kubectl describe pod my-pod -n production
+kubectl get events --sort-by='.lastTimestamp'
+
+# Logs
+kubectl logs my-pod -n production
+kubectl logs my-pod -n production --previous
+kubectl logs -f my-pod -n production --tail=100
+
+# Execution
+kubectl exec -it my-pod -n production -- /bin/sh
+kubectl exec my-pod -n production -- env
+
+# Networking
+kubectl port-forward my-pod 8080:80 -n production
+kubectl run netshoot --image=nicolaka/netshoot:latest --rm -it -- /bin/bash
+
+# Resources
+kubectl top nodes
+kubectl top pods -n production
+
+# Events
+kubectl get events --field-selector involvedObject.name=my-pod
+```
+
+### Debug Flow
+
+```bash
+# 1. Get pod status
+kubectl get pod my-pod -n production
+
+# 2. Describe for events
+kubectl describe pod my-pod -n production
+
+# 3. Check logs
+kubectl logs my-pod -n production
+kubectl logs my-pod -n production --previous
+
+# 4. Check resources
+kubectl top pod my-pod -n production
+
+# 5. Execute debug
+kubectl exec -it my-pod -n production -- /bin/sh
+
+# 6. Network test
+kubectl run curl --image=curlimages/curl -it --rm -- sh
+```
+
+### Quick Reference
+
+| Issue | First Command | Second Command |
+|-------|---------------|----------------|
+| Pod not starting | `kubectl describe pod` | `kubectl get events` |
+| App crash | `kubectl logs --previous` | `kubectl describe pod` |
+| Service unreachable | `kubectl get endpoints` | `kubectl describe svc` |
+| Network issue | `kubectl exec -- sh` (netshoot) | `curl`, `nslookup` |
+| Resource issue | `kubectl top pod` | `kubectl describe node` |
+
+## Related Topics
+
+- [Pods](./pods) - Pod lifecycle
+- [Services](./services) - Service debugging
+- [Networking](./networking) - Network policies
+- [Observability](./observability) - Log analysis

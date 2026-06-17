@@ -1,0 +1,538 @@
+---
+sidebar_position: 16
+description: Linux shell fundamentals — shell types, environment, expansion, redirection, and pipes for DevOps engineers.
+---
+
+# Linux Shell
+
+## Overview
+
+The shell is the primary interface between a user and Linux — it interprets commands, manages processes, and provides the environment in which all automation runs. For DevOps engineers, the shell is not optional: every CI/CD pipeline, deployment script, infrastructure configuration, and operational task ultimately runs as shell code.
+
+Linux supports multiple shells, each with different feature sets and tradeoffs. Bash (Bourne Again Shell) dominates interactive use and scripting. Dash is the POSIX-compliant `/bin/sh` on Debian/Ubuntu, faster but fewer features. Zsh is the interactive powerhouse with plugins like Oh-My-Zsh. Understanding the differences, especially POSIX compliance, determines whether your scripts work across systems or silently fail.
+
+Shell expansion is the process the shell uses to transform your command line before execution. Understanding expansion order — brace, tilde, parameter, command substitution — is essential for writing correct scripts and debugging unexpected behavior. Redirection and pipes let you compose simple commands into powerful data processing pipelines.
+
+## When To Use
+
+- Interactive shell sessions (ssh, local terminal)
+- Simple to moderate automation (scripts under ~200 lines)
+- Pipeline data processing (grep, awk, sed, sort)
+- CI/CD pipeline steps
+- One-liners and ad-hoc system administration
+
+## When NOT To Use
+
+- Complex applications with many data structures — use Python or Go
+- When POSIX portability is required — write POSIX sh, not bash-specific
+- Performance-critical text processing on large files — use awk or dedicated tools
+- Complex state machines or error recovery — use a real programming language
+
+## Core Concepts
+
+### Shell Types
+
+| Shell | Path | Features | Use Case |
+|-------|------|----------|----------|
+| bash | /bin/bash | Full features, readline, history | Interactive + scripting |
+| dash | /bin/dash | POSIX sh, fast, minimal | `/bin/sh` on Debian/Ubuntu |
+| zsh | /bin/zsh | Advanced completion, plugins | Interactive power users |
+| sh | /bin/sh | POSIX minimal | Portable scripts, shebang |
+| fish | /usr/bin/fish | User-friendly, syntax highlighting | Interactive (not scripting) |
+
+```bash
+# Check which shells are available
+cat /etc/shells
+
+# Check the default shell for a user
+getent passwd username
+# username:x:1000:1000::/home/username:/bin/bash
+
+# Change shell for current user
+chsh -s /usr/bin/zsh
+
+# Check script interpreter
+head -1 myscript.sh
+# #!/bin/bash — uses bash
+# #!/usr/bin/env bash — finds bash in PATH
+# #!/bin/sh — uses system's POSIX sh (often dash)
+```
+
+### Expansion Order
+
+The shell processes expansions in this exact order (critical to understand):
+
+1. **Brace expansion**: `{a,b,c}` → `a b c`
+2. **Tilde expansion**: `~` → `$HOME`, `~user` → user's home
+3. **Parameter/variable expansion**: `$VAR`, `${VAR}`
+4. **Command substitution**: `$(cmd)`, `` `cmd` ``
+5. **Arithmetic expansion**: `$((expr))`
+6. **Word splitting**: Split on IFS characters
+7. **Pathname expansion**: Glob patterns (`*`, `?`, `[...]`)
+
+```bash
+# Example: understanding expansion order
+VAR=5
+echo {1..$VAR}        # Brace expansion happens BEFORE variable expansion
+# Output: {1..5} — because $VAR isn't expanded during brace expansion
+
+echo $(($VAR + 2))    # Arithmetic expansion
+# Output: 7
+
+# Correct way: use eval (or restructure)
+eval "echo {1..$VAR}"
+# Output: 1 2 3 4 5
+```
+
+### Redirection and File Descriptors
+
+Every process has three standard file descriptors:
+
+| FD | Name | Description |
+|----|------|-------------|
+| 0 | stdin | Input (keyboard, pipe) |
+| 1 | stdout | Normal output |
+| 2 | stderr | Error output |
+
+```bash
+# Basic redirections
+command > output.txt        # Redirect stdout to file (truncate)
+command >> output.txt       # Redirect stdout to file (append)
+command 2> errors.txt       # Redirect stderr
+command 2>&1               # Redirect stderr to stdout
+command &> all.txt          # Redirect both stdout and stderr (bash)
+command &>> all.txt         # Append both to same file
+
+# Order matters! 2>&1 means "redirect stderr to current stdout"
+# Wrong: command > out.txt 2>&1
+# Correct: command 2>&1 > out.txt
+# The first sends stderr to current stdout (terminal), THEN redirects stdout
+
+# Redirect to the same file safely (avoid truncation)
+command >| output.txt       # Overrides noclobber for this command
+set -o noclobber            # Prevent > overwriting existing files
+
+# Here-doc: multi-line input
+cat <<EOF
+Hello $USER
+Today is $(date)
+EOF
+
+# Here-doc with quoting (no expansion)
+cat <<'EOF'
+Hello $USER          # Variable not expanded
+$(date)              # Command not executed
+EOF
+
+# Here-string
+cat <<< "hello world"
+echo "line1
+line2" | wc -l
+
+# exec for persistent redirection
+exec 3> /tmp/socket   # Open FD 3 for output to /tmp/socket
+echo "data" >&3        # Write to FD 3
+exec 3>&-             # Close FD 3
+```
+
+### Pipes and Process Substitution
+
+```bash
+# Basic pipe
+cat /var/log/syslog | grep "error" | sort | uniq -c | sort -rn
+
+# tee: pipe and save to file simultaneously
+cat /var/log/syslog | tee /tmp/filtered.log | grep "error"
+
+# process substitution: treat command output as a file
+diff <(grep "error" /var/log/a) <(grep "error" /var/log/b)
+while read -r line; do
+  echo "Processing: $line"
+done < <(find /var/log -name "*.log")
+
+# Named pipe (FIFO)
+mkfifo /tmp/myfifo
+echo "data" > /tmp/myfifo &   # writer
+cat /tmp/myfifo               # reader
+
+# pipe stderr (important)
+command 2>&1 | grep error
+command |& grep error         # bash shorthand for 2>&1 |
+```
+
+### Environment and Quoting
+
+```bash
+# Environment variables
+export VAR=value              # Export to child processes
+VAR=value command             # One-time export for command
+env VAR=value command         # Explicit env prefix
+printenv                      # List all env vars
+echo $VAR                     # Print value
+echo "${VAR:-default}"        # Use default if unset
+echo "${VAR:=default}"        # Set default if unset
+unset VAR                     # Remove variable
+
+# Quoting rules
+echo "Hello $USER"            # Double quotes: expand $, \, `, ! (bash)
+echo 'Hello $USER'            # Single quotes: no expansion
+echo Hello\ $USER             # Backslash: escape single char
+echo $'Line1\nLine2'          # ANSI-C quoting: \n, \t, etc.
+
+# Word splitting
+VAR="one two three"
+for word in $VAR; do         # Splits on IFS (space, tab, newline)
+  echo "$word"
+done
+
+# Prevent word splitting with quotes
+for word in "$VAR"; do
+  echo "$word"
+done
+# Output: "one two three" (one item) vs "one" "two" "three" (three items)
+```
+
+### Job Control
+
+```bash
+# Background jobs
+long_running_command &
+jobs                        # List background jobs
+fg %1                      # Bring job 1 to foreground
+bg %1                      # Resume job 1 in background
+Ctrl+Z                     # Suspend current job
+kill %1                    # Kill job 1
+
+# nohup: immune to hangup (SIGHUP)
+nohup ./backup.sh &
+# Or: nohup ./backup.sh > backup.log 2>&1 &
+
+# disown: remove job from job table (persists after shell exit)
+disown %1                  # Disown job 1
+disown -h %1               # Make job 1 immune to SIGHUP but keep in table
+disown -a                  # Disown all jobs
+```
+
+## Real Production Example
+
+Building a production log analysis pipeline using shell primitives:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+readonly LOG_DIR="/var/log"
+readonly ERROR_LOG="/tmp/errors_$(date +%Y%m%d_%H%M%S).log"
+readonly REPORT_FILE="/tmp/report_$(date +%Y%m%d).txt"
+
+# Process substitution: compare today's errors vs yesterday's
+TODAY_ERRORS=$(mktemp)
+YESTERDAY_ERRORS=$(mktemp)
+
+# Extract errors from today's auth log
+grep -h "ERROR\|FAILED\|CRIT" "${LOG_DIR}"/auth.log "${LOG_DIR}"/syslog 2>/dev/null \
+    | grep "$(date +%b)" \
+    | awk '{print $NF}' \
+    | sort > "$TODAY_ERRORS"
+
+# Yesterday's errors (for comparison)
+grep -h "ERROR\|FAILED\|CRIT" "${LOG_DIR}"/auth.log "${LOG_DIR}"/syslog 2>/dev/null \
+    | grep "$(date -d 'yesterday' +%b)" \
+    | awk '{print $NF}' \
+    | sort > "$YESTERDAY_ERRORS"
+
+# Diff using process substitution (no intermediate files needed)
+diff <(sort "$TODAY_ERRORS" | uniq -c | sort -rn) \
+     <(sort "$YESTERDAY_ERRORS" | uniq -c | sort -rn) \
+     > "${ERROR_LOG}" || true  # diff returns non-zero on differences
+
+# Generate report
+{
+    echo "=== Error Analysis Report ==="
+    echo "Generated: $(date)"
+    echo "Today errors: $(wc -l < "$TODAY_ERRORS")"
+    echo "Yesterday errors: $(wc -l < "$YESTERDAY_ERRORS")"
+    echo ""
+    echo "Top 10 error messages:"
+    sort "$TODAY_ERRORS" | uniq -c | sort -rn | head -10
+} > "$REPORT_FILE"
+
+# Cleanup temp files
+rm -f "$TODAY_ERRORS" "$YESTERDAY_ERRORS"
+
+# Email report (via external mail command)
+if command -v mail &>/dev/null; then
+    mail -s "Daily Error Report - $(hostname)" admin@example.com < "$REPORT_FILE"
+fi
+
+echo "Report: $REPORT_FILE"
+```
+
+```bash
+# Real-time monitoring with timeout and pipefail
+timeout 60 bash -c '
+    tail -f /var/log/nginx/access.log | \
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "500\|502\|503"; then
+            echo "[ALERT] $(date): $line" >&2
+            # Count per minute with process substitution
+            exec 3>&1
+            count=$(mktemp)
+            echo "$line" >> "$count"
+            jobs -p | xargs -r kill 2>/dev/null || true
+        fi
+    done
+' 2>/tmp/nginx_alert.log
+```
+
+## CLI Examples
+
+```bash
+# Shell expansion examples
+echo {1..10}                 # 1 2 3 ... 10
+echo {a..z}                 # a b c ... z
+echo file{1,2,3}.txt       # file1.txt file2.txt file3.txt
+echo ~                      # /home/username
+echo ~root                  # /root
+
+# Redirection patterns
+make > build.log 2>&1      # Capture all output
+make 2>&1 | tee build.log  # Capture and display
+
+# File descriptor manipulation
+exec 3<> /dev/tcp/8.8.8.8/80  # Open TCP socket (bash)
+echo -e "GET / HTTP/1.0\r\n\r\n" >&3
+cat <&3                      # Read response
+exec 3>&-                    # Close FD 3
+
+# Shell check: detect bashisms in scripts
+shellcheck -s sh script.sh  # Check for POSIX compliance
+shellcheck script.sh         # Check for bash issues
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `echo` | Print with expansion |
+| `printf` | Formatted print (portable) |
+| `test` / `[ ]` | Conditionals |
+| `read` | Read input |
+| `shift` | Shift positional parameters |
+| `eval` | Execute string as command |
+| `trap` | Signal handling |
+| `getopts` | Option parsing |
+| `export` | Set environment |
+| `typeset` / `declare` | Variable attributes |
+| `local` | Function-local variable |
+| `return` | Function return value |
+| `source` / `.` | Execute in current shell |
+| `exec` | Replace current process |
+
+## Monitoring
+
+```bash
+# Debug mode: print commands before execution
+bash -x script.sh
+# Or inside script: set -x / set +x
+
+# Verbose: print raw input before expansion
+bash -v script.sh
+
+# Execution trace with timestamps (Bash 5.1+)
+BASH_XTRACEFD=3 exec 3>/tmp/trace.log
+set -x
+# ... commands ...
+set +x
+
+# Profile script performance
+time script.sh
+# Or with GNU time:
+/usr/bin/time -v script.sh
+
+# Watch command output
+watch -n 5 'ls -la /tmp'
+```
+
+## Security
+
+**Shell injection:** Never pass unvalidated input to `eval`, `sh -c`, or `$(...)`:
+```bash
+# DANGEROUS:
+cmd="ls $user_input"   # If user_input = "; rm -rf /"
+eval "$cmd"
+
+# SAFER:
+# Validate input with case statement
+case "$user_input" in
+  [!a-zA-Z0-9_.-]*) echo "Invalid"; exit 1 ;;
+esac
+cmd="ls -- $user_input"   # Use -- to stop option parsing
+"$cmd"                    # Don't use eval
+```
+
+**PATH security:**
+```bash
+# Define explicit PATH — never trust inherited PATH in cron/scripts
+PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+export PATH
+
+# Use absolute paths for critical commands
+/bin/ls /usr/bin/grep /usr/bin/awk
+```
+
+**Restricted shells:**
+```bash
+# rbash: restricted bash (can't cd, can't set PATH, can't use / in commands)
+# /bin/rbash or ln -s /bin/bash /bin/rbash
+# For specific restricted commands:
+# In /etc/passwd: rbash user shell with allowed commands in PATH
+```
+
+**Shell history security:**
+```bash
+# Don't store sensitive commands in history
+# In ~/.bashrc:
+export HISTIGNORE="*password*:*secret*:*key*"
+export HISTCONTROL=ignoredups:erasedups
+shopt -s histappend
+
+# For even more security:
+# In /etc/profile (system-wide):
+# export HISTSIZE=0  # Disable history for all users
+```
+
+## Troubleshooting
+
+**"Command not found":**
+```bash
+# Usually PATH or typo issue
+type -a command       # Show all locations of command
+which command         # Show primary location
+hash -r              # Clear command hash table
+command -v command   # Returns path if found, empty if not
+```
+
+**FD leaks in loops:**
+```bash
+# Opening FD in a loop without closing causes leaks
+# WRONG:
+while read -r line; do
+    exec 3>"$line"   # Each iteration opens new FD 3
+done < file
+# FIX: close within loop
+while read -r line; do
+    exec 3>"$line"
+    echo "wrote to $line"
+    exec 3>&-         # Close before next iteration
+done < file
+
+# Or use a subshell (FDs closed on subshell exit):
+while read -r line; do
+    (
+        exec 3>"$line"
+        echo "wrote"
+    )  # FD 3 closed here
+done < file
+```
+
+**Unexpected behavior with spaces in variables:**
+```bash
+# WRONG:
+for f in $(find . -name "*.txt"); do
+    rm $f              # Fails on files with spaces
+done
+
+# RIGHT:
+while IFS= read -r -d '' f; do
+    rm -- "$f"         # -- stops option parsing, quotes preserve spaces
+done < <(find . -name "*.txt" -print0)
+# Or with bash 4+:
+shopt -s globstar nullglob
+for f in **/*.txt; do
+    rm -- "$f"
+done
+```
+
+**set -e surprises:**
+```bash
+# set -e exits on ANY command failure, including:
+set -e
+grep "pattern" file     # Exits if no match (grep returns 1)
+[[ -z "$var" ]] || exit # Explicit || exit
+((count++))             # Exits if result is 0
+
+# Fix: use || true explicitly
+grep "pattern" file || true
+```
+
+## Interview Questions
+
+1. **What is the exact order of shell expansion? Why does this matter?**
+
+Brace expansion → tilde expansion → parameter/variable expansion → command substitution → arithmetic expansion → word splitting → pathname expansion. This matters because expansion at the wrong stage causes unexpected behavior. For example, `$VAR` inside `{1..$VAR}` doesn't work because brace expansion happens before variable expansion. Understanding this order is essential for writing correct scripts and debugging quoting issues.
+
+2. **What is the difference between `2>&1 >file` and `>file 2>&1`?**
+
+The second is correct. In `2>&1`, the shell resolves `&1` to the current destination of FD 1. In `>file 2>&1`: first `>file` redirects stdout to file, then `2>&1` makes stderr point to the same place as stdout (the file). In `2>&1 >file`: first `2>&1` makes stderr point to current stdout (the terminal), then `>file` redirects stdout to the file. Result: stdout goes to file, stderr still goes to terminal. Order of redirections matters because each is processed left to right.
+
+3. **What is word splitting and why does it matter?**
+
+After expansions, the shell splits the result on characters in IFS (Internal Field Separator, default: space, tab, newline). This means `VAR="one two"` becomes two words when unquoted: `one` and `two`. This is why `rm $VAR` behaves differently from `rm "$VAR"`. With spaces in a filename, unquoted variables cause failures or dangerous behavior. Always quote variables unless you explicitly want word splitting.
+
+4. **How does process substitution work and when would you use it?**
+
+Process substitution `<(command)` runs `command` and makes its output available as a file descriptor (like `/dev/fd/63`). It allows commands that expect filenames to receive command output. Use it when comparing outputs of two commands (`diff <(cmd1) <(cmd2)`), when reading from a command that only outputs to stdout, or when a tool needs a file path. It requires bash or zsh — not available in strict POSIX sh.
+
+5. **What is a subshell? How does it differ from the current shell?**
+
+A subshell is a child process that inherits the parent's environment (variables, working directory) but cannot modify the parent's state. Changes to variables, cd commands, and FD modifications in a subshell are lost when the subshell exits. Subshells are created by: `$(command)`, `\`command\``, `(command)`, `| pipeline`, and `&` background jobs. Use subshells to isolate environment changes: `(cd /tmp && make)` changes directory just for that command.
+
+## Cheat Sheet
+
+```bash
+# Expansion
+echo {1..5}                  # 1 2 3 4 5
+echo ~                      # $HOME
+echo ${VAR:-default}        # default if unset
+echo $(date)                # command substitution
+echo $((2 + 2))             # arithmetic
+
+# Redirection
+cmd > file                  # stdout to file
+cmd >> file                 # append
+cmd 2>&1                    # stderr to stdout
+cmd &> file                 # both to file
+cmd <<EOF                   # here-doc
+cmd <<'EOF'                 # here-doc (literal)
+
+# Pipes
+cmd1 | cmd2                 # pipe stdout to stdin
+cmd | tee file              # pipe and save
+cmd 2>&1 | grep error       # include stderr in pipe
+
+# Process substitution
+diff <(cmd1) <(cmd2)        # compare command outputs
+while read line; do ...; done < <(find ...)
+
+# Quoting
+"expand $var"               # variable expansion
+'no expansion'              # literal
+\`cmd\`                      # command substitution (legacy)
+$'\n\t'                     # ANSI-C quoting
+
+# Job control
+cmd &                       # background
+Ctrl+Z                      # suspend
+fg, bg                      # fore/background
+nohup cmd &                 # immune to hangup
+```
+
+## Related Topics
+
+- [Bash](./bash) — Advanced scripting patterns
+- [Filesystem](./filesystem) — /proc filesystem for process info
+- [Processes](./processes) — Process management
+- [SSH](./ssh) — Remote shell execution
+- [Commands Handbook](./commands-handbook) — Command reference

@@ -1,0 +1,709 @@
+# Organization Node
+
+## Overview
+
+The Organization node is the root of the GCP resource hierarchy. It represents your company or organization and provides central control over all GCP resources, IAM policies, and organization policies. When created, the Organization node enables enterprise-grade features like folder-based resource organization, organization-level IAM roles, and centralized audit logging.
+
+Without an Organization node, GCP operates in a "resource manager hierarchy-less" mode where projects are independent and can only be accessed by users with direct project-level permissions. Organizations are typically created by the Super Admin role (usually the Google Workspace or Cloud Identity primary admin) and are tied to the organization's domain.
+
+The Organization node provides a single pane of glass for governance, compliance, and security teams to enforce policies across all projects and folders. It's the foundation for enterprise cloud governance and should be set up early in your GCP journey.
+
+## When To Use
+
+- **Enterprise deployments**: Any organization with multiple teams, projects, or departments that need centralized governance
+- **Compliance requirements**: When you need organization-wide audit logs, data residency controls, or regulatory compliance
+- **Multi-project architectures**: When you need to organize projects into folders and apply consistent policies
+- **Centralized billing**: When you need to aggregate billing across all projects under a single master billing account
+- **Security and access control**: When you need org-level IAM roles that cascade to all projects
+- **Shared VPCs**: When you need to share VPC networks across multiple projects
+- **Domain-wide administration**: When you want all Google Workspace users to have automatic access based on their group membership
+
+## When NOT To Use
+
+- **Individual developers or small teams**: Organization adds complexity; personal projects don't need it
+- **Pure experimentation or learning**: Free-tier projects don't require organization
+- **Isolated single-project use cases**: When projects truly don't need to share resources or policies
+- **When you don't have Cloud Identity or Google Workspace**: You need one of these to create an Organization node
+
+## Architecture
+
+**Resource Hierarchy:**
+```
+Google Workspace / Cloud Identity Organization
+    └── Organization Node (org-XXXXXXXXXXXX)
+        └── Folders (optional nesting, max 10 levels)
+            └── Projects
+                └── Resources (VMs, Storage, etc.)
+```
+
+**Organization Node Components:**
+
+1. **Organization Resource**: The root entity representing your company
+2. **Organization Administrator**: `roles/organization.admin` - full control over org resources
+3. **Organization Policy Administrator**: `roles/orgpolicy.policyAdmin` - manage org policies
+4. **Organization IAM Admin**: `roles/iam.organizationAdmin` - manage IAM policies
+5. **Folders**: Logical containers for projects (e.g., by team, environment, application)
+6. **Organization Policies**: Constraints enforced across all resources
+
+**Roles Hierarchy:**
+
+| Role | Scope | Capabilities |
+|------|-------|--------------|
+| Organization Admin | Org | Full control over all GCP resources |
+| Folder Admin | Folder | Manage folder and children |
+| Project Creator | Org | Create new projects ( IAM constraint) |
+| Project Owner | Project | Full control of specific project |
+| Billing Account User | Org | Link projects to billing accounts |
+
+**Organization Policy Inheritance:**
+- Organization policies cascade down to all folders and projects
+- Folder policies can add restrictions but not remove Organization-level restrictions
+- Project policies can further restrict but cannot expand
+
+## Core Concepts
+
+### Organization ID
+Every organization has a unique numeric ID (`org-XXXXXXXXXXXX`) used in APIs and gcloud commands:
+```bash
+gcloud organizations list
+gcloud organizations describe 123456789012
+```
+
+### Organization Roles
+
+**Google-managed roles:**
+- `roles/organization.admin`: Full access to all resources
+- `roles/orgpolicy.policyAdmin`: Manage organization policies
+- `roles/resourcemanager.projectCreator`: Create projects in organization
+- `roles/resourcemanager.folderAdmin`: Create and manage folders
+- `roles/iam.organizationAdmin`: Manage organization-level IAM
+
+**Be careful with Organization Admin**—it includes permissions to delete the organization and all resources. Use more specific roles for most admin tasks.
+
+### Folders
+
+Folders provide logical grouping and inheritance:
+```bash
+# Create folder
+gcloud resource-manager folders create folders/PROD \
+    --organization=123456789012 \
+    --display-name="Production"
+
+# Move project to folder
+gcloud projects move my-project \
+    --folder=folders/987654321098
+```
+
+### Organization Policies (Org Policies)
+
+Constraints enforced organization-wide:
+
+```bash
+# List available constraints
+gcloud org-policies list --organization=123456789012
+
+# Disable serial port access
+gcloud org-policies set-policy serial-port-disable.yaml \
+    --organization=123456789012
+
+# Require resources in specific regions
+gcloud org-policies set-policy resource-locations.yaml \
+    --organization=123456789012
+```
+
+**Common Constraints:**
+| Constraint | Description |
+|------------|-------------|
+| `compute.disableSerialPortAccess` | Disable serial port on all VMs |
+| `compute.vmExternalIp` | Restrict VM external IPs |
+| `compute.requireOsLogin` | Require OS Login for SSH |
+| `constraints/iam.disableServiceAccountKeyCreation` | Prevent SA key creation |
+| `constraints/sql.restrictPublicIp` | Prevent public IP on Cloud SQL |
+| `constraints/iam.disableWorkloadIdentityFederation` | Control workload identity |
+| `constraints/resourceLocations` | Limit resource locations |
+
+### Organization Policy YAML Format
+
+```yaml
+name: organizations/123456789012/policies/constraint-name
+spec:
+  rules:
+  - deny:
+      values: ["restricted-value"]
+    condition:
+      expression: "resource.location != 'us-central1'"
+  - enforce: true
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Folders per organization | 1,000 |
+| Folder nesting depth | 10 levels |
+| Organization policies per org | Unlimited |
+| Projects per organization | 30 (soft limit), expandable |
+| Custom roles per organization | 300 |
+
+### Key Gotchas
+
+- **Organization can only be created by Workspace/Cloud Identity super admin**—not by regular users
+- **Deleting an organization is irreversible**—all projects and data will be deleted
+- **Organization Admin is extremely powerful**—use org policy admin for policy management
+- **Org policies are deny-by-allow**—`enforce: false` doesn't deny, it just doesn't enforce
+- **Folder moves can affect hundreds of projects**—plan organizational changes carefully
+- **Organization policies can take up to 15 minutes** to propagate to all resources
+- **Some constraints only affect new resources**—existing resources may not be affected
+
+## Real Production Example
+
+A production organization setup:
+
+```bash
+# 1. Get organization ID (requires Organization Admin or Super Admin)
+gcloud organizations list
+
+# 2. Set up folder structure for environments
+gcloud resource-manager folders create "environments/production" \
+    --organization=123456789012 \
+    --display-name="Production"
+
+gcloud resource-manager folders create "environments/staging" \
+    --organization=123456789012 \
+    --display-name="Staging"
+
+gcloud resource-manager folders create "environments/development" \
+    --organization=123456789012 \
+    --display-name="Development"
+
+# 3. Create team folders
+gcloud resource-manager folders create "teams/platform" \
+    --organization=123456789012 \
+    --display-name="Platform Team"
+
+gcloud resource-manager folders create "teams/data" \
+    --organization=123456789012 \
+    --display-name="Data Team"
+
+# 4. Set up organization policies
+# Disable VM serial port access
+cat > serial-port-disable.yaml << 'EOF'
+name: organizations/123456789012/policies/compute.disableSerialPortAccess
+spec:
+  rules:
+  - enforce: false
+EOF
+gcloud org-policies set-policy serial-port-disable.yaml \
+    --organization=123456789012
+
+# Require OS Login
+cat > os-login-enforce.yaml << 'EOF'
+name: organizations/123456789012/policies/compute.requireOsLogin
+spec:
+  rules:
+  - enforce: true
+EOF
+gcloud org-policies set-policy os-login-enforce.yaml \
+    --organization=123456789012
+
+# 5. Grant folder-level permissions
+gcloud resource-manager folders add-iam-policy-binding folders/PROD_ID \
+    --member="group:platform-team@company.com" \
+    --role="roles/resourcemanager.folderAdmin"
+
+gcloud resource-manager folders add-iam-policy-binding folders/PROD_ID \
+    --member="group:devops@company.com" \
+    --role="roles/viewer"
+
+# 6. Create projects under folders
+gcloud projects create my-prod-app \
+    --folder=folders/PROD_ID \
+    --name="Production App"
+
+gcloud projects create my-staging-app \
+    --folder=folders/STAGING_ID \
+    --name="Staging App"
+```
+
+```hcl
+# Terraform: Organization setup
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "organization_id" {
+  description = "The organization ID"
+  type        = string
+}
+
+variable "billing_account" {
+  description = "The billing account ID"
+  type        = string
+}
+
+# Folder: Production
+resource "google_folder" "production" {
+  display_name = "Production"
+  parent       = "organizations/${var.organization_id}"
+}
+
+# Folder: Staging
+resource "google_folder" "staging" {
+  display_name = "Staging"
+  parent       = "organizations/${var.organization_id}"
+}
+
+# Folder: Development
+resource "google_folder" "development" {
+  display_name = "Development"
+  parent       = "organizations/${var.organization_id}"
+}
+
+# Folder: Teams
+resource "google_folder" "platform_team" {
+  display_name = "Platform Team"
+  parent       = "organizations/${var.organization_id}"
+}
+
+# Organization Policy: Disable serial port
+resource "google_org_policy_policy" "disable_serial_port" {
+  name     = "organizations/${var.organization_id}/policies/compute.disableSerialPortAccess"
+  org_id   = var.organization_id
+  policy {
+    enforce = false
+  }
+}
+
+# Organization Policy: Require OS Login
+resource "google_org_policy_policy" "require_os_login" {
+  name   = "organizations/${var.organization_id}/policies/compute.requireOsLogin"
+  org_id = var.organization_id
+  policy {
+    enforce = true
+  }
+}
+
+# Organization Policy: Resource location restrictions
+resource "google_org_policy_policy" "resource_location" {
+  name   = "organizations/${var.organization_id}/policies/constraints/iam.disableServiceAccountKeyCreation"
+  org_id = var.organization_id
+  policy {
+    constraint {
+      constraint = "iam.disableServiceAccountKeyCreation"
+    }
+    boolean_policy {
+      enforced = true
+    }
+  }
+}
+
+# Grant folder admin to platform team
+resource "google_folder_iam_member" "platform_admin" {
+  folder = google_folder.platform_team.folder_id
+  role   = "roles/viewer"
+  member = "group:platform-team@company.com"
+}
+
+# Grant viewer to all environments for devops
+resource "google_folder_iam_member" "devops_viewer" {
+  folder = google_folder.production.folder_id
+  role   = "roles/viewer"
+  member = "group:devops@company.com"
+}
+
+# Project under production folder
+resource "google_project" "prod_app" {
+  name       = "Production App"
+  project_id = "my-prod-app"
+  folder     = google_folder.production.folder_id
+  billing_account = var.billing_account
+
+  labels = {
+    environment = "production"
+    team        = "platform"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# List organization
+gcloud organizations list
+
+# Describe organization
+gcloud organizations describe 123456789012
+
+# Get organization IAM policy
+gcloud organizations get-iam-policy 123456789012
+
+# Set organization IAM policy
+gcloud organizations set-iam-policy 123456789012 policy.json
+
+# Add IAM binding
+gcloud organizations add-iam-policy-binding 123456789012 \
+    --member="user:admin@company.com" \
+    --role="roles/organization.admin"
+
+# List folders
+gcloud resource-manager folders list --organization=123456789012
+
+# Create folder
+gcloud resource-manager folders create "folders/team-name" \
+    --organization=123456789012 \
+    --display-name="Team Name"
+
+# Describe folder
+gcloud resource-manager folders describe folders/FOLDER_ID
+
+# Move folder
+gcloud resource-manager folders move folders/CHILD_ID \
+    --folder=folders/PARENT_ID
+
+# Move project to folder
+gcloud projects move my-project --folder=folders/FOLDER_ID
+
+# List org policies
+gcloud org-policies list --organization=123456789012
+
+# Describe specific org policy
+gcloud org-policies describe compute.disableSerialPortAccess \
+    --organization=123456789012
+
+# Set org policy
+gcloud org-policies set-policy policy.yaml --organization=123456789012
+
+# Reset org policy to default
+gcloud org-policies reset compute.disableSerialPortAccess \
+    --organization=123456789012
+```
+
+## Terraform Example
+
+```hcl
+# Complete organization and folder structure
+provider "google" {
+  organization = "123456789012"
+}
+
+# Folder hierarchy
+resource "google_folder" "root_environments" {
+  display_name = "Environments"
+  parent       = "organizations/123456789012"
+}
+
+resource "google_folder" "production" {
+  display_name = "Production"
+  parent       = google_folder.root_environments.id
+}
+
+resource "google_folder" "staging" {
+  display_name = "Staging"
+  parent       = google_folder.root_environments.id
+}
+
+resource "google_folder" "development" {
+  display_name = "Development"
+  parent       = google_folder.root_environments.id
+}
+
+resource "google_folder" "teams" {
+  display_name = "Teams"
+  parent       = "organizations/123456789012"
+}
+
+resource "google_folder" "platform_team" {
+  display_name = "Platform"
+  parent       = google_folder.teams.id
+}
+
+resource "google_folder" "data_team" {
+  display_name = "Data"
+  parent       = google_folder.teams.id
+}
+
+# Organization Policies
+resource "google_org_policy_policy" "disable_serial_port" {
+  org_id = "123456789012"
+  name   = "organizations/123456789012/policies/compute.disableSerialPortAccess"
+  policy {
+    enforce = false
+  }
+}
+
+resource "google_org_policy_policy" "require_os_login" {
+  org_id = "123456789012"
+  name   = "organizations/123456789012/policies/compute.requireOsLogin"
+  policy {
+    enforce = true
+  }
+}
+
+resource "google_org_policy_policy" "restrict_shared_vpc" {
+  org_id = "123456789012"
+  name   = "organizations/123456789012/policies/compute.restrictSharedVpc"
+  policy {
+    constraint {
+      constraint = "constraints/compute.restrictSharedVpc"
+    }
+    list_policy {
+      allow {
+        values = ["projects/my-host-project"]
+      }
+    }
+  }
+}
+
+# Project factory pattern
+resource "google_project" "example" {
+  name       = "Example Project"
+  project_id = "my-example-project"
+  folder     = google_folder.production.id
+  billing_account = "XXXXXX-XXXXXX-XXXXXX"
+
+  labels = {
+    environment = "production"
+    managed_by  = "terraform"
+  }
+}
+
+# Enable required APIs
+resource "google_project_service" "example_services" {
+  project = google_project.example.id
+  service = "compute.googleapis.com"
+
+  disable_dependent_services = true
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List organizations | `gcloud organizations list` |
+| Describe organization | `gcloud organizations describe ORG_ID` |
+| Get IAM policy | `gcloud organizations get-iam-policy ORG_ID` |
+| Set IAM policy | `gcloud organizations set-iam-policy ORG_ID policy.json` |
+| Add IAM binding | `gcloud organizations add-iam-policy-binding ORG_ID --member=MEMBER --role=ROLE` |
+| List folders | `gcloud resource-manager folders list --organization=ORG_ID` |
+| Create folder | `gcloud resource-manager folders create PATH --organization=ORG_ID` |
+| Move project | `gcloud projects move PROJECT --folder=FOLDER_ID` |
+| List org policies | `gcloud org-policies list --organization=ORG_ID` |
+| Set org policy | `gcloud org-policies set-policy POLICY.yaml --organization=ORG_ID` |
+
+## Monitoring
+
+**Key Monitoring Areas:**
+
+1. **Organization Policy Changes**: Track who modifies org policies
+   ```bash
+   gcloud logging read 'resource.type="organization" AND protoPayload.methodName="SetOrgPolicy"' \
+       --organization=123456789012
+   ```
+
+2. **Project Creation**: Monitor new projects for compliance
+   ```bash
+   gcloud logging read 'resource.type="project" AND protoPayload.methodName="CreateProject"' \
+       --organization=123456789012
+   ```
+
+3. **IAM Changes at Organization Level**: Audit permission changes
+   ```bash
+   gcloud logging read 'resource.type="organization" AND protoPayload.methodName="SetIAMPolicy"' \
+       --organization=123456789012
+   ```
+
+**Recommended Alerts:**
+- New projects created outside approved folders
+- Organization policy changes
+- New Organization Admin role bindings
+- Projects without billing accounts linked
+
+## Security
+
+**Organization Security Best Practices:**
+
+1. **Create dedicated organization admin group**
+   ```bash
+   gcloud organizations add-iam-policy-binding 123456789012 \
+       --member="group:org-admins@company.com" \
+       --role="roles/organization.admin"
+   ```
+
+2. **Enable organization-level audit logging**
+   ```bash
+   # Enable Data Access logs for all services
+   gcloud organizations update 123456789012 \
+       --enable-audit-logging
+   ```
+
+3. **Restrict who can create projects**
+   ```bash
+   # Only allow project creation in specific folders
+   cat > restrict-project-creation.yaml << 'EOF'
+   name: organizations/123456789012/policies/resourcemanager.constraint orgPolicy
+   spec:
+     rules:
+     - condition:
+         expression: "resource.location not in ['folders/PROD_ID']"
+       deny:
+         values: ["deny"]
+   EOF
+   ```
+
+4. **Protect against data exfiltration**
+   ```bash
+   # Restrict external IP addresses on VMs
+   gcloud org-policies set-policy restrict-external-ip.yaml
+   ```
+
+5. **Use organization-level CMEK**
+   - Configure default CMEK for GCS, BigQuery, etc.
+   - Centralize key management
+
+## Cost Optimization
+
+**Organization-Level Cost Controls:**
+
+1. **Budget alerts at organization level**
+   ```bash
+   gcloud billing budgets create \
+       --billing-account=XXXXXX \
+       --display-name="Org Total Budget" \
+       --amount=100000USD \
+       --threshold-rules=percent=0.5,percent=0.8,percent=1.0
+   ```
+
+2. **Restrict expensive regions**
+   ```bash
+   # Prevent resources in expensive regions
+   cat > restrict-regions.yaml << 'EOF'
+   name: organizations/123456789012/policies/constraints/allowed
+   spec:
+     rules:
+     - allow:
+         values: ["us-central1", "us-east1", "europe-west1"]
+   EOF
+   ```
+
+3. **Disable unused APIs at org level**
+   - Use org policies to disable APIs not needed in your organization
+
+4. **Set default labels via organization policy**
+   ```yaml
+   name: organizations/123456789012/policies/constraints
+   spec:
+     rules:
+     - require:
+         labels:
+         - environment
+         - team
+         - cost-center
+   ```
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Can't access organization**
+   ```bash
+   # Verify you have the correct role
+   gcloud organizations get-iam-policy 123456789012
+   
+   # Check if you're a member of the org
+   gcloud organizations describe 123456789012
+   ```
+
+2. **Organization policy not applying**
+   ```bash
+   # Check if policy is set correctly
+   gcloud org-policies describe compute.disableSerialPortAccess \
+       --organization=123456789012
+   
+   # Verify policy inheritance
+   # Note: Some constraints only affect NEW resources, not existing ones
+   
+   # Force refresh
+   gcloud org-policies reset CONSTRAINT --organization=123456789012
+   gcloud org-policies set-policy policy.yaml --organization=123456789012
+   ```
+
+3. **Folder move failing**
+   ```bash
+   # Check if folder is already at max depth (10 levels)
+   gcloud resource-manager folders describe folders/FOLDER_ID
+   
+   # Verify permissions
+   gcloud resource-manager folders get-iam-policy folders/FOLDER_ID
+   ```
+
+4. **Project won't move to folder**
+   ```bash
+   # Check folder exists and is accessible
+   gcloud resource-manager folders describe folders/FOLDER_ID
+   
+   # Verify move permissions (needs resourcemanager.folderAdmin on target)
+   gcloud projects move my-project --folder=folders/FOLDER_ID
+   ```
+
+## Interview Questions
+
+1. **What's the difference between an Organization Admin and a Project Owner? When would you use each?**
+
+2. **How do organization policies work and why are they important for enterprise security?**
+
+3. **Explain the folder hierarchy in GCP. What's the maximum nesting depth and why does it matter?**
+
+4. **How would you design a folder structure for a company with multiple business units and environments?**
+
+5. **What happens when you set an organization policy at the org level versus the folder level?**
+
+## Cheat Sheet
+
+```
+# Organization Commands
+gcloud organizations list                           # List organizations
+gcloud organizations describe ORG_ID               # Describe org
+gcloud organizations get-iam-policy ORG_ID         # Get IAM policy
+gcloud organizations set-iam-policy ORG_ID FILE    # Set IAM policy
+
+# Folder Commands
+gcloud resource-manager folders create PATH --organization=ORG_ID
+gcloud resource-manager folders list --organization=ORG_ID
+gcloud resource-manager folders describe FOLDER_ID
+gcloud resource-manager folders get-iam-policy FOLDER_ID
+gcloud projects move PROJECT --folder=FOLDER_ID
+
+# Org Policy Commands
+gcloud org-policies list --organization=ORG_ID
+gcloud org-policies describe CONSTRAINT --organization=ORG_ID
+gcloud org-policies set-policy POLICY.yaml --organization=ORG_ID
+gcloud org-policies reset CONSTRAINT --organization=ORG_ID
+
+# Key Roles
+roles/organization.admin          # Full org access
+roles/orgpolicy.policyAdmin      # Manage org policies
+roles/resourcemanager.folderAdmin # Manage folders
+roles/resourcemanager.projectCreator # Create projects
+```
+
+## Labs
+
+1. **Organization Setup**: Create organization, set up initial admin group, configure audit logging
+2. **Folder Structure**: Design and implement folder hierarchy for a multi-team organization
+3. **Organization Policies**: Implement security org policies (OS Login, no serial port, resource locations)
+4. **IAM at Scale**: Configure folder-level IAM, test inheritance, verify access control
+5. **Policy Enforcement**: Create policy that enforces labels across all projects, verify enforcement
+
+## Related Services
+
+- [Resource Hierarchy](./resource-hierarchy)
+- [Folders](./folders)
+- [Projects](./projects)
+- [IAM](./iam)
+- [Billing](./billing)

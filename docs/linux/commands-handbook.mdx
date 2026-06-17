@@ -1,0 +1,785 @@
+---
+sidebar_position: 23
+description: Comprehensive Linux commands handbook for DevOps and SRE engineers — file ops, networking, processes, text processing, system info.
+---
+
+# Linux Commands Handbook
+
+## Overview
+
+This is the comprehensive reference for Linux commands used daily in DevOps, SRE, and infrastructure roles. Every command includes real usage patterns, not just syntax. This page is the definitive cheat sheet — bookmark it.
+
+The commands here are organized by category. For each command, the most important and commonly-used flags are shown with production examples. This is not an exhaustive man page — it is the working engineer's reference for commands you actually type.
+
+## When To Use
+
+- Quick command reference during work
+- Interview preparation
+- Learning what commands are available
+- Finding the right tool for a task
+
+## When NOT To Use
+
+- When you need exhaustive man page detail (use `man <command>`)
+- When you need platform-specific commands (some commands vary between Linux distros)
+
+## Core Concepts
+
+### Filesystem Structure
+
+```
+/               Root — everything starts here
+├── bin/        Essential binaries (old, still symlinked to /usr/bin)
+/├── boot/      Kernel, bootloader
+├── dev/        Device files (ssd, nvme0, tty, null)
+/├── etc/       System configuration
+├── home/       User home directories
+├── lib/        Libraries (old, symlinked to /usr/lib)
+/├── media/     Removable media mount points
+├── mnt/        Temporary mount points
+├── opt/        Optional/third-party software
+├── proc/       Virtual filesystem — kernel & process info
+├── root/       root user's home (NOT /home/root)
+/├── run/       Runtime data (PID files, sockets)
+/├── sbin/      System binaries (old, symlinked)
+/├── srv/       Data for services (web content, git repos)
+/├── sys/       Virtual filesystem — kernel objects (sysfs)
+/├── tmp/       Temporary files (cleared on boot)
+/├── usr/       User programs and libraries
+└── var/        Variable data (logs, spools, caches)
+```
+
+Key directories for DevOps:
+- `/var/log/` — all system and application logs
+- `/var/lib/` — application state and data
+- `/etc/systemd/` — systemd unit files and configuration
+- `/etc/nginx/` — nginx configuration
+- `/opt/` — applications (Datadog, monitoring agents, etc.)
+
+## File Operations
+
+### ls — List directory contents
+
+```bash
+ls -lah /var/log/                    # -l long, -a all (incl dotfiles), -h human sizes
+ls -ltr /var/log/                    # -t by time modified, -r reverse (oldest last)
+ls -ld /etc/nginx/                   # -d don't recurse into directories
+ls --color=auto                      # colorize output (usually default)
+```
+
+### find — Search for files
+
+```bash
+# Find by name
+find /var/log -name "*.log" -mtime -7        # .log files modified in last 7 days
+find / -name "nginx.conf" 2>/dev/null         # suppress permission errors
+find / -xdev -name "*.core" -size +100M       # -xdev don't cross filesystem boundaries
+find . -name "*.tmp" -delete                   # delete found files
+
+# Find by type
+find /var -type f -perm /u=x                   # executable files
+find /var -type d -mtime 0                     # directories modified today
+find /var -type l                              # symbolic links
+
+# Find and execute
+find /var/log -name "*.log" -exec wc -l {} +  # run wc on each (batch)
+find /var/log -name "*.log" -exec rm {} \;    # run rm on each (separate)
+find /var/log -name "*.log" -print0 | xargs -0 rm   # handle spaces in filenames
+
+# Advanced: find with conditions
+find /var/log -type f \( -name "*.log" -o -name "*.gz" \) -mtime +30
+```
+
+### stat — Detailed file information
+
+```bash
+stat /var/log/syslog
+# File: /var/log/syslog
+# Size: 5242880    Blocks: 10240      IO Block: 4096   regular file
+# Device: 08:01     Inode: 131073     Links: 1
+# Access: (0640/-rw-r-----)  Uid: (    0/    sys)   Gid: (    4/     adm)
+# Access: 2024-01-15 10:30:00.000000000 +0000  ← last read
+# Modify: 2024-01-15 09:15:00.000000000 +0000  ← last write
+# Change: 2024-01-15 09:15:00.000000000 +0000  ← metadata change
+```
+
+### cp, mv, rm
+
+```bash
+cp -a /source/ /dest/               # -a archive mode (preserves perms, timestamps, links)
+cp -av /source/ /dest/              # -v verbose shows what's copied
+cp -p file1 file2                   # -p preserves attributes
+mv oldname newname                  # rename or move
+rm -rf /path/to/dir                 # -r recursive, -f force (no confirmation)
+```
+
+### rsync — Fast, versatile file copying
+
+```bash
+# Mirror directories
+rsync -avz --delete /source/ /dest/     # -a archive, -v verbose, -z compress, --delete removes dest files not in source
+
+# Exclude patterns
+rsync -avz --exclude='*.log' --exclude='node_modules/' /app/ /backup/app/
+
+# Dry run
+rsync -avzn /source/ /dest/         # -n dry run, -v verbose
+
+# Bandwidth limit
+rsync -avz --bwlimit=1000 /source/ /dest/    # limit to 1000 KB/s
+
+# Over SSH with compression
+rsync -avz -e "ssh -C" /source/ user@host:/dest/
+```
+
+## Text Processing
+
+### cat — Concatenate and display
+
+```bash
+cat file.txt                        # display file
+cat file1 file2 > combined.txt      # combine files
+cat -n file.txt                     # -n number all lines
+cat -s file.txt                     # -s squeeze blank lines
+tac file.txt                        # reverse order (last line first)
+```
+
+### head, tail — First/last lines
+
+```bash
+head -n 20 file.txt                 # first 20 lines
+head -c 100 file.txt                # first 100 bytes
+tail -n 20 file.txt                 # last 20 lines
+tail -f /var/log/syslog             # -f follow (real-time updates)
+tail -F /var/log/app.log            # -F follow + handle rotation
+tail -f /var/log/app.log | grep ERROR   # pipeline for filtering
+tail -f --lines=100 /var/log/syslog # show last 100 lines and follow
+
+# Combined: see new errors as they arrive
+tail -f /var/log/nginx/error.log | awk '/error/ {print strftime("%H:%M:%S"), $0; fflush()}'
+```
+
+### grep — Search text
+
+```bash
+grep "error" /var/log/syslog        # find lines with "error"
+grep -i "error" file                # -i case insensitive
+grep -v "INFO" file                 # -v invert (exclude matches)
+grep -n "error" file                # -n show line numbers
+grep -c "error" file                # -c count matches (not lines)
+grep -r "error" /var/log/           # -r recursive search
+grep -A 5 "error" file              # -A show N lines after match
+grep -B 5 "error" file              # -B show N lines before match
+grep -E "error|warn|crit" file      # -E extended regex (or)
+grep -P "^\d{4}-\d{2}-\d{2}" file  # -P Perl regex (lookahead, etc)
+grep --include="*.log" "error" /var/log/   # only .log files
+
+# Context: lines around match
+grep -C 3 "error" file              # 3 lines before and after
+grep -c "error" /var/log/*.log      # count per file
+```
+
+### awk — Pattern scanning and processing
+
+```bash
+# Print fields
+awk '{print $1, $3}' file           # print columns 1 and 3
+awk -F: '{print $1, $5}' /etc/passwd   # -F set field separator
+awk '{print NF}' file               # NF = number of fields
+awk '{print NR, $0}' file           # NR = line number
+
+# Filtering
+awk '/error/ {print $0}' file       # same as grep
+awk '/error/ && /2024/ {print $0}' file   # AND condition
+awk '$3 > 100 {print $0}' file      # numeric comparison
+awk -F, '$4 > 100 {print $1, $4}' file   # CSV filtering
+
+# Computations
+awk '{sum+=$2} END {print sum}' file
+awk '{count++} END {print count}' file
+awk 'NR>1 {sum+=$2; sumsq+=$2*$2} END {print sqrt(sumsq/NR)}' file
+
+# Column sums and grouping
+awk '{sum[$1]+=$2} END {for (k in sum) print k, sum[k]}' file
+# Given: apple 10, apple 20, banana 5
+# Output: apple 30, banana 5
+
+# Pretty printing
+awk '{printf "%-20s %10.2f\n", $1, $2}' file   # formatted output
+```
+
+### sed — Stream editor
+
+```bash
+# Substitutions
+sed 's/old/new/g' file              # replace all occurrences
+sed 's/old/new/' file               # replace first occurrence per line
+sed -i 's/old/new/g' file           # -i edit in place
+sed -i.bak 's/old/new/g' file       # backup before edit
+
+# Addresses (line numbers or patterns)
+sed '3s/old/new/' file              # only line 3
+sed '1,10s/old/new/' file           # lines 1-10
+sed '/pattern/!s/old/new/' file     # ! negate (not matching lines)
+sed '/pattern/,+5d' file            # delete pattern and next 5 lines
+
+# Delete, insert
+sed '3d' file                       # delete line 3
+sed '/pattern/d' file               # delete matching lines
+sed '1i\title' file                 # insert before line 1
+sed '1a\footer' file                # append after line 1
+
+# Multiline (GNU sed)
+sed ':a;N;$!ba;s/\n/,/g' file       # join all lines with comma
+```
+
+### sort, uniq, wc
+
+```bash
+sort file.txt                       # sort lines alphabetically
+sort -n file.txt                    # -n numeric sort
+sort -k2 -t: file.txt               # -k sort by column 2, -t field separator
+sort -u file.txt                    # -u unique (sort + uniq)
+sort -r file.txt                    # -r reverse
+sort -h file.txt                    # -h human numeric (1K, 1M)
+
+uniq file.txt                       # remove adjacent duplicates
+uniq -c file.txt                    # -c count occurrences
+uniq -d file.txt                    # -d only duplicated lines
+sort file.txt | uniq -c | sort -rn  # most common lines
+
+wc -l file.txt                      # -l line count
+wc -w file.txt                      # -w word count
+wc -c file.txt                      # -c byte count
+```
+
+### tr — Translate/transform
+
+```bash
+tr 'a-z' 'A-Z' < file.txt           # uppercase
+tr -d '[:punct:]' < file.txt        # -d delete punctuation
+tr -s ' ' < file.txt                # -s squeeze (collapse multiple spaces)
+echo "hello" | tr '[:lower:]' '[:upper:]'
+```
+
+### xargs — Build command from input
+
+```bash
+find /var/log -name "*.log" | xargs rm    # delete all found .log files
+find /var/log -name "*.log" | xargs -0 rm # -0 handle spaces in filenames
+find /var/log -name "*.log" -print0 | xargs -0 rm
+echo "a b c" | xargs -n1                  # -n1 one argument per command
+echo "a b c" | xargs -I {} echo "item: {}"   # -I replace {}
+ls *.log | xargs -P 4 -I {} gzip {}       # -P parallel (4 processes)
+```
+
+## Networking
+
+### ss — Socket statistics (modern netstat)
+
+```bash
+ss -tunapl                          # -t tcp, -u udp, -n numbers, -a all, -p process, -l listening
+ss -tunapl state established        # only established connections
+ss -tunapl sport = :80              # filter by source port
+ss -tunapl dport = :443             # filter by dest port
+ss -tunapl src 10.0.0.1             # filter by source IP
+ss -tunapl | grep ESTAB | wc -l     # count established connections
+ss -s                               # summary (total counts)
+ss -i                               # -i detailed (TCP internal info)
+ss -e                               # -e extended (detailed)
+```
+
+### ip — Network configuration (modern ifconfig)
+
+```bash
+ip addr                            # show all IP addresses
+ip addr show eth0                  # specific interface
+ip link show                       # interface status
+ip link set eth0 up/down           # bring interface up/down
+ip addr add 10.0.0.5/24 dev eth0   # add IP address
+ip addr del 10.0.0.5/24 dev eth0   # remove IP address
+ip route                           # routing table
+ip route add default via 10.0.0.1  # default gateway
+ip neigh                          # ARP table (neighbors)
+ip -s link                         # interface statistics
+```
+
+### ping, traceroute, mtr
+
+```bash
+ping -c 5 8.8.8.8                 # -c count, 5 pings then stop
+ping -i 0.2 8.8.8.8               # -i interval (0.2 seconds)
+ping -s 1000 8.8.8.8              # -s packet size (1000 bytes)
+ping -M do -s 1472 8.8.8.8        # -M do = don't fragment, max MTU
+
+traceroute 8.8.8.8                # route to host (UDP)
+traceroute -I 8.8.8.8             # -I use ICMP
+traceroute -T 8.8.8.8             # -T use TCP SYN
+traceroute -m 30 8.8.8.8          # -m max hops
+
+mtr 8.8.8.8                       # -m real-time traceroute with stats
+mtr -r 8.8.8.8                    # -r report mode (no interactive)
+```
+
+### curl, wget
+
+```bash
+curl -s url                         # -s silent (no progress)
+curl -I url                         # -I HEAD request (headers only)
+curl -v url                         # -v verbose
+curl -o file url                    # -o output to file
+curl -O url                         # -O use remote filename
+curl -L url                         # -L follow redirects
+curl -H "Authorization: Bearer $TOKEN" url   # custom header
+curl -d '{"key":"value"}' -H "Content-Type: application/json" url
+curl -X POST url                    # explicit POST
+curl --max-time 10 url              # timeout
+curl -w "%{http_code}" url          # -w show HTTP code
+curl -w "\n%{time_total}s" url      # timing
+curl -k url                         # -k ignore SSL errors
+
+wget -c url                         # -c continue (resume download)
+wget -r -l 2 url                    # -r recursive, -l depth
+wget --no-check-certificate url     # ignore SSL
+wget -q -O - url                    # -q quiet, -O - stdout
+```
+
+### nslookup, dig
+
+```bash
+nslookup example.com                # DNS lookup
+nslookup -type=mx example.com       # MX records
+nslookup example.com 8.8.8.8        # specific DNS server
+
+dig +short example.com              # +short minimal output
+dig +trace example.com              # full recursive trace
+dig @8.8.8.8 example.com            # specific DNS server
+dig +noall +answer example.com      # only answer section
+dig -x 8.8.8.8                     # reverse lookup
+```
+
+### nmap — Network exploration
+
+```bash
+nmap -sT localhost                  # -sT TCP connect scan
+nmap -sS 192.168.1.1                # -sS SYN scan (stealth)
+nmap -sU 192.168.1.1                # UDP scan
+nmap -p 80,443 192.168.1.0/24       # specific ports
+nmap -p- 192.168.1.1                # all ports
+nmap -O 192.168.1.1                 # -O OS detection
+nmap -A 192.168.1.1                 # -A aggressive (OS, version, scripts)
+nmap --script vuln 192.168.1.1      # vulnerability scripts
+```
+
+### tcpdump — Packet capture
+
+```bash
+tcpdump -i eth0                    # capture on interface
+tcpdump -i any                     # all interfaces
+tcpdump -n host 10.0.0.1           # filter by host
+tcpdump -n port 80                 # filter by port
+tcpdump -n 'port 80 and host 10.0.0.1'   # combined filter
+tcpdump -c 100 -w file.pcap         # -c count, -w write to file
+tcpdump -r file.pcap                # read from file
+tcpdump -XX -i eth0                 # -XX show hex and ASCII
+tcpdump -A -i eth0                  # ASCII only
+tcpdump -i eth0 'tcp[tcpflags] & tcp-syn != 0'   # SYN packets only
+```
+
+## Process Management
+
+### ps — Process status
+
+```bash
+ps aux                             # -a all, -x includes not attached to TTY, -u user format
+ps aux | grep nginx                # find nginx processes
+ps aux --sort=-%cpu                # sort by CPU (descending)
+ps aux --sort=-%mem                # sort by memory
+ps -ef                             # -e all, -f full format (shows PPID)
+ps -eLf                            # -eLf threads (LWP)
+ps -o pid,ppid,cmd --no-headers    # custom output
+ps -p 1234 -o comm=                # command name of PID 1234
+
+# Fields: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+# STAT: R=running, S=sleeping, T=stopped, Z=zombie, D=disk sleep
+```
+
+### top, htop — Process monitoring
+
+```bash
+top                                # real-time process list
+top -b -n 1                        # -b batch mode (non-interactive), -n count
+top -u www-data                    # -u specific user
+top -p 1234                        # -p specific PID
+top -d 2                           # -d delay (2 seconds)
+
+# In top:
+# Press 1: show per-CPU stats
+# Press m: toggle memory display
+# Press t: toggle CPU display
+# Press c: show full command line
+# Press k: kill process
+# Press r: renice process
+# Press z: color/more
+# q: quit
+
+htop                               # better top (if installed)
+htop -u www-data                   # filter by user
+htop -p 1234,5678                  # specific PIDs
+# In htop: F4 filter, F5 tree view, F6 sort
+```
+
+### kill, pkill, killall
+
+```bash
+kill -9 1234                       # SIGKILL (force kill)
+kill -15 1234                      # SIGTERM (graceful)
+kill -l                            # list all signals
+kill -HUP 1                        # SIGHUP (reload config — common pattern)
+
+pkill nginx                        # kill by name (all nginx processes)
+pkill -u www-data nginx            # -u user: only processes owned by user
+pkill -f "python.*worker"          # -f pattern match on full command line
+pkill -9 -f "python.*worker"       # force kill with pattern
+
+killall nginx                      # kill all processes named nginx
+killall -i nginx                   # -i interactive (confirm each)
+```
+
+### nohup, disown, bg, fg
+
+```bash
+nohup ./script.sh &                # run immune to SIGHUP (survives shell exit)
+nohup ./script.sh > output.log 2>&1 &
+# SIGHUP sent to process when terminal closes — nohup blocks this
+
+disown %1                          # remove job 1 from job table
+disown -h %1                       # make job 1 immune to SIGHUP (stay in table)
+disown -a                          # disown all jobs
+
+jobs                               # list background jobs
+fg %1                              # bring job 1 to foreground
+bg %1                              # resume job 1 in background
+Ctrl+Z                             # suspend current foreground job
+```
+
+### lsof — List open files
+
+```bash
+lsof +D /var/log/                  # +D search by directory (all open files in dir)
+lsof -p 1234                       # files opened by PID 1234
+lsof -i :80                        # processes using port 80
+lsof -i tcp:80                     # TCP processes on port 80
+lsof -i @10.0.0.1:80               # connections to specific IP:port
+lsof -u www-data                   # files opened by user
+lsof -c nginx                      # files opened by command starting with nginx
+lsof -n                            # -n no hostname resolution (faster)
+```
+
+## Disk/IO
+
+### df, du
+
+```bash
+df -h                             # -h human, shows filesystem sizes
+df -h -T                          # -T show filesystem type
+df -h -x tmpfs -x devtmpfs        # exclude in-memory filesystems
+df -i                            # inode usage (can fill before blocks)
+
+du -sh /var/log/                  # -s summary, -h human
+du -h --max-depth=1 /var/log/     # one level deep
+du -h /var/log/ | sort -rh | head -10  # largest directories
+du -sh * | sort -h                # all items in current dir, sorted
+```
+
+### lsblk, blkid, fdisk
+
+```bash
+lsblk                             # list block devices (tree view)
+lsblk -f                          # -f show filesystem
+lsblk -a                          # -a all (including empty)
+blkid                             # list block devices with UUIDs and types
+blkid /dev/sda1                   # specific device
+
+fdisk -l /dev/sda                 # -l list partition table
+fdisk /dev/sda                    # interactive partition editor
+```
+
+### mount, umount
+
+```bash
+mount                             # show all mounted
+mount /dev/sda1 /mnt              # mount device to directory
+mount -o ro /dev/sda1 /mnt        # -o read-only
+mount -t ext4 /dev/sda1 /mnt      # -t specify filesystem type
+mount -a                          # mount all from /etc/fstab
+
+umount /mnt                       # unmount
+umount -f /mnt                    # -f force (busy NFS)
+umount -l /mnt                    # -l lazy (detaches immediately)
+```
+
+### iostat, iotop
+
+```bash
+iostat -xz 1 5                    # -x extended, -z omit idle devices, interval 1s, 5 times
+# Key columns: await (I/O latency), %util (device busy %), r/s, w/s
+
+iostat -p sda                     # -p per-partition stats
+iostat -d -k 1                    # -d device only, -k KB/s not ops/s
+
+iotop                            # real-time per-process I/O
+iotop -o                          # -o only show processes with I/O
+iotop -a                          # -a accumulated I/O since start
+iotop -b                          # -b batch mode (for logging)
+```
+
+## Archive/Compression
+
+### tar
+
+```bash
+tar -cvf archive.tar /path/        # -c create, -v verbose, -f file
+tar -xvf archive.tar               # -x extract
+tar -xvf archive.tar -C /dest/     # -C change to directory
+tar -czvf archive.tar.gz /path/    # -z gzip compression
+tar -xzvf archive.tar.gz           # extract gzipped
+tar -cjvf archive.tar.bz2 /path/   # -j bzip2 compression
+tar -xzvf archive.tar.xz           # -J xz compression
+tar -tvf archive.tar               # -t list contents without extracting
+tar -czvf --exclude='*.log' --exclude='node_modules' archive.tar.gz /path/
+```
+
+### gzip, bzip2, xz, zip
+
+```bash
+gzip file                         # compress (creates file.gz, removes original)
+gzip -d file.gz                   # -d decompress
+gzip -k file                      # -k keep original
+gzip -9 file                      # -9 best compression (slower)
+gunzip file.gz                    # alias for gzip -d
+
+bzip2 file                        # bzip2 (better than gzip, slower)
+bunzip2 file.bz2                  # decompress bzip2
+
+xz file                           # xz (best compression, slowest)
+unxz file.xz                      # decompress
+
+zip archive.zip file1 file2       # create zip
+zip -r archive.zip dir/           # -r recursive
+unzip archive.zip                 # extract
+unzip -l archive.zip              # list without extracting
+zip -9 -r archive.zip dir/        # -9 best compression
+```
+
+## Package Management
+
+### apt (Debian/Ubuntu)
+
+```bash
+apt update                         # update package list
+apt upgrade                        # upgrade all packages
+apt install nginx                  # install package
+apt remove nginx                   # remove package (keep config)
+apt purge nginx                    # remove package AND config
+apt search nginx                   # search packages
+apt show nginx                     # package details
+apt list --installed               # installed packages
+apt list --upgradable              # packages with updates available
+apt autoremove                     # remove unused dependencies
+apt-cache policy nginx             # available versions
+```
+
+### dnf/yum (RHEL/Fedora)
+
+```bash
+dnf install nginx                  # install
+dnf remove nginx                   # remove
+dnf update                         # update all
+dnf update nginx                   # update specific
+dnf search nginx                   # search
+dnf info nginx                     # details
+dnf list installed                 # installed
+dnf list available                 # available
+dnf history                        # transaction history
+dnf repolist                       # enabled repos
+dnf downgrade nginx-1.18           # downgrade
+dnf groupinstall "Development Tools"   # install group
+```
+
+### zypper (SUSE)
+
+```bash
+zypper install nginx               # install
+zypper remove nginx                # remove
+zypper update                     # update all
+zypper search nginx                # search
+zypper info nginx                  # details
+zypper repos                      # list repos
+```
+
+## SSH
+
+```bash
+ssh user@host                     # connect
+ssh -i key.pem user@host          # -i identity file (private key)
+ssh -p 2222 user@host             # -p non-default port
+ssh -L 8080:localhost:80 user@host   # -L local port forward
+ssh -R 9090:localhost:80 user@host   # -R remote port forward
+ssh -N -L 8080:localhost:80 user@host   # -N don't execute command (tunnel only)
+ssh -o "StrictHostKeyChecking=no" host   # auto-accept host keys
+ssh -o "ConnectionAttempts=3" host      # retry on failure
+
+# SSH config (~/.ssh/config)
+# Host myserver
+#     HostName example.com
+#     User ubuntu
+#     Port 2222
+#     IdentityFile ~/.ssh/mykey.pem
+#     StrictHostKeyChecking no
+#     ServerAliveInterval 60
+
+# SSH tunnel
+ssh -L 5432:localhost:5432 user@db-server   # local port 5432 → remote postgres
+ssh -D 1080 user@host              # SOCKS proxy on port 1080
+
+# Copy files
+scp file.txt user@host:/path/      # copy to remote
+scp -r /dir/ user@host:/path/      # -r recursive
+scp user@host:/path/file.txt .     # copy from remote
+scp -i key.pem file.txt user@host:/path/   # with key
+
+# rsync over SSH
+rsync -avz -e "ssh -p 2222" /local/ user@host:/remote/
+```
+
+## User Management
+
+```bash
+whoami                            # current user
+who                               # who is logged in
+w                                 # who + what they're doing
+last                              # login history
+lastb                             # bad login attempts
+id                                # UID, GID, groups
+
+useradd -m -s /bin/bash user      # -m create home, -s shell
+usermod -aG sudo user             # -aG append to group
+userdel -r user                   # -r remove home directory
+passwd user                       # set password
+
+groupadd developers               # create group
+groups user                       # show user's groups
+```
+
+## System Info
+
+```bash
+uname -a                          # all system info
+uname -r                          # kernel version
+cat /etc/os-release               # distribution info
+hostnamectl                       # hostname, machine ID, timezone
+timedatectl                       # time and timezone
+uptime                            # load average, uptime
+who -b                            # last boot time
+
+lscpu                             # CPU info
+lspci                             # PCI devices
+lsusb                             # USB devices
+hwinfo                            # full hardware info (if installed)
+```
+
+## Real Production Examples
+
+```bash
+# Find and compress old log files
+find /var/log -name "*.log" -mtime +30 -exec gzip {} \;
+
+# Count unique IPs hitting a web server
+tail -n 100000 /var/log/nginx/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -20
+
+# Monitor disk space and alert if > 85%
+df -h | awk 'NR>1 {gsub(/%/,"",$5); if ($5+0 > 85) print $1 " is at "$5"%"}'
+
+# Find largest files
+du -h --max-depth=1 / | sort -rh | head -10
+
+# Restart service on error pattern
+tail -f /var/log/app.log | while read line; do echo "$line" | grep -q ERROR && systemctl restart app; done
+
+# Monitor connection count per IP
+ss -tunapl | awk '{print $6}' | cut -d: -f1 | sort | uniq -c | sort -rn | head -10
+
+# Extract errors with context
+grep -A 5 -B 5 "ERROR" /var/log/app.log
+
+# Replace string in all config files
+find /etc -name "*.conf" -exec sed -i 's/old_value/new_value/g' {} \;
+```
+
+## Interview Questions
+
+1. **How do you safely delete log files older than 30 days without deleting files currently being written to?**
+
+Use `find` with `-mtime +30` (not `-mmin`) and `-type f` — this matches files not directories. Don't use `-name "*.log"` alone because active log files also match. Consider using `logrotate` which handles safe rotation (it renames, compresses, then removes) rather than deleting while in use. If deleting directly: `find /var/log -name "*.log" -mtime +30 -type f -exec rm -f {} \;` — the `-type f` ensures you don't delete directories, and `-mtime +30` only matches files not touched in 30+ days.
+
+2. **What is the difference between `xargs -I{}` and `xargs -n1`?**
+
+`-n1` passes one argument per command invocation. `-I{}` replaces `{}` in the command template with the input argument. `-I{}` is more flexible: you can use the argument multiple times, in different positions, or with other text. Example: `echo "file1 file2 file3" | xargs -I{} sh -c 'echo "Processing {}" && rm {}'` — with `-I{}`, you can embed the argument in a shell command string, which `-n1` can't do.
+
+3. **How would you extract the 5th column from a CSV where some fields contain commas within quotes?**
+
+Use `FPAT` in awk (GNU awk) to define field pattern: `awk -v FPAT='([^,]*|"[^"]*")' '{print $5}' file.csv`. This defines a field as either non-comma text OR quoted text with commas inside. Alternative: use Python csv module or `csvtool`. Pure shell: `while IFS= read -r line; do echo "$line" | awk -F',' '{print $5}'; done < file.csv` fails on quoted commas.
+
+4. **What is the difference between `kill -9` and `kill -15`? When would you use each?**
+
+`kill -15` (SIGTERM) is graceful — it asks the process to terminate. The process can intercept it, clean up (close files, flush buffers, remove PID file), and exit cleanly. `kill -9` (SIGKILL) cannot be caught or ignored — the kernel immediately terminates the process with no cleanup. Always try `kill -15` first (or just `kill`) and give the process time (30-60s) to clean up. Use `kill -9` only when the process is hung, refusing to respond to SIGTERM, or you cannot afford to wait. After `kill -9`, you may need to manually clean up PID files, sockets, or shared memory.
+
+5. **How do you count the number of established connections to port 443?**
+
+```bash
+ss -tunapl state established sport = :443 | grep -c ESTAB
+# Or filter directly:
+ss -tunapl state established '( dport = :443 )' | grep -c ESTAB
+# Or with awk:
+ss -tunapl | awk '/ESTAB/ && /:443$/ {count++} END {print count}'
+```
+
+## Cheat Sheet
+
+```bash
+# Files
+ls -lath        find . -name "*.log"     cat -n file       head/tail -20
+cp -a src dst   mv old new               rm -rf            rsync -avz
+
+# Text
+grep -ri "error"   awk '{print $2}'   sed 's/a/b/g'    sort | uniq -c
+wc -l              xargs -0            tr '[:upper:]' '[:lower:]'
+
+# Network
+ss -tunapl     ip addr        curl -I url      dig +short
+ping -c 5      traceroute     nmap -sT         tcpdump -i eth0
+
+# Process
+ps aux | grep   top           kill -15 PID    pkill name
+lsof -i :80    nohup cmd &    bg/fg %1
+
+# Disk
+df -h          du -sh *       iostat -xz 1   mount/umount
+
+# Archive
+tar -czvf     tar -xzvf      gzip file       gunzip file.gz
+zip -r        unzip
+
+# System
+uname -r       uptime         free -h         whoami
+```
+
+## Related Topics
+
+- [Shell](./shell) — Shell fundamentals
+- [Bash](./bash) — Bash scripting
+- [Processes](./processes) — Process management
+- [Networking](./networking) — Network stack
+- [SSH](./ssh) — Secure shell
+- [Logs](./logs) — Log analysis

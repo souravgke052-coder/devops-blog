@@ -1,0 +1,783 @@
+---
+title: "Kubernetes Security"
+description: "Complete guide to Kubernetes security - Pod Security, Network Policies, Secrets, and admission control"
+sidebar_position: 17
+---
+
+# Kubernetes Security
+
+## Overview
+
+Kubernetes security is a multi-layered approach spanning authentication, authorization, network policies, Pod Security Standards, Secrets management, and admission control. A comprehensive security strategy protects the control plane, worker nodes, workloads, and data through defense in depth.
+
+## When to Use
+
+- **Production clusters** - always implement security hardening
+- **Multi-tenant environments** - isolate workloads
+- **Compliance requirements** - PCI-DSS, SOC2, HIPAA
+- **Protecting sensitive data** - secrets, credentials
+- **Network segmentation** - isolate workloads
+
+## When NOT to Use
+
+- **Development clusters** - security may impede rapid iteration
+- **Testing with containers** - some restrictions may not be needed
+
+## Core Concepts
+
+### Security Layers
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Kubernetes Security Layers                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. Authentication                                                    │   │
+│  │     - Certificates, Service Account Tokens, OIDC                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  2. Authorization (RBAC)                                              │   │
+│  │     - Role, ClusterRole, RoleBinding                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  3. Admission Control                                                 │   │
+│  │     - PodSecurity, LimitRanger, ResourceQuota                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  4. Network Security                                                  │   │
+│  │     - NetworkPolicies, CNI plugins                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  5. Pod Security                                                      │   │
+│  │     - SecurityContext, PodSecurityStandards                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  6. Secrets Management                                               │   │
+│  │     - Encryption at rest, external secrets                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pod Security Standards
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Pod Security Standards (PSS)                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Privileged (unrestricted)                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - No restrictions                                                   │   │
+│  │  - Use for infrastructure components only                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Baseline (minimum restrictions)                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - Disallow privileged pods                                          │   │
+│  │  - Restrict hostPath, hostNetwork, hostPID                          │   │
+│  │  - Require secure capabilities (drop ALL)                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Restricted (strictest)                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  - All baseline + additional restrictions                           │   │
+│  │  - Require non-root user                                            │   │
+│  │  - Require read-only root filesystem                                 │   │
+│  │  - Require seccomp profile                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### Security Context
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Security Context Levels                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Pod Level Security Context                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  spec:                                                               │   │
+│  │    securityContext:                                                 │   │
+│  │      runAsNonRoot: true                                             │   │
+│  │      runAsUser: 10000                                               │   │
+│  │      runAsGroup: 10000                                              │   │
+│  │      fsGroup: 10000                                                 │   │
+│  │      seccompProfile:                                                │   │
+│  │        type: RuntimeDefault                                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Container Level Security Context                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  containers:                                                        │   │
+│  │  - name: app                                                        │   │
+│  │    securityContext:                                                 │   │
+│  │      allowPrivilegeEscalation: false                                │   │
+│  │      readOnlyRootFilesystem: true                                   │   │
+│  │      capabilities:                                                  │   │
+│  │        drop: ["ALL"]                                                │   │
+│  │      seccompProfile:                                                │   │
+│  │        type: RuntimeDefault                                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production Security Configuration
+
+```yaml
+# Namespace with PodSecurity Standards
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    # Enforce baseline, audit restricted, warn restricted
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# Network Policy - Default Deny
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# Network Policy - Allow DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+# ServiceAccount with restricted permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-service-account
+  namespace: production
+---
+# Production Deployment with security hardening
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+    spec:
+      serviceAccountName: api-service-account
+      
+      # Security context at pod level
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Topology spread for availability
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+      
+      # Pod disruption budget
+      podDisruptionBudget:
+        minAvailable: 2
+      
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.1
+        imagePullPolicy: Always
+        
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 9090
+          name: grpc
+          protocol: TCP
+        
+        # Environment variables from secrets
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: database-url
+              optional: false
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: api-key
+        
+        # Resource limits (required for security)
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        
+        # Security context at container level
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 10000
+          runAsGroup: 10000
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /healthz/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Volume mounts
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: ca-certificates
+          mountPath: /etc/ssl/certs
+          readOnly: true
+      
+      # Init containers
+      initContainers:
+      - name: check-permissions
+        image: busybox:latest
+        command: ["sh", "-c", "echo 'Checking permissions'"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      
+      # Ephemeral volumes
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+      - name: ca-certificates
+        configMap:
+          name: ca-certificates
+      
+      # Tolerations for tainted nodes
+      tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+---
+# RBAC - Role for the service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: api-service-role
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-service-role-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: api-service-account
+  namespace: production
+roleRef:
+  kind: Role
+  name: api-service-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Network Policy Examples
+
+```yaml
+# Allow traffic from frontend to API
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+```
+
+### Admission Controller Configuration
+
+```yaml
+# LimitRange for resource constraints
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: production-limits
+  namespace: production
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "8"
+      memory: 16Gi
+    min:
+      cpu: 50m
+      memory: 64Mi
+    maxLimitRequestRatio:
+      cpu: "10"
+      memory: "10"
+
+---
+# ResourceQuota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: production-quota
+  namespace: production
+spec:
+  hard:
+    requests.cpu: "40"
+    requests.memory: 80Gi
+    limits.cpu: "80"
+    limits.memory: 160Gi
+    pods: "100"
+    services: "20"
+    persistentvolumeclaims: "50"
+    secrets: "20"
+    configmaps: "30"
+```
+
+## YAML Examples
+
+### Pod Security Context
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    runAsGroup: 10000
+    fsGroup: 10000
+    supplementalGroups: [10000]
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+### Container Security Context
+
+```yaml
+containers:
+- name: app
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 10000
+    capabilities:
+      drop:
+      - ALL
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+## CLI Examples (kubectl)
+
+### Security Operations
+
+```bash
+# Check if user can perform action
+kubectl auth can-i create pods
+kubectl auth can-i --list --as=john@example.com
+
+# Get secrets (encrypted)
+kubectl get secrets -n production
+
+# Create TLS secret
+kubectl create secret tls api-tls --cert=cert.pem --key=key.pem
+
+# Create docker registry secret
+kubectl create secret docker-registry my-registry \
+  --docker-username=user \
+  --docker-password=pass \
+  --docker-server=gcr.io
+
+# Check PodSecurity Standards
+kubectl get namespace production -o jsonpath='{.metadata.labels}' | jq
+
+# View API server admission configuration
+kubectl get admissionregistration.k8s.io
+```
+
+### RBAC Operations
+
+```bash
+# Check role bindings
+kubectl get rolebindings -n production
+
+# Create role
+kubectl create role pod-reader --verb=get,list,watch --resource=pods -n production
+
+# Create role binding
+kubectl create rolebinding my-binding \
+  --role=pod-reader \
+  --user=john@example.com \
+  -n production
+```
+
+### Network Policy Operations
+
+```bash
+# List network policies
+kubectl get networkpolicy
+kubectl get networkpolicy -n production
+
+# Create network policy
+kubectl apply -f network-policy.yaml
+
+# Delete network policy
+kubectl delete networkpolicy my-policy -n production
+```
+
+## Common Commands
+
+```bash
+# Check pod security context
+kubectl get pod my-pod -n production -o jsonpath='{.spec.securityContext}'
+
+# Check container security context
+kubectl get pod my-pod -n production -o jsonpath='{.spec.containers[0].securityContext}'
+
+# Get events related to security
+kubectl get events --field-selector reason=FailedCreate
+
+# Check ServiceAccount
+kubectl get serviceaccount api-sa -n production -o yaml
+
+# Generate token for ServiceAccount
+kubectl create token api-sa -n production --duration=1h
+```
+
+## Monitoring
+
+### Security Metrics
+
+| Metric | Description |
+|--------|-------------|
+| pod_security_standard_violations | Pods violating PSS |
+| secret_encryption_status | Encryption at rest status |
+| authentication_failures | Auth failure count |
+
+### Prometheus Queries
+
+```promql
+# Pods running as root
+count(kube_pod_spec_security_context_run_as_non_root == 0)
+
+# Containers without read-only filesystem
+count(kube_pod_container_spec_read_only_root_filesystem == 0)
+
+# Failed authentication
+sum(rate(apiserver_request_total{code=~"5.."}[5m]))
+```
+
+## Security
+
+### Secret Encryption
+
+```yaml
+# encryption-config.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets
+  - configmaps
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: <base64-encoded-32-byte-key>
+  - identity: {}
+```
+
+### Pod Security Best Practices
+
+```yaml
+# Required settings for production:
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+```
+
+### Image Security
+
+```yaml
+# Use specific image tags, not 'latest'
+image: gcr.io/myproject/api:v2.3.1
+
+# Use private registry with image pull secrets
+imagePullSecrets:
+- name: my-registry-secret
+
+# Security options
+image: myimage@sha256:abc123...  # Digest reference
+```
+
+## Cost Optimization
+
+Security configuration typically doesn't add significant cost, but consider:
+- Resource limits prevent over-provisioning
+- Network policies reduce unnecessary traffic
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pod denied by PodSecurity | PSS enforcement | Update pod spec |
+| 403 Forbidden | RBAC issue | Check role bindings |
+| Can't pull image | ImagePullBackOff | Check registry credentials |
+| Network policy blocking | Too restrictive | Add appropriate rules |
+
+### Diagnostic Commands
+
+```bash
+# Check pod security
+kubectl describe pod my-pod | grep -A 10 "Security"
+
+# Check RBAC
+kubectl auth can-i --list --as=user@example.com
+
+# Check network policy
+kubectl describe networkpolicy my-policy
+
+# Check admission controller
+kubectl get pod -n kube-system | grep security
+
+# Check events for security issues
+kubectl get events --field-selector reason=Failed
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is the principle of least privilege in Kubernetes?**
+A: Grant only the minimum permissions required for a user, service, or process to perform its function. Use RBAC to limit access to specific resources and verbs.
+
+**Q: What are Pod Security Standards?**
+A: PSS defines three policy levels (Privileged, Baseline, Restricted) that control what security settings pods must or should use. They replace the deprecated PodSecurityPolicy.
+
+**Q: How do NetworkPolicies work?**
+A: NetworkPolicies are namespace-scoped resources that filter network traffic using pod selectors, namespace selectors, and port specifications. By default, all traffic is allowed; NetworkPolicies restrict traffic.
+
+### Intermediate Questions
+
+**Q: What is the difference between PodSecurityPolicy and PodSecurity Standards?**
+A: PSP was an admission controller (removed in 1.25). PSS uses labels on namespaces to enforce security standards with built-in profiles.
+
+**Q: How do you secure Secrets in Kubernetes?**
+A: Enable encryption at rest in etcd, use RBAC to restrict access, set short TTLs on ServiceAccount tokens, use external secrets management (Vault), and rotate secrets regularly.
+
+### Advanced Questions
+
+**Q: How would you implement zero-trust networking in Kubernetes?**
+A: Implement default-deny NetworkPolicies, use mutual TLS (mTLS) via service mesh, enforce encryption in transit, apply strict RBAC, and use admission controllers to enforce security policies.
+
+## Cheat Sheet
+
+### Secure Pod YAML
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    fsGroup: 10000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+      limits:
+        memory: "128Mi"
+        cpu: "200m"
+    volumeMounts:
+    - name: tmp
+      mountPath: /tmp
+  volumes:
+  - name: tmp
+    emptyDir: {}
+```
+
+### Essential Commands
+
+```bash
+# Check permissions
+kubectl auth can-i create pods
+
+# Create secure ServiceAccount
+kubectl create serviceaccount my-sa -n production
+
+# Check pod security
+kubectl get pod my-pod -o jsonpath='{.spec.securityContext}'
+
+# Create network policy
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+EOF
+```
+
+### Security Checklist
+
+- [ ] RBAC configured with least privilege
+- [ ] NetworkPolicies enforce default deny
+- [ ] PodSecurity Standards applied
+- [ ] Secrets encrypted at rest
+- [ ] No privileged containers
+- [ ] Read-only root filesystem
+- [ ] Non-root user configuration
+- [ ] Resource limits set
+- [ ] Image pull secrets configured
+
+## Related Topics
+
+- [RBAC](./rbac) - Role-based access control
+- [Secrets](./secrets) - Secrets management
+- [Networking](./networking) - Network policies
+- [Services](./services) - Service security

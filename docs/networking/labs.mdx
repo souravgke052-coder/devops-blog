@@ -1,0 +1,646 @@
+# Networking Labs
+
+## Overview
+
+These hands-on labs build practical networking skills through real configuration and debugging exercises. Each lab includes objectives, step-by-step instructions, and expected outcomes. Complete them in order—they build on each other.
+
+**Prerequisites**: Linux VM (or WSL), basic command line familiarity, root/sudo access.
+
+## Lab 1: Build a Simple Linux Router with NAT
+
+### Objectives
+- Configure IP forwarding in Linux
+- Set up NAT using iptables
+- Verify traffic flows through the router
+
+### Setup
+Two VMs connected via a switch or TAP interface:
+- Router VM: 2 NICs (eth0 to internet, eth1 to internal)
+- Client VM: 1 NIC on internal network
+
+### Steps
+
+**Step 1: Configure IP addresses**
+
+On the router:
+```bash
+# Enable IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-router.conf
+
+# Configure internal interface
+ip addr add 10.0.0.1/24 dev eth1
+ip link set eth1 up
+
+# Verify
+ip addr show eth1
+```
+
+On the client:
+```bash
+# Set default gateway
+ip route add default via 10.0.0.1
+
+# Verify routing
+ip route show
+```
+
+**Step 2: Configure NAT**
+
+On the router:
+```bash
+# Allow forwarding from internal network
+iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
+
+# Allow established connections back
+iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Configure SNAT (or MASQUERADE)
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# Verify NAT rules
+iptables -t nat -L -v -n
+iptables -L FORWARD -v -n
+```
+
+**Step 3: Verify**
+
+From client:
+```bash
+# Test connectivity
+ping -c 3 8.8.8.8
+
+# Verify source IP is being NAT'd
+curl ifconfig.me
+# Should show router's public IP, not client's
+```
+
+From router:
+```bash
+# Watch NAT in action
+watch -n 1 'iptables -t nat -L POSTROUTING -v -n'
+```
+
+### Expected Outcome
+Client can reach internet through router. Router performs SNAT, so all client traffic appears to come from router's IP.
+
+---
+
+## Lab 2: Packet Capture and Analysis
+
+### Objectives
+- Capture HTTP/HTTPS traffic with tcpdump
+- Analyze TCP handshake and termination
+- Identify performance issues in captures
+
+### Steps
+
+**Step 1: Capture HTTP traffic**
+
+```bash
+# Start capture
+sudo tcpdump -i any -nn -A 'port 80' -w /tmp/http-capture.pcap &
+
+# Make HTTP request
+curl -v http://example.com/
+
+# Stop capture
+kill %1
+
+# Analyze
+tcpdump -r /tmp/http-capture.pcap -nn -A | head -50
+```
+
+**Step 2: Analyze TCP handshake**
+
+```bash
+# Filter for SYN, SYN-ACK, ACK
+tcpdump -r /tmp/http-capture.pcap -nn 'tcp[tcpflags] & (tcp-syn|tcp-ack) != 0'
+
+# Look for SYN packets (client initiates)
+tcpdump -r /tmp/http-capture.pcap -nn 'tcp[tcpflags] = tcp-syn'
+
+# Look for SYN-ACK (server responds)
+tcpdump -r /tmp/http-capture.pcap -nn 'tcp[tcpflags] = tcp-syn|tcp-ack'
+```
+
+**Step 3: Capture and analyze TLS handshake**
+
+```bash
+# Capture HTTPS (TLS 1.3 traffic is encrypted, but we can see handshake)
+sudo tcpdump -i any -nn 'port 443' -w /tmp/https-capture.pcap &
+
+curl -v https://example.com/
+
+kill %1
+
+# View TCP-level handshake before TLS kicks in
+tcpdump -r /tmp/https-capture.pcap -nn -v | head -30
+```
+
+**Step 4: Detect retransmissions**
+
+```bash
+# Create some packet loss simulation
+sudo tc qdisc add dev eth0 root netem loss 5%
+
+# Capture with loss
+sudo tcpdump -i any -nn port 80 -w /tmp/lossy.pcap &
+curl http://example.com/
+kill %1
+
+# Analyze retransmissions
+tcpdump -r /tmp/lossy.pcap -nn | grep -i retrans
+
+# Clean up
+sudo tc qdisc del dev eth0 root
+```
+
+### Expected Outcome
+Understand tcpdump output, identify TCP flags, observe handshake sequence. With simulated loss, see retransmissions in capture.
+
+---
+
+## Lab 3: WireGuard VPN Setup
+
+### Objectives
+- Generate WireGuard keypairs
+- Configure WireGuard interface
+- Establish VPN connection between two hosts
+
+### Setup
+Two VMs (or one VM and a remote server) with public IPs.
+
+### Steps
+
+**Step 1: Install WireGuard**
+
+```bash
+# Ubuntu/Debian
+sudo apt update && sudo apt install wireguard
+
+# Check installation
+wg --version
+```
+
+**Step 2: Generate keys**
+
+On both hosts:
+```bash
+# Generate private key (keep secret!)
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# View keys (in real use, keep private key secret!)
+cat privatekey
+cat publickey
+```
+
+**Step 3: Configure Server (Host A)**
+
+```bash
+# /etc/wireguard/wg0.conf on Server
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <SERVER_PRIVATE_KEY>
+
+# Allow forwarding
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+PublicKey = <CLIENT_PUBLIC_KEY>
+AllowedIPs = 10.0.0.2/32
+```
+
+**Step 4: Configure Client (Host B)**
+
+```bash
+# /etc/wireguard/wg0.conf on Client
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <CLIENT_PRIVATE_KEY>
+DNS = 8.8.8.8
+
+[Peer]
+PublicKey = <SERVER_PUBLIC_KEY>
+Endpoint = <SERVER_IP>:51820
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+```
+
+**Step 5: Start WireGuard**
+
+On server:
+```bash
+sudo wg-quick up wg0
+sudo systemctl enable wg-quick@wg0
+sudo wg show
+```
+
+On client:
+```bash
+sudo wg-quick up wg0
+sudo wg show
+```
+
+**Step 6: Verify**
+
+```bash
+# From client, test connection to server
+ping -c 3 10.0.0.1
+
+# From client, access internet via VPN
+curl --interface wg0 ifconfig.me
+
+# Check WireGuard status
+sudo wg show
+# Should show peer, latest handshake, transfer stats
+```
+
+### Expected Outcome
+Client can ping server via VPN tunnel. All client traffic can route through VPN. WireGuard shows encrypted packets.
+
+---
+
+## Lab 4: NGINX Reverse Proxy with SSL
+
+### Objectives
+- Configure NGINX as reverse proxy
+- Set up SSL/TLS termination
+- Implement load balancing
+
+### Steps
+
+**Step 1: Install NGINX**
+
+```bash
+sudo apt update && sudo apt install nginx
+sudo systemctl start nginx
+sudo systemctl enable nginx
+```
+
+**Step 2: Create self-signed certificate**
+
+```bash
+sudo mkdir -p /etc/nginx/ssl
+
+# Generate private key and certificate
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/selfsigned.key \
+  -out /etc/nginx/ssl/selfsigned.crt \
+  -subj "/CN=localhost"
+
+# Combine into bundle
+sudo cat /etc/nginx/ssl/selfsigned.crt /etc/nginx/ssl/selfsigned.key \
+  | sudo tee /etc/nginx/ssl/localhost.bundle.crt
+
+echo "Certificate created"
+openssl x509 -in /etc/nginx/ssl/selfsigned.crt -text -noout | head -20
+```
+
+**Step 3: Configure reverse proxy**
+
+```bash
+# /etc/nginx/conf.d/reverse-proxy.conf
+upstream backend {
+    server 127.0.0.1:8080;
+    server 127.0.0.1:8081 backup;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name localhost;
+    
+    # Redirect HTTP to HTTPS
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name localhost;
+    
+    ssl_certificate /etc/nginx/ssl/selfsigned.crt;
+    ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+    
+    location / {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;
+        
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+**Step 4: Start backend services**
+
+```bash
+# Simple Python HTTP servers for testing
+python3 -m http.server 8080 --directory /tmp &
+python3 -m http.server 8081 --directory /tmp &
+
+sleep 2
+ss -tlnp | grep -E '8080|8081'
+```
+
+**Step 5: Test**
+
+```bash
+# Test HTTP redirect
+curl -I http://localhost/
+
+# Test HTTPS reverse proxy
+curl -k https://localhost/api/
+
+# Test with verbose output
+curl -vk https://localhost/ 2>&1 | head -40
+
+# Check NGINX status
+curl http://localhost/nginx_status
+```
+
+### Expected Outcome
+HTTP requests redirect to HTTPS. HTTPS requests proxy to backend. SSL handshake works.
+
+---
+
+## Lab 5: AWS VPC with Public/Private Subnets
+
+### Prerequisites
+- AWS account with appropriate permissions
+- AWS CLI configured
+
+### Objectives
+- Create a VPC with proper subnet segmentation
+- Configure routing for public/private subnets
+- Set up NAT Gateway for private subnet internet access
+
+### Steps
+
+**Step 1: Create VPC**
+
+```bash
+# Create VPC
+VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --query 'Vpc.VpcId' --output text)
+echo "VPC ID: $VPC_ID"
+
+# Enable DNS hostnames
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+
+# Tag for easier identification
+aws ec2 create-tags --resources $VPC_ID --tags Key=Name,Value=lab-vpc
+```
+
+**Step 2: Create subnets**
+
+```bash
+# Public subnet (in AZ-1)
+PUBLIC_SUBNET=$(aws ec2 create-subnet --vpc-id $VPC_ID \
+  --cidr-block 10.0.0.0/24 \
+  --availability-zone us-east-1a \
+  --query 'Subnet.SubnetId' --output text)
+aws ec2 create-tags --resources $PUBLIC_SUBNET --tags Key=Name,Value=public-subnet
+
+# Private subnet (in AZ-1)
+PRIVATE_SUBNET=$(aws ec2 create-subnet --vpc-id $VPC_ID \
+  --cidr-block 10.0.1.0/24 \
+  --availability-zone us-east-1a \
+  --query 'Subnet.SubnetId' --output text)
+aws ec2 create-tags --resources $PRIVATE_SUBNET --tags Key=Name,Value=private-subnet
+
+echo "Public: $PUBLIC_SUBNET, Private: $PRIVATE_SUBNET"
+```
+
+**Step 3: Create and attach Internet Gateway**
+
+```bash
+# Create IGW
+IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+echo "IGW ID: $IGW_ID"
+
+# Attach to VPC
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+# Tag
+aws ec2 create-tags --resources $IGW_ID --tags Key=Name,Value=lab-igw
+```
+
+**Step 4: Create route tables**
+
+```bash
+# Public route table (with route to IGW)
+PUBLIC_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --query 'RouteTable.RouteTableId' --output text)
+aws ec2 create-route --route-table-id $PUBLIC_RT \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+aws ec2 associate-route-table --route-table-id $PUBLIC_RT --subnet-id $PUBLIC_SUBNET
+echo "Public route table: $PUBLIC_RT"
+
+# Private route table (with route to NAT GW - we'll add NAT GW later)
+PRIVATE_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --query 'RouteTable.RouteTableId' --output text)
+aws ec2 associate-route-table --route-table-id $PRIVATE_RT --subnet-id $PRIVATE_SUBNET
+echo "Private route table: $PRIVATE_RT"
+```
+
+**Step 5: Create NAT Gateway**
+
+```bash
+# Allocate Elastic IP
+EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --query 'AllocationId' --output text)
+echo "EIP Allocation: $EIP_ALLOC"
+
+# NAT Gateway in public subnet
+NAT_GW=$(aws ec2 create-nat-gateway --subnet-id $PUBLIC_SUBNET \
+  --allocation-id $EIP_ALLOC \
+  --query 'NatGateway.NatGatewayId' --output text)
+echo "NAT Gateway: $NAT_GW"
+
+# Wait for NAT Gateway to be available
+echo "Waiting for NAT Gateway..."
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW
+
+# Add route through NAT Gateway to private route table
+aws ec2 create-route --route-table-id $PRIVATE_RT \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_GW
+
+echo "Route table updated with NAT Gateway"
+```
+
+**Step 6: Verify configuration**
+
+```bash
+# Check VPC
+aws ec2 describe-vpcs --vpc-ids $VPC_ID
+
+# Check subnets
+aws ec2 describe-subnets --subnet-ids $PUBLIC_SUBNET $PRIVATE_SUBNET
+
+# Check route tables
+aws ec2 describe-route-tables --route-table-ids $PUBLIC_RT $PRIVATE_RT
+
+# Expected:
+# Public route table: has route 0.0.0.0/0 -> IGW
+# Private route table: has route 0.0.0.0/0 -> NAT GW
+```
+
+**Step 7: Launch test instances**
+
+```bash
+# Launch instance in public subnet
+aws ec2 run-instances --image-id ami-0c55b159cbfafe1f0 \
+  --count 1 --instance-type t3.micro \
+  --key-name your-key-name \
+  --subnet-id $PUBLIC_SUBNET \
+  --associate-public-ip-address \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=public-instance}]'
+
+# Launch instance in private subnet (no public IP)
+aws ec2 run-instances --image-id ami-0c55b159cbfafe1f0 \
+  --count 1 --instance-type t3.micro \
+  --key-name your-key-name \
+  --subnet-id $PRIVATE_SUBNET \
+  --no-associate-public-ip-address \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=private-instance}]'
+```
+
+### Expected Outcome
+Public instance has internet access and is reachable from internet (with SG rules). Private instance accesses internet via NAT Gateway but cannot be reached from internet directly.
+
+### Cleanup
+
+```bash
+# Terminate instances (replace with actual instance IDs)
+aws ec2 terminate-instances --instance-ids i-xxx i-yyy
+
+# Delete NAT Gateway and EIP
+aws ec2 delete-nat-gateway --nat-gateway-id $NAT_GW
+sleep 30  # Wait for deletion
+aws ec2 release-address --allocation-id $EIP_ALLOC
+
+# Delete VPC (must be empty first)
+aws ec2 delete-subnet --subnet-id $PUBLIC_SUBNET
+aws ec2 delete-subnet --subnet-id $PRIVATE_SUBNET
+aws ec2 delete-route-table --route-table-id $PUBLIC_RT
+aws ec2 delete-route-table --route-table-id $PRIVATE_RT
+aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
+aws ec2 delete-vpc --vpc-id $VPC_ID
+```
+
+---
+
+## Lab 6: Diagnose a Connectivity Issue
+
+### Scenario
+Users report they can't access the web application at `api.example.com`. You've been asked to diagnose.
+
+### Symptoms
+- HTTP requests timeout
+- Some users see "Connection refused"
+
+### Debugging Steps
+
+**Step 1: Check DNS resolution**
+
+```bash
+dig +short api.example.com A
+nslookup api.example.com
+
+# If wrong IP, DNS issue
+# If no response, DNS server unreachable
+```
+
+**Step 2: Check basic connectivity**
+
+```bash
+ping -c 3 api.example.com
+
+# If ping fails, check:
+# - Routing: ip route get <IP>
+# - Firewall: iptables -L
+```
+
+**Step 3: Check port accessibility**
+
+```bash
+nc -zv api.example.com 80
+nc -zv api.example.com 443
+
+# Connection refused = service down
+# Timeout = firewall blocking
+```
+
+**Step 4: Check service status (if you have access)**
+
+```bash
+ssh user@api-server
+ss -tuln | grep -E '80|443'
+systemctl status nginx
+journalctl -u nginx --no-pager -n 50
+```
+
+**Step 5: Check load balancer (if using)**
+
+```bash
+# AWS ALB
+aws elbv2 describe-target-health --target-group-arn arn:aws:elasticloadbalancing:...
+
+# Check if instances are healthy
+# If unhealthy, investigate instance health
+```
+
+**Step 6: Capture traffic**
+
+```bash
+# If you have access to the server
+sudo tcpdump -i any -nn port 80 -w /tmp/issue.pcap &
+
+# Make request from client
+curl -v http://api.example.com/
+
+kill %1
+tcpdump -r /tmp/issue.pcap -nn | head -30
+```
+
+**Step 7: Check for recent changes**
+
+```bash
+# Check nginx config recently changed?
+ls -la /etc/nginx/sites-enabled/
+nginx -t
+
+# Check deployment history
+git log --oneline -10
+```
+
+### Diagnosis Framework
+
+| Symptom | Likely Cause | Investigation |
+|---------|--------------|---------------|
+| DNS fails | DNS misconfiguration | Check resolv.conf, DNS server |
+| Ping fails | Routing/firewall | traceroute, ip route |
+| Connection refused | Service down | ss, systemctl |
+| Connection timeout | Firewall block | tcpdump on both ends |
+| Intermittent | Load balancer issue | Check target health |
+| Slow | Network congestion | mtr, ss -ti for retrans |
+
+---
+
+## Related Topics
+
+- [Overview](./overview) — Networking fundamentals
+- [Debugging](./debugging) — Debugging techniques
+- [Firewall](./firewall) — Linux firewall configuration
+- [NAT](./nat) — NAT setup
+- [VPC](./vpc) — Cloud VPC design
+- [VPN](./vpn) — WireGuard VPN

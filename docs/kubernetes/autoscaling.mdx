@@ -1,0 +1,721 @@
+---
+title: "Kubernetes Autoscaling"
+description: "Complete guide to Kubernetes autoscaling - HPA, VPA, and Cluster Autoscaler for adaptive resource management"
+sidebar_position: 15
+---
+
+# Kubernetes Autoscaling
+
+## Overview
+
+Kubernetes provides multiple layers of autoscaling to match workload demand with resource capacity. **Horizontal Pod Autoscaler (HPA)** scales pods based on metrics, **Vertical Pod Autoscaler (VPA)** adjusts container resource requests, and **Cluster Autoscaler** adjusts the number of nodes in a cluster. Together they provide comprehensive autoscaling for cloud-native applications.
+
+## When to Use
+
+- **Variable traffic patterns** - web applications with fluctuating users
+- **CPU-intensive workloads** - batch processing, ML inference
+- **Memory-intensive applications** - caching, data processing
+- **Cost optimization** - scale down during low traffic
+- **High availability** - ensure capacity during traffic spikes
+- **Resource optimization** - right-size pod resource requests
+
+## When NOT to Use
+
+- **Stable workloads** - autoscaling adds overhead
+- **Very short-lived tasks** - scaling takes time
+- **Stateful applications with fixed scaling** - use alternative patterns
+- **Predictable batch jobs** - schedule capacity in advance
+
+## Core Concepts
+
+### Autoscaling Stack
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Kubernetes Autoscaling Stack                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Cluster Autoscaler (Node Level)                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Adds/removes nodes based on pending pods                            │   │
+│  │  Responds to: Pods pending due to resource constraints              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  Horizontal Pod Autoscaler (Pod Level)                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Scales pod replicas based on CPU, memory, custom metrics           │   │
+│  │  Adjusts: Replica count                                              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  Vertical Pod Autoscaler (Container Level)                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Adjusts container resource requests based on usage                  │   │
+│  │  Adjusts: CPU/memory requests                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### HPA Behavior
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HPA Decision Flow                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Metric Collection (every 15 seconds)                                        │
+│      │                                                                        │
+│      ▼                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Calculate: current_replicas × (current_metric / target_metric)    │   │
+│  │  Example: 5 × (80 / 60) = 6.67 → round up = 7                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Stabilization Window (default 5 min)                                │   │
+│  │  - Prevents rapid scaling                                           │   │
+│  │  - Configurable via behavior section                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              ▼                                               │
+│  Scale Action (if needed)                                                   │
+│      │                                                                        │
+│      ▼                                                                        │
+│  kubectl scale deployment → new replica count                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production API with Full Autoscaling Stack
+
+```yaml
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+  namespace: production
+  labels:
+    app: api-service
+spec:
+  # Scale target
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  
+  # Replica bounds
+  minReplicas: 3
+  maxReplicas: 50
+  
+  # Metrics
+  metrics:
+  # CPU-based scaling
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  
+  # Memory-based scaling
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  
+  # Custom metric from Prometheus
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"
+  
+  # Scaling behavior
+  behavior:
+    # Scale down behavior
+    scaleDown:
+      # Stabilization window
+      stabilizationWindowSeconds: 300
+      # Policies evaluated in order
+      policies:
+      # Scale down by 10% every minute
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+      # Scale down by max 4 pods per minute
+      - type: Pods
+        value: 4
+        periodSeconds: 60
+      # Use most conservative policy (smallest scale)
+      selectPolicy: Min
+    
+    # Scale up behavior
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Immediate scale up
+      policies:
+      # Double pods every 15 seconds
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      # Add max 10 pods every 15 seconds
+      - type: Pods
+        value: 10
+        periodSeconds: 15
+
+---
+# VerticalPodAutoscaler for right-sizing
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-service-vpa
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  updatePolicy:
+    # Auto mode: automatically update pod resources
+    # "Off" mode just provides recommendations
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: api
+      # Constraints on resource adjustments
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 4
+        memory: 8Gi
+      # Controlled resource mutation
+      controlledResources:
+      - cpu
+      - memory
+      # Pod disruption budget during updates
+      controlledValues: RequestsAndLimits
+      # Mode for resource updates
+      mode: "Auto"
+
+---
+# Deployment with resource requests/limits for HPA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.1
+        ports:
+        - containerPort: 8080
+        
+        # Required for HPA - requests must be set
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        
+        livenessProbe:
+          httpGet:
+            path: /healthz/live
+            port: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+```
+
+### Custom Metrics HPA
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: queue-worker-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: queue-worker
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  # Queue depth metric (from Prometheus)
+  - type: Pods
+    pods:
+      metric:
+        name: queue_depth
+      target:
+        type: AverageValue
+        averageValue: "100"
+  
+  - type: Pods
+    pods:
+      metric:
+        name: processing_time_p95
+      target:
+        type: AverageValue
+        averageValue: "500ms"
+```
+
+## YAML Examples
+
+### Basic HPA
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+### HPA with Multiple Metrics
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+### HPA with Scaling Policies
+
+```yaml
+spec:
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+```
+
+## CLI Examples (kubectl)
+
+### Basic HPA Operations
+
+```bash
+# Create HPA
+kubectl apply -f hpa.yaml
+
+# Auto-create HPA from deployment
+kubectl autoscale deployment myapp --cpu-percent=70 --min=2 --max=10
+
+# List HPAs
+kubectl get hpa
+kubectl get hpa -o wide
+
+# Describe HPA
+kubectl describe hpa myapp-hpa
+
+# Get HPA YAML
+kubectl get hpa myapp-hpa -o yaml
+
+# Get HPA status
+kubectl get hpa myapp-hpa -o jsonpath='{.status}'
+
+# Delete HPA
+kubectl delete hpa myapp-hpa
+
+# Watch HPA
+kubectl get hpa -w
+```
+
+### HPA Operations
+
+```bash
+# Edit HPA
+kubectl edit hpa myapp-hpa
+
+# Patch HPA
+kubectl patch hpa myapp-hpa -p '{"spec":{"minReplicas":5}}'
+
+# Set replicas directly (pause autoscaling)
+kubectl scale deployment myapp --replicas=10
+
+# Resume autoscaling
+kubectl rollout undo deployment myapp
+
+# View HPA recommendations
+kubectl get hpa myapp-hpa -o jsonpath='{.status}' | jq
+```
+
+### VPA Operations
+
+```bash
+# Create VPA (recommendation only)
+kubectl apply -f vpa.yaml
+
+# Get VPA recommendations
+kubectl get vpa myapp-vpa -o yaml | grep -A 20 "recommendation"
+
+# Update VPA mode
+kubectl patch vpa myapp-vpa -p '{"spec":{"updatePolicy":{"updateMode":"Auto"}}}'
+
+# Delete VPA
+kubectl delete vpa myapp-vpa
+```
+
+### Cluster Autoscaler (GKE)
+
+```bash
+# Enable cluster autoscaler on node pool
+gcloud container node-pools update my-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --enable-autoscaling \
+  --min-nodes=1 \
+  --max-nodes=10
+
+# Update autoscaling
+gcloud container node-pools update my-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --min-nodes=2 \
+  --max-nodes=20
+```
+
+## Common Commands
+
+```bash
+# Create HPA from CLI
+kubectl autoscale deployment myapp --min=3 --max=15 --cpu-percent=70
+
+# Generate HPA YAML
+kubectl autoscale deployment myapp --min=3 --max=15 --cpu-percent=70 --dry-run=client -o yaml
+
+# Get HPA metrics
+kubectl get hpa myapp -o jsonpath='{.metrics}'
+
+# Force scale down
+kubectl patch hpa myapp -p '{"spec":{"minReplicas":1}}'
+
+# Check HPA status
+kubectl describe hpa myapp | grep -A 10 "Conditions"
+```
+
+## Monitoring
+
+### HPA Metrics
+
+| Metric | Description |
+|--------|-------------|
+| current_replicas | Current pod count |
+| desired_replicas | Target pod count from HPA |
+| cpu_utilization | Current CPU usage % |
+| memory_utilization | Current memory usage % |
+
+### Prometheus Queries
+
+```promql
+# HPA scaling events
+sum(rate(kube_horizontalpodautoscaler_status_current_replicas[5m]))
+
+# CPU utilization vs target
+kube_hpa_status_current_replicas * 100 / kube_hpa_spec_min_replicas
+
+# Desired vs actual replicas
+kube_hpa_spec_max_replicas - kube_hpa_status_desired_replicas
+```
+
+### GKE Metrics
+
+```bash
+# Check HPA status
+kubectl get hpa -A
+
+# View custom metrics in Cloud Monitoring
+# - kubernetes.io/hpa/current_replicas
+# - kubernetes.io/hpa/desired_replicas
+```
+
+## Security
+
+### RBAC for Autoscaling
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hpa-manager
+  namespace: production
+rules:
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers/status"]
+  verbs: ["get"]
+- apiGroups: ["autoscaling"]
+  resources: ["verticalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+```
+
+## Cost Optimization
+
+### Autoscaling Best Practices
+
+```yaml
+# Right-size initial replicas
+spec:
+  minReplicas: 2  # Don't go below 2 for HA
+
+# Configure scale-down to reduce costs
+behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300  # 5 minutes
+    policies:
+    - type: Percent
+      value: 50  # Scale down by 50%
+    selectPolicy: Min  # Most conservative
+
+# Avoid over-provisioning
+# Set maxReplicas based on actual peak + buffer
+```
+
+### Spot Instance with Cluster Autoscaler
+
+```bash
+# Create spot node pool with autoscaling
+gcloud container node-pools create spot-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --spot \
+  --enable-autoscaling \
+  --min-nodes=0 \
+  --max-nodes=50 \
+  --node-labels=workload-type=batch
+
+# Taint spot nodes
+gcloud container node-pools create spot-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --spot \
+  --node-taints=spot=true:NoSchedule
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| HPA not scaling | No resource requests | Add requests to containers |
+| HPA stuck | Deployment conflicts | Check deployment spec |
+| VPA not applying | Wrong updateMode | Set updateMode: Auto |
+| Cluster not scaling | Quota limit | Check cloud quotas |
+| Over-scaling | Metric too aggressive | Adjust target metrics |
+
+### Diagnostic Commands
+
+```bash
+# Check HPA status
+kubectl get hpa myapp -o wide
+
+# Check HPA conditions
+kubectl describe hpa myapp | grep -A 5 "Conditions"
+
+# Check why scaling didn't happen
+kubectl describe hpa myapp | grep -A 10 "Events"
+
+# Check metrics server
+kubectl get apiservice v1beta1.metrics.k8s.io -o yaml
+
+# Check Cluster Autoscaler logs
+kubectl logs -n kube-system -l app=cluster-autoscaler --tail=100
+
+# Check VPA recommendations
+kubectl get vpa myapp -o jsonpath='{.status.recommendation}'
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is the Horizontal Pod Autoscaler (HPA)?**
+A: HPA automatically scales the number of pods in a Deployment or ReplicaSet based on observed CPU utilization, memory usage, or custom metrics.
+
+**Q: How does HPA calculate the number of replicas?**
+A: HPA uses the formula: desiredReplicas = ceil(currentReplicas * (currentMetricValue / targetMetricValue))
+
+**Q: What is the difference between HPA and VPA?**
+A: HPA scales the number of replicas horizontally. VPA adjusts the CPU and memory resource requests of existing pods vertically.
+
+### Intermediate Questions
+
+**Q: What metrics does HPA support?**
+A: HPA supports Resource metrics (CPU, memory), Pod metrics (custom per-pod), Object metrics (external objects), and External metrics (from external systems like Prometheus).
+
+**Q: How do you prevent HPA from scaling down too quickly?**
+A: Configure scaleDown stabilizationWindowSeconds in the behavior section. This adds a delay before scaling down, preventing rapid oscillation.
+
+### Advanced Questions
+
+**Q: How does HPA work with Cluster Autoscaler?**
+A: HPA scales pods based on metrics. If pods can't be scheduled due to resource constraints, Cluster Autoscaler adds nodes. Together they provide complete autoscaling coverage.
+
+**Q: How would you implement scale-to-zero?**
+A: Scale-to-zero requires specific workload types (Knative, KEDA). Standard Kubernetes HPA has minReplicas >= 1. For true scale-to-zero, use Knative Serving or KEDA with specific scalers.
+
+## Cheat Sheet
+
+### HPA YAML Template
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+```
+
+### VPA YAML Template
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: myapp-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+  updatePolicy:
+    updateMode: "Auto"  # Auto, Off, Initial
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 4
+        memory: 16Gi
+```
+
+### Essential Commands
+
+```bash
+# Create HPA
+kubectl autoscale deployment myapp --cpu-percent=70 --min=2 --max=10
+
+# Get HPA status
+kubectl get hpa
+kubectl describe hpa myapp
+
+# Delete HPA
+kubectl delete hpa myapp
+
+# Create VPA
+kubectl apply -f vpa.yaml
+
+# Get VPA recommendations
+kubectl get vpa myapp -o jsonpath='{.status.recommendation}'
+```
+
+### Autoscaling Comparison
+
+| Type | What Changes | Use Case |
+|------|--------------|----------|
+| HPA | Replica count | Variable traffic, parallel workloads |
+| VPA | Resource requests | Right-sizing, memory optimization |
+| Cluster Autoscaler | Node count | Node capacity, cloud costs |
+| KEDA | Replica count (event-driven) | Queue-based, metric-driven |
+
+## Related Topics
+
+- [Deployments](./deployments) - Deployment scaling
+- [Metrics Server](./observability) - Metrics collection
+- [GKE](./gke) - GKE autoscaling features

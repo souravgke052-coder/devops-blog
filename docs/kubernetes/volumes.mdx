@@ -1,0 +1,606 @@
+---
+title: "Kubernetes Volumes"
+description: "Complete guide to Kubernetes Volumes - persistent storage, emptyDir, hostPath, and volume types"
+sidebar_position: 8
+---
+
+# Kubernetes Volumes
+
+## Overview
+
+Kubernetes **Volumes** provide persistent or ephemeral storage for containers within a Pod. Unlike container filesystems which are ephemeral, Volumes persist data across container restarts and can be shared between containers in the same Pod. Kubernetes supports many volume types ranging from ephemeral empty directories to cloud provider block storage.
+
+## When To Use
+
+- **Persistent data** that must survive container restarts
+- **Shared data** between containers in a Pod
+- **Database storage** requiring durable volumes
+- **Configuration files** mounted from ConfigMaps/Secrets
+- **Temporary storage** for caching or scratch space
+- **Application state** that needs to persist
+
+## When NOT to Use
+
+- **For ephemeral scratch data** - container filesystem is fine
+- **When you need cross-pod sharing** - use shared storage (NFS, Ceph)
+- **For stateful distributed systems** - use StatefulSets with proper PVs
+- **For simple configuration** - use ConfigMaps mounted as volumes
+
+## Core Concepts
+
+### Volume Types Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Kubernetes Volume Types                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Ephemeral (lives with Pod):                                                │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                   │
+│  │   emptyDir    │  │   configMap   │  │    secret     │                   │
+│  │  (temp disk)  │  │  (config)     │  │  (sensitive)  │                   │
+│  └───────────────┘  └───────────────┘  └───────────────┘                   │
+│                                                                              │
+│  Persistent (survives Pod):                                                 │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                   │
+│  │  persistent   │  │   NFS         │  │   cloud       │                   │
+│  │   VolumeClaim │  │  (network FS) │  │  (GCE PD, EBS)│                   │
+│  └───────────────┘  └───────────────┘  └───────────────┘                   │
+│                                                                              │
+│  Special:                                                                    │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                   │
+│  │  hostPath     │  │  downwardAPI  │  │  projected    │                   │
+│  │ (node fs)     │  │ (pod metadata)│  │ (multi source)│                   │
+│  └───────────────┘  └───────────────┘  └───────────────┘                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Volume Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Volume Lifecycle                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  emptyDir:              Pod created → Volume mounted → Pod deleted → Volume │
+│                        deleted                                                                       │
+│                                                                              │
+│  hostPath:              Volume exists on node                               │
+│                        Pod created → Volume mounted → Pod deleted → Volume   │
+│                        persists (unless configured otherwise)               │
+│                                                                              │
+│  persistentVolumeClaim: Pre-provisioned PV or dynamic provision             │
+│                        PVC created → PV bound → Pod uses PVC → Pod deleted   │
+│                        → PVC deleted → PV reclaimed/deleted                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### Volume Mount Flow
+
+```
+Pod Specification
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  spec:                                                                       │
+│    containers:                                                               │
+│    - name: app                                                               │
+│      volumeMounts:                                                           │
+│      - name: data                                                            │
+│        mountPath: /data                                                      │
+│    volumes:                                                                  │
+│    - name: data                                                              │
+│      persistentVolumeClaim:                                                  │
+│        claimName: my-pvc                                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  kubelet on Node                                                             │
+│    │                                                                         │
+│    ▼                                                                         │
+│  Mount volume to container at /data                                          │
+│    │                                                                         │
+│    ▼                                                                         │
+│  Container sees /data with contents of the volume                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production Application with Multiple Volume Types
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: production-app
+  namespace: production
+spec:
+  containers:
+  - name: app
+    image: gcr.io/myproject/app:v2.3.1
+    
+    # EmptyDir for temp data
+    volumeMounts:
+    - name: tmp-storage
+      mountPath: /tmp
+    - name: cache
+      mountPath: /app/cache
+    - name: config
+      mountPath: /etc/config
+      readOnly: true
+    - name: secrets
+      mountPath: /etc/secrets
+      readOnly: true
+    - name: data
+      mountPath: /data
+    - name: ca-certificates
+      mountPath: /etc/ssl/certs
+      readOnly: true
+    - name: pod-info
+      mountPath: /etc/podinfo
+      readOnly: true
+    
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "2000m"
+  
+  # All volumes defined at pod level
+  volumes:
+  # Ephemeral tmp storage (memory-backed)
+  - name: tmp-storage
+    emptyDir:
+      medium: Memory
+      sizeLimit: 100Mi
+  
+  # Cache storage (disk-backed)
+  - name: cache
+    emptyDir:
+      sizeLimit: 1Gi
+  
+  # ConfigMap for configuration
+  - name: config
+    configMap:
+      name: app-config
+      items:
+      - key: app.yaml
+        path: config.yaml
+      defaultMode: 0644
+  
+  # Secret for sensitive data
+  - name: secrets
+    secret:
+      secretName: app-secrets
+      items:
+      - key: api-key
+        path: api.key
+      defaultMode: 0600
+  
+  # Persistent volume for application data
+  - name: data
+    persistentVolumeClaim:
+      claimName: app-data-pvc
+  
+  # CA certificates
+  - name: ca-certificates
+    configMap:
+      name: ca-certificates
+  
+  # Downward API for pod metadata
+  - name: pod-info
+    downwardAPI:
+      items:
+      - path: "labels"
+        fieldRef:
+          fieldPath: metadata.labels
+      - path: "annotations"
+        fieldRef:
+          fieldPath: metadata.annotations
+      - path: "name"
+        fieldRef:
+          fieldPath: metadata.name
+      - path: "namespace"
+        fieldRef:
+          fieldPath: metadata.namespace
+      - path: "uid"
+        fieldRef:
+          fieldPath: metadata.uid
+      - path: "cpu_limit"
+        resourceFieldRef:
+          containerName: app
+          resource: limits.cpu
+      - path: "memory_limit"
+        resourceFieldRef:
+          containerName: app
+          resource: limits.memory
+
+---
+# PersistentVolumeClaim for the application
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data-pvc
+  namespace: production
+  labels:
+    app: production-app
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: standard-rwo
+  resources:
+    requests:
+      storage: 50Gi
+  selector:
+    matchLabels:
+      type: production-data
+```
+
+## YAML Examples
+
+### emptyDir Volume
+
+```yaml
+# Memory-backed tmpfs (fast, limited by node memory)
+volumeMounts:
+- name: tmpfs-volume
+  mountPath: /tmp
+volumes:
+- name: tmpfs-volume
+  emptyDir:
+    medium: Memory
+    sizeLimit: 256Mi
+
+# Disk-backed (uses node disk)
+volumes:
+- name: disk-volume
+  emptyDir:
+    sizeLimit: 1Gi
+```
+
+### hostPath Volume
+
+```yaml
+# WARNING: hostPath is for single-node testing only
+volumes:
+# Read docker socket (for docker-in-docker)
+- name: docker-socket
+  hostPath:
+    path: /var/run/docker.sock
+    type: Socket
+
+# Read node filesystem
+- name: node-logs
+  hostPath:
+    path: /var/log
+    type: Directory
+
+# Create directory if not exists
+- name: node-data
+  hostPath:
+    path: /data/app
+    type: DirectoryOrCreate
+```
+
+### NFS Volume
+
+```yaml
+volumes:
+- name: nfs-storage
+  nfs:
+    server: nfs.example.com
+    path: /shared/data
+    readOnly: false
+```
+
+### PersistentVolumeClaim Reference
+
+```yaml
+volumes:
+# Standard PVC
+- name: app-data
+  persistentVolumeClaim:
+    claimName: my-pvc
+    readOnly: false
+
+# With specific access mode
+- name: shared-data
+  persistentVolumeClaim:
+    claimName: shared-pvc
+    readOnly: true
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create PVC
+kubectl apply -f pvc.yaml
+
+# List PVCs
+kubectl get pvc
+kubectl get pvc -n production
+kubectl get pvc --all-namespaces
+
+# Describe PVC
+kubectl describe pvc app-data-pvc -n production
+
+# Get PVC YAML
+kubectl get pvc app-data-pvc -n production -o yaml
+
+# Delete PVC
+kubectl delete pvc app-data-pvc -n production
+
+# Check PVC status
+kubectl get pvc -n production -o wide
+```
+
+### PersistentVolume Operations
+
+```bash
+# List PVs
+kubectl get pv
+kubectl get pv -o wide
+
+# Describe PV
+kubectl describe pv pv-name
+
+# Check binding
+kubectl get pv --show-charts
+
+# Delete PV
+kubectl delete pv pv-name
+```
+
+### Debugging
+
+```bash
+# Check volume status in pod
+kubectl describe pod mypod | grep -A 10 "Volumes"
+
+# Check mount points inside pod
+kubectl exec mypod -- mount | grep /data
+
+# Check storage usage
+kubectl exec mypod -- df -h /data
+
+# Check volume contents
+kubectl exec mypod -- ls -la /data
+```
+
+## Common Commands
+
+```bash
+# Check PVC events
+kubectl get events --field-selector involvedObject.name=app-data-pvc
+
+# Check PV status
+kubectl get pv | grep -E "Bound|Available|Failed"
+
+# Check storage class
+kubectl get storageclass
+kubectl describe storageclass standard
+
+# Patch PVC resource requests
+kubectl patch pvc app-data-pvc -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| kubelet_volume_stats_capacity_bytes | Volume capacity |
+| kubelet_volume_stats_used_bytes | Volume usage |
+| kubelet_volume_stats_available_bytes | Available space |
+| kubelet_volume_stats_health | Volume health |
+
+### Prometheus Queries
+
+```promql
+# Volume usage by PVC
+kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes
+
+# Volumes over 80% full
+(kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) > 0.8
+
+# Volume available space
+kubelet_volume_stats_available_bytes
+```
+
+## Security
+
+### Volume Security Context
+
+```yaml
+spec:
+  securityContext:
+    runAsUser: 10000
+    runAsGroup: 10000
+    fsGroup: 10000
+  
+  containers:
+  - name: app
+    securityContext:
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - name: data
+      mountPath: /data
+      readOnly: false
+```
+
+### RBAC for PVC Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pvc-manager
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+```
+
+## Cost Optimization
+
+### Storage Tier Selection
+
+| Storage Class | Use Case | Cost |
+|--------------|----------|------|
+| standard | Frequently accessed data | Lower |
+| standard-rwo | Block storage, single zone | Medium |
+| premium-rwo | High-performance block | Higher |
+| nfs-standard | Shared file storage | Medium |
+| ultra | Maximum performance | Highest |
+
+### Monitoring Storage Costs
+
+```bash
+# Check PVC sizes
+kubectl get pvc -A -o json | jq '.items[] | {name: .metadata.name, size: .spec.resources.requests.storage}'
+
+# Find oversized PVCs
+kubectl get pvc -A -o json | jq '.items[] | select(.status.capacity != null) | {name: .metadata.name, requested: .spec.resources.requests.storage, capacity: .status.capacity}'
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| PVC pending | No matching PV or storage class | Check storage class, provisioner |
+| Volume mount failed | Path doesn't exist | Create directory, use DirectoryOrCreate |
+| Disk space full | PVC too small | Expand PVC or clean up data |
+| ReadOnly filesystem | Wrong mount options | Check volume mode |
+
+### Diagnostic Commands
+
+```bash
+# Check PVC status
+kubectl get pvc app-data-pvc
+
+# Check events for PVC
+kubectl get events --field-selector involvedObject.name=app-data-pvc
+
+# Describe pod for volume issues
+kubectl describe pod mypod | grep -A 20 "Volumes"
+
+# Check storage class availability
+kubectl get storageclass
+
+# Verify PV binding
+kubectl get pv | grep app-data-pvc
+
+# Check mount inside container
+kubectl exec mypod -- mount | grep volume
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a Kubernetes Volume?**
+A: A Volume is a directory accessible to containers in a Pod. Unlike container filesystem which is ephemeral, Volumes persist data and can be shared between containers in the same Pod.
+
+**Q: What is the difference between emptyDir and persistentVolumeClaim?**
+A: emptyDir is ephemeral storage that lives as long as the Pod. PVC provides persistent storage that survives Pod deletion and can be shared across Pod lifecycles.
+
+**Q: What is the purpose of volumeMounts in a container spec?**
+A: volumeMounts tells the kubelet where to mount a volume within the container's filesystem and with what options (readOnly, subPath, etc.).
+
+### Intermediate Questions
+
+**Q: How does Kubernetes handle volume mounting?**
+A: The kubelet on each node handles volume mounting. For cloud volumes, it calls the cloud provider's API to attach the volume to the node, then mounts it to the container's filesystem.
+
+**Q: What is the Downward API volume?**
+A: The Downward API exposes pod and container metadata (labels, annotations, resource limits) as files that can be read by containers.
+
+### Advanced Questions
+
+**Q: How would you expand a PersistentVolumeClaim?**
+A: PVCs can be expanded if the StorageClass allows it (allowVolumeExpansion: true). Simply patch the PVC with the new size. The underlying PV will be expanded automatically.
+
+## Cheat Sheet
+
+### Volume YAML Template
+
+```yaml
+volumes:
+# emptyDir (ephemeral)
+- name: tmp
+  emptyDir: {}
+
+# emptyDir with size limit
+- name: cache
+  emptyDir:
+    sizeLimit: 1Gi
+    medium: Memory
+
+# PersistentVolumeClaim
+- name: data
+  persistentVolumeClaim:
+    claimName: my-pvc
+    readOnly: false
+
+# ConfigMap
+- name: config
+  configMap:
+    name: my-config
+
+# Secret
+- name: secrets
+  secret:
+    secretName: my-secret
+
+# hostPath (testing only)
+- name: node-files
+  hostPath:
+    path: /data
+    type: DirectoryOrCreate
+
+# NFS
+- name: shared
+  nfs:
+    server: nfs.example.com
+    path: /shared
+```
+
+### Common Commands
+
+```bash
+# List PVCs
+kubectl get pvc
+
+# Get PVC details
+kubectl get pvc pvc-name -o yaml
+
+# Describe PVC
+kubectl describe pvc pvc-name
+
+# Delete PVC
+kubectl delete pvc pvc-name
+```
+
+## Related Topics
+
+- [Storage Classes](./storage-classes) - Dynamic provisioning
+- [StatefulSets](./statefulsets) - Stateful application storage
+- [ConfigMaps](./configmaps) - Configuration volumes
+- [Secrets](./secrets) - Sensitive data volumes

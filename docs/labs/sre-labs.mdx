@@ -1,0 +1,1360 @@
+---
+sidebar_position: 8
+title: SRE Labs
+description: Hands-on Site Reliability Engineering labs
+---
+
+# SRE Labs
+
+## Overview
+
+Build SRE skills through hands-on labs covering observability, alerting, SLOs, incident response, and production operations.
+
+## Prerequisites
+
+- Kubernetes cluster (for container labs)
+- Prometheus and Grafana (for monitoring labs)
+- Basic understanding of system administration
+
+### Required Setup
+
+```bash
+# Verify kubectl access
+kubectl cluster-info
+kubectl get nodes
+
+# Check monitoring tools
+kubectl get pods -n monitoring
+
+# Install additional tools
+brew install prometheus grafana jq
+```
+
+---
+
+## Lab 1: SLO and Error Budget Setup
+
+**Objective**: Define SLOs, create error budgets, and track reliability metrics
+**Estimated Time**: 35 minutes
+**Prerequisites**: Running Kubernetes cluster, Prometheus installed
+
+### Step-by-Step
+
+#### 1. Define SLOs for a Service
+
+```bash
+# Create SLO configuration
+cat > slo-config.yaml << 'EOF'
+# Service Level Objectives Configuration
+apiVersion: sloth.dev/v1
+kind: SLO
+metadata:
+  name: api-availability
+  labels:
+    owner: platform-team
+    service: api-gateway
+spec:
+  serviceLevelIndicator:
+    prometheus:
+      availability:
+        total_metric: http_requests_total{job="api-gateway"}
+        errors_metric: http_requests_total{job="api-gateway",status=~"5.."}
+    window: 30d
+  objectives:
+    - ratio: 0.999
+      window: 30d
+      display-name: "99.9% Availability"
+---
+apiVersion: sloth.dev/v1
+kind: SLO
+metadata:
+  name: api-latency
+  labels:
+    owner: platform-team
+    service: api-gateway
+spec:
+  serviceLevelIndicator:
+    prometheus:
+      latency:
+        total_metric: http_request_duration_seconds_bucket{job="api-gateway"}
+        good_metric: http_request_duration_seconds_bucket{job="api-gateway",le="0.5"}
+    window: 30d
+  objectives:
+    - ratio: 0.95
+      window: 30d
+      display-name: "95% requests under 500ms"
+    - ratio: 0.99
+      window: 30d
+      display-name: "99% requests under 1s"
+EOF
+```
+
+#### 2. Calculate Error Budget
+
+```bash
+# Error budget calculation script
+cat > calculate_error_budget.sh << 'EOF'
+#!/bin/bash
+
+# SLO parameters
+SLO_PERCENTAGE=99.9
+PERIOD_DAYS=30
+TOTAL_REQUESTS=$1
+
+if [ -z "$TOTAL_REQUESTS" ]; then
+    echo "Usage: $0 <total_requests>"
+    exit 1
+fi
+
+# Calculate allowed error rate
+ALLOWED_ERROR_RATE=$(echo "scale=6; (100 - $SLO_PERCENTAGE) / 100" | bc)
+
+# Calculate error budget
+ALLOWED_ERRORS=$(echo "scale=0; $TOTAL_REQUESTS * $ALLOWED_ERROR_RATE / 1" | bc)
+
+# Calculate remaining budget (assuming some errors already consumed)
+ERRORS_CONSUMED=${2:-0}
+REMAINING_BUDGET=$(echo "$ALLOWED_ERRORS - $ERRORS_CONSUMED" | bc)
+
+echo "SLO: ${SLO_PERCENTAGE}% availability over ${PERIOD_DAYS} days"
+echo "Total requests: $TOTAL_REQUESTS"
+echo "Allowed errors: $ALLOWED_ERRORS"
+echo "Errors consumed: $ERRORS_CONSUMED"
+echo "Remaining error budget: $REMAINING_BUDGET"
+echo ""
+echo "Budget exhaustion date (at current burn rate):"
+python3 -c "
+import datetime
+daily_budget = $REMAINING_BUDGET / $PERIOD_DAYS
+burn_rate = $ERRORS_CONSUMED / $PERIOD_DAYS
+if burn_rate > 0:
+    days_remaining = daily_budget / burn_rate
+    exhaustion = datetime.datetime.now() + datetime.timedelta(days=days_remaining)
+    print(f'  ~{days_remaining:.1f} days from now ({exhaustion.strftime(\"%Y-%m-%d\"})')
+else:
+    print('  No burn detected - budget stable')
+"
+EOF
+chmod +x calculate_error_budget.sh
+
+# Run calculation
+./calculate_error_budget.sh 1000000 1000
+```
+
+#### 3. Query SLO Metrics in Prometheus
+
+```bash
+# Query availability SLO
+cat > slo_queries.txt << 'EOF'
+# Availability (request success rate)
+sum(rate(http_requests_total{job="api-gateway"}[5m]))
+/
+sum(rate(http_requests_total{job="api-gateway"}[5m]))
+
+# Error rate
+sum(rate(http_requests_total{job="api-gateway",status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total{job="api-gateway"}[5m]))
+
+# Latency SLO (95th percentile under 500ms)
+sum(rate(http_request_duration_seconds_bucket{job="api-gateway",le="0.5"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count{job="api-gateway"}[5m]))
+
+# Burn rate (how fast we're consuming error budget)
+sum(rate(http_requests_total{job="api-gateway",status=~"5.."}[1h]))
+/
+sum(rate(http_requests_total{job="api-gateway"}[1h]))
+/
+(1 - 0.999)  # Compare against SLO target
+EOF
+
+# Test queries in Prometheus
+curl -s "http://localhost:9090/api/v1/query?query=$(cat slo_queries.txt | grep -A1 'Availability' | tail -1 | tr -d '\n' | jq -s '.[]' -Rs)"
+```
+
+### Validation
+
+```bash
+# Verify SLO recording rules exist
+kubectl get slo -n monitoring
+
+# Check Prometheus for SLO metrics
+curl -s "http://localhost:9090/api/v1/query?query=slo:serviceLevelIndicator" | jq
+
+# View error budget burn in Grafana
+# Dashboard: SLI/SLO Overview
+# Panel: Error Budget Burn Rate
+```
+
+### Cleanup
+
+```bash
+kubectl delete -f slo-config.yaml
+rm -f slo-config.yaml calculate_error_budget.sh slo_queries.txt
+```
+
+---
+
+## Lab 2: Alerting and Incident Management
+
+**Objective**: Configure Prometheus alerts, create runbooks, and practice incident response
+**Estimated Time**: 40 minutes
+**Prerequisites**: Prometheus and Alertmanager installed
+
+### Step-by-Step
+
+#### 1. Create Prometheus Alert Rules
+
+```bash
+# Create alert rules
+cat > alert-rules.yaml << 'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: application-alerts
+  namespace: monitoring
+  labels:
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+  - name: application.rules
+    interval: 30s
+    rules:
+    # High error rate alert
+    - alert: HighErrorRate
+      expr: |
+        sum(rate(http_requests_total{status=~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total[5m])) > 0.05
+      for: 5m
+      labels:
+        severity: critical
+        team: platform
+      annotations:
+        summary: "High HTTP 5xx error rate"
+        description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+        runbook_url: "https://runbooks.example.com/high-error-rate"
+
+    # Latency alert
+    - alert: HighLatency
+      expr: |
+        histogram_quantile(0.95, 
+          sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+        ) > 1
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "High API latency"
+        description: "95th percentile latency is {{ $value | humanizeDuration }} (threshold: 1s)"
+
+    # Availability SLO alert
+    - alert: SLOErrorBudgetBurn
+      expr: |
+        sum(rate(http_requests_total{status=~"5.."}[1h]))
+        /
+        sum(rate(http_requests_total[1h])) / 0.001 > 1
+      for: 1h
+      labels:
+        severity: warning
+      annotations:
+        summary: "Error budget burn rate elevated"
+        description: "Error budget is being consumed at 1.5x the sustainable rate"
+
+  - name: infrastructure.rules
+    rules:
+    # Pod not ready
+    - alert: PodNotReady
+      expr: |
+        kube_pod_status_ready{condition="true"} == 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod not ready"
+        description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} has been not ready for more than 10 minutes"
+
+    # High memory usage
+    - alert: HighMemoryUsage
+      expr: |
+        (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High memory usage on {{ $labels.instance }}"
+        description: "Memory usage is {{ $value | humanize }}%"
+
+    # Pod OOM killed
+    - alert: PodOOMKilled
+      expr: |
+        increase(kube_pod_container_status_restarts_total[1h]) > 0
+        and
+        kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} was OOM killed"
+EOF
+
+kubectl apply -f alert-rules.yaml
+```
+
+#### 2. Configure Alertmanager
+
+```bash
+cat > alertmanager-config.yaml << 'EOF'
+global:
+  resolve_timeout: 5m
+  slack_api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default-receiver'
+  routes:
+  - match:
+      severity: critical
+    receiver: 'critical-receiver'
+    continue: true
+  - match:
+      severity: warning
+    receiver: 'warning-receiver'
+
+receivers:
+- name: 'default-receiver'
+  email_configs:
+  - to: 'sre-team@example.com'
+    send_resolved: true
+    headers:
+      subject: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+
+- name: 'critical-receiver'
+  slack_configs:
+  - channel: '#critical-alerts'
+    send_resolved: true
+    title: '{{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
+    text: |
+      {{ range .Alerts }}
+      *Alert:* {{ .Annotations.summary }}
+      *Description:* {{ .Annotations.description }}
+      *Severity:* {{ .Labels.severity }}
+      *Runbook:* {{ .Annotations.runbook_url }}
+      {{ end }}
+
+- name: 'warning-receiver'
+  slack_configs:
+  - channel: '#warnings'
+    send_resolved: true
+    title: '{{ if eq .Status "firing" }}⚠️{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
+
+inhibit_rules:
+- source_match:
+    severity: 'critical'
+  target_match:
+    severity: 'warning'
+  equal: ['alertname', 'namespace']
+EOF
+
+kubectl create secret generic alertmanager-config \
+    --from-file=alertmanager.yaml=alertmanager-config.yaml \
+    -n monitoring
+
+kubectl rollout restart statefulset alertmanager-main -n monitoring
+```
+
+#### 3. Create Runbook
+
+```bash
+# Runbook for HighErrorRate
+cat > runbooks/high-error-rate.md << 'EOF'
+# High Error Rate Runbook
+
+## Symptoms
+- HTTP 5xx error rate above 5% for 5+ minutes
+- Users experiencing failed requests
+
+## Diagnosis
+
+1. **Check which endpoints are failing**
+```bash
+kubectl exec -n monitoring deploy/prometheus -- promtool query instant \
+  'topk(10, sum by (handler, status) (rate(http_requests_total{status=~"5.."}[5m])))'
+```
+
+2. **Check recent deployments**
+```bash
+kubectl rollout history deployment -A | grep -A5 -B5 "$(date +%Y-%m-%d)"
+```
+
+3. **Check application logs**
+```bash
+kubectl logs -l app=api-gateway --tail=100 | grep -E '(ERROR|FATAL|5[0-9]{2})'
+```
+
+4. **Check downstream dependencies**
+```bash
+# Test database connectivity
+kubectl exec -it deploy/api-gateway -- nc -zv postgres 5432
+
+# Test cache connectivity
+kubectl exec -it deploy/api-gateway -- redis-cli ping
+```
+
+## Resolution
+
+### If caused by recent deployment:
+1. Rollback to previous version:
+```bash
+kubectl rollout undo deployment/api-gateway
+```
+
+### If database issue:
+1. Check database connections
+2. Scale up connection pool if exhausted
+
+### If application issue:
+1. Scale horizontally to handle load
+2. Enable rate limiting
+
+## Post-Incident
+- [ ] Update SLO error budget tracking
+- [ ] Create Jira ticket for root cause analysis
+- [ ] Schedule postmortem if impact was significant
+EOF
+
+mkdir -p runbooks
+mv runbooks/high-error-rate.md runbooks/
+```
+
+#### 4. Practice Incident Response
+
+```bash
+# Create incident response script
+cat > incident-response.sh << 'EOF'
+#!/bin/bash
+
+set -e
+
+INCIDENT_ID="INC-$(date +%Y%m%d-%H%M%S)"
+SLACK_CHANNEL="#incidents"
+
+echo "=== Incident Response ==="
+echo "Incident ID: $INCIDENT_ID"
+echo "Started: $(date)"
+echo ""
+
+# 1. Acknowledge alert
+echo "Step 1: Acknowledge the incident"
+read -p "Alert name: " ALERT_NAME
+read -p "Severity (SEV1/SEV2/SEV3): " SEVERITY
+read -p "Impact description: " IMPACT
+
+# 2. Post to Slack
+echo ""
+echo "Step 2: Notify Slack channel"
+curl -X POST "$SLACK_WEBHOOK_URL" \
+  -H 'Content-type: application/json' \
+  -d "{
+    \"text\": \"🔴 *Incident Declared*\",
+    \"blocks\": [
+      {
+        \"type\": \"section\",
+        \"text\": {
+          \"type\": \"mrkdwn\",
+          \"text\": \"*ID:* $INCIDENT_ID\n*Severity:* $SEVERITY\n*Alert:* $ALERT_NAME\n*Impact:* $IMPACT\"
+        }
+      }
+    ]
+  }"
+
+# 3. Create incident channel
+echo ""
+echo "Step 3: Create incident channel (manual)"
+echo "Run: /incident create $INCIDENT_ID"
+echo "Join: $SLACK_CHANNEL"
+
+# 4. Gather initial information
+echo ""
+echo "Step 4: Gather information"
+read -p "Current status: " CURRENT_STATUS
+read -p "Affected systems: " AFFECTED_SYSTEMS
+
+# 5. Page on-call if SEV1
+if [ "$SEVERITY" == "SEV1" ]; then
+    echo ""
+    echo "Step 5: Page on-call engineer"
+    # Add pagerduty or opsgenie integration
+    # curl -X POST "https://events.pagerduty.com/v2/enqueue" ...
+fi
+
+# 6. Document timeline
+echo ""
+echo "Step 6: Start timeline documentation"
+cat > "incident-${INCIDENT_ID}.md" << DOC
+# Incident Report: $INCIDENT_ID
+
+## Summary
+- **Alert:** $ALERT_NAME
+- **Severity:** $SEVERITY
+- **Impact:** $IMPACT
+- **Status:** $CURRENT_STATUS
+- **Affected:** $AFFECTED_SYSTEMS
+
+## Timeline
+| Time | Event |
+|------|-------|
+| $(date -Iseconds) | Incident declared |
+DOC
+
+echo ""
+echo "=== Incident declared: $INCIDENT_ID ==="
+echo "Timeline file: incident-${INCIDENT_ID}.md"
+echo "Join $SLACK_CHANNEL for updates"
+EOF
+chmod +x incident-response.sh
+```
+
+### Validation
+
+```bash
+# Verify alert rules loaded
+kubectl get prometheusrule -n monitoring
+
+# Check Prometheus alerts
+curl -s "http://localhost:9090/api/v1/rules?type=alert" | jq '.data.groups[].rules[] | select(.type=="alerting") | .name'
+
+# Test alert notification
+curl -X POST "http://localhost:9093/api/v1/alerts" \
+  -H "Content-Type: application/json" \
+  -d '[{"labels":{"alertname":"TestAlert"}}]'
+```
+
+### Cleanup
+
+```bash
+kubectl delete -f alert-rules.yaml
+kubectl delete secret alertmanager-config -n monitoring
+rm -f alert-rules.yaml alertmanager-config.yaml incident-response.sh
+rm -rf runbooks
+```
+
+---
+
+## Lab 3: Observability with Prometheus and Grafana
+
+**Objective**: Set up comprehensive monitoring with custom metrics and dashboards
+**Estimated Time**: 40 minutes
+**Prerequisites**: Kubernetes cluster, Prometheus Operator, Grafana
+
+### Step-by-Step
+
+#### 1. Instrument Application with Metrics
+
+```yaml
+# deployment with Prometheus annotations
+cat > monitored-app.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  labels:
+    app: api-server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: api-server
+        image: your-registry/api-server:v1
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: admin
+        resources:
+          limits:
+            memory: 512Mi
+            cpu: 500m
+        env:
+        - name: METRICS_ENABLED
+          value: "true"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  annotations:
+    prometheus.io/scrape: "true"
+spec:
+  selector:
+    app: api-server
+  ports:
+  - port: 80
+    targetPort: 8080
+EOF
+```
+
+#### 2. Create Custom Metrics
+
+```python
+# Example Python application with Prometheus metrics
+cat > app_with_metrics.py << 'EOF'
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import random
+import time
+
+# Define metrics
+REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+
+REQUEST_LATENCY = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request latency',
+    ['method', 'endpoint'],
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]
+)
+
+ACTIVE_CONNECTIONS = Gauge(
+    'http_active_connections',
+    'Number of active HTTP connections'
+)
+
+QUEUE_SIZE = Gauge(
+    'job_queue_size',
+    'Number of jobs in queue'
+)
+
+def process_request(method, endpoint):
+    """Simulate request processing"""
+    start = time.time()
+    ACTIVE_CONNECTIONS.inc()
+    
+    try:
+        # Simulate work
+        time.sleep(random.uniform(0.01, 0.2))
+        
+        status = random.choices([200, 201, 400, 500], weights=[80, 10, 8, 2])[0]
+        REQUEST_COUNT.labels(method=method, endpoint=endpoint, status=status).inc()
+        
+        if status >= 500:
+            raise Exception("Server error")
+            
+    finally:
+        ACTIVE_CONNECTIONS.dec()
+        REQUEST_LATENCY.labels(method=method, endpoint=endpoint).observe(time.time() - start)
+
+if __name__ == '__main__':
+    start_http_server(9090)  # Metrics server
+    print("Metrics available on :9090/metrics")
+    
+    endpoints = ['/api/users', '/api/orders', '/api/products']
+    
+    while True:
+        endpoint = random.choice(endpoints)
+        process_request('GET', endpoint)
+        time.sleep(0.1)
+EOF
+```
+
+#### 3. Create ServiceMonitor
+
+```yaml
+cat > service-monitor.yaml << 'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-server-monitor
+  labels:
+    release: prometheus  # Matches prometheus selector
+spec:
+  jobLabel: api-server
+  selector:
+    matchLabels:
+      app: api-server
+  namespaceSelector:
+    matchNames:
+    - default
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: api-server-pod-monitor
+spec:
+  selector:
+    matchLabels:
+      app: api-server
+  podMetricsEndpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+EOF
+```
+
+#### 4. Build Grafana Dashboard
+
+```json
+cat > grafana-dashboard.json << 'EOF'
+{
+  "dashboard": {
+    "title": "API Server Overview",
+    "uid": "api-server-overview",
+    "panels": [
+      {
+        "title": "Request Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total[5m])) by (endpoint)",
+            "legendFormat": "{{endpoint}}"
+          }
+        ],
+        "yAxes": [{"label": "req/s", "min": 0}]
+      },
+      {
+        "title": "Error Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (endpoint) / sum(rate(http_requests_total[5m])) by (endpoint)",
+            "legendFormat": "{{endpoint}}"
+          }
+        ],
+        "yAxes": [{"label": "error %", "min": 0, "max": 1}]
+      },
+      {
+        "title": "Latency (p95)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+            "legendFormat": "p95 - {{endpoint}}"
+          }
+        ],
+        "yAxes": [{"label": "seconds", "min": 0}]
+      },
+      {
+        "title": "Active Connections",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "http_active_connections",
+            "legendFormat": "Active"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+# Import dashboard via API
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -u admin:$(kubectl get secret grafana -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d) \
+  -d @grafana-dashboard.json \
+  "http://localhost:3000/api/dashboards/db"
+```
+
+### Validation
+
+```bash
+# Check metrics endpoint
+curl -s localhost:9090/metrics | head -20
+
+# Verify Prometheus targets
+curl -s "http://localhost:9090/api/v1/targets" | jq '.data.activeTargets[] | select(.labels.app=="api-server")'
+
+# Check Grafana dashboard
+curl -s "http://localhost:3000/api/dashboards/uid/api-server-overview" \
+  -u admin:PASSWORD | jq '.dashboard.title'
+```
+
+### Cleanup
+
+```bash
+kubectl delete -f monitored-app.yaml
+kubectl delete -f service-monitor.yaml
+rm -f monitored-app.yaml service-monitor.yaml app_with_metrics.py grafana-dashboard.json
+```
+
+---
+
+## Lab 4: Postmortem and Blameless Culture
+
+**Objective**: Write effective postmortems and establish blameless culture practices
+**Estimated Time**: 30 minutes
+**Prerequisites**: Completed incident, incident timeline data
+
+### Step-by-Step
+
+#### 1. Create Postmortem Template
+
+```bash
+cat > postmortem-template.md << 'EOF'
+# Postmortem: [Incident Title]
+
+## Incident Summary
+| Field | Value |
+|-------|-------|
+| **Date** | YYYY-MM-DD |
+| **Duration** | X hours Y minutes |
+| **Severity** | SEV1/SEV2/SEV3 |
+| **Impact** | [Brief description of user/business impact] |
+| **Detection** | How was the incident detected? |
+| **Time to Detect** | X minutes |
+| **Time to Resolve** | X minutes |
+
+## Timeline (All times UTC)
+| Time | Event |
+|------|-------|
+| HH:MM | Event description |
+| HH:MM | Alert triggered |
+| HH:MM | Engineer acknowledged |
+| HH:MM | Root cause identified |
+| HH:MM | Mitigation applied |
+| HH:MM | Incident resolved |
+
+## Root Cause Analysis
+
+### What happened?
+[Detailed description of what occurred]
+
+### Why did it happen?
+[Root cause analysis using 5 Whys or similar methodology]
+
+### Why were we vulnerable?
+[System design, process, or tooling gaps]
+
+## Resolution
+
+### Immediate Actions
+- [ ] Action 1
+- [ ] Action 2
+
+### Long-term Fixes
+| Issue | Fix | Owner | Due Date |
+|-------|-----|-------|----------|
+| Root cause | Solution | @person | YYYY-MM-DD |
+
+## Lessons Learned
+
+### What went well?
+- [ ] Positive observation 1
+- [ ] Positive observation 2
+
+### What could be improved?
+- [ ] Improvement opportunity 1
+- [ ] Improvement opportunity 2
+
+### Action Items
+| Action | Type | Priority | Owner |
+|--------|------|----------|-------|
+| Implement feature X | Preventive | High | @person |
+
+## Supporting Evidence
+- Screenshot/logs/graphs
+
+## Review Questions
+- [ ] Has the fix been verified in production?
+- [ ] Have all action items been assigned?
+- [ ] Has this been shared with stakeholders?
+- [ ] Are there any remaining risks?
+EOF
+
+echo "Postmortem template created"
+```
+
+#### 2. Analyze Common Failure Patterns
+
+```bash
+# Create failure pattern analysis script
+cat > analyze_failure_patterns.py << 'EOF'
+#!/usr/bin/env python3
+"""Analyze incident data to identify recurring patterns"""
+
+import json
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+
+# Sample incident data
+incidents = [
+    {
+        "id": "INC-001",
+        "date": "2024-01-15",
+        "root_cause_category": "Database",
+        "time_to_resolve_minutes": 45,
+        "severity": "SEV2",
+        "services_affected": ["api-gateway", "user-service"]
+    },
+    {
+        "id": "INC-002",
+        "date": "2024-01-20",
+        "root_cause_category": "Configuration",
+        "time_to_resolve_minutes": 120,
+        "severity": "SEV1",
+        "services_affected": ["api-gateway"]
+    },
+    {
+        "id": "INC-003",
+        "date": "2024-02-05",
+        "root_cause_category": "Database",
+        "time_to_resolve_minutes": 30,
+        "severity": "SEV2",
+        "services_affected": ["order-service", "payment-service"]
+    },
+    # Add more incidents...
+]
+
+def analyze_patterns(incidents):
+    print("=== Incident Pattern Analysis ===\n")
+    
+    # Category frequency
+    categories = Counter(i["root_cause_category"] for i in incidents)
+    print("Root Cause Categories:")
+    for cat, count in categories.most_common():
+        pct = (count / len(incidents)) * 100
+        print(f"  {cat}: {count} ({pct:.1f}%)")
+    
+    # Service frequency
+    services = Counter()
+    for i in incidents:
+        services.update(i["services_affected"])
+    
+    print("\nMost Affected Services:")
+    for svc, count in services.most_common(5):
+        print(f"  {svc}: {count} incidents")
+    
+    # Resolution time by category
+    print("\nAverage Resolution Time by Category:")
+    by_category = defaultdict(list)
+    for i in incidents:
+        by_category[i["root_cause_category"]].append(i["time_to_resolve_minutes"])
+    
+    for cat, times in sorted(by_category.items(), 
+                             key=lambda x: sum(x[1])/len(x[1]), 
+                             reverse=True):
+        avg = sum(times) / len(times)
+        print(f"  {cat}: {avg:.0f} minutes")
+    
+    # Severity distribution
+    severities = Counter(i["severity"] for i in incidents)
+    print("\nSeverity Distribution:")
+    for sev, count in severities.most_common():
+        print(f"  {sev}: {count}")
+
+if __name__ == "__main__":
+    analyze_patterns(incidents)
+EOF
+chmod +x analyze_failure_patterns.py
+
+python3 analyze_failure_patterns.py
+```
+
+#### 3. Create Action Item Tracker
+
+```bash
+cat > action-item-tracker.sh << 'EOF'
+#!/bin/bash
+
+ACTION_FILE="action-items.csv"
+
+# Initialize tracking file
+init_tracker() {
+    echo "ID,Category,Description,Owner,Priority,Status,DueDate,CompletedDate" > "$ACTION_FILE"
+    echo "AI-001,Monitoring,Add alerting for disk usage > 80%,@john,High,Open,2024-02-01," >> "$ACTION_FILE"
+    echo "AI-002,Documentation,Update runbook for database failover,@jane,Medium,In Progress,2024-02-15," >> "$ACTION_FILE"
+    echo "AI-003,Testing,Add chaos engineering tests,@bob,Low,Open,2024-03-01," >> "$ACTION_FILE"
+}
+
+# Add new action item
+add_item() {
+    read -p "ID: " id
+    read -p "Category: " category
+    read -p "Description: " description
+    read -p "Owner: " owner
+    read -p "Priority (High/Medium/Low): " priority
+    read -p "Due Date (YYYY-MM-DD): " duedate
+    
+    echo "$id,$category,$description,$owner,$priority,Open,$duedate," >> "$ACTION_FILE"
+    echo "Added: $id"
+}
+
+# Update status
+update_status() {
+    read -p "Item ID: " id
+    read -p "New Status (Open/In Progress/Completed): " status
+    
+    if [ "$status" == "Completed" ]; then
+        completed=$(date +%Y-%m-%d)
+        awk -F',' -v id="$id" -v status="$status" -v completed="$completed" \
+            'BEGIN {OFS=","} $1==id {$6=status; $8=completed} {print}' "$ACTION_FILE" > tmp && mv tmp "$ACTION_FILE"
+    else
+        awk -F',' -v id="$id" -v status="$status" \
+            'BEGIN {OFS=","} $1==id {$6=status} {print}' "$ACTION_FILE" > tmp && mv tmp "$ACTION_FILE"
+    fi
+    echo "Updated: $id -> $status"
+}
+
+# View tracker
+view_tracker() {
+    echo ""
+    echo "=== Action Item Tracker ==="
+    column -t -s',' "$ACTION_FILE"
+    echo ""
+    
+    echo "Summary:"
+    echo "  Open: $(grep -c ',Open,' "$ACTION_FILE" 2>/dev/null || echo 0)"
+    echo "  In Progress: $(grep -c ',In Progress,' "$ACTION_FILE" 2>/dev/null || echo 0)"
+    echo "  Completed: $(grep -c ',Completed,' "$ACTION_FILE" 2>/dev/null || echo 0)"
+}
+
+case "$1" in
+    init) init_tracker ;;
+    add) add_item ;;
+    update) update_status ;;
+    view) view_tracker ;;
+    *) echo "Usage: $0 {init|add|update|view}" ;;
+esac
+EOF
+chmod +x action-item-tracker.sh
+```
+
+### Validation
+
+```bash
+# Verify postmortem template
+head -20 postmortem-template.md
+
+# Run pattern analysis
+python3 analyze_failure_patterns.py
+
+# Test tracker
+./action-item-tracker.sh init
+./action-item-tracker.sh view
+```
+
+### Cleanup
+
+```bash
+rm -f postmortem-template.md analyze_failure_patterns.py action-item-tracker.sh action-items.csv
+```
+
+---
+
+## Lab 5: Chaos Engineering
+
+**Objective**: Implement chaos engineering practices to test system resilience
+**Estimated Time**: 40 minutes
+**Prerequisites**: Kubernetes cluster, Litmus or ChaosMesh installed
+
+### Step-by-Step
+
+#### 1. Install Chaos Mesh
+
+```bash
+# Install ChaosMesh via Helm
+helm repo add chaos-mesh https://charts.chaos-mesh.org
+helm repo update
+
+kubectl create namespace chaos-mesh
+helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-mesh \
+    --set chaosDaemon.runtime=containerd \
+    --set chaosDaemon.httpPort=31767
+
+# Verify installation
+kubectl get pods -n chaos-mesh
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=chaos-dashboard -n chaos-mesh
+
+# Port forward to dashboard
+kubectl port-forward -n chaos-mesh svc/chaos-dashboard 2333:2333
+```
+
+#### 2. Create Chaos Experiments
+
+```yaml
+# Pod kill experiment
+cat > pod-kill-experiment.yaml << 'EOF'
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: pod-kill-experiment
+  namespace: chaos-mesh
+spec:
+  action: pod-kill
+  mode: one
+  duration: 60s
+  schedule: "*/5 * * * *"
+  selector:
+    namespaces:
+    - production
+    labelSelectors:
+      app: api-server
+---
+# Network chaos experiment
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: network-partition
+  namespace: chaos-mesh
+spec:
+  action: partition
+  mode: one
+  duration: 30s
+  delay:
+    latency: "100ms"
+    correlation: 0.1
+  selector:
+    namespaces:
+    - production
+    labelSelectors:
+      app: api-server
+  target:
+    mode: one
+    selector:
+      namespaces:
+      - production
+      labelSelectors:
+        app: database
+EOF
+
+# CPU stress experiment
+cat > cpu-stress-experiment.yaml << 'EOF'
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: cpu-stress
+  namespace: chaos-mesh
+spec:
+  mode: one
+  stressors:
+    cpu:
+      workers: 2
+      load: 80
+  selector:
+    namespaces:
+    - production
+    labelSelectors:
+      app: api-server
+  duration: 60s
+EOF
+```
+
+#### 3. Define Steady State Hypothesis
+
+```yaml
+# Define steady state before chaos
+cat > steady-state-check.yaml << 'EOF'
+apiVersion: flagger.app/v1beta1
+kind: MetricTemplate
+metadata:
+  name: latency-check
+spec:
+  provider:
+    type: prometheus
+    address: http://prometheus:9090
+  interval: 1m
+  retryInterval: 30s
+  thresholdRange:
+    max:
+      value: 0.5  # 500ms
+  query: |
+    histogram_quantile(0.95,
+      sum(rate(http_request_duration_seconds_bucket{job="api-gateway"}[5m])) by (le)
+    )
+---
+apiVersion: flagger.app/v1beta1
+kind: MetricTemplate
+metadata:
+  name: error-rate-check
+spec:
+  provider:
+    type: prometheus
+    address: http://prometheus:9090
+  interval: 1m
+  retryInterval: 30s
+  thresholdRange:
+    max:
+      value: 0.05  # 5%
+  query: |
+    sum(rate(http_requests_total{status=~"5..",job="api-gateway"}[5m]))
+    /
+    sum(rate(http_requests_total{job="api-gateway"}[5m]))
+EOF
+```
+
+#### 4. Run Chaos Experiment
+
+```bash
+# Apply experiment
+kubectl apply -f pod-kill-experiment.yaml
+
+# Monitor experiment
+watch kubectl get podchaos -n chaos-mesh
+
+# View experiment in dashboard
+# http://localhost:2333
+
+# Check if steady state hypothesis holds
+# Query Prometheus during experiment
+curl -s "http://localhost:9090/api/v1/query?query=histogram_quantile(0.95,sum(rate(http_request_duration_seconds_bucket{job=%22api-gateway%22}[5m]))by(le))"
+
+# Verify system behavior:
+# 1. Did error rate spike?
+# 2. Did latency increase?
+# 3. Did the system recover automatically?
+# 4. Were alerts triggered appropriately?
+```
+
+#### 5. Document Chaos Results
+
+```bash
+cat > chaos-report-template.md << 'EOF'
+# Chaos Engineering Report
+
+## Experiment: [Name]
+**Date:** YYYY-MM-DD
+**Duration:** X minutes
+**Hypothesis:** [What should happen]
+
+## Experiment Details
+| Parameter | Value |
+|-----------|-------|
+| Target | Service/Pod |
+| Action | pod-kill/network-latency/etc |
+| Duration | X minutes |
+
+## Results
+
+### Steady State Before
+| Metric | Value |
+|--------|-------|
+| Error Rate | X% |
+| Latency (p95) | Xms |
+| Availability | X% |
+
+### During Chaos
+| Metric | Value |
+|--------|-------|
+| Error Rate | X% |
+| Latency (p95) | Xms |
+| Availability | X% |
+
+### After Chaos
+| Metric | Value |
+|--------|-------|
+| Recovery Time | X seconds |
+| Data Loss | Yes/No |
+
+## Hypothesis Verdict
+- [ ] PASSED: System behaved as expected
+- [ ] FAILED: Unexpected behavior observed
+
+## Observations
+- What worked well
+- What surprised us
+
+## Recommendations
+- Fixes to implement
+- Additional experiments to run
+
+## Next Experiment
+[Description of next chaos experiment to run]
+EOF
+```
+
+### Validation
+
+```bash
+# List running experiments
+kubectl get chaos -n chaos-mesh
+
+# Check experiment history
+kubectl describe podchaos pod-kill-experiment -n chaos-mesh
+
+# Verify metrics during experiment
+# Check Grafana dashboard for:
+# - Error rate spike
+# - Latency increase
+# - Recovery behavior
+```
+
+### Cleanup
+
+```bash
+# Stop and remove experiments
+kubectl delete -f pod-kill-experiment.yaml
+kubectl delete -f cpu-stress-experiment.yaml
+
+# Optional: Remove ChaosMesh
+helm uninstall chaos-mesh -n chaos-mesh
+kubectl delete namespace chaos-mesh
+
+rm -f pod-kill-experiment.yaml cpu-stress-experiment.yaml
+rm -f steady-state-check.yaml chaos-report-template.md
+```
+
+---
+
+## Interview Prep Connections
+
+Review these common SRE interview topics:
+
+- [SRE Fundamentals](/docs/sre/fundamentals)
+- [SLOs and Error Budgets](/docs/sre/slos)
+- [Incident Management](/docs/sre/incident-response)
+- [Observability](/docs/monitoring/observability)
+
+Common interview questions:
+- "How do you define SLOs for a service?"
+- "Walk me through your incident response process"
+- "What is error budget and how do you use it?"
+- "How would you design a chaos engineering program?"
+- "Explain the difference between SLO, SLA, and SLI"
+
+## Related Topics
+
+- [Prometheus & Grafana](/docs/monitoring/prometheus)
+- [Kubernetes Operations](/labs/kubernetes-labs)
+- [Alerting Best Practices](/docs/monitoring/alerting)

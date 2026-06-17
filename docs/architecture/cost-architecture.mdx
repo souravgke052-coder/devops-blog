@@ -1,0 +1,903 @@
+# Cost Architecture
+
+sidebar_position: 8
+
+## Overview
+
+Cost architecture encompasses the strategies, practices, and tools for optimizing cloud spending while maintaining performance and reliability. This document covers FinOps practices, tagging strategies, chargeback models, cost optimization techniques, and budget management for the DevOps Blog platform on GCP.
+
+## When To Use
+
+- Optimizing cloud spend across services
+- Implementing cost visibility and accountability
+- Planning infrastructure with cost constraints
+- Setting up chargeback/showback models
+- Building cost-aware architectures
+
+## When NOT to Use
+
+- Cost optimization should always be considered, not optional
+- Skipping cost optimization leads to budget overruns
+- Cost should be a consideration in all architecture decisions
+
+## Core Concepts
+
+### FinOps Principles
+
+1. **Inform**: Understand cost drivers and allocation
+2. **Optimize**: Right-size resources, eliminate waste
+3. **Operate**: Continuous improvement, anomaly detection
+
+### Cost Visibility Pyramid
+
+```
+                    ┌─────────┐
+                    │  C-Level │
+                    │  Budget  │
+                    └────┬────┘
+                         │
+                    ┌────┴────┐
+                    │ Finance │
+                    │ Chargeback│
+                    └────┬────┘
+                         │
+                    ┌────┴────┐
+                    │  Teams  │
+                    │ Showback │
+                    └────┬────┘
+                         │
+                    ┌────┴────┐
+                    │  Devs   │
+                    │  Alerts  │
+                    └─────────┘
+```
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Cost Management Architecture                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     Cost Visibility Layer                          │   │
+│  │                                                                    │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │   │
+│  │  │ Cloud       │  │ Billing      │  │ Budget      │               │   │
+│  │  │ Billing      │──│ Export       │──│ Alerts      │               │   │
+│  │  │ Dashboard    │  │ (BigQuery)   │  │ (PagerDuty) │               │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     Tagging & Allocation                           │   │
+│  │                                                                    │   │
+│  │  Required Tags:                     Cost Centers:                 │   │
+│  │  ├─ environment: prod/dev/staging    ├─ team: platform            │   │
+│  │  ├─ team: platform/commerce          ├─ product: blog             │   │
+│  │  ├─ service: content-api             ├─ customer: internal        │   │
+│  │  ├─ cost-center: PLT-001             └─ environment: prod         │   │
+│  │  └─ owner: platform@company.com                                   │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     Optimization Actions                           │   │
+│  │                                                                    │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │   │
+│  │  │ Rightsizing │  │ ComMITTED   │  │  Spot/      │               │   │
+│  │  │ (Recommender│──│ USE         │──│  Preemptible│               │   │
+│  │  │    API)     │  │ (CUDs)      │  │  Instances  │               │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘               │   │
+│  │                                                                    │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │   │
+│  │  │  Caching    │  │  Storage    │  │  Scheduling │               │   │
+│  │  │  (CDN/Redis)│──│  Tiering    │──│  (Scale to  │               │   │
+│  │  │             │  │             │  │   Zero)     │               │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### FinOps Implementation - Stripe-style Cost Tracking
+
+```typescript
+// Cost tracking and attribution service
+import { BigQuery } from '@google-cloud/bigquery';
+import { PubSub } from '@google-cloud/pubsub';
+import { CloudFunctionsEvent } from '@google-cloud/functions-framework';
+
+const bigquery = new BigQuery();
+const pubsub = new PubSub();
+
+interface CostRecord {
+  resource_name: string;
+  resource_id: string;
+  cost: number;
+  currency: string;
+  usage_start_time: string;
+  usage_end_time: string;
+  labels: Record<string, string>;
+  location: string;
+  service: string;
+  sku: string;
+}
+
+// Cloud Function to process billing exports
+exportconst processBillingExport = async (event: CloudFunctionsEvent<any>) => {
+  const file = event.data;
+
+  if (!file.bucket?.includes('billing-export')) {
+    console.log('Not a billing export file, skipping');
+    return;
+  }
+
+  console.log(`Processing billing export: ${file.name}`);
+
+  const dataset = bigquery.dataset('cost_analysis');
+  const table = dataset.table('daily_costs');
+
+  // Load export file into BigQuery
+  const [job] = await bigquery.createLoadJob({
+    sourceUris: [`gs://${file.bucket}/${file.name}`],
+    destinationTable: table,
+    schema: {
+      fields: [
+        { name: 'resource_name', type: 'STRING' },
+        { name: 'resource_id', type: 'STRING' },
+        { name: 'cost', type: 'FLOAT64' },
+        { name: 'currency', type: 'STRING' },
+        { name: 'usage_start_time', type: 'TIMESTAMP' },
+        { name: 'usage_end_time', type: 'TIMESTAMP' },
+        { name: 'labels', type: 'JSON' },
+        { name: 'location', type: 'STRING' },
+        { name: 'service', type: 'STRING' },
+        { name: 'sku', type: 'STRING' }
+      ]
+    },
+    format: 'CSV',
+    skipLeadingRows: 1
+  });
+
+  await job.promise();
+
+  // Enrich with cost center information
+  await enrichCostData();
+
+  // Calculate team-level aggregations
+  await calculateTeamCosts();
+
+  console.log('Billing export processed successfully');
+};
+
+// Enrich cost records with cost center mapping
+async function enrichCostData(): Promise<void> {
+  await bigquery.query(`
+    UPDATE cost_analysis.daily_costs
+    SET
+      cost_center = (
+        SELECT cost_center
+        FROM cost_management.resource_tags
+        WHERE resource_id = cost_analysis.daily_costs.resource_id
+      ),
+      team = (
+        SELECT team
+        FROM cost_management.resource_tags
+        WHERE resource_id = cost_analysis.daily_costs.resource_id
+      )
+    WHERE cost_center IS NULL
+  `);
+}
+
+// Calculate team-level costs for chargeback
+async function calculateTeamCosts(): Promise<void> {
+  await bigquery.query(`
+    CREATE OR REPLACE TABLE cost_analysis.team_daily_costs AS
+    SELECT
+      DATE(usage_start_time) as date,
+      team,
+      service,
+      SUM(cost) as total_cost,
+      COUNT(DISTINCT resource_id) as resource_count
+    FROM cost_analysis.daily_costs
+    WHERE team IS NOT NULL
+    GROUP BY 1, 2, 3
+  `);
+}
+
+// Generate team cost reports
+exportconst generateTeamReport = async (event: CloudFunctionsEvent<any>) => {
+  const { team, period } = JSON.parse(
+    Buffer.from(event.data.message.data, 'base64').toString()
+  );
+
+  const [rows] = await bigquery.query({
+    query: `
+      SELECT
+        DATE_TRUNC(DATE(usage_start_time), WEEK) as week,
+        service,
+        SUM(cost) as total_cost,
+        SUM(cost) / (
+          SELECT SUM(cost)
+          FROM cost_analysis.daily_costs
+          WHERE team = @team
+          AND usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @period DAY)
+        ) * 100 as cost_percentage
+      FROM cost_analysis.daily_costs
+      WHERE team = @team
+      AND usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @period DAY)
+      GROUP BY 1, 2
+      ORDER BY 1, 3 DESC
+    `,
+    params: { team, period: parseInt(period) }
+  });
+
+  // Generate report
+  const report = {
+    team,
+    period_days: period,
+    generated_at: new Date().toISOString(),
+    summary: {
+      total_cost: rows.reduce((sum, row) => sum + row.total_cost, 0),
+      service_count: new Set(rows.map(r => r.service)).size
+    },
+    weekly_breakdown: rows
+  };
+
+  // Store report
+  const dataset = bigquery.dataset('cost_reports');
+  const table = dataset.table(`${team}_cost_report`);
+  await table.insert([{
+    ...report,
+    generated_at: new Date().toISOString()
+  }]);
+
+  // Publish for notification
+  await pubsub.topic('cost-reports').publish({
+    attributes: { team },
+    data: Buffer.from(JSON.stringify(report))
+  });
+
+  return report;
+};
+
+// Anomaly detection for cost spikes
+exportconst detectCostAnomalies = async () => {
+  const [yesterday] = await bigquery.query(`
+    SELECT
+      service,
+      SUM(cost) as total_cost
+    FROM cost_analysis.daily_costs
+    WHERE DATE(usage_start_time) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    GROUP BY 1
+  `);
+
+  const [lastWeek] = await bigquery.query(`
+    SELECT
+      service,
+      AVG(daily_cost) as avg_cost,
+      STDDEV(daily_cost) as stddev_cost
+    FROM (
+      SELECT
+        service,
+        DATE(usage_start_time) as date,
+        SUM(cost) as daily_cost
+      FROM cost_analysis.daily_costs
+      WHERE usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+      AND usage_start_time < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
+      GROUP BY 1, 2
+    )
+    GROUP BY 1
+  `);
+
+  const anomalies: Array<{ service: string; expected: number; actual: number; spike_percent: number }> = [];
+
+  for (const today of yesterday) {
+    const baseline = lastWeek.find(w => w.service === today.service);
+    if (!baseline) continue;
+
+    const threshold = baseline.avg_cost + (3 * baseline.stddev_cost); // 3 sigma
+    if (today.total_cost > threshold) {
+      anomalies.push({
+        service: today.service,
+        expected: baseline.avg_cost,
+        actual: today.total_cost,
+        spike_percent: ((today.total_cost - baseline.avg_cost) / baseline.avg_cost) * 100
+      });
+    }
+  }
+
+  if (anomalies.length > 0) {
+    await sendCostAnomalyAlert(anomalies);
+  }
+};
+```
+
+### Cost Allocation with Labels
+
+```typescript
+// Label validation and enforcement
+exportconst validateResourceLabels = async (event: CloudFunctionsEvent<any>) => {
+  const resource = event.data;
+
+  const requiredLabels = ['environment', 'team', 'service', 'cost-center', 'owner'];
+  const missingLabels = requiredLabels.filter(
+    label => !resource.labels?.[label]
+  );
+
+  if (missingLabels.length > 0) {
+    // Check if this is a blocklisted resource type
+    const blocklistTypes = ['gce', 'cloud_sql', 'cloud_run', 'gke'];
+    if (blocklistTypes.some(type => resource.type.includes(type))) {
+      throw new Error(
+        `Missing required labels on ${resource.type}/${resource.name}: ${missingLabels.join(', ')}. ` +
+        'Please add labels before deploying. See: https://wiki.corp/cost-tagging'
+      );
+    }
+
+    // Log warning for non-blocklisted resources
+    console.warn(`Resource ${resource.name} is missing labels: ${missingLabels.join(', ')}`);
+  }
+
+  // Validate label values
+  const validEnvironments = ['production', 'staging', 'development', 'test'];
+  const environment = resource.labels?.['environment'];
+  if (environment && !validEnvironments.includes(environment)) {
+    throw new Error(
+      `Invalid environment label: ${environment}. Must be one of: ${validEnvironments.join(', ')}`
+    );
+  }
+};
+```
+
+### Terraform Cost Management
+
+```hcl
+# Terraform - Cost-Optimized Infrastructure
+
+variable "project_id" {
+  type = string
+}
+
+variable "environment" {
+  type    = string
+  default = "production"
+}
+
+# Required labels for cost tracking
+locals {
+  common_labels = {
+    environment = var.environment
+    team        = "platform"
+    managed_by  = "terraform"
+    cost-center = "PLT-001"
+  }
+}
+
+# Cloud Run - Cost-optimized configuration
+resource "google_cloud_run_v2_service" "content_api" {
+  name     = "content-api"
+  location = "us-central1"
+
+  labels = merge(local.common_labels, {
+    service = "content-api"
+  })
+
+  template {
+    service_account = google_service_account.content_api.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/content-api:v1"
+      resources {
+        limits = {
+          cpu    = "1"    # Right-sized for actual usage
+          memory = "512Mi"
+        }
+        cpu_idle = true   # Pay only for actual CPU usage
+      }
+    }
+
+    # Optimize scaling for cost
+    scaling {
+      # Keep at least 1 for production to avoid cold starts
+      min_instance_count = var.environment == "production" ? 1 : 0
+      # Cap max to prevent runaway costs
+      max_instance_count = 50
+      # Limit concurrent requests per instance
+      max_instance_request_concurrency = 80
+    }
+  }
+}
+
+# Committed Use Discounts (CUDs)
+# Purchase 1-year commitments for baseline workloads
+
+# Compute CUD for Cloud Run (when available)
+resource "google_commitment" "cloud_run_commitment" {
+  region         = "us-central1"
+  commitment_type = "CUD_TYPE_COMPASSIONATE"
+  description     = "Cloud Run 1-year commitment"
+
+  resources = ["us-central1"]
+
+  amount          = "4000"  # 4000 vCPU hours
+  plan            = "TIER_1"
+}
+
+# Resource-based labeling for all resources
+resource "google_sql_database_instance" "postgres" {
+  name             = "content-db"
+  database_version = "POSTGRES_15"
+  region           = "us-central1"
+
+  deletion_protection = true
+
+  settings {
+    tier              = "db-n1-standard-2"  # Right-sized
+    availability_type = var.environment == "production" ? "REGIONAL" : "ZONAL"
+    disk_autoresize   = true
+    disk_size         = 50  # Right-sized, not default
+
+    backup_configuration {
+      enabled      = true
+      start_time   = "03:00"
+      retry_interval = 300
+    }
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+    }
+  }
+
+  # Required labels
+  database_version = "POSTGRES_15"
+}
+
+# Memorystore with appropriate tier
+resource "google_redis_instance" "cache" {
+  name           = "content-cache"
+  tier           = "STANDARD_HA"  # HA for production, BASIC for dev
+  memory_size_gb = var.environment == "production" ? 5 : 1
+  region         = "us-central1"
+
+  labels = merge(local.common_labels, {
+    service = "cache"
+  })
+
+  auth_enabled = true
+
+  # Only enable persistence for production
+  persistence_config {
+    persistence_mode = var.environment == "production" ? "RDB" : "DISABLED"
+  }
+}
+
+# GCS with lifecycle policies
+resource "google_storage_bucket" "content" {
+  name          = "${var.project_id}-content-${var.environment}"
+  location      = "US"
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true
+
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+    condition {
+      age = 30  # Auto-delete after 30 days
+    }
+  }
+
+  lifecycle_rule {
+    action {
+      type = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+    condition {
+      age = 7  # Move to cheaper storage after 7 days
+    }
+  }
+}
+
+# Cloud Scheduler for cost-efficient jobs
+resource "google_cloud_scheduler_job" "cleanup_job" {
+  name        = "cleanup-old-data"
+  description = "Cleanup job runs daily to reduce storage costs"
+  region      = "us-central1"
+  schedule    = "0 2 * * *"  # 2 AM daily
+  time_zone   = "UTC"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://content-api-${google_cloud_run_v2_service.content_api.location}.run.app/admin/cleanup"
+  }
+
+  # Cost: ~$0.10/month
+}
+
+# Budget alerts
+resource "google_billing_budget" "monthly_budget" {
+  title = "Monthly Spending Budget - ${var.environment}"
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = var.environment == "production" ? "50000" : "5000"
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.5   # Alert at 50%
+  }
+  threshold_rules {
+    threshold_percent = 0.9   # Alert at 90%
+  }
+  threshold_rules {
+    threshold_percent = 1.0   # Alert at 100%
+  }
+
+  filter {
+    labels {
+      key   = "environment"
+      value = [var.environment]
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email.id]
+}
+
+# Notification channel
+resource "google_monitoring_notification_channel" "email" {
+  display_name = "Billing Alerts"
+  type         = "email"
+
+  labels = {
+    email_address = "platform-team@company.com"
+  }
+}
+
+# Service Accounts
+resource "google_service_account" "content_api" {
+  account_id   = "content-api-sa"
+  display_name = "Content API Service Account"
+}
+
+# IAM with cost considerations
+resource "google_project_iam_member" "content_api_roles" {
+  for_each = toset([
+    "roles/cloudsql.client",
+    "roles/storage.objectViewer",
+    "roles/redis.viewer"
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.content_api.email}"
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### Cost Optimization Patterns
+
+| Pattern | Description | Savings Potential |
+|---------|-------------|-------------------|
+| Rightsizing | Match instance sizes to actual usage | 20-40% |
+| Committed Use | 1 or 3 year commitments for baseline | 30-60% |
+| Spot/Preemptible | Use for batch and fault-tolerant workloads | 60-90% |
+| Caching | CDN, application cache, query cache | 30-50% on egress |
+| Auto-scaling to zero | Scale non-production to zero | 80%+ |
+| Storage tiering | Move old data to cheaper storage | 50-80% |
+| Cleanup automation | Delete unused resources | Variable |
+
+### Committed Use Discount Strategy
+
+```yaml
+# CUD Planning Spreadsheet Structure
+services:
+  cloud_run:
+    baseline_vcpu_hours: 10000  # Monthly baseline
+    cud_percent: 70             # Commit 70% of baseline
+    hourly_cud_rate: 0.006      # $/vCPU-hour with 1-year CUD
+    on_demand_rate: 0.008       # $/vCPU-hour on-demand
+    monthly_savings: 420        # (0.008 - 0.006) * 10000 * 0.7
+
+  cloud_sql:
+    baseline_instance_hours: 744  # Monthly (24 * 31)
+    cud_percent: 60
+    hourly_cud_rate: 0.025
+    on_demand_rate: 0.045
+    monthly_savings: 893
+```
+
+### Anti-patterns
+
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| Oversized instances | Paying for unused capacity | Use recommender, right-size |
+| No auto-scaling | Over-provisioned resources | Scale based on actual load |
+| Always-on resources | Wasted compute in off-hours | Scheduled scale-to-zero |
+| No lifecycle policies | Orphaned storage accumulates | Auto-delete old data |
+| Cross-region egress | Unnecessary data transfer | Minimize cross-region calls |
+| No budget alerts | No visibility into overspend | Set up budgets with alerts |
+
+## Monitoring
+
+### Cost Dashboard Queries
+
+```sql
+-- Daily cost by service
+SELECT
+  DATE(usage_start_time) as date,
+  service,
+  SUM(cost) as total_cost,
+  SUM(cost) / SUM(SUM(cost)) OVER (PARTITION BY DATE(usage_start_time)) * 100 as cost_pct
+FROM cost_analysis.daily_costs
+WHERE usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+GROUP BY 1, 2
+ORDER BY 1 DESC, 3 DESC;
+
+-- Monthly trend by team
+SELECT
+  DATE_TRUNC(DATE(usage_start_time), MONTH) as month,
+  COALESCE(team, 'untagged') as team,
+  SUM(cost) as total_cost
+FROM cost_analysis.daily_costs
+WHERE usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+GROUP BY 1, 2
+ORDER BY 1, 3 DESC;
+
+-- Top 10 cost drivers
+SELECT
+  resource_name,
+  service,
+  SUM(cost) as total_cost
+FROM cost_analysis.daily_costs
+WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+GROUP BY 1, 2
+ORDER BY 3 DESC
+LIMIT 10;
+
+-- Forecast next month
+WITH daily_costs AS (
+  SELECT
+    DATE(usage_start_time) as date,
+    SUM(cost) as daily_cost
+  FROM cost_analysis.daily_costs
+  WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  GROUP BY 1
+)
+SELECT
+  AVG(daily_cost) as avg_daily_cost,
+  AVG(daily_cost) * 31 as projected_monthly_cost,
+  AVG(daily_cost) * 31 * 1.1 as projected_with_buffer
+FROM daily_costs;
+```
+
+### Cloud Monitoring Cost Alerts
+
+```hcl
+resource "google_monitoring_alert_policy" "cost_anomaly" {
+  display_name = "Cost Anomaly Alert"
+
+  conditions {
+    display_name = "Daily cost increased by 50%"
+
+    condition_threshold {
+      filter = |
+        resource.type="project" AND
+        metric.type="billing.googleapis.com/cost_amount"
+
+      duration      = 0
+      comparison    = "COMPARISON_GT"
+      threshold_value = 0
+
+      aggregations {
+        alignment_period   = "86400s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
+    }
+  }
+}
+
+# Cost anomaly detection via BigQuery ML
+resource "google_bigquery_routine" "cost_forecast" {
+  routine_id    = "cost_forecast"
+  routine_type  = "PROCEDURE"
+
+  body = <<-EOF
+    -- Anomaly detection using Z-score
+    WITH stats AS (
+      SELECT
+        service,
+        AVG(cost) as mean,
+        STDDEV(cost) as stddev
+      FROM cost_analysis.daily_costs
+      WHERE usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+      GROUP BY 1
+    )
+    SELECT
+      d.service,
+      d.cost as actual_cost,
+      s.mean,
+      s.stddev,
+      (d.cost - s.mean) / NULLIF(s.stddev, 0) as z_score
+    FROM cost_analysis.daily_costs d
+    JOIN stats s ON d.service = s.service
+    WHERE ABS((d.cost - s.mean) / NULLIF(s.stddev, 0)) > 3
+  EOF
+}
+```
+
+## Security
+
+### Cost Security Considerations
+
+```hcl
+# Prevent unauthorized resource creation
+resource "google_org_policy_policy" "restrict_resource_creation" {
+  name = "projects/${var.project_id}/policies/gcp.resourceLocations"
+
+  spec {
+    rules {
+      enforce = true
+      condition {
+        expression = "resource.location.notIn(['us-central1', 'europe-west1'])"
+        title      = "Restrict to approved regions"
+      }
+    }
+  }
+}
+
+# Limit maximum instance sizes
+resource "google_org_policy_policy" "limit_compute_instance_size" {
+  name = "projects/${var.project_id}/policies/compute.maxInstanceSize"
+
+  spec {
+    rules {
+      enforce = "n1-standard-8"  # Cap at 8 vCPU
+    }
+  }
+}
+
+# Prevent billing on test projects
+resource "google_billing_budget" "test_project_budget" {
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "100"  # $100 max for test
+    }
+  }
+
+  filter {
+    labels {
+      key   = "environment"
+      value = ["test", "development"]
+    }
+  }
+}
+```
+
+## Cost Optimization by Service
+
+### Cloud Run Costs
+
+| Optimization | Before | After | Savings |
+|-------------|--------|-------|---------|
+| Min instances = 1 always | $500/mo | - | Baseline needed |
+| Min instances = 0 (dev) | $200/mo | $50/mo | 75% |
+| CPU idle = false | $500/mo | $350/mo | 30% |
+| Right-size memory | $500/mo | $350/mo | 30% |
+
+### Cloud SQL Costs
+
+| Tier | vCPU | RAM | $/month | Use Case |
+|------|------|-----|---------|----------|
+| db-n1-standard-1 | 1 | 3.75GB | $73 | Dev/test |
+| db-n1-standard-2 | 2 | 7.5GB | $145 | Small prod |
+| db-n1-standard-4 | 4 | 15GB | $290 | Medium prod |
+| db-n1-standard-8 | 8 | 30GB | $580 | Large prod |
+
+### Committed Use Discount Savings
+
+| Service | On-Demand | 1-Year CUD | 3-Year CUD | Savings |
+|---------|-----------|------------|------------|---------|
+| Cloud SQL (n1-standard-2) | $145/mo | $102/mo | $73/mo | 30-50% |
+| Cloud Run (per vCPU) | $8/mo | $5.60/mo | $4/mo | 30-50% |
+| Memorystore (5GB) | $180/mo | $126/mo | $90/mo | 30-50% |
+
+## Troubleshooting
+
+### Common Cost Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| Unusually high Cloud SQL cost | Oversized instance, high connections | Right-size, use connection pooler |
+| High egress charges | Data transfer to external services | Use VPC peering, minimize transfer |
+| Growing storage costs | No lifecycle policies, orphaned data | Implement cleanup, lifecycle rules |
+| High compute costs | Over-provisioned instances | Use recommender API, right-size |
+| Unexpected scaling | Traffic spike, no max limits | Set max instance limits |
+
+### Cost Investigation Commands
+
+```bash
+# Check BigQuery cost by query
+bq query --use_legacy_sql=false \
+  'SELECT * FROM cost_analysis.daily_costs WHERE service = "bigquery" ORDER BY usage_start_time DESC LIMIT 10'
+
+# View Cloud SQL costs
+gcloud sql instances list --format="table(name,tier,region,settings.availabilityType,state)"
+
+# Check Memorystore costs
+gcloud redis instances list --format="table(name,tier,memorySizeGb,location)"
+
+# Review spending trends
+gcloud billing accounts list
+gcloud billing budgets list --billing-account=XXXXX
+
+# Export cost data
+gcloud alpha billing accounts get-iam-policy <billing-account>
+```
+
+## Interview Questions
+
+### Q1: How do you implement cost visibility for a microservices architecture?
+**Answer**: Use resource labels consistently across all resources (environment, team, service, cost-center). Export billing data to BigQuery for analysis. Build dashboards by team and service. Implement chargeback/showback to make teams aware of their costs. Set up budget alerts at team and project level.
+
+### Q2: When should you use Committed Use Discounts vs on-demand?
+**Answer**: CUDs make sense for baseline, predictable workloads. Calculate baseline by looking at minimum usage over 30+ days. Commit 60-70% of baseline to leave room for variance. Avoid committing for highly variable or growing workloads where you might outgrow the commitment.
+
+### Q3: How do you handle cost optimization for development environments?
+**Answer**: Scale dev environments to zero when not in use via scheduled scaling. Use lower-tier resources (smaller Cloud SQL, BASIC Memorystore). Implement auto-delete for dev resources older than 30 days. Use development-specific projects with lower budgets and alerts.
+
+### Q4: What is your approach to cost anomaly detection?
+**Answer**: Establish baseline with rolling 30-day average. Detect anomalies using standard deviation (2-3 sigma). Alert when daily cost exceeds threshold. Investigate using cost breakdown by service. Automate common causes (unused resources, oversized instances) remediation.
+
+### Q5: How do you balance cost optimization with reliability?
+**Answer**: Never compromise on availability requirements for cost savings. Use HA configuration in production regardless of cost. Reserve HA for production only. Use CUDs to get discounts without sacrificing reliability. Test cost optimization changes before applying to production.
+
+## Cheat Sheet
+
+```bash
+# Enable billing export to BigQuery
+gcloud billing accounts get-iam-policy <billing-account-id> --format=json
+
+# Set up budget alerts
+gcloud billing budgets create --billing-account=<id> --threshold=0.5 --amount=50000
+
+# View cost optimization recommendations
+gcloud recommender recommendations list \
+  --project=${PROJECT_ID} \
+  --location=us-central1 \
+  --recommender=google.cloudsql.instanceRecommender
+
+# Apply recommendations
+gcloud recommender recommendations apply <recommendation-id> \
+  --project=${PROJECT_ID}
+
+# Check resource labels
+gcloud assets search-all-resources \
+  --query="labels.environment=production" \
+  --format="table(resource_type,display_name)"
+
+# Export cost data
+gcloud billing export bigquery dataset create \
+  --billing-account=<account-id> \
+  --dataset-name=cost_data
+
+# Calculate potential CUD savings
+# Cloud Run: (on_demand_rate - cud_rate) * monthly_usage * commitment_percent
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Platform architecture introduction
+- [Multi-Region](./multi-region.mdx) - Multi-region cost considerations
+- [Disaster Recovery](./disaster-recovery.mdx) - DR cost management
+- [Security Architecture](./security-architecture.mdx) - Cost-related security

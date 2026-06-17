@@ -1,0 +1,634 @@
+# HTTP/HTTPS
+
+## Overview
+
+HTTP (Hypertext Transfer Protocol) is the foundation of the web. Despite being around since 1990, HTTP continues to evolve—HTTP/1.1 remains ubiquitous, HTTP/2 is widely deployed, and HTTP/3 (built on QUIC) is rapidly gaining adoption. Understanding HTTP at a deep level matters for DevOps because: debugging API issues requires reading HTTP headers, optimizing performance means understanding connection reuse and compression, and securing applications means implementing TLS correctly.
+
+HTTP/2 introduced multiplexing (multiple requests over a single connection), header compression (HPACK), and server push. HTTP/3 goes further with QUIC's 0-RTT connection establishment and stream independence. Yet understanding HTTP/1.1 remains essential—it's what you'll debug when inspecting raw traffic, and many internal services still use it.
+
+This page covers HTTP from a DevOps perspective: the wire protocol, headers that matter for operations, connection management, caching, and security considerations.
+
+## When To Use
+
+- **API development**: REST, GraphQL, and gRPC all use HTTP as transport
+- **Load balancer configuration**: L7 load balancing requires understanding headers and routing
+- **Performance optimization**: Connection reuse, compression, caching strategies
+- **Security hardening**: HSTS, CSP, CORS, content type sniffing
+- **Debugging production issues**: Reading access logs, decoding headers, replaying requests
+
+## When NOT To Use
+
+- **Binary protocols**: gRPC uses HTTP/2 but has its own protobuf encoding
+- **WebSocket**: Different upgrade mechanism, though uses HTTP for handshake
+- **Non-HTTP services**: Databases, SSH, DNS don't use HTTP (different transport)
+
+## Core Concepts
+
+### HTTP/1.1 Request-Response
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         Request                             │
+├─────────────────────────────────────────────────────────────┤
+│ GET /api/v1/users HTTP/1.1\r\n                              │
+│ Host: api.example.com\r\n                                   │
+│ Accept: application/json\r\n                                │
+│ Authorization: Bearer eyJhbGc...\r\n                        │
+│ User-Agent: curl/7.88.1\r\n                                 │
+│ \r\n                                                        │
+│ (no body for GET)                                           │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                         Response                            │
+├─────────────────────────────────────────────────────────────┤
+│ HTTP/1.1 200 OK\r\n                                         │
+│ Date: Mon, 16 Jun 2025 10:30:00 GMT\r\n                     │
+│ Content-Type: application/json\r\n                          │
+│ Content-Length: 156\r\n                                     │
+│ Cache-Control: max-age=300\r\n                              │
+│ ETag: "abc123"\r\n                                          │
+│ \r\n                                                        │
+│ {"users": [{"id": 1, "name": "Alice"}]}                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### HTTP Methods
+
+| Method | Safe | Idempotent | Body | Use |
+|--------|------|------------|------|-----|
+| GET | Yes | Yes | No | Read resource |
+| HEAD | Yes | Yes | No | Same as GET but headers only |
+| POST | No | No | Yes | Create resource |
+| PUT | No | Yes | Yes | Replace resource |
+| PATCH | No | No | Yes | Partial update |
+| DELETE | No | Yes | No | Delete resource |
+| OPTIONS | Yes | Yes | No | CORS preflight, API discovery |
+| TRACE | Yes | Yes | No | Debug (echo request) |
+| CONNECT | No | No | Yes | Proxy tunneling (HTTPS) |
+
+### HTTP Status Codes
+
+| Range | Category | Meaning |
+|-------|----------|---------|
+| 1xx | Informational | Request received, continuing |
+| 100 | Continue | Client should send body |
+| 101 | Switching Protocols | Upgrade to WebSocket/TLS |
+| 2xx | Success | Request successfully received |
+| 200 | OK | Success |
+| 201 | Created | Resource created (POST) |
+| 204 | No Content | Success, no body |
+| 3xx | Redirection | Further action needed |
+| 301 | Moved Permanently | Cacheable redirect |
+| 302 | Found | Temporary redirect (may change to POST) |
+| 303 | See Other | Force GET after POST |
+| 304 | Not Modified | Use cached response |
+| 307 | Temporary Redirect | Preserve method |
+| 308 | Permanent Redirect | Preserve method |
+| 4xx | Client Error | Problem with request |
+| 400 | Bad Request | Malformed request |
+| 401 | Unauthorized | Authentication needed |
+| 403 | Forbidden | Permission denied |
+| 404 | Not Found | Resource doesn't exist |
+| 405 | Method Not Allowed | Method not supported |
+| 409 | Conflict | State conflict (e.g., duplicate) |
+| 429 | Too Many Requests | Rate limited |
+| 5xx | Server Error | Problem with server |
+| 500 | Internal Server Error | Generic server error |
+| 502 | Bad Gateway | Upstream error |
+| 503 | Service Unavailable | Overloaded, maintenance |
+| 504 | Gateway Timeout | Upstream timeout |
+
+### Important HTTP Headers
+
+**Request Headers**:
+- `Host`: Required for HTTP/1.1, identifies target (enables virtual hosting)
+- `Authorization`: Credentials (Bearer, Basic, Digest)
+- `Accept`: Media types client accepts
+- `Accept-Encoding`: Supported compression (gzip, br, deflate)
+- `Accept-Language`: Preferred languages
+- `User-Agent`: Client identification
+- `Cookie`: Session cookies from server
+- `Cache-Control`: Cache directives
+- `If-None-Match`: Conditional request with ETag
+- `If-Modified-Since`: Conditional request with date
+
+**Response Headers**:
+- `Content-Type`: Media type (application/json, text/html)
+- `Content-Length`: Size in bytes
+- `Content-Encoding`: Compression (gzip, br)
+- `Cache-Control`: Caching directives
+- `ETag`: Version identifier for caching
+- `Set-Cookie`: Cookies to store
+- `Location`: Redirect target (3xx)
+- `WWW-Authenticate`: Authentication challenge (401)
+- `Strict-Transport-Security`: HSTS (force HTTPS)
+- `Access-Control-Allow-Origin`: CORS (4+ hours)
+
+### HTTP/2 Improvements
+
+HTTP/2 addresses HTTP/1.1's head-of-line blocking by multiplexing multiple streams over a single TCP connection:
+
+**Key features**:
+- **Multiplexing**: Multiple requests/responses simultaneously (no request 2 waiting for request 1)
+- **Header compression**: HPACK reduces header overhead by ~85%
+- **Server push**: Server can push resources before client requests
+- **Stream prioritization**: Streams have weights and dependencies
+- **Single connection**: Eliminates TCP handshake overhead
+
+```
+HTTP/1.1: 6 connections for parallel resources, serialized headers
+          Connection 1: GET /index.html
+          Connection 2: GET /style.css
+          Connection 3: GET /app.js
+          ... (browsers limit concurrent connections per host)
+
+HTTP/2: Single connection, multiplexed streams
+          Stream 1: GET /index.html
+          Stream 2: GET /style.css
+          Stream 3: GET /app.js
+          (all over single TCP connection)
+```
+
+**HTTP/2 frame structure**:
+```
++-----------------------------------------------+
+| Length (24 bits) | Type (8) | Flags (8) | R | |
+|              Stream ID (31 bits)              |
++-----------------------------------------------+
+|               Frame Payload                   |
++-----------------------------------------------+
+```
+
+### HTTP/3 and QUIC
+
+HTTP/3 runs over QUIC (UDP-based) instead of TCP:
+
+**Advantages**:
+- **0-RTT**: Can send data immediately on reconnect (resumption)
+- **No head-of-line blocking**: Stream loss only affects that stream
+- **Connection migration**: Switch networks without reconnecting
+- **Built-in TLS 1.3**: Encryption integrated into transport
+
+**Disadvantages**:
+- QUIC still has CPU overhead (userspace stack)
+- Not all networks allow UDP 443
+- Newer, less deployed
+
+## Real Production Example
+
+### NGINX Configuration for HTTP/2 and TLS
+
+```nginx
+# /etc/nginx/nginx.conf
+http {
+    # Enable HTTP/2
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        # SSL/TLS configuration
+        ssl_certificate /etc/ssl/certs/api.example.com.bundle.crt;
+        ssl_certificate_key /etc/ssl/private/api.example.com.key;
+        
+        # Modern TLS configuration
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+        ssl_prefer_server_ciphers off;
+        
+        # OCSP stapling
+        ssl_stapling on;
+        ssl_stapling_verify on;
+        resolver 8.8.8.8 1.1.1.1 valid=300s;
+        
+        # Security headers
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        
+        # Gzip compression
+        gzip on;
+        gzip_types application/json application/javascript text/css text/html;
+        gzip_min_length 1000;
+        
+        # Connection management
+        keepalive_timeout 65;
+        keepalive_requests 1000;
+        
+        # Proxy to upstream
+        location /api/ {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+    
+    upstream backend {
+        server 10.0.0.5:8080;
+        server 10.0.0.6:8080;
+        keepalive 32;  # Connection pooling
+    }
+}
+```
+
+### curl Examples
+
+```bash
+# Basic request
+curl -v https://api.example.com/users/1
+# -v shows request/response headers
+
+# POST with JSON body
+curl -X POST https://api.example.com/users \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "email": "alice@example.com"}'
+
+# With authentication
+curl -H "Authorization: Bearer $TOKEN" https://api.example.com/users
+
+# Custom headers
+curl -H "X-Custom-Header: value" \
+  -H "Accept: application/json" \
+  https://api.example.com/users
+
+# Save response headers
+curl -D headers.txt -o response.json https://api.example.com/users/1
+# Check headers: X-RateLimit-Remaining, ETag, Cache-Control
+
+# Conditional request (If-None-Match)
+curl -H "If-None-Match: \"abc123\"" https://api.example.com/users/1
+
+# Follow redirects
+curl -L https://api.example.com/redirect-target
+
+# Time the request
+curl -w "@curl-format.txt" -o /dev/null -s https://api.example.com/users
+
+# curl-format.txt:
+# time_namelookup: %{time_namelookup}\n
+# time_connect: %{time_connect}\n
+# time_appconnect: %{time_appconnect}\n
+# time_pretransfer: %{time_pretransfer}\n
+# time_redirect: %{time_redirect}\n
+# time_starttransfer: %{time_starttransfer}\n
+# time_total: %{time_total}\n
+```
+
+## CLI Examples
+
+```bash
+# HTTP/1.1 request without TLS
+echo -e "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n" | nc example.com 80
+
+# HTTP/2 request (nghttp)
+nghttp -v https://example.com
+nghttp -ns https://example.com  # -n: no buffer, -s: stats
+
+# HTTP/3 with curl (if compiled with quiche)
+curl --http3 https://example.com -v
+
+# HTTP testing with Apache Bench
+ab -n 1000 -c 10 https://api.example.com/users
+# -n: total requests, -c: concurrent clients
+
+# Siege for load testing
+siege -c 50 -t 30S https://api.example.com/api/users
+
+# Check HTTP/2 support
+curl -I --http2 https://example.com
+# If HTTP/2, shows "HTTP/2 200"
+# If not, falls back to HTTP/1.1
+
+# Decode gzipped response
+curl https://api.example.com | gzip -d
+
+# Show only headers
+curl -I https://api.example.com
+curl -D - -o /dev/null https://api.example.com
+
+# Check certificate chain
+curl -Iv https://example.com 2>&1 | grep -E "(SSL|subject|issuer|Certificate)"
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `curl` | HTTP client | `curl -v https://example.com` |
+| `wget` | Download files | `wget -O output.html https://example.com` |
+| `nc` | Netcat for raw HTTP | `echo "GET / HTTP/1.1" \| nc host 80` |
+| `nghttp` | HTTP/2 client | `nghttp -v https://example.com` |
+| `h2load` | HTTP/2 load testing | `h2load -n 1000 -c 10 https://example.com` |
+| `ab` | Apache Bench | `ab -n 1000 -c 10 url` |
+| `siege` | Load testing | `siege -c 50 url` |
+| `httping` | Latency monitoring | `httping -g https://example.com` |
+| `mitmproxy` | HTTP debugging proxy | `mitmproxy --listen-port 8080` |
+
+## Monitoring
+
+### Key HTTP Metrics
+
+```bash
+# NGINX stub_status (enable with stub_status on;)
+# Access at /nginx_status
+# Active connections: 42
+# server accepts handled requests
+#   12345 12345 54321
+# Reading: 2 Writing: 3 Waiting: 37
+
+# Prometheus NGINX exporter metrics
+# nginx_connections_active
+# nginx_connections_reading
+# nginx_connections_waiting
+# nginx_requests_total
+```
+
+### Prometheus Queries
+
+```promql
+# Request rate by status code
+sum(rate(http_requests_total[5m])) by (status_code)
+
+# Error rate (5xx)
+sum(rate(http_requests_total{status_code=~"5.."}[5m])) /
+sum(rate(http_requests_total[5m]))
+
+# Latency histogram
+histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+
+# Request size
+rate(http_request_size_bytes_sum[5m]) / rate(http_request_size_bytes_count[5m])
+
+# Response size
+rate(http_response_size_bytes_sum[5m]) / rate(http_response_size_bytes_count[5m])
+```
+
+### Logging for Debugging
+
+```bash
+# NGINX access log format with timing
+log_format timing '$remote_addr - $remote_user [$time_local] '
+                 '"$request" $status $body_bytes_sent '
+                 '"$http_referer" "$http_user_agent" '
+                 'rt=$request_time uct="$upstream_connect_time" '
+                 'uht="$upstream_header_time" urt="$upstream_response_time"';
+
+# Parse common log for slow requests
+awk '{if ($NF > 5) print $NF, $0}' /var/log/nginx/access.log | sort -rn | head
+
+# HAProxy HTTP stats
+# stats uri: /haproxy?stats
+# Shows: frontend/backend metrics, response times, queue depth
+```
+
+## Security
+
+### Security Headers
+
+```nginx
+# HSTS (HTTP Strict Transport Security)
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+
+# X-Frame-Options (prevent clickjacking)
+add_header X-Frame-Options "DENY" always;
+
+# X-Content-Type-Options (prevent MIME sniffing)
+add_header X-Content-Type-Options "nosniff" always;
+
+# X-XSS-Protection (legacy, CSP preferred)
+add_header X-XSS-Protection "1; mode=block" always;
+
+# Content Security Policy
+add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'" always;
+
+# Referrer Policy
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# Permissions Policy
+add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+```
+
+### CORS Configuration
+
+```nginx
+location /api/ {
+    # Preflight request
+    if ($request_method = 'OPTIONS') {
+        add_header 'Access-Control-Allow-Origin' '*';
+        add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS';
+        add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization';
+        add_header 'Access-Control-Max-Age' 1728000;
+        add_header 'Content-Type' 'text/plain; charset=utf-8';
+        add_header 'Content-Length' 0;
+        return 204;
+    }
+    
+    add_header 'Access-Control-Allow-Origin' '$http_origin' always;
+    add_header 'Access-Control-Allow-Credentials' 'true' always;
+    add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS';
+    add_header 'Access-Control-Allow-Headers' 'DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization';
+}
+```
+
+### Rate Limiting
+
+```nginx
+# Rate limit zone
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
+
+server {
+    location /api/ {
+        limit_req zone=api_limit burst=20 nodelay;
+        # burst: allow burst of requests
+        # nodelay: don't delay, just reject
+        
+        # Custom error page
+        limit_req_status 429;
+    }
+}
+
+# IP-based blocking
+location /admin/ {
+    allow 10.0.0.0/8;
+    allow 192.168.0.0/16;
+    deny all;
+}
+```
+
+## Cost Optimization
+
+### HTTP Optimization for Cost
+
+**Compression reduces bandwidth**:
+```bash
+# Gzip typically reduces text by 70-80%
+# Brotli (br) is 15-20% better than gzip
+
+# nginx: enable both
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 6;
+gzip_types application/json application/javascript text/css text/html;
+
+# brotli (requires module)
+brotli on;
+brotli_types application/json application/javascript text/css text/html;
+brotli_comp_level 6;
+```
+
+**Connection reuse**:
+```bash
+# Keep-alive reduces connection overhead
+# HTTP/1.1 keeps connection open by default
+
+# HTTP/2 multiplexes over single connection
+listen 443 ssl http2;
+
+# Keep connection pool to upstream
+upstream backend {
+    server 10.0.0.5:8080;
+    keepalive 32;  # 32 idle connections
+}
+
+# For API clients: use HTTP/2 or connection pooling
+```
+
+**Caching**:
+```bash
+# Cache static assets at edge (CloudFront)
+# Cache-Control: public, max-age=31536000, immutable
+
+# Cache API responses (authenticated? no. public? yes)
+# Cache-Control: private, max-age=0, must-revalidate
+
+# ETags enable conditional requests (304 Not Modified)
+# If-None-Match: "abc123"
+```
+
+## Troubleshooting
+
+### Common HTTP Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 400 Bad Request | Malformed request, missing Host header | Check headers, curl -v |
+| 401 Unauthorized | Missing/wrong credentials | Check Authorization header |
+| 403 Forbidden | CORS, IP block, permissions | Check CSP, allow rules |
+| 404 Not Found | Wrong path, routing config | Check routes, path prefix |
+| 502 Bad Gateway | Upstream unreachable | Check upstream, health |
+| 503 Service Unavailable | Upstream overloaded | Scale, rate limit |
+| 504 Gateway Timeout | Upstream slow | Timeout config, optimize |
+| 429 Too Many Requests | Rate limit exceeded | Backoff, retry-after |
+
+### Debugging with tcpdump
+
+```bash
+# Capture HTTP traffic
+tcpdump -i eth0 -A 'port 80 or port 443' | grep -E "(GET|POST|HTTP/|Host:)"
+
+# Capture specific URL
+tcpdump -i eth0 -A 'port 443 and host api.example.com' | strings | grep -E "(GET|POST| HTTP/)"
+
+# Save full capture for Wireshark
+tcpdump -i eth0 -w /tmp/http.pcap 'port 80 or port 443'
+# Open in Wireshark, filter: http.request or http.response
+```
+
+### HTTP/2 Debugging
+
+```bash
+# Check if server offers HTTP/2
+curl -I --http2 https://example.com
+# If works, shows HTTP/2
+
+# NGHTTP2 tools
+nghttp -v https://example.com  # Verbose request/response
+nghttp -ns https://example.com  # Stats (streams, window updates)
+
+# h2load for load testing HTTP/2
+h2load -n 10000 -c 100 -m 10 https://example.com/
+# -n: requests, -c: clients, -m: max concurrent streams
+
+# Check HTTP/2 frames
+# In Wireshark: follow "HTTP/2 stream" for multiplexed streams
+```
+
+## Interview Questions
+
+**Q1: What's the difference between HTTP/1.1, HTTP/2, and HTTP/3?**
+
+A: HTTP/1.1 (1999) introduced persistent connections (keep-alive), chunked transfer encoding, and virtual hosting. Its limitation: head-of-line blocking—only one request/response can be in flight per connection, and browsers use 6 connections per domain to parallelize. HTTP/2 (2015) adds multiplexing (multiple streams over one connection), HPACK header compression, server push, and stream prioritization. Fixes head-of-line blocking, but TCP head-of-line blocking remains—if one packet is lost, all streams stall until retransmission. HTTP/3 (2022) runs over QUIC (UDP), eliminating TCP head-of-line blocking—stream loss only affects that stream. Also offers 0-RTT resumption and connection migration. HTTP/2 and HTTP/3 negotiate via ALPN during TLS handshake; HTTP/2 can also use prior knowledge.
+
+**Q2: What is CORS and how do you debug CORS issues?**
+
+A: CORS (Cross-Origin Resource Sharing) restricts which origins (scheme + host + port) can access resources. Browsers enforce CORS; servers send `Access-Control-Allow-Origin` headers. Preflight requests (OPTIONS) check allowed methods/headers before actual request. Common CORS issues: (1) Missing `Access-Control-Allow-Origin` header—server must explicitly allow origin, (2) Wrong origin in header—must match exactly, (3) Credentials with wildcard origin—cannot use `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials: true`, (4) Missing preflight handling—server must handle OPTIONS for non-simple methods/headers. Debug with curl: `curl -H "Origin: https://app.example.com" -I https://api.example.com` to see headers returned.
+
+**Q3: How does HTTP caching work, and what are the tradeoffs?**
+
+A: HTTP caching uses headers: `Cache-Control` (directives like max-age, no-cache, no-store, private), `ETag` (opaque version token), `Last-Modified` (timestamp). Cacheable responses are stored by browsers, CDNs, proxies. On subsequent requests, client checks: (1) Freshness—within max-age? Use cached. (2) Stale-while-revalidate—use cached, update in background. (3) Must-revalidate—revalidate if stale. Conditional requests use `If-None-Match` (ETag) or `If-Modified-Since`. Server returns 304 Not Modified if valid, saving bandwidth. Tradeoffs: longer max-age = faster response, but stale content during deploys; shorter max-age = more revalidation requests; `no-store` = never cached, always fetch.
+
+**Q4: What is a 502 error and how do you debug it?**
+
+A: 502 Bad Gateway means the gateway/proxy received an invalid response from upstream. Common causes: (1) Upstream server down or unreachable (check upstream health), (2) Upstream returning malformed response (check upstream logs), (3) Timeout (upstream slow, increase timeouts), (4) Upstream overloaded (scale or queue requests), (5) DNS resolution failure (upstream hostname doesn't resolve). Debug: check NGINX/HAProxy logs for upstream errors, `curl -v` directly to upstream IP to isolate, check upstream response format, check connection pool exhaustion (`upstream sent too big header`).
+
+**Q5: How would you implement request tracing across microservices?**
+
+A: Distributed tracing requires: (1) Trace ID generation at entry (load balancer or first service), propagated via `X-Request-ID` or `X-B3-TraceId` header, (2) Propagate trace context in all outgoing HTTP calls, (3) Log correlation—include trace ID in all logs, (4) Collect traces (Jaeger, Zipkin, AWS X-Ray) via sidecar or agent. Implementation: NGINX can generate/forward trace ID with `$request_id` variable (unique 32-char hex). Services extract from header, add to logs, pass in outgoing requests. Format: `X-Request-ID: abc123def456` or B3 format: `X-B3-TraceId: 4bf92f3577b34da6a3ce929d0e0e4736`. Sample rate: don't trace 100%—use header or config to sample 1-10%.
+
+## Cheat Sheet
+
+### HTTP Status Codes Quick Reference
+
+| Code | Meaning | When |
+|------|---------|------|
+| 200 | OK | Success |
+| 201 | Created | POST created resource |
+| 204 | No Content | Success, no body |
+| 301 | Moved | Permanent redirect (cache) |
+| 302 | Found | Temp redirect |
+| 304 | Not Modified | Use cache |
+| 400 | Bad Request | Malformed |
+| 401 | Unauthorized | Auth needed |
+| 403 | Forbidden | No permission |
+| 404 | Not Found | Missing |
+| 429 | Rate Limited | Slow down |
+| 500 | Server Error | App crashed |
+| 502 | Bad Gateway | Upstream bad |
+| 503 | Unavailable | Overloaded |
+| 504 | Timeout | Upstream slow |
+
+### Common Headers
+
+| Header | Type | Purpose |
+|--------|------|---------|
+| Host | Req | Target hostname (required HTTP/1.1) |
+| Content-Type | Both | Media type (application/json) |
+| Content-Length | Both | Body size |
+| Authorization | Req | Credentials |
+| Cache-Control | Both | Caching directives |
+| ETag | Resp | Version identifier |
+| If-None-Match | Req | Conditional request |
+| X-Request-ID | Req | Tracing correlation |
+| X-Forwarded-For | Req | Client IP (proxy) |
+
+### Security Headers
+
+| Header | Value | Purpose |
+|--------|-------|---------|
+| HSTS | max-age=31536000 | Force HTTPS |
+| X-Frame-Options | DENY/SAMEORIGIN | Clickjacking protection |
+| X-Content-Type | nosniff | Prevent MIME sniff |
+| CSP | policy | XSS mitigation |
+
+## Related Topics
+
+- [HTTPS](./https) — TLS/HTTPS implementation
+- [TLS](./tls) — TLS 1.3 deep dive
+- [Load Balancing](./load-balancing) — L7 load balancing
+- [Reverse Proxy](./reverse-proxy) — NGINX/HAProxy config
+- [Observability](./observability) — HTTP metrics

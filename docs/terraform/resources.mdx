@@ -1,0 +1,889 @@
+# Terraform Resources
+
+## Overview
+
+Resources are the fundamental building blocks in Terraform. Each resource block describes a specific infrastructure object (compute instance, network, storage bucket, etc.). Understanding resource configuration is critical for building production-grade infrastructure.
+
+## When To Use
+
+- **Creating infrastructure**: All cloud resources are defined as resources
+- **Updating existing resources**: Modify resource attributes in-place
+- **Destroying resources**: Terraform manages lifecycle via `terraform destroy`
+- **Importing existing infrastructure**: Map existing resources to Terraform config
+
+## When NOT To Use
+
+- **Reading existing infrastructure**: Use `data` sources instead
+- **Transient configuration**: Use local values or variables
+- **Non-infrastructure configuration**: Use other Terraform constructs
+
+## Core Concepts
+
+### Resource Block Structure
+
+```hcl
+resource "TYPE" "NAME" {
+  # Configuration
+  
+  # Meta-arguments
+  depends_on = [...]
+  count      = 3
+  for_each   = var.instance_names
+  lifecycle {
+    create_before_destroy = true
+  }
+  provider = google.west
+}
+```
+
+### Resource Dependencies
+
+```hcl
+# Implicit dependency (Terraform infers)
+resource "google_compute_instance" "web" {
+  network_interface {
+    network = google_compute_network.vpc.id  # Depends on network
+  }
+}
+
+# Explicit dependency
+resource "google_compute_instance" "db" {
+  # ...
+  depends_on = [
+    google_sql_database_instance.primary
+  ]
+}
+```
+
+## Real Production Example
+
+### Compute Instances
+
+```hcl
+# main.tf - Compute Resources
+locals {
+  instance_tags = {
+    environment = var.environment
+    team        = var.team
+    managed_by  = "terraform"
+  }
+}
+
+# Instance Template
+resource "google_compute_instance_template" "web_template" {
+  name        = "web-template-${var.environment}"
+  description = "Web server instance template"
+  
+  machine_type = var.machine_type
+  instance_description = "Web server instances"
+  
+  # Confidential instance for enhanced security
+  confidential_instance_config {
+    enable_confidential_compute = var.enableConfidentialCompute
+  }
+  
+  # Scheduling options
+  scheduling {
+    on_host_maintenance = "MIGRATE"
+    automatic_restart   = true
+    preemptible         = false
+    
+    # For spot instances
+    preemptible = true
+    termination_action = "STOP"  # STOP or DELETE
+  }
+  
+  # Service account
+  service_account {
+    email  = google_service_account.web.email
+    scopes = ["cloud-platform"]
+  }
+  
+  # Disk configuration
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+    
+    disk_size_gb = 50
+    disk_type    = "pd-ssd"
+    
+    encryption_key = google_kms加密密钥.crypto_key.id
+  }
+  
+  # Network interface
+  network_interface {
+    network    = google_compute_network.vpc.id
+    subnetwork = google_compute_subnet.private.id
+    
+    # Secondary IPs for alias ranges
+    secondary_ip_range {
+      ip_cidr_range = "${var.pod_cidr}.0/20"
+      range_name    = "pods"
+    }
+    
+    # Access config for public IP
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+  
+  # Shielded VM options
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+  
+  # Labels
+  labels = merge(local.instance_tags, {
+    instance_type = "web"
+  })
+  
+  # Metadata
+  metadata = {
+    startup-script = file("${path.module}/scripts/startup.sh")
+    shutdown-script = file("${path.module}/scripts/shutdown.sh")
+    enable-oslogin = "TRUE"
+  }
+  
+  tags = ["web", "http-server", "https-server"]
+  
+  # Guest accelerators (GPU)
+  guest_accelerators {
+    accelerator_type  = "nvidia-tesla-t4"
+    accelerator_count = 1
+  }
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Managed Instance Group
+resource "google_compute_region_instance_group_manager" "web_mig" {
+  name        = "web-mig-${var.environment}"
+  description = "Regional MIG for web servers"
+  base_instance_name = "web"
+  
+  region   = var.region
+  versions {
+    name           = "v1"
+    instance_template = google_compute_instance_template.web_template.id
+    
+    # Canary version for gradual rollout
+    instance_template = google_compute_instance_template.web_template_canary.id
+    target_size       = 1  # Canary size
+  }
+  
+  auto_healing_policies {
+    initial_delay_sec = 60
+    health_check      = google_compute_region_health_check.auto_healing.id
+  }
+  
+  update_policy {
+    type                  = "ROLLING_TYPE_UPDATE"
+    minimal_action        = "REPLACE"
+    max_surge_fixed       = 3
+    max_unavailable_fixed = 0
+    min_ready_sec         = 60
+    
+    rolling_update_policy {
+      type              = "PROACTIVE"
+      minimal_action    = "REPLACE"
+      max_surge_fixed   = 3
+      max_unavailable_fixed = 0
+    }
+  }
+  
+  named_ports {
+    name  = "http"
+    port  = 8080
+  }
+  
+  stateful_disks {
+    device_name = "boot"
+    source      = google_compute_instance_template.web_template.disks[0].source
+    mode        = "READ_WRITE"
+  }
+}
+
+# Regional Health Check
+resource "google_compute_health_check" "auto_healing" {
+  name               = "auto-healing-health-check"
+  check_interval_sec = 10
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
+  
+  http_health_check {
+    port         = 8080
+    request_path = "/healthz"
+    host         = "localhost"
+  }
+}
+```
+
+### Network Resources
+
+```hcl
+# VPC Network
+resource "google_compute_network" "vpc" {
+  name                    = "vpc-${var.environment}"
+  auto_create_subnetworks = false
+  description             = "Custom VPC for ${var.environment}"
+  
+  # Private Google Access
+  private_ip_google_access = true
+  
+  mtu = 1460  # Jumbo frames
+  
+  routing_mode = "Regional"  # or GLOBAL for HA
+  
+  # BGP routing for Cloud Router
+  bgp {
+    asn = var.vpc_asn
+  }
+}
+
+# Subnet
+resource "google_compute_subnetwork" "private" {
+  name          = "subnet-private-${var.region}-${var.environment}"
+  ip_cidr_range = var.private_subnet_cidr
+  network       = google_compute_network.vpc.id
+  region        = var.region
+  
+  # Private Google Access
+  private_ip_google_access = true
+  
+  # Private Google Access with Private NAT
+  private_ipv6_google_access = "ENABLE_OUTBOUND_VM_PUCCESS_TO_GOOGLE"
+  
+  # Secondary ranges for pods/services
+  secondary_ip_range = [
+    {
+      ip_cidr_range = "${var.pod_cidr}.0/20"
+      range_name    = "pods"
+    },
+    {
+      ip_cidr_range = "${var.service_cidr}.0/20"
+      range_name    = "services"
+    }
+  ]
+  
+  # Flow logs for VPC
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = 0.5
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+  
+  # Purpose for Shared VPC
+  purpose = "PRIVATE"  # or REGIONAL_MANAGED |
+}
+
+# Firewall Rules
+resource "google_compute_firewall" "allow_internal" {
+  name        = "allow-internal-${var.environment}"
+  network     = google_compute_network.vpc.id
+  direction   = "INGRESS"
+  priority    = 65534
+  source_ranges = ["10.0.0.0/8"]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "icmp"
+  }
+  
+  # Exempt from logging for performance
+  disabled = false
+}
+
+resource "google_compute_firewall" "allow_health_checks" {
+  name        = "allow-health-checks-${var.environment}"
+  network     = google_compute_network.vpc.id
+  direction   = "INGRESS"
+  priority    = 1000
+  
+  # GCP health check IP ranges
+  source_ranges = [
+    "35.191.0.0/16",  # Health check
+    "130.211.0.0/22", # Load balancer
+  ]
+  
+  target_tags = ["web", "api"]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["8080"]
+  }
+}
+```
+
+### Cloud SQL
+
+```hcl
+# Cloud SQL Instance
+resource "google_sql_database_instance" "postgres" {
+  name             = "postgres-${var.environment}"
+  database_version = "POSTGRES_15"
+  region           = var.region
+  
+  deletion_protection = var.environment == "prod" ? true : false
+  
+  settings {
+    tier              = var.db_tier
+    region            = var.region
+    availability_type = var.environment == "prod" ? "REGIONAL" : "ZONAL"
+    
+    # Disk configuration
+    disk_size      = 100  # GB
+    disk_type      = "PD_SSD"
+    disk_autoresize = true
+    
+    # Backup configuration
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+      backup_retention_settings {
+        retained_backups = 7
+        retention_unit   = "COUNT"
+      }
+    }
+    
+    # IP configuration
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+      
+      # Authorized networks for external access
+      authorized_networks {
+        name  = "internal"
+        value = var.private_subnet_cidr
+      }
+      
+      # SSL required
+      require_ssl = true
+      
+      # IAM authentication
+      iam_authentication = true
+    }
+    
+    # Maintenance window
+    maintenance_window {
+      day          = 7   # Sunday
+      hour         = 4   # 4 AM
+      update_track = "stable"
+    }
+    
+    # Insights
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+      record_application_tags = true
+      record_client_address   = false
+    }
+    
+    # Database flags
+    database_flags {
+      name  = "max_connections"
+      value = "200"
+    }
+    
+    database_flags {
+      name  = "log_min_duration_statement"
+      value = "1000"
+    }
+    
+    # Enable high availability
+    if var.environment == "prod" {
+      availability_type = "REGIONAL"
+    }
+  }
+  
+  # Enable point-in-time recovery
+  restore_backup_context {
+    backup_kind = "ON_DEMAND"
+  }
+  
+  # Timeouts
+  timeouts {
+    create = "30m"
+    update = "30m"
+    delete = "30m"
+  }
+}
+
+# Database
+resource "google_sql_database" "app_db" {
+  name     = "webapp"
+  instance = google_sql_database_instance.postgres.name
+  
+  charset = "UTF8"
+  collation = "en_US.UTF8"
+}
+
+# User
+resource "google_sql_user" "app_user" {
+  name     = "webapp_user"
+  instance = google_sql_database_instance.postgres.name
+  
+  # Password from Secret Manager
+  password = data.google_secret_manager_secret_version.db_password.secret_data
+  
+  # Type for IAM authentication
+  type = "CLOUD_IAM_USER"
+}
+```
+
+### GCS Storage
+
+```hcl
+# Storage Bucket
+resource "google_storage_bucket" "app_bucket" {
+  name          = "${var.project_id}-${var.environment}-storage"
+  location      = var.region
+  storage_class = var.environment == "prod" ? "STANDARD" : "NEARLINE"
+  
+  uniform_bucket_level_access = true
+  
+  # Object versioning
+  versioning {
+    enabled = true
+  }
+  
+  # Lifecycle rules
+  lifecycle_rule {
+    condition {
+      age = 30  # days
+      matches_prefix = ["logs/"]
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "COLDLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 90  # days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      is_live = false
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  # Encryption
+  encryption {
+    default_kms_key_name = google_kms_key.storage_key.id
+  }
+  
+  # CORS configuration
+  cors {
+    origin          = ["https://example.com"]
+    method          = ["GET", "POST"]
+    response_header = ["*"]
+    max_age_seconds = 3600
+  }
+  
+  # Website configuration
+  website {
+    main_page_suffix = "index.html"
+    not_found_page   = "404.html"
+  }
+  
+  # Access logs
+  logging {
+    log_bucket        = google_storage_bucket.access_logs.name
+    log_object_prefix = "access-logs"
+  }
+  
+  labels = {
+    environment = var.environment
+  }
+}
+```
+
+## CLI Examples
+
+### Resource Operations
+
+```bash
+# Plan specific resource
+terraform plan -target=google_compute_instance.web_server
+
+# Apply specific resource
+terraform apply -target=google_compute_instance.web_server
+
+# Destroy specific resource
+terraform destroy -target=google_compute_instance.web_server
+
+# Import existing resource
+terraform import google_compute_instance.web_server \
+  projects/my-project/zones/us-central1-a/instances/web-server
+
+# Import to module
+terraform import module.vpc.google_compute_network.vpc \
+  projects/my-project/global/networks/vpc-name
+
+# List resources
+terraform state list
+
+# Show resource
+terraform state show google_compute_instance.web_server
+```
+
+### Resource Graph
+
+```bash
+# Generate dependency graph
+terraform graph | dot -Tsvg > graph.svg
+
+# Graph with dependencies
+terraform graph -type=plan | jq '.'
+
+# Count resources by type
+terraform state list | cut -d. -f1 | sort | uniq -c
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform plan -target=RESOURCE` | Plan specific resource |
+| `terraform apply -target=RESOURCE` | Apply specific resource |
+| `terraform destroy -target=RESOURCE` | Destroy specific resource |
+| `terraform import RESOURCE ID` | Import existing resource |
+| `terraform state show RESOURCE` | Show resource details |
+| `terraform state mv SRC DST` | Move/rename resource |
+| `terraform state rm RESOURCE` | Remove from state |
+
+## Best Practices
+
+### 1. Use Lifecycle Policies
+
+```hcl
+resource "google_compute_instance" "server" {
+  # ...
+  
+  lifecycle {
+    create_before_destroy = true   # Zero-downtime deployments
+    prevent_destroy       = false  # Set true for critical resources
+    ignore_changes        = [tags] # Don't reconcile external changes
+  }
+}
+```
+
+### 2. Use count or for_each for Multiple Resources
+
+```hcl
+# For multiple similar resources
+resource "google_compute_instance" "server" {
+  count = 3
+  name  = "server-${count.index}"
+  # ...
+}
+
+# For dynamic resources based on map
+resource "google_compute_instance" "server" {
+  for_each = toset(["web", "api", "worker"])
+  name     = each.key
+  # ...
+}
+```
+
+### 3. Use Sensitive Flag for Secrets
+
+```hcl
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+output "db_password" {
+  value     = var.db_password
+  sensitive = true
+}
+```
+
+### 4. Add Descriptive Comments
+
+```hcl
+# Web server instances behind load balancer
+resource "google_compute_instance" "web" {
+  # ...
+}
+```
+
+### 5. Use Remote State for Cross-Environment References
+
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-project-terraform-state"
+    prefix = "network"
+  }
+}
+
+resource "google_compute_instance" "app" {
+  network_interface {
+    subnetwork = data.terraform_remote_state.network.outputs.subnet_id
+  }
+}
+```
+
+## Monitoring / State Management
+
+### Resource Monitoring
+
+```bash
+# List all resources
+terraform state list
+
+# Count by type
+terraform state list | grep "google_compute" | wc -l
+
+# Show dependencies
+terraform graph -type=plan | jq '.'
+```
+
+### Drift Detection
+
+```bash
+# Detect drift
+terraform plan -detailed-exitcode
+# Exit code 2 = changes pending
+
+# Refresh state
+terraform refresh
+
+# Show state vs config
+terraform show
+```
+
+## Security
+
+### Resource-Level Security
+
+```hcl
+# Enable Shielded VMs
+resource "google_compute_instance" "secure_server" {
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+}
+
+# Use VPC Firewall rules
+resource "google_compute_firewall" "restrictive" {
+  name        = "restrictive-${var.environment}"
+  network     = google_compute_network.vpc.id
+  source_ranges = ["10.0.0.0/8"]
+  
+  # Deny all except explicitly allowed
+  deny {
+    protocol = "all"
+  }
+}
+
+# Enable Private Service Connect
+resource "google_compute_global_address" "private" {
+  name         = "private-service-connect"
+  purpose      = "VPC_PEERING"
+  address_type = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.vpc.id
+}
+```
+
+### Encryption at Rest
+
+```hcl
+# CMEK for persistent disks
+resource "google_compute_disk" "encrypted" {
+  name  = "encrypted-disk"
+  zone  = var.zone
+  size  = 100
+  
+  encryption_key = google_kms_key_ring.crypto_key.id
+}
+
+# CMEK for Cloud SQL
+resource "google_sql_database_instance" "postgres" {
+  encryption_key_name = google_kms_key.cloudsql_key.id
+}
+```
+
+## Cost Optimization
+
+### Right-Sizing Resources
+
+```hcl
+# Custom machine types for better pricing
+resource "google_compute_instance" "app" {
+  machine_type = "e2-custom-2-4096"  # 2 vCPU, 4GB RAM
+  
+  # Or use predefined types based on environment
+  machine_type = var.environment == "dev" ? "e2-micro" : "e2-medium"
+}
+
+# Use preemptible for batch processing
+resource "google_compute_instance_template" "batch" {
+  scheduling {
+    preemptible = true
+    automatic_restart = false
+  }
+}
+```
+
+### Storage Optimization
+
+```hcl
+# Standard storage for frequent access
+resource "google_storage_bucket" "hot" {
+  storage_class = "STANDARD"
+}
+
+# Nearline for infrequent access
+resource "google_storage_bucket" "archive" {
+  storage_class = "NEARLINE"
+  
+  lifecycle_rule {
+    condition { age = 30 }
+    action { type = "SetStorageClass"; storage_class = "COLDLINE" }
+  }
+}
+```
+
+## Troubleshooting
+
+### Resource Already Exists
+
+```bash
+# Error: Resource already exists
+# Solution: Import existing resource
+terraform import google_compute_instance.web_server \
+  projects/my-project/zones/us-central1-a/instances/web-server
+```
+
+### Resource Not Found
+
+```bash
+# Error: Resource not found during plan
+# Solution: Resource was deleted outside Terraform
+terraform plan  # Shows drift
+terraform apply # Reconcile
+```
+
+### Circular Dependency
+
+```bash
+# Error: Cycle: resource references
+# Solution: Break the cycle
+# Use depends_on sparingly
+resource "null_resource" "break_cycle" {
+  depends_on = [google_sql_database_instance.db]
+}
+```
+
+### Concurrent Modification
+
+```bash
+# Error: State lock
+# Solution: Wait or force unlock
+terraform apply  # Wait for lock
+terraform force-unlock <lock-id>  # Emergency only
+```
+
+## Interview Questions
+
+### Q1: What are meta-arguments in Terraform resources?
+**A:** `depends_on`, `count`, `for_each`, `provider`, `lifecycle` - control resource behavior and dependencies.
+
+### Q2: Difference between `count` and `for_each`?
+**A:** `count` creates multiple instances of a resource using numeric index. `for_each` creates instances based on a map or set of strings, allowing named instances.
+
+### Q3: What is `create_before_destroy` lifecycle policy?
+**A:** Creates new resource before destroying old one, enabling zero-downtime deployments. Used with `lifecycle { create_before_destroy = true }`.
+
+### Q4: When would you use `depends_on`?
+**A:** When there's a隐性 dependency Terraform can't infer, or when ordering matters for non-resource dependencies.
+
+### Q5: How do you import existing infrastructure?
+**A:** Use `terraform import RESOURCE_TYPE.NAME RESOURCE_ID`. Resource configuration block should match actual infrastructure.
+
+### Q6: What is resource targeting?
+**A:** Using `-target=RESOURCE` flag to plan/apply specific resources without affecting others.
+
+### Q7: How do you handle sensitive data in resources?
+**A:** Mark variables as `sensitive = true`, use Secret Manager for passwords, avoid hardcoding secrets in configuration.
+
+### Q8: What is drift in Terraform context?
+**A:** When actual infrastructure differs from Terraform state due to out-of-band changes. Detected via `terraform plan`.
+
+## Cheat Sheet
+
+### Resource Syntax
+```hcl
+resource "TYPE" "NAME" {
+  # Configuration
+  attribute = "value"
+  
+  # Meta-arguments
+  depends_on = [...]
+  count      = 3
+  for_each   = var.items
+  provider   = google.west
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy       = false
+    ignore_changes        = [tags]
+  }
+}
+```
+
+### Resource Addressing
+```
+resource.google_compute_instance.server
+module.vpc.google_compute_network.main
+data.google_compute_zones.available
+```
+
+### Common Meta-Arguments
+| Meta-argument | Purpose |
+|--------------|---------|
+| `depends_on` | Explicit dependencies |
+| `count` | Number of instances |
+| `for_each` | Map/set of instances |
+| `provider` | Non-default provider |
+| `lifecycle` | Lifecycle policies |
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Terraform fundamentals
+- [Variables](./variables.mdx) - Variable patterns
+- [Modules](./modules.mdx) - Module patterns
+- [State](./state.mdx) - State management
+- [Lifecycle](./lifecycle.mdx) - Resource lifecycle
+- [Secrets](./secrets.mdx) - Secrets management

@@ -1,0 +1,900 @@
+# Terraform Workspaces
+
+## Overview
+
+Terraform workspaces allow you to manage multiple environments (dev, staging, prod) using the same configuration with isolated state files. Each workspace has its own state, enabling you to deploy identical infrastructure to multiple environments without duplicating configuration files.
+
+## When To Use
+
+- **Environment isolation**: Dev/staging/prod with same config
+- **Branch-based deployments**: Feature branches with isolated state
+- **Testing changes**: Test in isolation before applying to shared environments
+- **Tenant isolation**: Multi-tenant infrastructure with shared configuration
+
+## When NOT To Use
+
+- **Different configurations**: If environments differ significantly, use separate directories
+- **Production isolation**: Some teams prefer directory-based separation for stricter control
+- **Complex environments**: Workspaces don't support different variable values elegantly
+
+## Core Concepts
+
+### Workspace States
+
+```
+workspaces/
+├── default/        # Default workspace
+├── dev/
+├── staging/
+└── prod/
+```
+
+### Workspace Commands
+
+```bash
+terraform workspace new dev
+terraform workspace select dev
+terraform workspace list
+```
+
+## Real Production Example
+
+### Workspace-Based Infrastructure
+
+```hcl
+# versions.tf
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+  
+  # State in GCS with workspace prefix
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    # prefix set per workspace: workspace name
+  }
+}
+
+# =============================================================================
+# Variables - Environment-specific values
+# =============================================================================
+
+variable "environment" {
+  description = "Environment name (derived from workspace)"
+  type        = string
+  default     = "default"
+}
+
+variable "machine_type" {
+  description = "Machine type for instances"
+  type        = string
+  
+  # Workspace-specific defaults
+  default = {
+    default = "e2-medium"
+    dev     = "e2-medium"
+    staging = "e2-standard-2"
+    prod    = "e2-standard-4"
+  }
+}
+
+variable "mig_target_size" {
+  description = "Target MIG size"
+  type        = number
+  
+  default = {
+    default = 1
+    dev     = 1
+    staging = 2
+    prod    = 5
+  }
+}
+
+variable "db_tier" {
+  description = "Database instance tier"
+  type        = string
+  
+  default = {
+    default = "db-g1-small"
+    dev     = "db-g1-small"
+    staging = "db-n1-standard-2"
+    prod    = "db-n1-standard-8"
+  }
+}
+
+variable "enable_autoscaling" {
+  description = "Enable autoscaling"
+  type        = bool
+  
+  default = {
+    default = false
+    dev     = false
+    staging = true
+    prod    = true
+  }
+}
+
+# =============================================================================
+# Locals - Computed from workspace
+# =============================================================================
+
+locals {
+  workspace = terraform.workspace
+  
+  # Environment-specific configuration
+  env_config = {
+    dev = {
+      enable_cdn              = false
+      enable_cloud_armor      = false
+      deletion_protection     = false
+      backup_retention_days   = 7
+      monitoring_level        = "basic"
+    }
+    staging = {
+      enable_cdn              = true
+      enable_cloud_armor      = true
+      deletion_protection     = true
+      backup_retention_days   = 14
+      monitoring_level        = "detailed"
+    }
+    prod = {
+      enable_cdn              = true
+      enable_cloud_armor      = true
+      deletion_protection     = true
+      backup_retention_days   = 30
+      monitoring_level        = "detailed"
+    }
+  }
+  
+  current_env_config = lookup(local.env_config, local.workspace, local.env_config.dev)
+  
+  common_labels = {
+    environment = local.workspace
+    managed_by  = "terraform"
+    workspace   = local.workspace
+  }
+  
+  # Environment-specific tags
+  instance_tags = merge(local.common_labels, {
+    cost-center = local.workspace == "prod" ? "production" : "development"
+    team        = "platform"
+  })
+}
+
+# =============================================================================
+# Network
+# =============================================================================
+
+resource "google_compute_network" "vpc" {
+  name                    = "vpc-${local.workspace}"
+  auto_create_subnetworks = false
+  description             = "VPC for ${local.workspace} environment"
+  
+  delete_protection = local.current_env_config.deletion_protection ? "PROTECTED" : "UNPROTECTED"
+}
+
+resource "google_compute_subnetwork" "subnet" {
+  name          = "subnet-${local.workspace}"
+  ip_cidr_range = var.vpc_cidr
+  network       = google_compute_network.vpc.id
+  region        = var.region
+  
+  private_ip_google_access = true
+  
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = local.workspace == "prod" ? 0.5 : 0.1
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+}
+
+# Cloud Router and NAT
+resource "google_compute_router" "router" {
+  name    = "router-${local.workspace}"
+  network = google_compute_network.vpc.id
+  region  = var.region
+  
+  bgp {
+    asn = 65001
+  }
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "nat-${local.workspace}"
+  router                             = google_compute_router.router.name
+  region                             = var.region
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+  
+  nat_ip_allocate_option = "AUTO_ONLY"
+  
+  min_ports_per_vm = 32
+}
+
+# =============================================================================
+# Firewall Rules
+# =============================================================================
+
+resource "google_compute_firewall" "allow_internal" {
+  name        = "allow-internal-${local.workspace}"
+  network     = google_compute_network.vpc.id
+  source_ranges = ["10.0.0.0/8"]
+  priority    = 65534
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+}
+
+resource "google_compute_firewall" "allow_http" {
+  name        = "allow-http-${local.workspace}"
+  network     = google_compute_network.vpc.id
+  source_ranges = ["0.0.0.0/0"]
+  target_tags = ["http-server"]
+  priority    = 1000
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+}
+
+# =============================================================================
+# Compute
+# =============================================================================
+
+resource "google_compute_instance_template" "app" {
+  name        = "app-template-${local.workspace}"
+  description = "App instance template for ${local.workspace}"
+  
+  machine_type = lookup(var.machine_type, local.workspace, "e2-medium")
+  
+  service_account {
+    email  = google_service_account.app.email
+    scopes = ["cloud-platform"]
+  }
+  
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 50
+    disk_type    = "pd-ssd"
+  }
+  
+  network_interface {
+    subnetwork = google_compute_subnetwork.subnet.id
+    
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+  
+  labels = local.instance_tags
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "google_compute_region_instance_group_manager" "app_mig" {
+  name                  = "app-mig-${local.workspace}"
+  base_instance_name    = "app"
+  region                = var.region
+  target_size           = lookup(var.mig_target_size, local.workspace, 1)
+  
+  version {
+    name            = "v1"
+    instance_template = google_compute_instance_template.app.id
+  }
+  
+  auto_healing_policies {
+    initial_delay_sec = 60
+    health_check      = google_compute_health_check.app.id
+  }
+  
+  update_policy {
+    type                  = "ROLLING_TYPE_UPDATE"
+    minimal_action        = "REPLACE"
+    max_surge_fixed       = local.workspace == "prod" ? 3 : 1
+    max_unavailable_fixed = 0
+  }
+}
+
+resource "google_compute_health_check" "app" {
+  name               = "health-check-${local.workspace}"
+  check_interval_sec = 10
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
+  
+  http_health_check {
+    port         = 8080
+    request_path = "/healthz"
+  }
+}
+
+# =============================================================================
+# Load Balancer (prod/staging only)
+# =============================================================================
+
+resource "google_compute_global_forwarding_rule" "http" {
+  count    = local.current_env_config.enable_cdn ? 1 : 0
+  name     = "http-${local.workspace}"
+  target   = google_compute_target_http_proxy.app.id
+  port_range = "80"
+  
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+}
+
+resource "google_compute_global_forwarding_rule" "https" {
+  count    = local.current_env_config.enable_cdn ? 1 : 0
+  name     = "https-${local.workspace}"
+  target   = google_compute_target_http_proxy.app.id
+  port_range = "443"
+  
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+}
+
+resource "google_compute_target_http_proxy" "app" {
+  name    = "proxy-${local.workspace}"
+  url_map = google_compute_url_map.app.id
+}
+
+resource "google_compute_url_map" "app" {
+  name            = "url-map-${local.workspace}"
+  default_service = google_compute_backend_service.app.id
+}
+
+resource "google_compute_backend_service" "app" {
+  name        = "backend-${local.workspace}"
+  protocol    = "HTTP"
+  port_name   = "http"
+  timeout_sec = 30
+  
+  backend {
+    group           = google_compute_region_instance_group_manager.app_mig.instance_group
+    balancing_mode  = "UTILIZATION"
+    max_utilization = 0.8
+  }
+  
+  health_checks = [google_compute_health_check.app.id]
+}
+
+# =============================================================================
+# Cloud SQL
+# =============================================================================
+
+resource "google_sql_database_instance" "postgres" {
+  name             = "postgres-${local.workspace}"
+  database_version = "POSTGRES_15"
+  region           = var.region
+  
+  deletion_protection = local.current_env_config.deletion_protection
+  
+  settings {
+    tier              = lookup(var.db_tier, local.workspace, "db-g1-small")
+    availability_type = local.workspace == "prod" ? "REGIONAL" : "ZONAL"
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+    }
+    
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = local.workspace == "prod"
+      backup_retention_settings {
+        retained_backups = local.current_env_config.backup_retention_days
+        retention_unit   = "COUNT"
+      }
+    }
+    
+    maintenance_window {
+      day          = 7
+      hour         = 4
+      update_track = "stable"
+    }
+  }
+}
+
+# =============================================================================
+# Service Account
+# =============================================================================
+
+resource "google_service_account" "app" {
+  account_id   = "app-${local.workspace}"
+  display_name = "App Service Account - ${local.workspace}"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_project_iam_member" "app_editor" {
+  project = var.project_id
+  role    = "roles/editor"
+  member  = "serviceAccount:${google_service_account.app.email}"
+}
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+output "workspace" {
+  description = "Current workspace name"
+  value       = local.workspace
+}
+
+output "environment_config" {
+  description = "Current environment configuration"
+  value       = local.current_env_config
+}
+
+output "vpc_id" {
+  description = "VPC network ID"
+  value       = google_compute_network.vpc.id
+}
+
+output "subnet_id" {
+  description = "Subnetwork ID"
+  value       = google_compute_subnetwork.subnet.id
+}
+
+output "mig_size" {
+  description = "MIG target size"
+  value       = lookup(var.mig_target_size, local.workspace, 1)
+}
+
+output "load_balancer_ip" {
+  description = "Load balancer IP (if enabled)"
+  value       = length(google_compute_global_forwarding_rule.https) > 0 ? google_compute_global_forwarding_rule.https[0].ip_address : null
+}
+```
+
+### Environment Variables
+
+```bash
+# common.sh - Set workspace variables
+export TF_WORKSPACE=dev
+export TF_VAR_project_id="my-project-dev"
+```
+
+### CI/CD Pipeline
+
+```yaml
+# .github/workflows/terraform.yml
+name: Terraform
+
+on:
+  push:
+    branches: [main, 'feature/**', 'hotfix/**']
+  pull_request:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+      
+      - name: Configure GCP
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      # Determine workspace from branch
+      - name: Determine workspace
+        id: workspace
+        run: |
+          BRANCH_NAME=${{ github.ref_name }}
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            echo "workspace=prod" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH_NAME" == "staging" ]]; then
+            echo "workspace=staging" >> $GITHUB_OUTPUT
+          elif [[ "$BRANCH_NAME" == "develop" ]]; then
+            echo "workspace=dev" >> $GITHUB_OUTPUT
+          else
+            echo "workspace=dev" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Terraform Init
+        run: |
+          terraform init -reconfigure -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+      
+      - name: Select Workspace
+        run: terraform workspace select ${{ steps.workspace.outputs.workspace }} || terraform workspace new ${{ steps.workspace.outputs.workspace }}
+      
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+      
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve tfplan
+```
+
+## HCL Examples
+
+### Workspace-Specific Variables
+
+```hcl
+variable "instance_count" {
+  type = number
+  default = {
+    default = 1
+    dev     = 1
+    staging = 2
+    prod    = 5
+  }
+}
+
+# Usage
+resource "google_compute_instance_group_manager" "app" {
+  target_size = lookup(var.instance_count, terraform.workspace, 1)
+}
+```
+
+### Workspace Metadata
+
+```hcl
+locals {
+  workspace_name = terraform.workspace
+  
+  env_labels = {
+    dev     = { env_type = "development" }
+    staging = { env_type = "staging" }
+    prod    = { env_type = "production" }
+  }
+}
+```
+
+### Conditional Resources
+
+```hcl
+# Only create load balancer in non-dev
+resource "google_compute_global_forwarding_rule" "lb" {
+  count = terraform.workspace != "dev" ? 1 : 0
+  # ...
+}
+```
+
+## CLI Examples
+
+### Workspace Management
+
+```bash
+# List all workspaces
+terraform workspace list
+
+# Show current workspace
+terraform workspace show
+
+# Create new workspace
+terraform workspace new staging
+
+# Create from existing state
+terraform workspace new dev -use-existing
+
+# Select workspace
+terraform workspace select prod
+
+# Delete empty workspace
+terraform workspace delete staging
+
+# Delete workspace (force if not empty)
+terraform workspace delete staging -force
+
+# Show workspace variables
+terraform workspace show
+```
+
+### Workspace with Backend
+
+```bash
+# Init with workspace prefix
+terraform init -backend-config="bucket=my-terraform-state"
+
+# State will be stored as:
+# gs://my-terraform-state/dev/default.tfstate
+# gs://my-terraform-state/prod/default.tfstate
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform workspace list` | List workspaces |
+| `terraform workspace show` | Show current workspace |
+| `terraform workspace new NAME` | Create workspace |
+| `terraform workspace select NAME` | Switch to workspace |
+| `terraform workspace delete NAME` | Delete workspace |
+| `terraform workspace select -use-existing` | Create from existing state |
+
+## Best Practices
+
+### 1. Use Descriptive Workspace Names
+
+```bash
+# Good
+terraform workspace new production
+terraform workspace new staging
+terraform workspace new development
+
+# Avoid
+terraform workspace new env1
+terraform workspace new p
+```
+
+### 2. Workspace-Specific Backend Configuration
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    # prefix automatically set to workspace name
+  }
+}
+```
+
+### 3. Use Maps for Environment-Specific Values
+
+```hcl
+variable "instance_types" {
+  type = map(string)
+  default = {
+    dev     = "e2-medium"
+    staging = "e2-standard-2"
+    prod    = "e2-standard-4"
+  }
+}
+
+locals {
+  instance_type = lookup(var.instance_types, terraform.workspace, "e2-medium")
+}
+```
+
+### 4. Tag Resources with Workspace
+
+```hcl
+locals {
+  common_labels = {
+    workspace = terraform.workspace
+    environment = terraform.workspace
+  }
+}
+```
+
+### 5. Protect Production Workspace
+
+```bash
+# Use CI/CD to prevent direct terraform apply to prod
+# Require approval for prod workspace changes
+# Restrict prod workspace access via IAM
+```
+
+### 6. Workspace Migration
+
+```bash
+# Create workspace for new environment
+terraform workspace new staging
+
+# Migrate state from directory-based config
+terraform init -migrate-state
+```
+
+## Monitoring / State Management
+
+### Workspace State Location
+
+```bash
+# GCS structure for workspace-based state
+gs://my-terraform-state/
+├── default/
+│   └── default.tfstate
+├── dev/
+│   └── default.tfstate
+├── staging/
+│   └── default.tfstate
+└── prod/
+    └── default.tfstate
+```
+
+### Workspace State Operations
+
+```bash
+# Pull workspace state
+terraform state pull > state.tfstate
+
+# View workspace state
+terraform state list
+
+# Migrate state between workspaces
+terraform state push state.tfstate
+```
+
+## Security
+
+### Workspace Access Control
+
+```hcl
+# IAM for workspace-specific state buckets (alternative approach)
+resource "google_storage_bucket_iam_member" "prod_state" {
+  bucket = "my-terraform-state-prod"
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:prod-ci@project.iam.gserviceaccount.com"
+}
+
+resource "google_storage_bucket_iam_member" "dev_state" {
+  bucket = "my-terraform-state-dev"
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:dev-ci@project.iam.gserviceaccount.com"
+}
+```
+
+### Workspace Isolation
+
+```bash
+# Use separate state buckets per environment for stronger isolation
+# Workspace prefix is sufficient for most use cases
+# Consider separate buckets for compliance requirements
+```
+
+## Cost Optimization
+
+### Workspace Resource Scaling
+
+```hcl
+variable "scaling_config" {
+  type = map(object({
+    min_replicas = number
+    max_replicas = number
+    mig_size     = number
+  }))
+  
+  default = {
+    dev = {
+      min_replicas = 1
+      max_replicas = 2
+      mig_size     = 1
+    }
+    staging = {
+      min_replicas = 1
+      max_replicas = 5
+      mig_size     = 2
+    }
+    prod = {
+      min_replicas = 3
+      max_replicas = 20
+      mig_size     = 5
+    }
+  }
+}
+
+locals {
+  scaling = lookup(var.scaling_config, terraform.workspace, var.scaling_config.dev)
+}
+```
+
+## Troubleshooting
+
+### State Not Found
+
+```bash
+# Error: No state found for workspace
+# Solution: Create workspace
+terraform workspace new staging
+terraform apply
+```
+
+### Workspace Lock
+
+```bash
+# Error: State locked
+# Solution: Check lock and wait or force unlock
+terraform state pull | jq '.metadata'
+terraform force-unlock <lock-id>
+```
+
+### Wrong Workspace Selected
+
+```bash
+# Check current workspace
+terraform workspace show
+
+# Switch to correct workspace
+terraform workspace select prod
+
+# Verify resources in state
+terraform state list
+```
+
+### Workspace with Partial Backend
+
+```bash
+# Initialize with bucket
+terraform init -backend-config="bucket=my-terraform-state"
+
+# State stored at workspace prefix
+# Check: gsutil ls gs://my-terraform-state/
+```
+
+## Interview Questions
+
+### Q1: What are Terraform workspaces?
+**A:** Isolated state files within the same configuration. Each workspace has its own state, enabling management of multiple environments with identical code.
+
+### Q2: How do workspaces differ from directories?
+**A:** Workspaces share the same configuration with different state. Directories have different configurations (and optionally different state).
+
+### Q3: How does workspace state get stored?
+**A:** With GCS backend, state is stored at `gs://bucket/workspace_name/terraform.tfstate`.
+
+### Q4: How do you set environment-specific variables with workspaces?
+**A:** Use maps with `terraform.workspace` as key: `lookup(var.config, terraform.workspace, "default")`.
+
+### Q5: How do you protect production workspace?
+**A:** Use CI/CD with manual approval, restrict IAM access, use separate state buckets, implement policy-as-code.
+
+### Q6: Can workspaces have different variables?
+**A:** Yes, using lookup functions or conditional expressions based on `terraform.workspace`.
+
+### Q7: What happens when you delete a workspace?
+**A:** The state file is deleted. Resources managed by that workspace's state are NOT destroyed - they're orphaned.
+
+### Q8: When should you NOT use workspaces?
+**A:** When environments have significantly different configurations, when compliance requires complete isolation, or when variable complexity becomes unmanageable.
+
+## Cheat Sheet
+
+### Workspace Commands
+```bash
+terraform workspace list          # List all
+terraform workspace show          # Current
+terraform workspace new NAME      # Create
+terraform workspace select NAME   # Switch
+terraform workspace delete NAME   # Delete
+```
+
+### Workspace Variable Lookup
+```hcl
+locals {
+  config = {
+    dev = { size = 1 }
+    prod = { size = 5 }
+  }
+  current = lookup(local.config, terraform.workspace, local.config.dev)
+}
+```
+
+### Conditional Resource
+```hcl
+resource "google_compute_instance" "prod_only" {
+  count = terraform.workspace == "prod" ? 1 : 0
+  # ...
+}
+```
+
+### State Location (GCS)
+```
+gs://bucket/workspace/default.tfstate
+```
+
+## Related Topics
+
+- [State](./state.mdx) - State management
+- [Backend](./backend.mdx) - Backend configuration
+- [Variables](./variables.mdx) - Variable patterns
+- [CI/CD](./cicd.mdx) - CI/CD integration
+- [Secrets](./secrets.mdx) - Secrets management

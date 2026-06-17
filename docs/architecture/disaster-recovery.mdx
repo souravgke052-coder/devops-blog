@@ -1,0 +1,990 @@
+# Disaster Recovery Architecture
+
+sidebar_position: 7
+
+## Overview
+
+Disaster recovery (DR) ensures business continuity when catastrophic failures occur. This document covers DR strategies, RTO/RPO targets, backup strategies, failover procedures, and runbooks for the DevOps Blog platform running on GCP.
+
+## When To Use
+
+- Planning for regional outages (natural disasters, infrastructure failures)
+- Meeting compliance requirements for data protection
+- Protecting critical business systems
+- Preparing for ransomware and data corruption scenarios
+- Business continuity planning
+
+## When NOT to Use
+
+- Non-critical systems with acceptable downtime
+- Development/test environments
+- When RTO/RPO requirements are flexible (acceptable extended downtime)
+- When DR costs exceed business value
+
+## Core Concepts
+
+### Key DR Metrics
+
+| Metric | Definition | Platform Target |
+|--------|------------|-----------------|
+| RTO (Recovery Time Objective) | Maximum acceptable downtime | < 30 minutes |
+| RPO (Recovery Point Objective) | Maximum acceptable data loss | < 5 minutes |
+| RCO (Recovery Cost Objective) | Maximum acceptable recovery cost | Budget-defined |
+| MTTR (Mean Time To Recovery) | Actual average recovery time | Measure and improve |
+
+### DR Strategies
+
+```
+DR Strategy Continuum (Cost vs Recovery Time):
+
+Cheapest ──────────────────────────────────────────► Most Expensive
+
+Pilot Light    Warm Standby    Active-Active    Multi-Region Active
+    │               │               │                │
+    │  Minimal      │  Scaled-down  │  All regions   │  Full capacity
+    │  resources    │  full stack   │  active,       │  in all regions
+    │  warm         │  in DR        │  load balanced │
+    │               │               │                │
+    ▼               ▼               ▼                ▼
+  Hours          Minutes         Minutes          Seconds
+  RTO            RTO             RTO              RTO
+```
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       Disaster Recovery Architecture                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌──────────────────────────┐     ┌──────────────────────────┐         │
+│  │     PRIMARY REGION       │     │     DR REGION            │         │
+│  │     (us-central1)        │     │     (europe-west1)       │         │
+│  │                          │     │                          │         │
+│  │  ┌──────────────────┐   │     │  ┌──────────────────┐   │         │
+│  │  │   Cloud Run      │   │     │  │   Cloud Run      │   │         │
+│  │  │   Services       │   │     │  │   (Warm Standby) │   │         │
+│  │  │                  │   │     │  │                  │   │         │
+│  │  │  min: 2          │   │     │  │  min: 0          │   │         │
+│  │  │  max: 100        │   │     │  │  max: 50         │   │         │
+│  │  └──────────────────┘   │     │  └────────┬─────────┘   │         │
+│  │              │          │     │           │             │         │
+│  │              │ Sync     │     │           │ Async       │         │
+│  │              ▼          │     │           │ Backup      │         │
+│  │  ┌──────────────────┐   │     │  ┌────────┴─────────┐   │         │
+│  │  │   Cloud SQL      │   │◄────┼─►│   Cloud SQL      │   │         │
+│  │  │   (Regional HA)  │   │     │  │   (Cross-region  │   │         │
+│  │  │                  │   │     │  │    replica)      │   │         │
+│  │  │  Primary         │   │     │  │  Read Replica    │   │         │
+│  │  └──────────────────┘   │     │  └──────────────────┘   │         │
+│  │              │          │     │           │             │         │
+│  │              │          │     │           │             │         │
+│  │              ▼          │     │           ▼             │         │
+│  │  ┌──────────────────┐   │     │  ┌──────────────────┐   │         │
+│  │  │   Cloud Storage  │   │     │  │   Cloud Storage  │   │         │
+│  │  │   (GCS)          │   │     │  │   (Cross-region  │   │         │
+│  │  │                  │   │     │  │    backup)       │   │         │
+│  │  │  Versioning: ON  │   │     │  │                  │   │         │
+│  │  │  Lifecycle: 30d  │   │     │  │  Versioning: ON  │   │         │
+│  │  └──────────────────┘   │     │  │  Lifecycle: 90d  │   │         │
+│  │                         │     │  │                  │   │         │
+│  └─────────────────────────┘     │  └──────────────────┘   │         │
+│                                  │                          │         │
+│                                  │  ┌──────────────────┐   │         │
+│                                  │  │   Cloud Spanner  │   │         │
+│                                  │  │   (Global)       │   │         │
+│                                  │  │                  │   │         │
+│                                  │  │  Replicas in:    │   │         │
+│                                  │  │  us, eu, asia    │   │         │
+│                                  │  └──────────────────┘   │         │
+│                                  └──────────────────────────┘         │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    DR Automation (Cloud Functions)                │   │
+│  │  - Automated health monitoring                                   │   │
+│  │  - DNS failover with Cloud DNS                                   │   │
+│  │  - Database promotion scripts                                    │   │
+│  │  - Notification via PagerDuty                                    │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Backup and Restore Automation
+
+```typescript
+// Backup Orchestration Service
+import { Storage } from '@google-cloud/storage';
+import { SQLAdmin } from '@google-cloud/sql-admin';
+import { PubSub } from '@google-cloud/pubsub';
+
+const storage = new Storage();
+const sqlAdmin = new SQLAdmin();
+const pubsub = new PubSub();
+
+const BACKUP_BUCKET = 'gs://devops-blog-dr-backups';
+const RETENTION_DAYS = 90;
+const DR_REGION = 'europe-west1';
+
+// Scheduled backup job - runs every 4 hours
+exportconst scheduledBackup = async (event: any) => {
+  console.log('Starting scheduled backup process');
+
+  const results = await Promise.allSettled([
+    backupCloudSQL(),
+    backupCloudSpanner(),
+    backupGCSData(),
+    backupSecretManager()
+  ]);
+
+  const failures = results.filter(r => r.status === 'rejected');
+  if (failures.length > 0) {
+    console.error('Some backups failed:', failures);
+    await sendAlert('BACKUP_FAILURE', failures.map(f => (f as any).reason));
+  }
+
+  console.log('Backup process completed');
+};
+
+// Cloud SQL Backup
+async function backupCloudSQL(): Promise<void> {
+  const instances = await sqlAdmin.instances.list();
+
+  for (const instance of instances.items || []) {
+    const instanceName = instance.name!;
+    const projectId = instance.project!;
+
+    console.log(`Backing up Cloud SQL instance: ${instanceName}`);
+
+    // Trigger on-demand backup
+    const [operation] = await sqlAdmin.instances.addBackupCycle({
+      instance: instanceName,
+      project: projectId
+    }).catch(async () => {
+      // If automatic backup exists, export to GCS
+      const backupConfig = await sqlAdmin.instances.getBackupRun(instanceName, {
+        project: projectId,
+        maxResults: 1
+      });
+
+      if (backupConfig[0].status === 'SUCCESSFUL') {
+        // Export backup to GCS
+        const bucket = storage.bucket(BACKUP_BUCKET.replace('gs://', ''));
+        const destFile = bucket.file(`sql-backups/${instanceName}/${new Date().toISOString()}.sql`);
+
+        await sqlAdmin.instances.exportInstance(instanceName, {
+          project: projectId,
+          exportContext: {
+            fileType: 'SQL',
+            uri: `gs://${BACKUP_BUCKET}/sql-backups/${instanceName}/${Date.now()}.sql`,
+            databases: [instanceName.replace('-db', '')]
+          }
+        });
+      }
+    });
+
+    if (operation) {
+      await operation.promise();
+    }
+
+    // Copy to DR region
+    await copyToDRRegion(
+      `sql-backups/${instanceName}/`,
+      `sql-backups/${instanceName}-dr/`
+    );
+
+    console.log(`Cloud SQL backup completed for: ${instanceName}`);
+  }
+}
+
+// Cloud Spanner Backup
+async function backupCloudSpanner(): Promise<void> {
+  const instances = await sqlAdmin.instances.listSpanner();
+
+  for (const instance of instances.items || []) {
+    if (!instance.name?.includes('spanner')) continue;
+
+    console.log(`Backing up Spanner instance: ${instance.name}`);
+
+    const backupId = `backup-${Date.now()}`;
+    const [operation, _] = await sqlAdmin.instances.backups.create({
+      parent: instance.name,
+      backupId,
+      expireTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+    });
+
+    await operation.promise();
+
+    console.log(`Spanner backup created: ${backupId}`);
+  }
+}
+
+// GCS Data Backup with versioning
+async function backupGCSData(): Promise<void> {
+  const buckets = [
+    'devops-blog-content',
+    'devops-blog-uploads',
+    'devops-blog-assets'
+  ];
+
+  for (const bucketName of buckets) {
+    console.log(`Backing up GCS bucket: ${bucketName}`);
+
+    // List all objects with versions
+    const [objects] = await storage.bucket(bucketName).getFiles({
+      versions: true
+    });
+
+    for (const file of objects) {
+      const [metadata] = await file.getMetadata();
+
+      // Copy current version to DR bucket
+      const drBucket = storage.bucket(`${bucketName}-dr-${DR_REGION}`);
+      await storage.bucket(bucketName).file(file.name).copy(
+        drBucket.file(file.name)
+      );
+    }
+
+    console.log(`GCS backup completed for: ${bucketName}`);
+  }
+}
+
+// DR Region Copy
+async function copyToDRRegion(sourcePrefix: string, destPrefix: string): Promise<void> {
+  const sourceBucket = storage.bucket(BACKUP_BUCKET.replace('gs://', ''));
+  const destBucket = storage.bucket(BACKUP_BUCKET.replace('gs://', '').replace('us-central1', DR_REGION));
+
+  const [files] = await sourceBucket.getFiles({ prefix: sourcePrefix });
+
+  for (const file of files) {
+    const destName = file.name.replace(sourcePrefix, destPrefix);
+    await file.copy(destBucket.file(destName));
+  }
+}
+
+// Database Restore Procedure
+exportconst restoreDatabase = async (event: any) => {
+  const { instanceId, backupTimestamp, targetInstance } = event;
+
+  console.log(`Starting restore of ${instanceId} from ${backupTimestamp}`);
+
+  // Verify backup exists
+  const backupExists = await verifyBackupExists(instanceId, backupTimestamp);
+  if (!backupExists) {
+    throw new Error(`Backup not found for ${instanceId} at ${backupTimestamp}`);
+  }
+
+  // Stop traffic to target instance
+  await pauseTraffic(targetInstance);
+
+  // Promote replica if using cross-region replica
+  if (targetInstance.includes('replica')) {
+    await promoteReadReplica(targetInstance);
+  }
+
+  // Restore from backup
+  await sqlAdmin.instances.restoreBackup(instanceId, {
+    backupId: `backup-${backupTimestamp}`,
+    project: process.env.PROJECT_ID!
+  });
+
+  // Verify restore
+  await verifyRestoreComplete(targetInstance);
+
+  // Resume traffic
+  await resumeTraffic(targetInstance);
+
+  // Send notification
+  await pubsub.topic('dr-notifications').publish({
+    attributes: { eventType: 'RESTORE_COMPLETED' },
+    data: Buffer.from(JSON.stringify({
+      instanceId,
+      targetInstance,
+      restoredAt: new Date().toISOString()
+    }))
+  });
+
+  console.log(`Restore completed for ${instanceId}`);
+};
+```
+
+### Failover Runbook Automation
+
+```typescript
+// DR Failover Orchestrator
+exportclass DRFailoverOrchestrator {
+  private readonly primaryRegion = 'us-central1';
+  private readonly drRegion = 'europe-west1';
+  private readonly healthCheckEndpoint = '/healthz';
+
+  constructor(
+    private readonly monitoring: MonitoringClient,
+    private readonly dns: DNSClient,
+    private readonly pubsub: PubSub
+  ) {}
+
+  async executeFailover(): Promise<FailoverResult> {
+    console.log('Starting DR failover procedure');
+
+    const startTime = Date.now();
+    const steps: FailoverStep[] = [];
+
+    try {
+      // Step 1: Verify primary is unhealthy
+      const primaryHealth = await this.checkRegionHealth(this.primaryRegion);
+      steps.push({ name: 'verify_primary_unhealthy', status: primaryHealth.healthy ? 'SKIPPED' : 'COMPLETED' });
+
+      if (primaryHealth.healthy) {
+        console.warn('Primary region appears healthy - failover may not be needed');
+        return { success: false, reason: 'Primary appears healthy', steps };
+      }
+
+      // Step 2: Promote DR database
+      console.log('Promoting DR database...');
+      await this.promoteDRDatabase();
+      steps.push({ name: 'promote_dr_database', status: 'COMPLETED' });
+
+      // Step 3: Update DNS to point to DR
+      console.log('Updating DNS records...');
+      await this.updateDNSForDR();
+      steps.push({ name: 'update_dns', status: 'COMPLETED' });
+
+      // Step 4: Scale up DR services
+      console.log('Scaling up DR services...');
+      await this.scaleUpDRServices();
+      steps.push({ name: 'scale_dr_services', status: 'COMPLETED' });
+
+      // Step 5: Verify DR is healthy
+      const drHealth = await this.checkRegionHealth(this.drRegion);
+      if (!drHealth.healthy) {
+        throw new Error('DR region health check failed');
+      }
+      steps.push({ name: 'verify_dr_healthy', status: 'COMPLETED' });
+
+      // Step 6: Send notifications
+      await this.sendFailoverNotification();
+
+      const duration = Date.now() - startTime;
+      console.log(`Failover completed in ${duration}ms`);
+
+      return {
+        success: true,
+        duration,
+        steps,
+        details: {
+          from: this.primaryRegion,
+          to: this.drRegion,
+          completedAt: new Date().toISOString()
+        }
+      };
+
+    } catch (error) {
+      console.error('Failover failed:', error);
+      await this.sendAlert('FAILOVER_FAILED', error);
+      throw error;
+    }
+  }
+
+  private async checkRegionHealth(region: string): Promise<HealthResult> {
+    const endpoint = `https://api-${region}.devops-blog.example.com${this.healthCheckEndpoint}`;
+
+    try {
+      const response = await fetch(endpoint, { timeout: 5000 });
+      const data = await response.json();
+
+      return {
+        healthy: response.ok && data.status === 'healthy',
+        latency: data.latencyMs,
+        region
+      };
+    } catch (error) {
+      return { healthy: false, error: (error as Error).message, region };
+    }
+  }
+
+  private async promoteDRDatabase(): Promise<void> {
+    // Promote read replica to primary
+    const command = new Command({
+      cmd: `gcloud sql instances promote-replica ${this.getDRInstanceName()}`,
+      timeout: 300000 // 5 minutes
+    });
+
+    await command.execute();
+
+    // Wait for promotion to complete
+    await this.waitForInstanceState('RUNNABLE', this.drRegion);
+  }
+
+  private async updateDNSForDR(): Promise<void> {
+    // Update Cloud DNS managed zone
+    const changes = await this.dns.changes.create({
+      batchBody: {
+        changes: {
+          additions: [{
+            name: 'api',
+            type: 'A',
+            ttl: 300,
+            data: await this.getDRIPAddress()
+          }]
+        }
+      }
+    });
+
+    await changes.promise();
+
+    // Wait for DNS propagation
+    await this.sleep(60); // 60 seconds for TTL
+  }
+
+  private async scaleUpDRServices(): Promise<void> {
+    const services = ['content-api', 'auth-api', 'billing-api'];
+
+    await Promise.all(services.map(service =>
+      this.scaleService(service, 5) // Scale to 5 instances
+    ));
+  }
+
+  private async scaleService(service: string, instances: number): Promise<void> {
+    await runCommand(`gcloud run services update ${service} --region ${this.drRegion} --min-instances ${instances}`);
+  }
+
+  private async getDRIPAddress(): Promise<string> {
+    const [service] = await runCommand(
+      `gcloud compute addresses describe dr-lb-ip --region=${this.drRegion} --format="get(address)"`
+    );
+    return service.stdout.trim();
+  }
+
+  private async sendFailoverNotification(): Promise<void> {
+    await this.pubsub.topic('dr-notifications').publish({
+      attributes: {
+        eventType: 'FAILOVER_COMPLETED',
+        timestamp: new Date().toISOString(),
+        fromRegion: this.primaryRegion,
+        toRegion: this.drRegion
+      },
+      data: Buffer.from(JSON.stringify({
+        message: 'DR failover completed successfully',
+        timestamp: new Date().toISOString()
+      }))
+    });
+
+    // Send to PagerDuty
+    await this.pagerDutyClient.events.send({
+      eventType: 'trigger',
+      payload: {
+        summary: 'DR Failover Completed',
+        severity: 'critical',
+        source: 'dr-orchestrator'
+      }
+    });
+  }
+
+  private getDRInstanceName(): string {
+    return `devops-blog-db-${this.drRegion}`;
+  }
+
+  private async waitForInstanceState(
+    targetState: string,
+    region: string,
+    maxWaitMs: number = 300000
+  ): Promise<void> {
+    const start = Date.now();
+
+    while (Date.now() - start < maxWaitMs) {
+      const instance = await this.sqlAdmin.instances.get(this.getDRInstanceName());
+      if (instance.state === targetState) return;
+      await this.sleep(10000);
+    }
+
+    throw new Error(`Instance did not reach state ${targetState} within ${maxWaitMs}ms`);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+```
+
+### Terraform for DR Infrastructure
+
+```hcl
+# Terraform - DR Configuration
+
+variable "project_id" {
+  type = string
+}
+
+variable "primary_region" {
+  type    = string
+  default = "us-central1"
+}
+
+variable "dr_region" {
+  type    = string
+  default = "europe-west1"
+}
+
+# DR Cloud SQL with Cross-Region Replica
+resource "google_sql_database_instance" "primary_db" {
+  name             = "devops-blog-primary-db"
+  database_version = "POSTGRES_15"
+  region           = var.primary_region
+
+  deletion_protection = true
+
+  settings {
+    tier              = "db-n1-standard-4"
+    availability_type = "REGIONAL"  # High availability in primary
+    disk_autoresize   = true
+
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "02:00"
+      point_in_time_recovery_enabled = true
+      backup_retention_settings {
+        retained_backups = 14
+        retention_unit   = "COUNT"
+      }
+    }
+
+    maintenance_window {
+      day          = 0  # Sunday
+      hour         = 4
+      update_track = "stable"
+    }
+  }
+}
+
+# Cross-region read replica for DR
+resource "google_sql_database_instance" "dr_replica" {
+  name                 = "devops-blog-dr-replica"
+  database_version     = "POSTGRES_15"
+  region               = var.dr_region
+  master_instance_name = google_sql_database_instance.primary_db.name
+
+  deletion_protection = false  # Can be deleted during DR
+
+  settings {
+    tier              = "db-n1-standard-4"
+    availability_type = "ZONAL"
+    disk_autoresize   = true
+  }
+}
+
+# DR Cloud Storage bucket with versioning
+resource "google_storage_bucket" "dr_backup" {
+  name          = "${var.project_id}-dr-backups-${var.dr_region}"
+  location      = var.dr_region
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+    condition {
+      age = 90  # Retain for 90 days
+    }
+  }
+
+  lifecycle_rule {
+    action {
+      type = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+    condition {
+      age = 30  # Move to nearline after 30 days
+    }
+  }
+
+  # Cross-region replication configuration
+  cross_region_properties {
+    placement {
+      data_locations = [var.dr_region, "europe-west4"]
+    }
+  }
+}
+
+# DR Cloud Run service with minimum instances (warm standby)
+resource "google_cloud_run_v2_service" "dr_api_service" {
+  name     = "content-api-dr"
+  location = var.dr_region
+
+  template {
+    service_account = google_service_account.dr_service.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/content-api:${var.image_tag}"
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "1Gi"
+        }
+      }
+    }
+
+    # Min instances = 0 for cost savings, scale up during DR
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 100
+    }
+  }
+}
+
+# Backup schedule via Cloud Scheduler
+resource "google_cloud_scheduler_job" "backup_job" {
+  name        = "dr-backup-job"
+  description = "Triggers backup Cloud Function every 4 hours"
+  region      = var.primary_region
+  schedule    = "0 */4 * * *"  # Every 4 hours
+  time_zone   = "UTC"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://${var.region}-${google_cloudfunctions2_function.backup_orchestrator.id}.run.app"
+
+    oidc_token {
+      service_account_email = google_service_account.backup_orchestrator.email
+    }
+  }
+}
+
+# Cloud Function for backup orchestration
+resource "google_cloudfunctions2_function" "backup_orchestrator" {
+  name        = "backup-orchestrator"
+  location    = var.primary_region
+  description = "Orchestrates database backups for DR"
+
+  build_config {
+    runtime     = "nodejs18"
+    entry_point = "scheduledBackup"
+
+    source {
+      storage_source {
+        bucket = "${var.project_id}-functions-source"
+        object = google_storage_bucket_object.backup_function.name
+      }
+    }
+  }
+
+  service_config {
+    max_instance_count    = 2
+    min_instance_count    = 0
+    timeout_seconds       = 600
+    available_memory      = "512M"
+    service_account_email = google_service_account.backup_orchestrator.email
+  }
+}
+
+# DR Alert policies
+resource "google_monitoring_alert_policy" "dr_backup_failure" {
+  display_name = "DR Backup Failure Alert"
+
+  conditions {
+    display_name = "Backup job failed"
+    condition_threshold {
+      filter = |
+        resource.type="cloud_scheduler_job" AND
+        metric.type="cloud_scheduler.googleapis.com/job/failures" AND
+        metric.value > 0
+      duration = 60s
+      comparison = comparison.GT
+      threshold_value = 0
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.pagerduty.id]
+}
+
+# Service Accounts
+resource "google_service_account" "dr_service" {
+  account_id   = "dr-service-sa"
+  display_name = "DR Service Account"
+}
+
+resource "google_service_account" "backup_orchestrator" {
+  account_id   = "backup-orchestrator-sa"
+  display_name = "Backup Orchestrator Service Account"
+}
+
+# IAM for backup
+resource "google_project_iam_member" "backup_orchestrator_roles" {
+  for_each = toset([
+    "roles/cloudsql.client",
+    "roles/storage.objectAdmin",
+    "roles/secretmanager.secretAccessor"
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.backup_orchestrator.email}"
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### DR Pattern: Database Failover
+
+```typescript
+// Automated database failover
+async function performDatabaseFailover(
+  sourceInstance: string,
+  targetInstance: string
+): Promise<void> {
+  const sqlAdmin = new SQLAdmin();
+
+  // 1. Verify target is reachable
+  const [targetInstanceData] = await sqlAdmin.instances.get(targetInstance);
+  if (targetInstanceData.state !== 'RUNNABLE') {
+    throw new Error(`Target instance ${targetInstance} not in RUNNABLE state`);
+  }
+
+  // 2. Stop all write traffic (implement in application)
+  await updateApplicationTraffic('read-only');
+
+  // 3. Wait for replication to catch up
+  const replicationLag = await getReplicationLag(sourceInstance);
+  if (replicationLag > 300) { // 5 minutes
+    console.warn(`High replication lag: ${replicationLag}s`);
+  }
+
+  // 4. Promote replica
+  const [operation] = await sqlAdmin.instances.demoteMaster(targetInstance, {
+    sourceInstanceData
+  });
+  await operation.promise();
+
+  // 5. Update DNS
+  await updateDatabaseDNS(targetInstance);
+
+  // 6. Resume traffic
+  await updateApplicationTraffic('read-write');
+
+  // 7. Log for audit
+  await logFailoverEvent({
+    sourceInstance,
+    targetInstance,
+    timestamp: new Date().toISOString(),
+    replicationLag
+  });
+}
+```
+
+### Anti-patterns
+
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| No regular DR testing | Untested procedures fail when needed | Quarterly DR drills |
+| Backups without restore testing | Backup may be corrupt | Test restore quarterly |
+| Single-region DR | DR region may be affected by same event | Choose geographically distant regions |
+| Manual failover | Slow, error-prone during crisis | Automate failover procedures |
+| Ignoring RTO/RPO | Over/under investment in DR | Define realistic targets |
+
+## Monitoring
+
+### DR-Specific Monitoring
+
+```yaml
+# DR Dashboard
+dashboard:
+  displayName: "Disaster Recovery Dashboard"
+
+  widgets:
+    - title: "Last Successful Backup"
+      singleValue:
+        value: |
+          fetch backup_time
+          | metric 'custom.googleapis.com/backup/last_successful'
+          | group_by 1m, max
+
+    - title: "Database Replication Lag"
+      gaugeChart:
+        displayName: "Replication Lag (seconds)"
+        metric: cloudsql.googleapis.com/database/postgresql/replication/replica_lag
+
+    - title: "DR Region Health"
+      scorecard:
+        displayName: "DR Region Status"
+        metric: custom.googleapis.com/dr/region_health
+```
+
+### Backup Verification
+
+```bash
+# Check backup status
+gcloud sql backups list --instance=devops-blog-primary-db
+
+# Verify backup integrity
+gcloud sql instances describe devops-blog-primary-db \
+  --format="table(settings.backupConfiguration)"
+
+# Test restore to point in time
+gcloud sql instances restore-backup devops-blog-dr-replica \
+  --backup-id=<backup-id>
+```
+
+## Security
+
+### DR Security Considerations
+
+```hcl
+# Encrypted backups
+resource "google_sql_database_instance" "primary_db" {
+  settings {
+    backup_configuration {
+      enabled = true
+      encryption_key_name = google_kms_crypto_key.backup_key.id
+    }
+  }
+}
+
+# Customer-managed encryption keys
+resource "google_kms_crypto_key" "backup_key" {
+  name            = "backup-encryption-key"
+  key_ring        = google_kms_key_ring.backup_key_ring.id
+  purpose         = "ENCRYPT_DECRYPT"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# DR access control - limited IAM
+resource "google_project_iam_member" "dr_service_readonly" {
+  project = var.project_id
+  role    = "roles/cloudsql.viewer"
+  member  = "serviceAccount:dr-service@${var.project_id}.iam.gserviceaccount.com"
+}
+```
+
+## Cost Optimization
+
+### DR Cost Management
+
+| Component | Full Capacity | Warm Standby | Pilot Light |
+|-----------|---------------|--------------|-------------|
+| Cloud Run | 100 instances | 5 instances | 0 instances |
+| Cloud SQL | Full instance | Same tier | Small instance |
+| Memorystore | Full cluster | Single node | None |
+| Monthly Cost | ~$50k | ~$15k | ~$5k |
+
+```hcl
+# Cost-optimized DR resources
+resource "google_sql_database_instance" "dr_replica" {
+  # Use smaller instance for DR
+  settings {
+    tier = "db-n1-standard-2"  # Smaller than primary
+  }
+}
+
+# Scheduled scaling for DR services
+resource "google_cloud_scheduler_job" "scale_down_dr" {
+  schedule = "0 22 * * *"  # 10 PM
+  # Scale down DR to minimum
+}
+
+resource "google_cloud_scheduler_job" "scale_up_dr" {
+  schedule = "0 8 * * *"  # 8 AM
+  # Scale up DR during business hours
+}
+```
+
+## Troubleshooting
+
+### Common DR Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| Replication lag high | Network issues, heavy write load | Increase instance size, reduce write load |
+| Failover slow | Manual steps, DNS TTL | Automate, reduce TTL |
+| Backup failures | Storage quota, permissions | Check IAM, increase quota |
+| DR region down | Regional outage | Use third region for critical systems |
+| Data corruption | Application bug, ransomware | Verify backups, restore from clean backup |
+
+### Emergency Procedures
+
+```bash
+# Emergency: Force promote DR replica
+gcloud sql instances promote-replica devops-blog-dr-replica
+
+# Emergency: Update DNS immediately
+gcloud dns record-sets transaction start --zone=prod-zone
+gcloud dns record-sets transaction add <DR_IP> \
+  --name=api.devops-blog.example.com \
+  --type=A --ttl=60 \
+  --zone=prod-zone
+gcloud dns record-sets transaction execute --zone=prod-zone
+
+# Emergency: Scale DR services immediately
+for service in content-api auth-api billing-api; do
+  gcloud run services update $service \
+    --region europe-west1 \
+    --min-instances 10
+done
+```
+
+## Interview Questions
+
+### Q1: What is your DR strategy and why?
+**Answer**: Warm standby in DR region with automated failover. Warm standby maintains minimum running instances to reduce RTO while keeping costs manageable. Automated failover ensures fast recovery without human intervention during crisis. DR region is geographically distant (US to EU) to avoid correlated failures.
+
+### Q2: How do you test your DR plan?
+**Answer**: Quarterly DR drills with actual failover to DR region. We verify RTO by measuring actual recovery time. Test restores of database backups quarterly. Chaos engineering to simulate regional failures. All tests documented with lessons learned.
+
+### Q3: What RTO/RPO can you actually achieve?
+**Answer**: Based on testing, we achieve RTO of approximately 15-20 minutes for automated failover scenarios. Our RPO is typically less than 5 minutes due to continuous replication. These meet our business requirements of RTO < 30 min and RPO < 15 min.
+
+### Q4: How do you handle data corruption scenarios?
+**Answer**: Point-in-time recovery from Cloud SQL with 14-day retention. Object versioning in GCS with immutable storage. Application-level audit logs for corruption detection. Regular integrity checks via checksum validation.
+
+### Q5: What happens if both primary and DR regions fail?
+**Answer**: We have a third backup region (asia-east1) for critical data stored in Spanner with global replication. GCS cross-region replication ensures object availability. For catastrophic multi-region failure, we maintain offline backups in cold storage with 24-hour RTO.
+
+## Cheat Sheet
+
+```bash
+# Check database backup status
+gcloud sql backups list --instance=devops-blog-primary-db
+
+# Promote DR replica
+gcloud sql instances promote-replica devops-blog-dr-replica
+
+# Verify replication status
+gcloud sql instances describe devops-blog-primary-db \
+  --format="get(settings.replicaConfiguration)"
+
+# Test DR failover
+gcloud functions call execute-failover \
+  --data='{"confirm":true}'
+
+# Check DR service health
+gcloud run services describe content-api-dr --region europe-west1
+
+# Update DNS for failover
+gcloud dns record-sets list --zone=prod-zone
+gcloud dns record-sets update api A --zone=prod-zone --rrdatas=<DR_IP>
+
+# Restore from backup
+gcloud sql instances restore-backup devops-blog-dr-replica \
+  --backup-id=<backup-id> \
+  --restore-instance=devops-blog-dr-replica
+
+# Verify backup integrity
+gcloud sql instances describe devops-blog-primary-db \
+  --format="get(settings.backupConfiguration)"
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Platform architecture introduction
+- [Multi-Region](./multi-region.mdx) - Cross-region deployment
+- [Cost Architecture](./cost-architecture.mdx) - DR cost management
+- [Security Architecture](./security-architecture.mdx) - Backup security

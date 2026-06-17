@@ -1,0 +1,1040 @@
+---
+sidebar_position: 7
+title: "CI/CD Interview Questions"
+description: "Advanced CI/CD interview questions covering pipeline design, deployment strategies, GitOps, and release management"
+---
+
+# CI/CD Interview Questions
+
+## Overview
+
+CI/CD is the backbone of modern software delivery. Senior engineers must understand not just how to write pipeline YAML, but how to design pipelines that are fast, reliable, secure, and maintainable.
+
+These questions probe your knowledge of deployment strategies, pipeline architecture, security scanning, and your ability to design pipelines for complex microservice architectures.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Compare blue-green deployments, canary releases, and rolling deployments. When would you choose each?**
+
+A: **Deployment strategy comparison**:
+
+**Rolling deployment**:
+- Gradually replaces instances with new version
+- Old and new versions run simultaneously
+- Downtime if load balancer doesn't handle gradual shift
+- Resource usage: N to 2N during rollout
+
+```
+Before:  [v1][v1][v1][v1]
+Step 1:  [v2][v1][v1][v1]
+Step 2:  [v2][v2][v1][v1]
+Step 3:  [v2][v2][v2][v1]
+Step 4:  [v2][v2][v2][v2]
+```
+
+**Blue-green deployment**:
+- Maintains two identical environments
+- Traffic switches instantly from blue (old) to green (new)
+- Quick rollback: switch back to blue
+- Resource cost: 2x infrastructure
+
+```
+Blue (production): [v1][v1][v1]
+Green (idle):      [v2][v2][v2]
+
+Switch: All traffic goes to Green
+Rollback: All traffic back to Blue
+```
+
+**Canary release**:
+- New version serves small % of traffic
+- Gradually increases traffic
+- Can catch issues before full rollout
+- Data: Real metrics from real users
+
+```
+Initial:     [v1][v1][v1][v1][v1][v1][v1][v1][v1][v1]
+10% canary:  [v2][v1][v1][v1][v1][v1][v1][v1][v1][v1]
+50% canary:  [v2][v2][v2][v2][v2][v1][v1][v1][v1][v1]
+100%:        [v2][v2][v2][v2][v2][v2][v2][v2][v2][v2]
+```
+
+**Selection guide**:
+
+| Strategy | Use When | Risk | Rollback Speed |
+|----------|----------|------|----------------|
+| Rolling | Stable apps, cost-sensitive | Low | Minutes |
+| Blue-Green | Zero-downtime critical apps | Very Low | Seconds |
+| Canary | High-risk changes, metrics-driven | Low-Medium | Minutes |
+
+**Implementation in Kubernetes**:
+
+```yaml
+# Rolling (default for Deployment)
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+
+# Blue-Green via Service selector change
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+spec:
+  selector:
+    app: my-app
+    version: green  # Switch from "blue" to "green"
+---
+# Also use PodDisruptionBudget to ensure old pods are evicted
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app
+spec:
+  maxUnavailable: 0  # No voluntary disruptions during switch
+  selector:
+    matchLabels:
+      app: my-app
+      version: blue  # Protect blue pods
+
+# Canary via Argo Rollouts
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: my-app
+spec:
+  strategy:
+    canary:
+      steps:
+        - setWeight: 5
+        - pause: {}  # Wait for manual approval or automatic analysis
+        - setWeight: 20
+        - pause: {duration: 10}
+        - setWeight: 50
+        - pause: {}
+        - setWeight: 100
+      analysis:
+        templates:
+          - templateName: success-rate
+        startingStep: 1
+        args:
+          - name: service-name
+            value: my-app-canary
+```
+
+---
+
+**Q: Explain the GitOps workflow. How does it differ from traditional CI/CD?**
+
+A: **GitOps vs Traditional CI/CD**:
+
+**Traditional CI/CD**:
+```
+Developer → Git → CI Server (build/test) → Deploy to Kubernetes
+                ↑
+        Pipeline pulls code,
+        builds image, deploys
+```
+
+**GitOps**:
+```
+Developer → Git → ArgoCD/Flux → Kubernetes
+              ↑
+        Changes auto-detected,
+        drift corrected
+```
+
+**GitOps principles**:
+1. **Declarative**: Everything described in Git
+2. **Versioned**: Every change is a Git commit
+3. **Automated sync**: Software agent ensures reality matches Git
+4. **Self-healing**: Drift is automatically corrected
+
+**ArgoCD implementation**:
+
+```yaml
+# Application definition in Git
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: production
+  source:
+    repoURL: https://github.com/org/infra-config
+    targetRevision: main
+    path: apps/my-app/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+**Advantages of GitOps**:
+- **Audit trail**: Every change is a commit with author/timestamp
+- **Rollback**: `git revert` + auto-sync = instant rollback
+- **Security**: CI server doesn't need Kubernetes credentials
+- **Consistency**: If CI dies, deployments continue (Flux/ArgoCD runs in-cluster)
+
+**Multi-environment with GitOps**:
+```
+infrastructure/
+├── apps/
+│   └── my-app/
+│       ├── base/
+│       │   ├── deployment.yaml
+│       │   └── service.yaml
+│       ├── staging/        # Points to base, overrides images
+│       │   └── kustomization.yaml
+│       └── production/
+│           └── kustomization.yaml
+```
+
+```yaml
+# apps/my-app/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+bases:
+  - ../base
+images:
+  - name: my-app
+    newTag: v1.2.3  # Changed here triggers production rollout
+replicas:
+  - name: my-app
+    count: 5
+```
+
+---
+
+**Q: What is a release pipeline? How do you implement zero-downtime releases?**
+
+A: **Release pipeline stages**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Release Pipeline                        │
+│                                                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐ │
+│  │  Build  │→ │  Test   │→ │ Security│→ │   Staging/QA    │ │
+│  │  Image  │  │  Suite  │  │  Scan   │  │   Deploy        │ │
+│  └─────────┘  └─────────┘  └─────────┘  └────────┬────────┘ │
+│                                                   │          │
+│                     ┌─────────────────────────────┘          │
+│                     │                                        │
+│                     ▼                                        │
+│  ┌──────────────────┴──────────────────┐                    │
+│  │         Pre-Production              │                    │
+│  │  (Smoke tests, integration tests,   │                    │
+│  │   load tests, canary analysis)      │                    │
+│  └──────────────────┬──────────────────┘                    │
+│                     │                                        │
+│                     ▼                                        │
+│  ┌─────────────────────────────────────────┐               │
+│  │        Production (Blue/Green/Canary)   │               │
+│  └─────────────────────────────────────────┘               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Zero-downtime release implementation**:
+
+1. **Database migrations must be backward compatible**:
+```sql
+-- WRONG: Breaking change
+ALTER TABLE users DROP COLUMN email;
+
+-- RIGHT: Multi-step migration
+-- Step 1: Deploy app that writes to BOTH old and new columns
+-- Step 2: Backfill new column
+-- Step 3: Deploy app that only reads from new column
+-- Step 4: Drop old column (separate release)
+```
+
+2. **Health check during deployment**:
+```yaml
+# Kubernetes readiness probe (must be accurate!)
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+---
+# App must return 200 only when ready to serve traffic
+# Include: database connectivity, cache connectivity, dependent services
+```
+
+3. **Graceful shutdown**:
+```go
+// Go example
+func main() {
+    srv := &http.Server{Addr: ":8080"}
+    
+    // Wait for OS signals
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+    
+    go func() {
+        <-sigChan
+        
+        // Stop accepting new connections
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        
+        // Wait for in-flight requests (with timeout)
+        srv.Shutdown(ctx)
+    }()
+    
+    http.ListenAndServe()
+}
+```
+
+4. **Connection draining**:
+```yaml
+# Load balancer configuration
+# AWS ALB: set deregistration_delay
+# Ensure in-flight requests complete before pod termination
+```
+
+---
+
+**Q: How do you handle secrets in CI/CD pipelines without exposing them?**
+
+A: **Secret management strategies**:
+
+**1. Vault Agent Sidecar (Kubernetes)**:
+```yaml
+# Inject secrets at runtime, not build time
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+spec:
+  serviceAccountName: my-app-sa
+  containers:
+    - name: app
+      image: my-app:latest
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+          readOnly: true
+  volumes:
+    - name: secrets
+      csi:
+        driver: vault.hashicorp.com
+        readOnly: true
+        args:
+          - '-role=my-app'
+```
+
+**2. External Secrets Operator**:
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: db-credentials
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: db-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: password
+      remoteRef:
+        key: prod/database
+        property: password
+```
+
+**3. CI/CD secret injection**:
+```yaml
+# GitHub Actions
+# secrets.DB_PASSWORD injected as env var at runtime
+
+# GitLab CI
+# variables in CI settings, masked
+
+# Jenkins with credentials plugin
+# withCredentials([string(credentialsId: 'db-password', variable: 'DB_PASSWORD')]) {
+#   sh 'deploy.sh'
+# }
+```
+
+**4. Sealed Secrets (GitOps-friendly)**:
+```bash
+# Encrypt secrets so they can be committed to Git
+kubectl create secret generic db-creds \
+  --from-literal=password=secret \
+  --dry-run=client -o yaml |
+  kubeseal --cert pub-cert.pem --format yaml > sealed-secret.yaml
+# sealed-secret.yaml can be committed to Git
+```
+
+**Pipeline patterns**:
+```yaml
+# DON'T: Bake secrets into image or config
+# FROM node:18
+# COPY . .
+# ENV DB_PASSWORD=secret123  # BAD: In image history
+
+# DO: Inject at runtime
+# FROM node:18
+# COPY . .
+# CMD ["node", "app.js"]  # DB_PASSWORD injected by K8s/Vault
+```
+
+---
+
+**Q: Explain the difference between GitHub Actions, GitLab CI, Jenkins, and Tekton.**
+
+A: **CI/CD platform comparison**:
+
+| Platform | Strengths | Weaknesses | Best For |
+|----------|-----------|------------|----------|
+| GitHub Actions | Native to GitHub, huge marketplace | Limited on-prem support | Open source, GitHub users |
+| GitLab CI | Built-in, full DevOps platform | Can be heavy | GitLab users, integrated platform |
+| Jenkins | Extremely flexible, self-hosted | YAML drift, plugin hell | Full control, complex workflows |
+| Tekton | Kubernetes-native, standards-based | Verbose | Cloud-native, Kubernetes-first |
+
+**GitHub Actions**:
+```yaml
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - run: npm ci
+      - run: npm test
+      - uses: actions/upload-artifact@v3
+        with:
+          name: coverage
+          path: coverage/
+```
+
+**GitLab CI**:
+```yaml
+stages:
+  - test
+  - build
+  - deploy
+
+test:
+  stage: test
+  image: node:18
+  script:
+    - npm ci
+    - npm test
+
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:dind
+  script:
+    - docker build -t my-app:$CI_COMMIT_SHA .
+    - docker push my-app:$CI_COMMIT_SHA
+
+deploy:
+  stage: deploy
+  script:
+    - kubectl apply -f k8s/
+  only:
+    - main
+```
+
+**Jenkins Pipeline**:
+```groovy
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                sh 'make build'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh 'make test'
+            }
+        }
+        stage('Deploy') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh 'make deploy'
+            }
+        }
+    }
+    post {
+        always {
+            junit '**/target/surefire-reports/*.xml'
+        }
+    }
+}
+```
+
+**Tekton**:
+```yaml
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: my-pipeline
+spec:
+  tasks:
+    - name: build
+      taskRef:
+        name: docker-build
+      params:
+        - name: image
+          value: my-app
+    - name: test
+      taskRef:
+        name: run-tests
+      runAfter: [build]
+    - name: deploy
+      taskRef:
+        name: kubectl-deploy
+      runAfter: [test]
+```
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: How do you build a secure container image? Walk through the Dockerfile best practices.**
+
+A: **Secure Dockerfile patterns**:
+
+**Multi-stage build**:
+```dockerfile
+# Build stage
+FROM node:18 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+
+# Production stage (minimal)
+FROM node:18-slim AS production
+WORKDIR /app
+
+# Create non-root user
+RUN groupadd -r appgroup && useradd -r -g appgroup appuser
+
+# Copy only what we need
+COPY --from=builder --chown=appuser:appgroup /app/dist ./dist
+COPY --from=builder --chown=appuser:appgroup /app/node_modules ./node_modules
+
+USER appuser
+
+# Use scratch or distroless for even smaller attack surface
+# FROM gcr.io/distroless/nodejs18-debian11
+```
+
+**Security hardening**:
+```dockerfile
+# Don't use latest tags
+FROM node:18.17.0  # Specific version
+
+# Explicitly set permissions
+COPY --chown=appuser:appgroup app /app
+
+# Remove unnecessary tools
+# In production: use distroless or scratch
+
+# Use build args carefully
+# Build args are visible in image history
+# Don't put secrets in build args
+ARG DB_PASSWORD  # Will be visible!
+# Better: inject via environment at runtime
+```
+
+**Dockerignore is critical**:
+```
+# .dockerignore
+node_modules
+.git
+*.log
+*.md
+.env*
+secrets.json
+```
+
+**Security scanning in CI**:
+```yaml
+# GitHub Actions with Trivy
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: 'my-app:${{ github.sha }}'
+    format: 'sarif'
+    output: 'trivy-results.sarif'
+    severity: 'CRITICAL,HIGH'
+
+# Scan for secrets
+- name: Detect secrets
+  uses: truffleHog/trufflehog@main
+  with:
+    path: ./
+    baseDepth: 10
+```
+
+---
+
+**Q: How do you implement a pipeline that supports multiple architectures (amd64, arm64)?**
+
+A: **Multi-architecture build strategy**:
+
+**Docker buildx**:
+```yaml
+# GitHub Actions
+- name: Set up Docker Buildx
+  uses: docker/setup-buildx-action@v3
+
+- name: Build and push multi-arch
+  uses: docker/build-push-action@v4
+  with:
+    context: .
+    platforms: linux/amd64,linux/arm64,linux/arm/v7
+    push: true
+    tags: |
+      my-app:latest
+      my-app:v1.2.3
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+```
+
+**QEMU emulation (for CI)**:
+```yaml
+# Enable QEMU for cross-platform builds
+- name: Enable QEMU
+  uses: docker/setup-qemu-action@v2
+  with:
+    image: tonistiigi/binfmt:latest
+    platforms: all
+```
+
+**Manifest for multi-arch images**:
+```bash
+# Create and push manifest
+docker manifest create my-app:v1.0 \
+  my-app:v1.0-amd64 \
+  my-app:v1.0-arm64
+
+docker manifest push my-app:v1.0
+
+# Or use buildx directly
+docker buildx imagetools create -t my-app:v1.0 \
+  my-app:v1.0-amd64 \
+  my-app:v1.0-arm64
+```
+
+**Kubernetes node affinity for multi-arch**:
+```yaml
+# If some workloads are architecture-specific
+apiVersion: v1
+kind: Pod
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values:
+                  - amd64
+```
+
+---
+
+**Q: How do you implement efficient caching in CI/CD pipelines?**
+
+A: **Caching strategies**:
+
+**Docker layer caching**:
+```yaml
+# GitHub Actions
+- name: Cache Docker layers
+  uses: actions/cache@v3
+  with:
+    path: /tmp/.buildx-cache
+    key: ${{ runner.os }}-buildx-${{ github.sha }}
+    restore-keys: |
+      ${{ runner.os }}-buildx-
+
+# In build step
+- name: Build
+  uses: docker/build-push-action@v4
+  with:
+    cache-from: type=local,src=/tmp/.buildx-cache
+    cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+```
+
+**Dependency caching**:
+```yaml
+# Node.js
+- name: Cache npm
+  uses: actions/cache@v3
+  with:
+    path: ~/.npm
+    key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-npm-
+
+# Python
+- name: Cache pip
+  uses: actions/cache@v3
+  with:
+    path: ~/.cache/pip
+    key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+# Go
+- name: Cache Go modules
+  uses: actions/cache@v3
+  with:
+    path: |
+      ~/.cache/go-build
+      ~/go/pkg/mod
+    key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+```
+
+**Maven/Gradle**:
+```yaml
+# Maven
+- name: Cache Maven
+  uses: actions/cache@v3
+  with:
+    path: ~/.m2/repository
+    key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+
+# Gradle
+- name: Cache Gradle
+  uses: actions/cache@v3
+  with:
+    path: |
+      ~/.gradle/caches
+      ~/.gradle/wrapper
+    key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+```
+
+**What NOT to cache**:
+```yaml
+# DON'T cache secrets or credentials
+# DON'T cache build outputs (they should be rebuilt)
+# DON'T cache system packages if they change frequently
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: Design a CI/CD pipeline for a microservices architecture with 50+ services.**
+
+A: **Microservices CI/CD architecture**:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      Monorepo or Polyrepo?                   │
+│                                                              │
+│  Monorepo:                           Polyrepo:               │
+│  - Atomic commits across services    - Independent versioning │
+│  - Shared tooling easier             - Teams can move fast   │
+│  - Tool: Bazel, Nx, Rush            - Tool: GitHub Actions   │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Commit Detection                          │
+│                                                              │
+│  - Trigger on changes to service directory                   │
+│  - Determine affected services (Nx affected, turbo)          │
+│  - Only build/test changed + dependents                      │
+└──────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+        ┌──────────┐   ┌──────────┐   ┌──────────┐
+        │ Service A│   │ Service B│   │ Service C│
+        │ Pipeline │   │ Pipeline │   │ Pipeline │
+        └────┬─────┘   └────┬─────┘   └────┬─────┘
+             │              │              │
+             ▼              ▼              ▼
+        ┌─────────────────────────────────────────┐
+        │          Shared Infrastructure           │
+        │   (Service mesh, Ingress, Auth)          │
+        └─────────────────────────────────────────┘
+```
+
+**Affected subgraph build**:
+```yaml
+# Nx affected (example)
+name: Affected Services CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for affected
+      
+      - uses: nrwl/nx-set-shas@v3
+      
+      - run: npm ci
+      
+      - name: Detect affected
+        id: affected
+        run: |
+          echo "affected=$(nx affected:apps --plain)" >> $GITHUB_OUTPUT
+      
+      - name: Build affected
+        if: steps.affected.outputs.affected != ''
+        run: nx affected --target=build --parallel
+      
+      - name: Test affected
+        if: steps.affected.outputs.affected != ''
+        run: nx affected --target=test --parallel
+```
+
+**Service mesh integration**:
+```yaml
+# Each service pushes to its own registry
+# ArgoCD or Flux watches specific image tags
+# Service mesh (Istio/Linkerd) handles traffic routing
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: service-a
+spec:
+  source:
+    targetRevision: service-a-v1.2.3  # Per-service version
+```
+
+**Shared infrastructure pipeline**:
+```yaml
+# Runs less frequently, affects all services
+name: Infrastructure Pipeline
+on:
+  push:
+    paths:
+      - 'infrastructure/**'
+      - 'platform/**'
+jobs:
+  deploy-infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Plan infrastructure
+        run: terraform plan
+      - name: Apply infrastructure
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve
+```
+
+---
+
+**Q: How do you implement feature flags alongside your CI/CD pipeline?**
+
+A: **Feature flag architecture**:
+
+```yaml
+# LaunchDarkly or Unleash in application
+# Split by percentage, user, attribute
+
+# Example: Gradual rollout
+launchdarkly:
+  - flag: new-checkout-flow
+    rollout:
+      percentage: 10
+      segment: beta-users
+    targeting:
+      - attribute: email
+        operator: endsWith
+        value: "@company.com"
+```
+
+**CI/CD integration**:
+
+```yaml
+# In pipeline, notify flag system of new deployment
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build and push
+        run: |
+          docker build -t my-app:${{ github.sha }} .
+          docker push my-app:${{ github.sha }}
+      
+      - name: Notify feature flags
+        run: |
+          curl -X POST https://app.launchdarkly.com/api/v2/flags/production/$FLAG_KEY
+             -H "Authorization: $LD_API_KEY"
+             -d '{"value": true, "comment": "Deployed via CI"}'
+```
+
+**GitOps with feature flags**:
+```yaml
+# ArgoCD sync waves for feature flag updates
+# Wave 0: Infrastructure
+# Wave 1: Base application
+# Wave 2: Feature flags (after app is healthy)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: feature-flags
+spec:
+  syncPolicy:
+    syncOptions:
+      - SyncWaveBehavior: ordered
+```
+
+**Progressive delivery**:
+```yaml
+# Argo Rollouts with analysis
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: my-app
+spec:
+  strategy:
+    canary:
+      analysis:
+        templates:
+          - templateName: success-rate
+        args:
+          - name: service-name
+            value: my-app-canary
+```
+
+---
+
+### Security Questions
+
+**Q: How do you secure your CI/CD pipeline? What are common attack vectors?**
+
+A: **Pipeline security concerns**:
+
+**1. Supply chain attacks**:
+```yaml
+# DON'T trust unverified actions
+# WRONG:
+- uses: some-random-user/action@v1  # Could be malicious
+
+# RIGHT: Pin to commit hash
+- uses: actions/checkout@a81ccb298 # Specific commit
+# Or verify the action owner
+
+# Use SLSA framework
+# Level 1: Provenance exists
+# Level 2: Hosted builder
+# Level 3: Hardened builder
+```
+
+**2. Secret exfiltration**:
+```yaml
+# CI logs can expose secrets
+# DON'T: echo $SECRET
+# DON'T: Print env vars
+
+# Enable secret masking
+- name: Deploy
+  env:
+    DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+  run: |
+    ./deploy.sh  # Should NOT echo DB_PASSWORD
+
+# Use temporary credentials (IAM roles, GCP service accounts)
+# DON'T persist long-lived credentials
+```
+
+**3. Dependency tampering**:
+```yaml
+# Use lockfiles
+- name: Install dependencies
+  run: npm ci  # Uses package-lock.json, not npm install
+
+# Pin third-party packages
+# Use GPG signing for commits
+# Enable Dependabot for updates
+```
+
+**4. Pipeline integrity**:
+```yaml
+# Require signed commits for main branch
+# Enable branch protection
+# Use OpenID Connect for cloud auth
+- name: Configure AWS Credentials
+  uses: aws-actions/configure-aws-credentials@v2
+  with:
+    role-to-assume: arn:aws:iam::123456789:role/GitHubActionsRole
+    aws-region: us-east-1
+# This avoids storing AWS credentials in secrets
+```
+
+**5. Container security**:
+```yaml
+# Scan for vulnerabilities
+- name: Trivy Scan
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: 'my-app:${{ github.sha }}'
+    format: 'sarif'
+    exit-code: '1'  # Fail on CRITICAL
+    severity: 'CRITICAL,HIGH'
+```
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Making pipelines too complex**: Simple pipelines are maintainable. Complexity = bugs.
+
+2. **Not handling failures properly**: Each stage should handle failures explicitly. Don't assume failure is obvious.
+
+3. **Ignoring caching**: Rebuilding everything every time is slow and expensive.
+
+4. **Not securing secrets**: Storing secrets in pipeline code or logs is a common vulnerability.
+
+5. **Forgetting rollback**: Every deployment should have a tested rollback path.
+
+## How to Structure Your Answers
+
+For **deployment questions**: Explain the mechanism, then trade-offs, then implementation.
+
+For **pipeline questions**: Start with the goal, then the stages, then failure handling.
+
+For **security questions**: Cover prevention, detection, and response.
+
+## Related Topics
+
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [SRE Questions](./sre-questions.mdx)
+- [Terraform Questions](./terraform-questions.mdx)
+- [Architecture Questions](./architecture-questions.mdx)

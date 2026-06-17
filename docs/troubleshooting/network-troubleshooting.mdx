@@ -1,0 +1,860 @@
+---
+sidebar_position: 4
+---
+
+# Network Troubleshooting Guide
+
+## Overview
+
+Network issues are among the most challenging to diagnose because they can involve multiple systems, protocols, and layers of infrastructure. This guide provides a systematic approach to network debugging using industry-standard tools and techniques.
+
+From DNS resolution to TCP handshake failures, from packet capture to SSL/TLS debugging, this guide covers the complete toolkit for network troubleshooting.
+
+## When To Use
+
+- **Connection Failures**: Connection refused, connection timeout, connection reset
+- **DNS Issues**: Name resolution failures, propagation delays, DNSSEC validation
+- **Latency Problems**: High latency, jitter, packet loss
+- **SSL/TLS Errors**: Certificate validation, protocol mismatch, chain issues
+- **Firewall Problems**: Rules blocking legitimate traffic, overly permissive rules
+- **Load Balancer Issues**: Health check failures, connection draining, upstream timeouts
+
+## When NOT To Use
+
+- **Application Logic Bugs**: Network is working but app has bugs
+- **Database Performance Issues**: Use database-specific troubleshooting
+- **Hardware Failures**: Physical cable/fiber breaks need networking team
+- **ISP-Level Issues**: BGP routing, upstream provider problems
+
+## Core Concepts / Methodology
+
+### The OSI Model and Troubleshooting
+
+Network troubleshooting follows the OSI layers:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    OSI LAYERS                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Layer 7: Application    HTTP, DNS, SMTP, SSH              │
+│           ↑ Troubleshoot with: logs, application metrics    │
+│           │                                                 │
+│  Layer 6-5: Session      TLS, SSH, WebSocket               │
+│           ↑ Troubleshoot with: SSL handshake logs           │
+│           │                                                 │
+│  Layer 4: Transport      TCP, UDP, Ports                    │
+│           ↑ Troubleshoot with: ss, connection states        │
+│           │                                                 │
+│  Layer 3: Network        IP, Routing, ICMP                  │
+│           ↑ Troubleshoot with: traceroute, routing tables   │
+│           │                                                 │
+│  Layer 2: Data Link      Ethernet, MAC, ARP                 │
+│           ↑ Troubleshoot with: arp, switch tables           │
+│           │                                                 │
+│  Layer 1: Physical       Cables, Signals, NICs              │
+│           ↑ Troubleshoot with: link status, cable tests     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Principle:** Always start at the lowest layer that could be causing the issue. If the physical link is down, higher-layer troubleshooting is pointless.
+
+### TCP Connection States
+
+Understanding TCP state machines is critical for debugging connection issues:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              TCP CONNECTION STATES                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  CLOSED → SYN_SENT → ESTABLISHED → CLOSE_WAIT → LAST_ACK   │
+│                  ↓                              ↓           │
+│              SYN_RECV ←───────────────── FIN_WAIT_1         │
+│                  ↓                         ↓               │
+│                  └───── ← ─────────── FIN_WAIT_2           │
+│                                                     ↓       │
+│                                              TIME_WAIT      │
+│                                                             │
+│  COMMON ISSUES:                                             │
+│  - FIN_WAIT_2: Server didn't close connection properly     │
+│  - TIME_WAIT: Too many short connections, adjust timeout   │
+│  - CLOSE_WAIT: Application leaked connections              │
+│  - SYN_RECV: Server overloaded, SYN flood attack           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Connection Troubleshooting Flow
+
+```
+Cannot Connect to Host?
+       │
+       ▼
+┌───────────────────┐
+│ Can you ping?     │──No──► Layer 1/2: Check cables, NIC, switch
+└────────┬──────────┘
+         │Yes
+         ▼
+┌───────────────────┐
+│ Can you reach port│──No──► Layer 3/4: Check routing, firewall
+└────────┬──────────┘
+         │Yes
+         ▼
+┌───────────────────┐
+│ Service responds? │──No──► Layer 7: Check application, logs
+└───────────────────┘
+```
+
+## Diagnostic Commands / Tools
+
+### Basic Connectivity
+
+#### `ping` - ICMP Reachability
+
+```bash
+# Basic ping
+ping -c 4 api.example.com
+
+# Output:
+# PING api.example.com (10.0.5.20) 56(84) bytes of data.
+# 64 bytes from 10.0.5.20: icmp_seq=1 ttl=64 time=0.5 ms
+# 64 bytes from 10.0.5.20: icmp_seq=2 ttl=64 time=0.6 ms
+# 64 bytes from 10.0.5.20: icmp_seq=3 ttl=64 time=0.5 ms
+# 4 packets transmitted, 4 received, 0% packet loss, time 3003ms
+
+# Continuous ping with timestamps
+ping -i 1 api.example.com | while read pong; do echo "$(date): $pong"; done
+
+# Flood ping (requires root, for stress testing)
+ping -f -c 1000 api.example.com
+```
+
+#### `traceroute` / `tracepath` - Path Analysis
+
+```bash
+# Trace route to host
+traceroute api.example.com
+
+# Output:
+# traceroute to api.example.com (10.0.5.20), 30 hops max, 60 byte packets
+#  1   10.0.0.1         0.5 ms   0.4 ms   0.3 ms  gateway
+#  2   10.0.1.1         1.2 ms   1.1 ms   0.9 ms  core-router
+#  3   10.0.5.20        2.1 ms   1.9 ms   1.8 ms  api-server
+#
+# Note: * * * means that hop is not responding to probes
+
+# Use specific protocol (TCP instead of ICMP)
+traceroute -T -p 443 api.example.com
+
+# MTR - continuous traceroute with statistics
+mtr api.example.com
+```
+
+#### `dig` - DNS Resolution
+
+```bash
+# Basic DNS lookup
+dig api.example.com
+
+# Output:
+# ;; ANSWER SECTION:
+# api.example.com.     300  IN  A  10.0.5.20
+#
+# ;; Query time: 5 ms
+# ;; SERVER: 8.8.8.8#53(8.8.8.8)
+
+# Query specific record type
+dig api.example.com AAAA    # IPv6
+dig _api._tcp.example.com SRV  # Service discovery
+
+# Trace DNS resolution
+dig +trace api.example.com
+
+# Short output (just the answer)
+dig +short api.example.com
+
+# Check MX records
+dig example.com MX
+
+# Query specific nameserver
+dig @8.8.8.8 api.example.com
+
+# DNSSEC validation
+dig +dnssec api.example.com
+```
+
+### Socket and Connection Analysis
+
+#### `ss` - Socket Statistics (Modern netstat)
+
+```bash
+# Show all listening ports
+ss -tulnp
+
+# Output:
+# Netid  State   Recv-Q  Send-Q   Local Address:Port    Peer Address:Port
+# tcp    LISTEN  0       128      0.0.0.0:22           0.0.0.0:*       users:(("sshd",pid=1234,fd=3))
+# tcp    LISTEN  0       511      0.0.0.0:80           0.0.0.0:*       users:(("nginx",pid=5678,fd=6))
+# tcp    LISTEN  0       511      0.0.0.0:443          0.0.0.0:*       users:(("nginx",pid=5678,fd=7))
+
+# Show established connections
+ss -tnp | grep ESTAB
+
+# Summary statistics
+ss -s
+
+# Output:
+# Total: 156 (kernel 158)
+# TCP:   42 (estab 12, closed 2, orphaned 0, synrecv 0, timewait 0)
+
+# Filter by state
+ss -tunap state established
+ss -tunap state time-wait
+
+# Show connections to specific host
+ss dst 10.0.5.20
+```
+
+#### `netstat` - (Legacy, but still useful)
+
+```bash
+# Routing table
+netstat -rn
+
+# Interface statistics
+netstat -i
+
+# Per-protocol statistics
+netstat -s
+
+# Connections with process IDs
+netstat -tunap
+```
+
+### HTTP/HTTPS Debugging
+
+#### `curl` - HTTP Testing
+
+```bash
+# Basic GET with verbose output
+curl -v https://api.example.com/health
+
+# Output:
+# * Connected to api.example.com (10.0.5.20) port 443 (#0)
+# * TLSv1.3 (IN), TLS handshake, Client hello (1):
+# * TLSv1.3 (OUT), TLS handshake, Server hello (2):
+# * TLSv1.3 (IN), TLS handshake, Finished (10):
+# > GET /health HTTP/1.1
+# > Host: api.example.com
+# > User-Agent: curl/7.68.0
+# < HTTP/1.1 200 OK
+# < Content-Type: application/json
+# {"status":"healthy"}
+
+# Show request and response headers
+curl -i https://api.example.com/api/data
+
+# Include headers in output
+curl -I https://api.example.com  # HEAD request only
+
+# Time the request
+curl -w "@/dev/stdin" -o /dev/null -s https://api.example.com <<< "time_namelookup: %{time_namelookup}\ntime_connect: %{time_connect}\ntime_starttransfer: %{time_starttransfer}\ntime_total: %{time_total}\n"
+
+# Output:
+# time_namelookup: 0.005
+# time_connect: 0.010
+# time_starttransfer: 0.052
+# time_total: 0.055
+
+# Follow redirects
+curl -L -v https://api.example.com/redirect-target
+
+# POST with JSON data
+curl -X POST -H "Content-Type: application/json" -d '{"key":"value"}' https://api.example.com/api
+```
+
+### Packet Capture
+
+#### `tcpdump` - Packet Sniffing
+
+```bash
+# Capture all packets on interface
+tcpdump -i eth0
+
+# Capture specific host
+tcpdump -i eth0 host 10.0.5.20
+
+# Capture specific port
+tcpdump -i eth0 port 443
+
+# Capture with timestamp
+tcpdump -i eth0 -tttt host api.example.com
+
+# Capture and save to file (for Wireshark)
+tcpdump -i eth0 -w /tmp/capture.pcap host 10.0.5.20
+
+# Read capture file
+tcpdump -r /tmp/capture.pcap
+
+# Capture with BPF filter (more efficient)
+tcpdump -i eth0 "tcp port 80 and not host 192.168.1.1"
+
+# Capture HTTP requests
+tcpdump -i eth0 -A "tcp port 80 and (((ip[2:2] - ((ip[0]&0xf)<<2)) - ((tcp[12]&0xf0)>>2)) != 0)" | grep -A 100 "GET"
+
+# Common BPF filter expressions:
+# port 80 or port 443
+# host 10.0.5.20 and not host 10.0.5.21
+# tcp[tcpflags] & tcp-syn != 0
+# tcp[tcpflags] & tcp-ack != 0
+# icmp
+```
+
+**Real tcpdump output example:**
+```
+14:32:01.234567 IP 192.168.1.100.52341 > 10.0.5.20.443: Flags [P.], seq 100:200, ack 300, win 502, options [nop,nop,TS val 12345 ecr 67890], length 100
+14:32:01.234890 IP 10.0.5.20.443 > 192.168.1.100.52341: Flags [.], ack 200, win 469, options [nop,nop,TS val 67890 ecr 12345], length 0
+```
+
+### SSL/TLS Analysis
+
+#### `openssl` - SSL/TLS Testing
+
+```bash
+# Test SSL connection and show certificate
+openssl s_client -connect api.example.com:443
+
+# Show full certificate chain
+openssl s_client -connect api.example.com:443 -showcerts
+
+# Check certificate expiration
+echo | openssl s_client -connect api.example.com:443 2>/dev/null | openssl x509 -noout -dates
+
+# Output:
+# notBefore=Jan 15 00:00:00 2026 GMT
+# notAfter=Feb 15 23:59:59 2027 GMT
+
+# Test specific TLS version
+openssl s_client -connect api.example.com:443 -tls1_2
+openssl s_client -connect api.example.com:443 -tls1_3
+
+# Check cipher suites
+openssl s_client -connect api.example.com:443 -cipher 'HIGH:!aNULL'
+
+# Verify certificate chain
+echo | openssl s_client -CAfile /etc/ssl/certs/ca-certificates.crt -connect api.example.com:443 2>&1 | grep "Verify"
+
+# Test client certificate authentication
+openssl s_client -connect api.example.com:443 -cert client.crt -key client.key
+
+# Check OCSP stapling
+openssl s_client -connect api.example.com:443 -status
+```
+
+## Real Production Scenarios
+
+### Scenario 1: Intermittent HTTPS Connection Timeouts
+
+**Symptom:**
+- Users report occasional timeouts when accessing the web application
+- Timeouts occur randomly, lasting 30-120 seconds
+- Problem affects approximately 5% of users
+
+**Diagnostic Commands:**
+```bash
+# Check for packet loss
+ping -c 100 api.example.com | tail -5
+# 100 packets transmitted, 95 received, 5% packet loss
+
+# Capture during incident
+tcpdump -i eth0 -w /tmp/timeout.pcap host api.example.com &
+# Wait for timeout to occur
+kill %1
+
+# Analyze capture
+tcpdump -r /tmp/timeout.pcap -tttt | head -100
+
+# Check TCP retransmissions
+tcpdump -r /tmp/timeout.pcap 'tcp[tcpflags] & tcp-ack != 0' | awk '{print $5}' | sort | uniq -c
+
+# Check SSL handshake timing
+for i in {1..50}; do
+  echo | openssl s_client -connect api.example.com:443 2>&1 | grep "Time"
+done
+```
+
+**Root Cause:**
+MTU size mismatch causing fragmentation. The load balancer was sending 1500-byte packets but the VPN tunnel had 1400-byte MTU, causing ICMP fragmentation needed messages to be blocked by a firewall, resulting in silent packet drops.
+
+**Fix:**
+```bash
+# Set correct MTU on server
+ip link set eth0 mtu 1400
+
+# Or enable Path MTU Discovery
+ip link set eth0 mtu 1500
+# And ensure ICMP filtering is not blocking " fragmentation needed"
+
+# Make permanent
+echo "MTU=1400" >> /etc/sysconfig/network-scripts/ifcfg-eth0
+```
+
+**Prevention:**
+- Test MTU compatibility during deployment
+- Monitor for packet fragmentation
+- Use MSS clamping on firewalls
+- Document MTU requirements in network design
+
+---
+
+### Scenario 2: DNS Resolution Failure for Internal Services
+
+**Symptom:**
+- Internal service mesh can't resolve `database.internal`
+- Applications fail to connect to backend services
+- `nslookup database.internal` works but `ping` fails
+
+**Diagnostic Commands:**
+```bash
+# Test DNS resolution
+nslookup database.internal
+# Server:    10.0.0.53
+# Address:   10.0.0.53#53
+#
+# Name:      database.internal
+# Address:   10.0.5.30
+
+# Check if DNS server is reachable
+dig database.internal
+
+# Test with different resolver
+dig @8.8.8.8 database.internal
+
+# Check search domain expansion
+# The issue might be "database" vs "database.internal"
+dig +search database
+
+# Check /etc/resolv.conf
+cat /etc/resolv.conf
+# nameserver 10.0.0.53
+# search company.internal
+
+# Check for DNS cache poisoning or corruption
+dig +dnssec database.internal
+
+# Verify the A record exists
+dig +short database.internal
+```
+
+**Root Cause:**
+CoreDNS in Kubernetes had a stale configmap pointing to an old DNS server IP (10.0.0.53 was decommissioned). When CoreDNS pod restarted, it couldn't resolve any internal services.
+
+**Fix:**
+```bash
+# Update CoreDNS configmap
+kubectl edit configmap coredns -n kube-system
+
+# Change to working DNS server
+# Before:
+# forward . 10.0.0.53
+# After:
+# forward . 10.0.0.100 10.0.0.101
+
+# Restart CoreDNS pods
+kubectl rollout restart deployment/coredns -n kube-system
+
+# Verify fix
+kubectl exec -it test-pod -- nslookup database.internal
+```
+
+**Prevention:**
+- Implement DNS health checks
+- Use multiple upstream DNS servers
+- Document DNS infrastructure dependencies
+- Alert on DNS resolution failures
+
+---
+
+### Scenario 3: Connection Reset by Peer in Kubernetes
+
+**Symptom:**
+- Long-running HTTP requests fail with "Connection reset by peer"
+- Affects file uploads and API calls taking > 30 seconds
+- New connections work fine
+
+**Diagnostic Commands:**
+```bash
+# Check service endpoints
+kubectl get endpoints api-service
+# Should show pods, if empty = no healthy backends
+
+# Check pod logs
+kubectl logs -l app=api --tail=100 | grep -i error
+
+# Check kube-proxy logs
+kubectl logs -n kube-system -l k8s-app=kube-proxy
+
+# Capture packets on a node
+tcpdump -i eth0 -w /tmp/k8s.pcap port 80 and "tcp[tcpflags] & tcp-rst != 0"
+
+# Check iptables rules on node
+iptables -L -n -v | grep -E "Chain|80|443"
+
+# Check conntrack table for NAT issues
+conntrack -L -p tcp --dport 80 | head -20
+
+# Test directly from node to pod IP
+kubectl exec -it test-pod -- curl -v http://10.0.5.30:8080/health
+```
+
+**Root Cause:**
+The Nginx ingress controller had a default `proxy_read_timeout` of 60 seconds, but the application was taking 90+ seconds for some requests. When timeout was reached, Nginx closed the connection, resulting in "Connection reset by peer" on the client side.
+
+**Fix:**
+```yaml
+# Update Ingress annotation
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+```
+
+```bash
+# Apply the fix
+kubectl apply -f ingress.yaml
+
+# Or patch existing
+kubectl patch ingress api-ingress -p '{"metadata":{"annotations":{"nginx.ingress.kubernetes.io/proxy-read-timeout":"300"}}}'
+```
+
+**Prevention:**
+- Set appropriate timeouts for application requirements
+- Monitor slow requests
+- Implement request timeout in application code
+- Add timeouts at every layer (client, LB, app)
+
+---
+
+### Scenario 4: Network Partition Detection and Recovery
+
+**Symptom:**
+- Applications in one availability zone can't reach services in another
+- No deployment or config changes were made
+- Some users affected, others not
+
+**Diagnostic Commands:**
+```bash
+# Check routing between AZs
+traceroute -M udp 10.1.0.10
+# or
+mtr 10.1.0.10
+
+# Check VPC peering or transit gateway
+aws ec2 describe-vpc-peering-connections
+aws ec2 describe-transit-gateway-attachments
+
+# Check security groups allow AZ traffic
+aws ec2 describe-security-groups --region us-east-1
+
+# Test MTU between AZs
+ping -M do -s 1400 10.1.0.10
+# If this fails but ping -s 1200 works = MTU issue
+
+# Check for route table issues
+ip route
+# or
+route -n
+
+# Check BGP neighbors (if using router)
+vtysh -c "show ip bgp summary"
+```
+
+**Root Cause:**
+The AWS Transit Gateway had a route table misconfiguration. The AZ-1 subnet was not included in the propagated routes to AZ-2, causing asymmetric routing where packets could reach the destination but return packets were dropped.
+
+**Fix:**
+```bash
+# Fix transit gateway route table
+aws ec2 create-transit-gateway-route \
+  --destination-cidr-block 10.0.0.0/16 \
+  --transit-gateway-route-table-id tgw-rtb-0123456789abcdef0 \
+  --transit-gateway-attachment-id tgw-attach-0123456789abcdef1
+
+# Or associate correct route table with attachment
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-attachment-id tgw-attach-0123456789abcdef1 \
+  --transit-gateway-route-table-id tgw-rtb-0123456789abcdef0
+```
+
+**Prevention:**
+- Implement health checks for inter-AZ connectivity
+- Use circuit breakers for cross-AZ calls
+- Document route table dependencies
+- Test failover procedures regularly
+
+---
+
+### Scenario 5: SSL Certificate Chain Issues
+
+**Symptom:**
+- Certificate works in browsers but fails in some API clients
+- Mobile apps reject connections with "unable to verify certificate chain"
+- OpenSSL tests pass but Java/Android fails
+
+**Diagnostic Commands:**
+```bash
+# Show full certificate chain
+openssl s_client -connect api.example.com:443 -showcerts
+
+# Verify chain with chain file
+openssl s_client -CAfile /tmp/fullchain.pem -connect api.example.com:443
+
+# Check each certificate in chain
+openssl x509 -in cert1.pem -text -noout
+openssl x509 -in cert2.pem -text -noout
+
+# Check certificate purpose
+openssl x509 -in cert.pem -purpose
+
+# Verify against CA store
+openssl s_client -CApath /etc/ssl/certs -connect api.example.com:443
+
+# Java-specific check (use keytool)
+keytool -printcert -sslserver api.example.com:443 -rfc
+
+# Check for SNI requirement
+openssl s_client -connect api.example.com:443 -servername api.example.com
+openssl s_client -connect api.example.com:443  # Without SNI
+```
+
+**Root Cause:**
+The server was configured with only the leaf certificate, not the full chain including the intermediate CA. Modern browsers have cached the intermediate, but other clients (Java, Go, mobile) that don't have the intermediate cached failed validation.
+
+**Fix:**
+```bash
+# For Nginx, concatenate certificates
+cat /etc/ssl/certs/example.com.crt /etc/ssl/certs/intermediate.crt > /etc/ssl/certs/example.com.chained.crt
+
+# Update Nginx config
+ssl_certificate /etc/ssl/certs/example.com.chained.crt;
+ssl_certificate_key /etc/ssl/private/example.com.key;
+
+# Reload Nginx
+nginx -s reload
+
+# For Apache
+SSLCertificateChainFile /etc/ssl/certs/intermediate.crt
+```
+
+**Prevention:**
+- Always include full chain when deploying certificates
+- Test with multiple clients (curl, openssl, Java, Python)
+- Use certificate testing tools (SSL Labs)
+- Implement certificate deployment checklists
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Connection Refused
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: VERIFY SERVICE IS LISTENING                        │
+├─────────────────────────────────────────────────────────────┤
+│ $ ss -tulnp | grep :80                                      │
+│ tcp LISTEN 0 511 *:80 *:*                                   │
+│                                                              │
+│ If nothing listening → Service not running                  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK FIREWALL                                      │
+├─────────────────────────────────────────────────────────────┤
+│ $ iptables -L -n | grep 80                                  │
+│ $ firewall-cmd --list-ports                                │
+│ $ aws ec2 describe-security-groups (for AWS)                │
+│                                                              │
+│ If blocked → Add rule to allow traffic                      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: TEST LOCAL CONNECTION                               │
+├─────────────────────────────────────────────────────────────┤
+│ $ curl -v http://localhost:80                                │
+│                                                              │
+│ If local works but remote fails → Network or firewall       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK ROUTING                                       │
+├─────────────────────────────────────────────────────────────┤
+│ $ traceroute -T -p 80 <destination>                         │
+│ $ ip route get <destination>                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: SSL/TLS Errors
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: VERIFY CERTIFICATE                                  │
+├─────────────────────────────────────────────────────────────┤
+│ $ echo | openssl s_client -connect host:443 2>/dev/null |   │
+│     openssl x509 -noout -dates                              │
+│                                                              │
+│ Check: Expiration? Valid dates? Correct hostname?          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: VERIFY FULL CHAIN                                   │
+├─────────────────────────────────────────────────────────────┤
+│ $ openssl s_client -connect host:443 -showcerts             │
+│                                                              │
+│ Should see: Root CA → Intermediate → Leaf                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CHECK HOSTNAME MATCH                                │
+├─────────────────────────────────────────────────────────────┤
+│ $ openssl s_client -connect host:443 | grep "Subject:"     │
+│ $ openssl s_client -connect host:443 | grep "Issuer:"      │
+│                                                              │
+│ CommonName must match the hostname used                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: TEST WITH SPECIFIC CIPHER/TLS                       │
+├─────────────────────────────────────────────────────────────┤
+│ $ openssl s_client -connect host:443 -tls1_2               │
+│ $ openssl s_client -connect host:443 -cipher HIGH:!aNULL    │
+│                                                              │
+│ Client may not support server's cipher suites               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Connection refused` | Nothing listening on port | Verify service running, check port binding |
+| `Connection timed out` | Firewall blocking or route missing | Check firewall rules, verify routing |
+| `No route to host` | Routing table issue | Check `ip route`, routing configuration |
+| `Network is unreachable` | Missing default route | Configure default gateway |
+| `Name or service not known` | DNS failure | Check `/etc/resolv.conf`, DNS server |
+| `certificate expired` | Certificate past validity | Renew certificate |
+| `unable to verify certificate` | Missing intermediate chain | Configure full chain |
+| `ssl_weak_cipher_suite` | Weak cipher negotiated | Disable weak ciphers |
+| `connection reset by peer` | Remote closed connection | Check timeout settings, application logs |
+| `broken pipe` | Writing to closed connection | Implement connection handling |
+
+## Monitoring / Log Analysis
+
+### Network Metrics to Monitor
+
+| Metric | Warning | Critical | Tool |
+|--------|---------|----------|------|
+| Packet Loss | > 1% | > 5% | ping, mtr |
+| Latency P99 | > 100ms | > 500ms | ping, smoke ping |
+| Connection Errors | > 10/min | > 100/min | ss, netstat |
+| DNS Resolution Time | > 50ms | > 200ms | dig |
+| SSL Handshake Failures | > 1% | > 5% | Logs |
+
+### Log Analysis for Network Issues
+
+```bash
+# Count connection errors by type
+grep -E "Connection refused|Connection timed out" /var/log/nginx/error.log | \
+  awk '{print $NF}' | sort | uniq -c | sort -rn
+
+# Find SSL handshake failures
+grep "SSL_do_handshake() failed" /var/log/nginx/error.log | \
+  awk -F',' '{print $NF}' | sort | uniq -c
+
+# Monitor connection states
+watch 'ss -s | grep TCP'
+
+# Real-time network interface errors
+watch 'ip -s link show eth0'
+```
+
+## Interview Questions
+
+### Question 1: Connection Debugging
+
+**Q:** A user can't connect to your API. The connection times out. Walk me through your debugging process.
+
+**A:**
+1. Verify the problem is reproducible
+2. Check if service is running locally: `curl localhost:port`
+3. Check if port is listening: `ss -tulnp | grep port`
+4. Test from same network: `ping host`
+5. Test TCP connection: `nc -zv host port`
+6. Check firewall: `iptables -L`, security groups
+7. Check routing: `traceroute`, `ip route get`
+8. Check DNS if using hostname: `dig`, `nslookup`
+9. Check if behind load balancer, check health checks
+
+### Question 2: SSL/TLS Debugging
+
+**Q:** An SSL certificate works in Chrome but fails in a Python script. What could be wrong?
+
+**A:**
+1. Certificate chain not properly configured on server (browsers cache intermediates)
+2. Python/OpenSSL doesn't trust the CA (check CA bundle)
+3. SNI not enabled (server requires it)
+4. Hostname mismatch (check CN/SAN)
+5. TLS version incompatibility (server only supports old TLS)
+6. Cipher suite mismatch
+7. Client certificate required but not provided
+
+```python
+# Python debugging
+import ssl
+print(ssl.get_default_verify_paths())
+# or
+import urllib.request
+urllib.request.urlopen('https://api.example.com', context=ssl.create_default_context())
+```
+
+### Question 3: High Latency Investigation
+
+**Q:** Users report that your API is slow. How do you identify where the latency is?
+
+**A:**
+1. Measure end-to-end time with timing headers
+2. Add timing at each layer (LB, app, DB)
+3. Use distributed tracing (Jaeger, Zipkin)
+4. Check each hop with `mtr` or `tcproute`
+5. Capture packets during slow request to measure per-hop time
+6. Profile application: slow queries, external calls, GC
+7. Check for packet loss (retransmissions add latency)
+
+## Cheat Sheet
+
+| Command | Purpose | Key Flags |
+|---------|---------|----------|
+| `ping` | Basic reachability | `-c count`, `-i interval` |
+| `traceroute` | Path analysis | `-T -p port` (TCP mode) |
+| `mtr` | Continuous path stats | Continuous, combined ping+traceroute |
+| `dig` | DNS queries | `+short`, `+trace`, `@server` |
+| `nslookup` | DNS lookup | Interactive |
+| `ss` | Socket stats | `-tulnp`, `state established` |
+| `netstat` | Network stats | `-rn`, `-i`, `-s` |
+| `curl` | HTTP testing | `-v`, `-w "%{time_total}"`, `-k` |
+| `tcpdump` | Packet capture | `-i eth0`, `-w file`, BPF filters |
+| `openssl s_client` | SSL testing | `-connect`, `-showcerts`, `-tls1_2` |
+| `nc` | Network swiss army knife | `-zv`, port scanning |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [Linux Troubleshooting](./linux-troubleshooting) - System-level debugging
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - Container networking
+- [GCP Troubleshooting](./gcp-troubleshooting) - Cloud networking

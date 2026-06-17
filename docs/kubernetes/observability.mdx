@@ -1,0 +1,714 @@
+---
+title: "Kubernetes Observability"
+description: "Complete guide to Kubernetes observability - metrics, logging, tracing, and monitoring stack setup"
+sidebar_position: 19
+---
+
+# Kubernetes Observability
+
+## Overview
+
+Kubernetes observability encompasses the collection, analysis, and visualization of metrics, logs, and traces to understand cluster and application behavior. A comprehensive observability stack includes Prometheus for metrics, Loki or Elasticsearch for logs, and Jaeger or Tempo for distributed tracing.
+
+## When to Use
+
+- **Production debugging** - understanding failures and performance issues
+- **Capacity planning** - right-sizing resources
+- **Incident response** - rapid root cause analysis
+- **Performance optimization** - identifying bottlenecks
+- **SLO/SLA monitoring** - tracking service levels
+
+## When NOT to Use
+
+- **Development clusters** - focus on functionality first
+- **Simple applications** - may not need full stack
+
+## Core Concepts
+
+### Three Pillars of Observability
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Three Pillars of Observability                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  METRICS (Quantitative)                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  CPU usage, Memory, Request rate, Error rate, Latency               │   │
+│  │  Examples: Prometheus, Cloud Monitoring, Datadog                    │   │
+│  │  Use: Alerting, dashboards, capacity planning                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  LOGS (Event records)                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Application logs, system logs, audit logs                          │   │
+│  │  Examples: Loki, Elasticsearch, Cloud Logging                       │   │
+│  │  Use: Debugging, audit, compliance                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  TRACES (Request flow)                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Distributed request paths, latency breakdown                       │   │
+│  │  Examples: Jaeger, Tempo, Zipkin                                     │   │
+│  │  Use: Performance analysis, debugging distributed systems           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Monitoring Stack Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Monitoring Stack Architecture                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    Metrics Collection                                │   │
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐                       │   │
+│  │  │  node-    │  │  kube-    │  │  app-     │                       │   │
+│  │  │  exporter │  │  state-   │  │  metrics  │                       │   │
+│  │  │  (nodes)  │  │  metrics  │  │  (custom) │                       │   │
+│  │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘                       │   │
+│  │        └──────────────┼──────────────┘                              │   │
+│  └───────────────────────┼───────────────────────────────────────────────┘   │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    Prometheus                                          │ │
+│  │  - Service discovery via Kubernetes API                               │ │
+│  │  - Scrape targets based on annotations                                │ │
+│  │  - Store time-series data                                             │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    Alertmanager                                        │ │
+│  │  - Deduplicate alerts                                                 │ │
+│  │  - Route to PagerDuty, Slack, Email                                   │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                          │                                                   │
+│                          ▼                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │                    Grafana                                             │ │
+│  │  - Dashboards: Cluster, Pod, Application                              │ │
+│  │  - Explore: ad-hoc queries                                            │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Monitoring Stack Setup (Prometheus Operator)
+
+```yaml
+# Prometheus Operator CRDs - typically installed via OperatorHub
+# This is an example of the configuration
+
+# ServiceMonitor for applications
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-service-monitor
+  namespace: production
+  labels:
+    app: api-service
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  namespaceSelector:
+    matchNames:
+    - production
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+  - port: grpc-metrics
+    path: /grpc/metrics
+    interval: 30s
+
+---
+# PodMonitor for pod metrics
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: api-service-pod-monitor
+  namespace: production
+  labels:
+    app: api-service
+spec:
+  selector:
+    matchLabels:
+      app: api-service
+  podMetricsEndpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+
+---
+# PrometheusRule for alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-service-alerts
+  namespace: production
+  labels:
+    app: api-service
+    release: prometheus
+spec:
+  groups:
+  - name: api-service
+    rules:
+    # High error rate
+    - alert: APIHighErrorRate
+      expr: |
+        sum(rate(http_requests_total{service="api-service", status=~"5.."}[5m])) 
+        / 
+        sum(rate(http_requests_total{service="api-service"}[5m])) > 0.05
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "API service high error rate"
+        description: "API service error rate is above 5%"
+    
+    # High latency
+    - alert: APIHighLatency
+      expr: |
+        histogram_quantile(0.99, 
+          sum(rate(http_request_duration_seconds_bucket{service="api-service"}[5m])) 
+          by (le)
+        ) > 2
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "API service high latency"
+        description: "API service p99 latency is above 2 seconds"
+    
+    # Pod not ready
+    - alert: APIPodNotReady
+      expr: |
+        kube_pod_status_ready{namespace="production", pod=~"api-service-.*", condition="true"} == 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "API pods not ready"
+        description: "API service pods have been not ready for more than 10 minutes"
+
+---
+# Grafana Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-service-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  api-service.json: |
+    {
+      "dashboard": {
+        "title": "API Service Dashboard",
+        "panels": [
+          {
+            "title": "Request Rate",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(rate(http_requests_total{service='api-service'}[5m])) by (status)",
+                "legendFormat": "{{status}}"
+              }
+            ]
+          },
+          {
+            "title": "Latency (p99)",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service='api-service'}[5m])) by (le))",
+                "legendFormat": "p99"
+              }
+            ]
+          },
+          {
+            "title": "Error Rate",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(rate(http_requests_total{service='api-service', status=~'5..'}[5m])) / sum(rate(http_requests_total{service='api-service'}[5m])) * 100",
+                "legendFormat": "Error %"
+              }
+            ]
+          },
+          {
+            "title": "CPU Usage",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(rate(container_cpu_usage_seconds_total{pod=~'api-service-.*'}[5m])) by (pod)",
+                "legendFormat": "{{pod}}"
+              }
+            ]
+          },
+          {
+            "title": "Memory Usage",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(container_memory_working_set_bytes{pod=~'api-service-.*'}) by (pod)",
+                "legendFormat": "{{pod}}"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Log aggregation with Fluent Bit
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: monitoring
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5
+        Log_Level     info
+        Daemon        off
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2021
+    
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*.log
+        Parser            docker
+        Tag               kube.*
+        Refresh_Interval  5
+        Mem_Buf_Limit     50MB
+        Skip_Long_Lines   On
+    
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           On
+        Merge_Log_Key       log_processed
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+    
+    [OUTPUT]
+        Name              loki
+        Match             kube.*
+        Host              loki.monitoring.svc.cluster.local
+        Port              3100
+        Labels            job=fluent-bit,namespace=$NAMESPACE,pod=$POD_NAME,container=$CONTAINER_NAME
+        Auto_Kubernetes_Labels On
+
+---
+# AlertManager configuration
+apiVersion: monitoring.coreos.com/v1
+kind: AlertmanagerConfig
+metadata:
+  name: api-service-alerts
+  namespace: monitoring
+spec:
+  receivers:
+  - name: default
+    slackConfigs:
+    - channel: "#alerts-api"
+      apiUrl:
+        name: slack-webhook
+        key: url
+      sendResolved: true
+      title: |
+        {{ if eq .Status "firing" }}:fire: API Service Alert{{ else }}:white_check_mark: API Service Resolved{{ end }}
+      text: |
+        {{ range .Alerts }}
+        *Alert:* {{ .Labels.alertname }}
+        *Severity:* {{ .Labels.severity }}
+        *Description:* {{ .Annotations.description }}
+        *Details:* {{ range .Labels.SortedPairs }} • {{ .Name }}: {{ .Value }}{{ end }}
+        {{ end }}
+  
+  route:
+    receiver: default
+    groupBy: ['alertname', 'severity']
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+    matchers:
+    - severity = critical
+```
+
+### Application Metrics Endpoint
+
+```yaml
+# Example: Adding Prometheus metrics to application
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-service-metrics
+  namespace: production
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    
+    scrape_configs:
+    - job_name: 'api-service'
+      static_configs:
+      - targets: ['localhost:8080']
+      metrics_path: /metrics
+      relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: '${POD_NAME}.api-service'
+```
+
+## YAML Examples
+
+### ServiceMonitor
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: myapp-monitor
+  namespace: production
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: myapp
+  endpoints:
+  - port: metrics
+    interval: 15s
+```
+
+### PrometheusRule
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: myapp-alerts
+spec:
+  groups:
+  - name: myapp
+    rules:
+    - alert: MyAppDown
+      expr: up{job="myapp"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "MyApp is down"
+```
+
+## CLI Examples (kubectl)
+
+### Metrics and Monitoring
+
+```bash
+# Check node metrics
+kubectl top nodes
+
+# Check pod metrics
+kubectl top pods
+kubectl top pods -n production
+
+# Get pod metrics with labels
+kubectl top pods -n production --sort-by=memory
+
+# Check metrics server
+kubectl get apiservice v1beta1.metrics.k8s.io
+
+# Check Prometheus pods
+kubectl get pods -n monitoring -l app=prometheus
+
+# Check Prometheus targets
+kubectl port-forward -n monitoring prometheus-k8s-0 9090:9090
+# Then open http://localhost:9090/targets
+
+# Check Alertmanager
+kubectl port-forward -n monitoring alertmanager-main-0 9093:9093
+```
+
+### Logging
+
+```bash
+# Get pod logs
+kubectl logs my-pod -n production
+kubectl logs my-pod -n production --tail=100
+kubectl logs my-pod -n production --previous
+
+# Stream logs
+kubectl logs -f my-pod -n production
+
+# Get logs from all pods in deployment
+kubectl logs deployment/api-service -n production
+
+# GKE logging
+gcloud logging read "resource.type=k8s_container" --project=my-project --limit=50
+
+# Check Fluent Bit logs
+kubectl logs -n monitoring -l app=fluent-bit --tail=100
+```
+
+### Service Level Objectives
+
+```bash
+# Define SLO in Prometheus
+# Availability = successful requests / total requests > 99.9%
+# Latency = p99 < 500ms
+```
+
+## Common Commands
+
+```bash
+# Check component status
+kubectl get componentstatuses
+
+# Check control plane health
+kubectl get cs
+
+# Get all events sorted by time
+kubectl get events --sort-by='.lastTimestamp'
+
+# Get events for specific resource
+kubectl get events --field-selector involvedObject.name=my-pod
+
+# Watch resource usage
+kubectl top nodes --watch
+kubectl top pods -n production --watch
+
+# Port forward Grafana
+kubectl port-forward -n monitoring grafana-xxx 3000:3000
+```
+
+## Monitoring
+
+### Key Metrics Categories
+
+| Category | Metrics | Purpose |
+|----------|---------|---------|
+| Infrastructure | CPU, Memory, Disk, Network | Node health |
+| Kubernetes | Pod status, node conditions, etcd | Cluster health |
+| Application | Request rate, latency, errors | Service health |
+| Business | User actions, conversions | Business metrics |
+
+### Prometheus Query Examples
+
+```promql
+# Pod CPU usage
+sum(rate(container_cpu_usage_seconds_total{pod=~"api-.*"}[5m])) by (pod)
+
+# Pod memory usage
+sum(container_memory_working_set_bytes{pod=~"api-.*"}) by (pod)
+
+# Request rate by status
+sum(rate(http_requests_total{service="api"}[5m])) by (status)
+
+# Error rate
+sum(rate(http_requests_total{service="api",status=~"5.."}[5m])) / sum(rate(http_requests_total{service="api"}[5m]))
+
+# Latency percentiles
+histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service="api"}[5m])) by (le))
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="api"}[5m])) by (le))
+histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{service="api"}[5m])) by (le))
+```
+
+### GKE Monitoring
+
+```bash
+# Enable Cloud Operations
+gcloud container clusters update my-cluster \
+  --zone=us-central1 \
+  --enable-monitoring
+
+# View GKE metrics in Cloud Monitoring
+# Metrics: kubernetes.io/container/*, kubernetes.io/pod/*, kubernetes.io/node/*
+
+# View logs
+gcloud logging read "resource.type=k8s_container" --project=my-project
+
+# Cloud Monitoring dashboards
+# In Cloud Console → Kubernetes Engine → Workloads
+```
+
+## Security
+
+### Monitoring Security Events
+
+```yaml
+# Audit policy to log security events
+apiVersion: audit.k8s.io/v1
+kind: Policy
+metadata:
+  name: audit-policy
+rules:
+# Log metadata for all requests
+- level: Metadata
+  resources:
+  - group: ""
+    resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["create", "update", "delete"]
+
+# Log request body for sensitive resources
+- level: RequestResponse
+  resources:
+  - group: ""
+    resources: ["secrets"]
+  verbs: ["create", "update", "delete"]
+```
+
+### RBAC for Monitoring
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods", "services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list", "watch"]
+```
+
+## Troubleshooting
+
+### Common Monitoring Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Metrics not showing | ServiceMonitor not matching | Check labels |
+| Missing metrics | Prometheus scraper issues | Check Prometheus logs |
+| High metric cardinality | Too many unique labels | Reduce label combinations |
+| Pod metrics missing | kubelet not reporting | Check kubelet health |
+
+### Diagnostic Commands
+
+```bash
+# Check Prometheus status
+kubectl get prometheus -n monitoring
+
+# Check Prometheus targets
+kubectl exec -n monitoring prometheus-k8s-0 -- wget -qO- localhost:9090/api/v1/targets | jq
+
+# Check service discovery
+kubectl exec -n monitoring prometheus-k8s-0 -- wget -qO- localhost:9090/api/v1/status/targets | jq
+
+# Check Alertmanager
+kubectl get alertmanager -n monitoring
+
+# Check Grafana
+kubectl get pods -n monitoring -l app=grafana
+
+# Check Fluent Bit
+kubectl get pods -n monitoring -l app=fluent-bit
+
+# View Prometheus config
+kubectl get prometheus -n monitoring -o yaml
+
+# Check metric scrape intervals
+kubectl get servicemonitor -A -o wide
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What are the three pillars of observability?**
+A: Metrics (quantitative measurements), Logs (event records), and Traces (request flow tracking). Together they provide comprehensive visibility into system behavior.
+
+**Q: How does Prometheus work with Kubernetes?**
+A: Prometheus uses Kubernetes service discovery to find targets (pods, services). It scrapes metrics endpoints based on ServiceMonitor or pod annotations. Data is stored in TSDB and queried via PromQL.
+
+**Q: What is the difference between Pushgateway and Prometheus scraping?**
+A: Prometheus typically pulls metrics from targets. Pushgateway is used for short-lived jobs that can't be scraped, allowing them to push metrics.
+
+### Intermediate Questions
+
+**Q: How would you set up alerting for a Kubernetes application?**
+A: Define PrometheusRules with alert expressions, route alerts to AlertManager, configure receivers (Slack, PagerDuty, Email), and create Grafana dashboards for visualization.
+
+**Q: What is the purpose of ServiceMonitor in Prometheus Operator?**
+A: ServiceMonitor defines which services to scrape and how. The Prometheus Operator automatically configures Prometheus to scrape the defined endpoints.
+
+### Advanced Questions
+
+**Q: How do you handle high cardinality metrics?**
+A: Use appropriate label values, avoid labels with unbounded cardinality (user IDs, request IDs), aggregate before scraping, and use recording rules.
+
+**Q: How would you implement distributed tracing in Kubernetes?**
+A: Deploy a tracing backend (Jaeger, Tempo), instrument applications with OpenTelemetry or similar, propagate trace context via headers, and create traces for service-to-service calls.
+
+## Cheat Sheet
+
+### Key Metrics
+
+| Metric Type | Examples | Alert Threshold |
+|-------------|----------|-----------------|
+| CPU | container_cpu_usage_seconds_total | > 80% |
+| Memory | container_memory_working_set_bytes | > 85% |
+| Latency | http_request_duration_seconds | p99 > 500ms |
+| Errors | `http_requests_total{status=5xx}` | > 1% |
+| Availability | `up{job="api"}` | = 0 |
+
+### Essential Commands
+
+```bash
+# Node metrics
+kubectl top nodes
+
+# Pod metrics
+kubectl top pods
+kubectl top pods -n production --sort-by=memory
+
+# Get events
+kubectl get events --sort-by='.lastTimestamp'
+
+# Check logs
+kubectl logs my-pod -n production --tail=100
+
+# Stream logs
+kubectl logs -f my-pod -n production
+```
+
+### Monitoring Stack
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Common Monitoring Stack                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Metrics: Prometheus + AlertManager + Grafana                               │
+│  Logs: Fluent Bit + Loki (or Elasticsearch + Kibana)                        │
+│  Traces: Jaeger or Tempo                                                     │
+│  Alerting: AlertManager + PagerDuty/Slack                                    │
+│                                                                              │
+│  Installation: Prometheus Operator (kube-prometheus-stack)                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Related Topics
+
+- [Security](./security) - Audit logging
+- [Debugging](./debugging) - Troubleshooting
+- [GKE](./gke) - Cloud-native monitoring

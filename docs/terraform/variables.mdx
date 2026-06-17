@@ -1,0 +1,869 @@
+# Terraform Variables
+
+## Overview
+
+Variables allow you to parameterize Terraform configurations, making them reusable across environments and teams. They enable Infrastructure as Code flexibility while maintaining configuration consistency and preventing hardcoded values.
+
+## When To Use
+
+- **Environment-specific values**: Different configs for dev/staging/prod
+- **Reusable modules**: Parameterized inputs and outputs
+- **Sensitive data handling**: Mark variables as sensitive to prevent exposure
+- **Complex configurations**: Break down large configs into manageable pieces
+
+## When NOT To Use
+
+- **Simple constants**: If a value never changes, hardcode it
+- **Derived values**: Use `local` values instead
+- **One-off configurations**: Variables add complexity for single-use values
+
+## Core Concepts
+
+### Variable Types
+
+```hcl
+# String
+variable "region" {
+  type    = string
+  default = "us-central1"
+}
+
+# Number
+variable "replicas" {
+  type    = number
+  default = 3
+}
+
+# Boolean
+variable "enable_monitoring" {
+  type    = bool
+  default = true
+}
+
+# List
+variable "availability_zones" {
+  type    = list(string)
+  default = ["us-central1-a", "us-central1-b", "us-central1-c"]
+}
+
+# Map
+variable "instance_config" {
+  type = map(string)
+  default = {
+    machine_type = "e2-medium"
+    disk_size    = "50"
+  }
+}
+
+# Object
+variable "web_server" {
+  type = object({
+    name         = string
+    machine_type = string
+    disk_size_gb = number
+    preemptible  = bool
+  })
+  default = {
+    name         = "web-server"
+    machine_type = "e2-medium"
+    disk_size_gb = 50
+    preemptible  = false
+  }
+}
+
+# Tuple
+variable "ports" {
+  type    = tuple([string, number, bool])
+  default = ["http", 80, true]
+}
+
+# Set
+variable "azs" {
+  type    = set(string)
+  default = ["us-east-1a", "us-east-1b"]
+}
+```
+
+### Variable Precedence
+
+```bash
+# Highest to lowest:
+# 1. -var on command line
+# 2. -var-file on command line
+# 3..auto.tfvars
+# 4. terraform.tfvars.json
+# 5. terraform.tfvars
+# 6. Environment variables (TF_VAR_*)
+# 7. Default in variable declaration
+```
+
+## Real Production Example
+
+### variables.tf
+
+```hcl
+# =============================================================================
+# Project & Environment
+# =============================================================================
+
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+  
+  validation {
+    condition     = length(var.project_id) > 0 && can(regex("^[a-z0-9-]+$", var.project_id))
+    error_message = "Project ID must be lowercase letters, numbers, and hyphens only."
+  }
+}
+
+variable "environment" {
+  description = "Deployment environment"
+  type        = string
+  
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod."
+  }
+}
+
+variable "region" {
+  description = "GCP region"
+  type        = string
+  default     = "us-central1"
+  
+  validation {
+    condition     = can(regex("^[a-z]+-[a-z]+[0-9]+$", var.region))
+    error_message = "Region must be a valid GCP region (e.g., us-central1)."
+  }
+}
+
+# =============================================================================
+# Network Configuration
+# =============================================================================
+
+variable "vpc_cidr" {
+  description = "CIDR range for VPC network"
+  type        = string
+  default     = "10.0.0.0/16"
+  
+  validation {
+    condition     = can(cidrhost(var.vpc_cidr, 0))
+    error_message = "Must be a valid CIDR range."
+  }
+}
+
+variable "private_subnet_cidrs" {
+  description = "CIDR ranges for private subnets"
+  type        = list(string)
+  default     = ["10.0.0.0/24", "10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "secondary_ranges" {
+  description = "Secondary IP ranges for subnets"
+  type = map(list(object({
+    ip_cidr_range = string
+    range_name    = string
+  })))
+  default = {}
+}
+
+# =============================================================================
+# Compute Configuration
+# =============================================================================
+
+variable "machine_type" {
+  description = "Machine type for compute instances"
+  type        = string
+  default     = "e2-medium"
+  
+  validation {
+    condition     = can(regex("^(e2|machineTypes/)[a-z]+-[0-9]+(-[0-9]+)?$", var.machine_type))
+    error_message = "Must be a valid GCP machine type."
+  }
+}
+
+variable "mig_target_size" {
+  description = "Target size for managed instance group"
+  type        = number
+  default     = 2
+  
+  validation {
+    condition     = var.mig_target_size >= 1 && var.mig_target_size <= 100
+    error_message = "MIG target size must be between 1 and 100."
+  }
+}
+
+variable "autoscaler_enabled" {
+  description = "Enable autoscaling for MIG"
+  type        = bool
+  default     = true
+}
+
+variable "min_replicas" {
+  description = "Minimum number of replicas for autoscaling"
+  type        = number
+  default     = 2
+}
+
+variable "max_replicas" {
+  description = "Maximum number of replicas for autoscaling"
+  type        = number
+  default     = 10
+}
+
+# =============================================================================
+# Database Configuration
+# =============================================================================
+
+variable "db_tier" {
+  description = "Cloud SQL instance tier"
+  type        = string
+  default     = "db-n1-standard-2"
+  
+  validation {
+    condition = can(regex("^db-[a-z]+-[0-9]+$", var.db_tier))
+    error_message = "Database tier must match pattern db-[type]-[size]."
+  }
+}
+
+variable "db_disk_size" {
+  description = "Cloud SQL disk size in GB"
+  type        = number
+  default     = 100
+  
+  validation {
+    condition     = var.db_disk_size >= 10 && var.db_disk_size <= 65536
+    error_message = "Disk size must be between 10 and 65536 GB."
+  }
+}
+
+variable "db_username" {
+  description = "Database master username"
+  type        = string
+  default     = "webapp"
+}
+
+variable "db_backup_enabled" {
+  description = "Enable automated backups"
+  type        = bool
+  default     = true
+}
+
+# =============================================================================
+# Service Accounts
+# =============================================================================
+
+variable "terraform_service_account" {
+  description = "Service account for Terraform to use"
+  type        = string
+  
+  validation {
+    condition     = can(regex("@.*\\.iam\\.gserviceaccount\\.com$", var.terraform_service_account))
+    error_message = "Must be a valid GCP service account email."
+  }
+}
+
+variable "app_service_account_email" {
+  description = "Service account for application instances"
+  type        = string
+}
+
+# =============================================================================
+# Security
+# =============================================================================
+
+variable "enable_private_endpoint" {
+  description = "Enable private endpoint for Cloud SQL"
+  type        = bool
+  default     = true
+}
+
+variable "enable_confidential_compute" {
+  description = "Enable confidential compute for instances"
+  type        = bool
+  default     = false
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDR blocks allowed to access resources"
+  type        = list(string)
+  default     = ["10.0.0.0/8"]
+}
+
+# =============================================================================
+# Cost Center & Tags
+# =============================================================================
+
+variable "cost_center" {
+  description = "Cost center for billing attribution"
+  type        = string
+  default     = "engineering"
+}
+
+variable "team" {
+  description = "Team responsible for resources"
+  type        = string
+  default     = "platform"
+}
+
+variable "owner" {
+  description = "Owner of the infrastructure"
+  type        = string
+  default     = ""
+}
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+
+variable "enable_cloud_armor" {
+  description = "Enable Cloud Armor for Load Balancer"
+  type        = bool
+  default     = true
+}
+
+variable "enable_deletion_protection" {
+  description = "Enable deletion protection for resources"
+  type        = bool
+  default     = false
+}
+
+variable "enable_vpc_flow_logs" {
+  description = "Enable VPC Flow Logs"
+  type        = bool
+  default     = true
+}
+```
+
+### terraform.tfvars
+
+```hcl
+# =============================================================================
+# Development Environment
+# =============================================================================
+
+project_id  = "my-project-dev"
+environment = "dev"
+region      = "us-central1"
+
+# Network
+vpc_cidr           = "10.0.0.0/16"
+private_subnet_cidrs = ["10.0.0.0/24", "10.0.1.0/24"]
+
+# Compute
+machine_type      = "e2-medium"
+mig_target_size   = 1
+autoscaler_enabled = false
+
+# Database
+db_tier     = "db-g1-small"
+db_disk_size = 20
+
+# Service Accounts
+terraform_service_account = "terraform-dev@my-project-dev.iam.gserviceaccount.com"
+
+# Feature Flags
+enable_private_endpoint    = true
+enable_confidential_compute = false
+enable_cloud_armor         = false
+enable_deletion_protection = false
+```
+
+### prod.tfvars
+
+```hcl
+# =============================================================================
+# Production Environment
+# =============================================================================
+
+project_id  = "my-project-prod"
+environment = "prod"
+region      = "us-central1"
+
+# Network
+vpc_cidr           = "10.1.0.0/16"
+private_subnet_cidrs = ["10.1.0.0/24", "10.1.1.0/24", "10.1.2.0/24"]
+
+# Compute
+machine_type      = "e2-standard-4"
+mig_target_size   = 3
+autoscaler_enabled = true
+min_replicas      = 3
+max_replicas      = 20
+
+# Database
+db_tier     = "db-n1-standard-8"
+db_disk_size = 500
+
+# Service Accounts
+terraform_service_account = "terraform-prod@my-project-prod.iam.gserviceaccount.com"
+
+# Feature Flags
+enable_private_endpoint    = true
+enable_confidential_compute = true
+enable_cloud_armor         = true
+enable_deletion_protection = true
+enable_vpc_flow_logs       = true
+
+# Cost Center
+cost_center = "production-platform"
+```
+
+## HCL Examples
+
+### Input Variable Usage
+
+```hcl
+# Basic usage
+resource "google_compute_instance" "web" {
+  name         = "web-server-${var.environment}"
+  machine_type = var.machine_type
+  zone         = "${var.region}-a"
+}
+
+# Map access
+locals {
+  instance_type_config = {
+    dev     = "e2-medium"
+    staging = "e2-standard-2"
+    prod    = "e2-standard-4"
+  }
+}
+
+# Reference map variable
+resource "google_compute_instance" "web" {
+  machine_type = local.instance_type_config[var.environment]
+}
+
+# List access
+resource "google_compute_instance" "server" {
+  zone = var.availability_zones[0]
+}
+
+# Object access
+resource "google_sql_database_instance" "db" {
+  settings {
+    tier = var.db_config.tier
+  }
+}
+```
+
+### Output Variables
+
+```hcl
+output "vpc_id" {
+  description = "VPC network ID"
+  value       = google_compute_network.vpc.id
+}
+
+output "instance_ips" {
+  description = "Private IPs of instances"
+  value       = google_compute_instance.server[*].network_interface[0].network_ip
+}
+
+output "db_connection_string" {
+  description = "Database connection string"
+  value       = "postgres://${var.db_username}:${var.db_password}@${google_sql_database_instance.db.private_ip}:5432/${var.db_name}"
+  sensitive   = true
+}
+```
+
+### Local Values
+
+```hcl
+locals {
+  # Computed local
+  environment_prefix = "${var.environment}-${var.region}"
+  
+  # Merge maps
+  common_labels = merge(
+    var.labels,
+    {
+      environment = var.environment
+      managed_by  = "terraform"
+    }
+  )
+  
+  # Conditional local
+  instance_config = var.environment == "prod" ? {
+    machine_type = "e2-standard-4"
+    disk_size    = 100
+  } : {
+    machine_type = "e2-medium"
+    disk_size    = 50
+  }
+}
+```
+
+## CLI Examples
+
+### Variable Assignment
+
+```bash
+# Using default values
+terraform plan
+
+# Using environment variable
+export TF_VAR_region="us-west2"
+terraform plan
+
+# Using tfvars file
+terraform plan -var-file="prod.tfvars"
+
+# Using command line flag (highest priority)
+terraform plan -var="environment=staging" -var="mig_target_size=5"
+
+# Multiple var files
+terraform apply -var-file="common.tfvars" -var-file="prod.tfvars"
+
+# Variable from stdin
+echo "environment = dev" | terraform plan -var-file=-
+```
+
+### Variable Inspection
+
+```bash
+# List all variables
+grep -h "variable \"" *.tf
+
+# Show variable values
+terraform console
+> var.environment
+> var.machine_type
+> var.db_tier
+
+# Validate variables
+terraform validate
+
+# Graph dependencies
+terraform graph | grep var
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform plan -var=KEY=VALUE` | Set variable inline |
+| `terraform plan -var-file=FILE` | Load variables from file |
+| `export TF_VAR_NAME=value` | Set via environment variable |
+| `terraform console` | Interactive variable evaluation |
+
+## Best Practices
+
+### 1. Use Descriptive Variable Names
+
+```hcl
+# Good
+variable "database_disk_size_gb" {
+  description = "Database persistent disk size in gigabytes"
+}
+
+# Bad
+variable "disk" {
+  description = "Disk"
+}
+```
+
+### 2. Always Provide Descriptions
+
+```hcl
+variable "project_id" {
+  description = "GCP project ID for resources"
+  type        = string
+}
+```
+
+### 3. Use Validation Rules
+
+```hcl
+variable "environment" {
+  type        = string
+  default     = "dev"
+  
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod."
+  }
+}
+```
+
+### 4. Group Variables Logically
+
+```hcl
+# =============================================================================
+# Network Variables
+# =============================================================================
+
+variable "vpc_cidr" { ... }
+variable "private_subnet_cidrs" { ... }
+
+# =============================================================================
+# Compute Variables
+# =============================================================================
+
+variable "machine_type" { ... }
+variable "mig_target_size" { ... }
+```
+
+### 5. Use Sensitive Flag for Secrets
+
+```hcl
+variable "db_password" {
+  description = "Database master password"
+  type        = string
+  sensitive   = true
+}
+
+variable "api_key" {
+  description = "External API key"
+  type        = string
+  sensitive   = true
+}
+```
+
+### 6. Structure tfvars Files
+
+```hcl
+# common.tfvars - shared across environments
+project_id          = "my-project"
+region              = "us-central1"
+terraform_service_account = "terraform@my-project.iam.gserviceaccount.com"
+cost_center         = "engineering"
+team                = "platform"
+
+# dev.tfvars
+environment       = "dev"
+mig_target_size   = 1
+enable_cloud_armor = false
+
+# prod.tfvars
+environment        = "prod"
+mig_target_size    = 5
+enable_cloud_armor = true
+```
+
+## Monitoring / State Management
+
+### Variable Usage Tracking
+
+```bash
+# Find variable references
+grep -r "var\." . | head -20
+
+# Find all variable definitions
+grep -h "variable \"" *.tf
+
+# Show variable dependencies
+terraform graph | grep var
+```
+
+## Security
+
+### Sensitive Variables
+
+```hcl
+# Mark as sensitive to prevent display
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+# Sensitive outputs also marked
+output "connection_string" {
+  value     = "postgres://user:pass@host:5432/db"
+  sensitive = true
+}
+```
+
+### Variable Encryption
+
+```bash
+# Encrypt tfvars file
+gcloud kms encrypt \
+  --location=global \
+  --keyring=tf-keyring \
+  --key=tf-key \
+  --plaintext-file=prod.tfvars \
+  --ciphertext-file=prod.tfvars.enc
+
+# Decrypt during apply
+gcloud kms decrypt \
+  --location=global \
+  --keyring=tf-keyring \
+  --key=tf-key \
+  --ciphertext-file=prod.tfvars.enc \
+  --plaintext-file=/dev/stdout | \
+  terraform apply -var-file=/dev/stdin
+```
+
+### Secret Manager Integration
+
+```hcl
+# Fetch secret from Secret Manager
+data "google_secret_manager_secret_version" "db_password" {
+  secret  = "${var.environment}-db-password"
+  version = "latest"
+}
+
+# Use in resource
+resource "google_sql_user" "db" {
+  name     = "webapp"
+  instance = google_sql_database_instance.primary.name
+  password = data.google_secret_manager_secret_version.db_password.secret_data
+}
+```
+
+## Cost Optimization
+
+### Variable-Based Resource Optimization
+
+```hcl
+# Environment-based sizing
+variable "instance_sizes" {
+  type    = map(string)
+  default = {
+    dev     = "e2-medium"
+    staging = "e2-standard-2"
+    prod    = "e2-standard-4"
+  }
+}
+
+# Use in resource
+resource "google_compute_instance" "app" {
+  machine_type = var.instance_sizes[var.environment]
+}
+
+# Disk size optimization
+variable "disk_sizes" {
+  type    = map(number)
+  default = {
+    dev     = 20
+    staging = 100
+    prod    = 500
+  }
+}
+
+resource "google_compute_disk" "data" {
+  size  = var.disk_sizes[var.environment]
+  zone  = var.zone
+  type  = "pd-ssd"
+}
+```
+
+## Troubleshooting
+
+### Undefined Variable
+
+```bash
+# Error: Reference to undeclared variable
+# Solution: Check variable name spelling and tfvars files
+terraform validate
+```
+
+### Variable Type Mismatch
+
+```bash
+# Error: Invalid value for input variable
+# Solution: Match type in tfvars with variable definition
+variable "ports" {
+  type = list(number)
+}
+# In tfvars:
+ports = [80, 443]  # Not ["80", "443"]
+```
+
+### Sensitive Variable Display
+
+```bash
+# Sensitive variables not shown by default
+terraform output db_password  # Shows <sensitive>
+
+# Show raw value (NOT recommended)
+terraform output -raw db_password
+```
+
+### Environment Variable Not Set
+
+```bash
+# Error: Required variable not set
+# Solution: Set TF_VAR_ prefixed env var or use tfvars file
+export TF_VAR_project_id="my-project"
+terraform plan
+```
+
+## Interview Questions
+
+### Q1: What is the order of variable precedence?
+**A:** From highest to lowest: command-line `-var`, command-line `-var-file`, environment variables (`TF_VAR_`), `terraform.tfvars`, `terraform.tfvars.json`, `.auto.tfvars`, default value.
+
+### Q2: How do you handle sensitive variables?
+**A:** Mark with `sensitive = true`, use Secret Manager, environment variables, or encrypted tfvars files. Never commit sensitive values.
+
+### Q3: What's the difference between variables and locals?
+**A:** Variables are input parameters passed in. Locals are computed values derived from variables, other locals, or resource attributes.
+
+### Q4: How do you validate input variables?
+**A:** Use `validation` block within variable definition with `condition` and `error_message`.
+
+### Q5: What's the difference between list and set in Terraform?
+**A:** List is ordered with indexed access. Set is unordered with unique values only.
+
+### Q6: How do you use maps in Terraform variables?
+**A:** Access with `var.map_name["key"]`. Can use `lookup()` for default values: `lookup(var.config, "key", "default")`.
+
+### Q7: Can you reference outputs from other Terraform states?
+**A:** Yes, using `terraform_remote_state` data source with the backend configuration and accessing outputs via `data.terraform_remote_state.NAME.outputs`.
+
+### Q8: What is a sensitive variable?
+**A:** A variable marked `sensitive = true` prevents Terraform from displaying its value in plan/apply output.
+
+## Cheat Sheet
+
+### Variable Definition
+```hcl
+variable "NAME" {
+  description = "What it does"
+  type        = string | number | bool | list() | map() | object() | tuple()
+  default     = VALUE
+  sensitive   = true | false
+  
+  validation {
+    condition     = EXPRESSION
+    error_message = "Description"
+  }
+}
+```
+
+### Variable Usage
+```hcl
+var.string_var
+var.number_var
+var.list_var[0]
+var.map_var["key"]
+var.object_var.attribute
+lookup(var.map, "key", "default")
+```
+
+### Variable Files
+```
+terraform.tfvars        # Auto-loaded
+.auto.tfvars           # Auto-loaded
+<name>.tfvars          # Manual: -var-file=<name>.tfvars
+environment.tfvars     # Manual: -var-file=environment.tfvars
+```
+
+### Environment Variables
+```bash
+export TF_VAR_region="us-west2"
+export TF_VAR_environment="prod"
+export TF_VAR_mig_target_size=5
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Terraform fundamentals
+- [Providers](./providers.mdx) - Provider configuration
+- [Resources](./resources.mdx) - Resource configuration
+- [Modules](./modules.mdx) - Module patterns
+- [Secrets](./secrets.mdx) - Secrets management
+- [State](./state.mdx) - State management

@@ -1,0 +1,896 @@
+---
+sidebar_position: 5
+---
+
+# Error Budget
+
+## Overview
+
+An error budget is the amount of unreliability you can afford in a given time window before it exceeds your SLO. It's the central currency of SRE decision-making — a concrete representation of how much "room to fail" remains. If your SLO is 99.9% availability over 30 days, your error budget is 43.8 minutes of downtime per month.
+
+Error budgets transform reliability from an abstract concept into something tangible and actionable. Instead of debating whether reliability is "good enough," teams can look at the error budget and have an objective conversation: "We have 80% of our budget remaining, so we can afford to ship this risky feature. We have only 20% remaining, so we should focus on reliability."
+
+The error budget also creates a natural mechanism for self-regulation. When the budget is healthy, invest in features and velocity. When the budget depletes, invest in reliability. This prevents both over-engineering (always building redundancy) and under-investing (always shipping features).
+
+## When To Use
+
+- **Making deployment decisions** — Should we ship this risky change now or wait?
+- **Prioritizing engineering work** — Feature work vs reliability work
+- **Setting alerting thresholds** — Alert when budget depletes beyond threshold
+- **Communicating reliability status** — Stakeholder updates on service health
+- **Postmortem context** — Understanding impact of past incidents
+- **SLO target validation** — Is our SLO too tight or too loose?
+
+## When NOT To Use
+
+- **For services without SLOs** — Error budget requires a defined SLO
+- **As a blame mechanism** — Budget burning is not anyone's "fault"
+- **Without tracking** — Unmeasured budgets provide no value
+- **As the only decision input** — Consider user impact, business context too
+
+## Core Concepts
+
+### Error Budget Formula
+
+```
+Error Budget = (1 - SLO) × Time Window
+
+For 99.9% SLO over 30 days:
+Error Budget = (1 - 0.999) × 30 days
+             = 0.001 × 43,200 minutes
+             = 43.2 minutes
+```
+
+### Error Budget Burn Rate
+
+Burn rate tells you how fast you're consuming your error budget:
+
+```
+Burn Rate = Actual Error Rate / Permitted Error Rate
+
+If actual errors = 0.2% and permitted = 0.1%:
+  Burn Rate = 0.002 / 0.001 = 2.0 (burning 2× faster than allowed)
+```
+
+At burn rate 1.0, you'll exactly exhaust your budget at the end of the window. At burn rate 2.0, you'll exhaust it in half the time.
+
+### Budget Depletion Policy
+
+Error budget policies define what happens as the budget depletes:
+
+```yaml
+error_budget_policy:
+  service: checkout-api
+  
+  thresholds:
+    - level: 100%   # Full budget
+      status: "healthy"
+      action: "Normal operations, feature development allowed"
+      
+    - level: 75%    # 25% burned
+      status: "warning"
+      action: "Increased monitoring, review pending changes"
+      
+    - level: 50%    # 50% burned
+      status: "at_risk"
+      action: 
+        - "Halt non-critical deployments"
+        - "Page SRE for investigation"
+        - "Notify team of reduced velocity"
+        
+    - level: 25%    # 75% burned
+      status: "critical"
+      action:
+        - "Freeze all production deployments"
+        - "Incident response mode"
+        - "Executive notification"
+        
+    - level: 0%     # Budget exhausted
+      status: "breached"
+      action:
+        - "Emergency reliability focus"
+        - "Customer communication if SLA impacted"
+        - "No new features until budget recovers"
+```
+
+### Budget Recovery
+
+Error budget naturally recovers as you go forward in time (sliding window). But you can also "earn back" budget by performing better than the SLO target:
+
+```python
+def budget_recovery_rate(achievement, target):
+    """
+    Calculate how fast you're recovering budget.
+    
+    Positive = recovering (better than target)
+    Negative = burning faster (worse than target)
+    """
+    return (achievement - target) / target
+
+# Example
+# SLO target 99.9%, actual achievement 99.95%
+# You're recovering budget at 5.5% of baseline rate
+recovery = budget_recovery_rate(99.95, 99.9)
+print(f"Recovery rate: {recovery:.4f}")  # 0.000556 = 5.56% recovery rate
+```
+
+## Real Production Example
+
+### Google-Scale Error Budget Policy
+
+Google's SRE teams typically implement multi-window burn rate alerts:
+
+```yaml
+# Multi-window burn rate alert (from Google SRE book)
+groups:
+  - name: error-budget-alerts
+    rules:
+      # Fast burn: 1 hour window, 50% budget burned
+      # For 30-day SLO: 1h = 1/(30×24) = 1/720 of window
+      # 50% in 1h = 360x burn rate
+      - alert: ErrorBudgetFastBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{status!~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total[1h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (1 / (30 * 24))
+          > 50
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error budget burning fast"
+          description: "50% of monthly budget burned in 1 hour"
+          
+      # Slow burn: 6 hour window, 50% budget burned  
+      # 50% in 6h = 60x burn rate
+      - alert: ErrorBudgetSlowBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{status!~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total[6h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (6 / (30 * 24))
+          > 50
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error budget burning slowly"
+          description: "50% of monthly budget burned in 6 hours"
+```
+
+### E-Commerce Platform Error Budget
+
+```yaml
+# Checkout service error budget configuration
+service: checkout
+slo:
+  target: 99.9%
+  window: 30d rolling
+  
+error_budget:
+  total_minutes: 43.8
+  consumed_minutes: 12.4  # Current consumption
+  remaining_minutes: 31.4
+  remaining_percent: 71.7%
+  
+current_metrics:
+  availability: 99.957%
+  burn_rate_1h: 0.3x  # Healthy - burning slower than target
+  burn_rate_6h: 0.5x
+  burn_rate_1d: 0.4x
+  
+incident_history:
+  last_30_days:
+    - date: "2024-01-15"
+      duration_minutes: 8.2
+      cause: "Database connection pool exhaustion"
+      resolution: "Increased pool size, added connection limits"
+      
+    - date: "2024-01-08"
+      duration_minutes: 4.2
+      cause: "Deploy-related latency spike"
+      resolution: "Implemented gradual rollout, increased rollback threshold"
+```
+
+## Metrics / Formulas / Frameworks
+
+### Error Budget Calculations
+
+```python
+def calculate_error_budget(slo_target, window_days):
+    """
+    Calculate total error budget in minutes.
+    
+    Args:
+        slo_target: SLO as decimal (0.999 for 99.9%)
+        window_days: Measurement window in days
+    """
+    window_minutes = window_days * 24 * 60
+    error_rate = 1 - slo_target
+    return error_rate * window_minutes
+
+# Examples
+print(f"99.9% over 30 days: {calculate_error_budget(0.999, 30):.1f} minutes")
+print(f"99.95% over 30 days: {calculate_error_budget(0.9995, 30):.1f} minutes")
+print(f"99.99% over 30 days: {calculate_error_budget(0.9999, 30):.1f} minutes")
+```
+
+### Budget Consumption Tracking
+
+```python
+def budget_consumed(achievement, target, window_days):
+    """
+    Calculate how much budget has been consumed.
+    
+    Returns tuple of (consumed_minutes, remaining_percent)
+    """
+    window_minutes = window_days * 24 * 60
+    total_budget = (1 - target) * window_minutes
+    
+    # Actual errors made
+    actual_errors = (1 - achievement) * window_minutes
+    
+    remaining = total_budget - actual_errors
+    remaining_pct = (remaining / total_budget) * 100 if total_budget > 0 else 0
+    
+    return max(0, remaining), remaining_pct
+
+# Example: 30-day window, 99.9% SLO, current achievement 99.85%
+remaining, remaining_pct = budget_consumed(0.9985, 0.999, 30)
+print(f"Remaining: {remaining:.1f} minutes ({remaining_pct:.1f}%)")
+# Remaining: 21.9 minutes (50%)
+```
+
+### Burn Rate Calculations
+
+```python
+def calculate_burn_rate(actual_achievement, target, window_hours, 
+                         measurement_minutes):
+    """
+    Calculate burn rate over a specific measurement window.
+    
+    Args:
+        actual_achievement: Current SLI value (0.999)
+        target: SLO target (0.999)
+        window_hours: The SLO window (30 days = 720 hours)
+        measurement_minutes: How long the measurement covers
+    """
+    # Error rate during measurement period
+    actual_error_rate = 1 - actual_achievement
+    
+    # Permitted error rate per minute
+    permitted_error_rate = (1 - target) / (window_hours * 60)
+    
+    # Actual error rate per minute in measurement window
+    measured_error_rate = actual_error_rate / measurement_minutes
+    
+    # Burn rate = actual vs permitted
+    burn_rate = measured_error_rate / permitted_error_rate if permitted_error_rate > 0 else 0
+    
+    return burn_rate
+
+# Example: 99.5% for last hour, 99.9% SLO, 30-day window
+burn = calculate_burn_rate(0.995, 0.999, 720, 60)
+print(f"Burn rate: {burn:.1f}x")  # 4.0x (burning 4x too fast)
+```
+
+### Time to Budget Exhaustion
+
+```python
+def time_to_exhaustion(current_achievement, target, window_hours, 
+                        remaining_budget_minutes):
+    """
+    Calculate hours until error budget is exhausted.
+    """
+    if current_achievement >= target:
+        return float('inf')  # No depletion happening
+    
+    burn_rate = calculate_burn_rate(
+        current_achievement, target, window_hours, 60
+    )
+    
+    if burn_rate <= 1:
+        return float('inf')  # Not burning faster than allowed
+    
+    # Base burn rate per minute (at 1x)
+    base_burn = (1 - target) / (window_hours * 60)
+    
+    # Additional burn rate per minute (above 1x)
+    excess_burn = base_burn * (burn_rate - 1)
+    
+    # Time until exhaustion
+    hours = remaining_budget_minutes / 60 / excess_burn
+    
+    return hours
+
+# Example
+hours = time_to_exhaustion(0.995, 0.999, 720, 30)
+print(f"Exhaustion in {hours:.1f} hours")  # ~29 hours
+```
+
+## Common Tools and Commands
+
+### Prometheus Error Budget Queries
+
+```promql
+-- Current error budget remaining (percentage)
+100 * (
+  1 - (
+    1 - (
+      sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+      /
+      sum(rate(http_requests_total{job="api"}[30d]))
+    )
+  )
+  /
+  (1 - 0.999)
+)
+
+-- Error budget consumed (minutes)
+(1 - (
+  sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total{job="api"}[30d]))
+)) * 30 * 24 * 60
+
+-- Burn rate (1 hour window)
+(
+  1 - (
+    sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+    /
+    sum(rate(http_requests_total{job="api"}[1h]))
+  )
+)
+/
+(1 - 0.999)
+/
+(1 / (30 * 24))
+
+-- Multi-window burn rate (both must be high for alert)
+(
+  (
+    1 - (
+      sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+      /
+      sum(rate(http_requests_total{job="api"}[1h]))
+    )
+  )
+  /
+  (1 - 0.999)
+  /
+  (1 / (30 * 24))
+)
+and
+(
+  (
+    1 - (
+      sum(rate(http_requests_total{job="api",status!~"5.."}[6h]))
+      /
+      sum(rate(http_requests_total{job="api"}[6h]))
+    )
+  )
+  /
+  (1 - 0.999)
+  /
+  (6 / (30 * 24))
+)
+> 14.4
+```
+
+### Grafana Error Budget Dashboard
+
+```json
+{
+  "title": "Error Budget Dashboard",
+  "panels": [
+    {
+      "title": "Error Budget Remaining",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "100 * (1 - (\n  (1 - (\n    sum(rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n    /\n    sum(rate(http_requests_total{job='api'}[30d]))\n  ))\n  /\n  (1 - 0.999)\n))",
+          "legendFormat": "Remaining %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "red"},
+              {"value": 25, "color": "orange"},
+              {"value": 50, "color": "yellow"},
+              {"value": 75, "color": "green"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Burn Rate Over Time",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(\n  1 - (\n    sum(rate(http_requests_total{job='api',status!~\"5..\"}[1h]))\n    /\n    sum(rate(http_requests_total{job='api'}[1h]))\n  )\n)\n/\n(1 - 0.999)\n/\n(1 / (30 * 24))",
+          "legendFormat": "1h burn rate"
+        },
+        {
+          "expr": "(\n  1 - (\n    sum(rate(http_requests_total{job='api',status!~\"5..\"}[6h]))\n    /\n    sum(rate(http_requests_total{job='api'}[6h]))\n  )\n)\n/\n(1 - 0.999)\n/\n(6 / (30 * 24))",
+          "legendFormat": "6h burn rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "yellow"},
+              {"value": 14.4, "color": "red"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Projected Monthly Achievement",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[7d]))\n  /\n  sum(rate(http_requests_total{job='api'}[7d]))\n) * 100",
+          "legendFormat": "Projected"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "thresholdsMode": "absolute",
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 99.9, "color": "yellow"},
+                {"value": 99.95, "color": "green"}
+              ]
+            },
+            "unit": "percent",
+            "decimals": 4
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+## Monitoring / Alerting Examples
+
+### Comprehensive Error Budget Alert Rules
+
+```yaml
+# prometheus/rules/error-budget-alerts.yaml
+groups:
+  - name: error-budget
+    interval: 60s
+    rules:
+      # Burn rate alert: 5% budget in 1 hour = 360x burn rate
+      - alert: ErrorBudgetFastBurnCritical
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{job="api"}[1h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (1 / (30 * 24 * 60))  # Per-minute normalization
+          > 50
+        for: 0m
+        labels:
+          severity: critical
+          category: error-budget
+        annotations:
+          summary: "Critical: Error budget burning at 50x rate"
+          description: |
+            50% of error budget will be consumed in 1 hour.
+            Current burn rate: {{ $value | printf "%.1f" }}x
+            Immediate investigation required.
+          runbook_url: "https://runbooks.example.com/error-budget-fast-burn"
+
+      # Slow burn: 5% budget in 6 hours = 60x burn rate
+      - alert: ErrorBudgetSlowBurnWarning
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{job="api"}[6h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (6 / (30 * 24 * 60))
+          > 50
+        for: 0m
+        labels:
+          severity: warning
+          category: error-budget
+        annotations:
+          summary: "Warning: Error budget burning at sustained rate"
+          description: |
+            50% of error budget will be consumed in 6 hours.
+            Investigate for root cause.
+
+      # Multi-window burn rate (both must be high)
+      - alert: ErrorBudgetMultiWindowBurn
+        expr: |
+          # Fast window (1h) burning > 14.4x
+          (
+            (
+              1 - (
+                sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+                /
+                sum(rate(http_requests_total{job="api"}[1h]))
+              )
+            )
+            /
+            (1 - 0.999)
+            /
+            (1 / (30 * 24 * 60))
+            > 14.4
+          )
+          and
+          # Slow window (6h) also burning > 14.4x
+          (
+            (
+              1 - (
+                sum(rate(http_requests_total{job="api",status!~"5.."}[6h]))
+                /
+                sum(rate(http_requests_total{job="api"}[6h]))
+              )
+            )
+            /
+            (1 - 0.999)
+            /
+            (6 / (30 * 24 * 60))
+            > 14.4
+          )
+        for: 5m
+        labels:
+          severity: critical
+          category: error-budget
+        annotations:
+          summary: "Sustained error budget burn across multiple windows"
+          description: |
+            Both 1h and 6h burn rates exceed 14.4x.
+            This indicates a sustained reliability issue.
+            Page on-call immediately.
+
+      # Budget exhausted
+      - alert: ErrorBudgetExhausted
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+            /
+            sum(rate(http_requests_total{job="api"}[30d]))
+          )
+          >= 0.999
+        for: 0m
+        labels:
+          severity: critical
+          category: error-budget
+        annotations:
+          summary: "ERROR BUDGET EXHAUSTED"
+          description: |
+            Monthly error budget has been exhausted.
+            All hands on reliability.
+            No new deployments until budget recovers.
+```
+
+## Security
+
+### Security Incidents and Error Budget
+
+Security incidents often cause rapid error budget consumption:
+
+```yaml
+# Detect security-related budget burn
+- alert: SecurityIncidentBudgetBurn
+  expr: |
+    (
+      1 - (
+        sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+        /
+        sum(rate(http_requests_total{job="api"}[1h]))
+      )
+    )
+    /
+    (1 - 0.999)
+    /
+    (1 / (30 * 24 * 60))
+    > 100
+  for: 2m
+  labels:
+    severity: critical
+    potential_security: "true"
+  annotations:
+    summary: "Possible security incident causing rapid budget burn"
+    description: "Burn rate > 100x in 1 hour - investigate for attacks"
+```
+
+### Error Budget Data Classification
+
+Error budget data reveals system reliability weaknesses:
+- Don't share detailed budget data publicly
+- Restrict access to budget dashboards
+- Be careful with incident postmortems in customer-facing docs
+
+## Cost Optimization
+
+### Error Budget Efficiency
+
+Getting more out of your error budget:
+
+```python
+def budget_efficiency(current_achievement, target, actual_budget_used):
+    """
+    Measure how efficiently you're using your budget.
+    
+    Lower is better (using less budget than allocated).
+    """
+    return actual_budget_used / (1 - target)
+
+# Example
+# SLO 99.9%, used 21.9 minutes out of 43.8 = 50% consumed
+# But achievement is 99.95%, so we're being efficient
+efficiency = budget_efficiency(0.9995, 0.999, 21.9)
+print(f"Efficiency: {efficiency:.2f}")
+# Actually using 50% of budget for 100% of target = 1.0 efficiency
+# This means we could tighten the SLO and still be safe
+```
+
+### Cost of Error Budget Depletion
+
+```yaml
+cost_of_depletion:
+  direct_costs:
+    - SLA credits to customers
+    - Emergency response overtime
+    - Potential customer churn
+    
+  indirect_costs:
+    - Engineering time diverted from features
+    - Reputation damage
+    - Stress on on-call team
+    
+  prevention_investment:
+    - Redundancy: "$X for Y% improvement"
+    - Better monitoring: "$Z to detect issues faster"
+    - Automation: "$W to reduce human error"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Error Budget Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| No error budget policy | Depletion has no consequences | Define thresholds and actions |
+| Policy not enforced | Teams ignore alerts | Executive buy-in, automate enforcement |
+| Wrong burn rate calculation | False alerts or missed alerts | Use correct formulas with proper windows |
+| Single window alerts | Noisy for transient spikes | Multi-window alerts for reliability |
+| Blaming individuals for burn | Anti-pattern, kills morale | Focus on systems, not people |
+
+### Error Budget Troubleshooting
+
+**Symptom**: Budget depleting fast but no clear incident
+
+**Diagnosis**:
+```bash
+# 1. Check if it's sustained or transient
+# Multi-window alerts should catch sustained issues
+
+# 2. Check which endpoint/request type is failing
+sum by (endpoint) (rate(http_requests_total{status=~"5.."}[1h]))
+/
+sum by (endpoint) (rate(http_requests_total[1h]))
+
+# 3. Check geographic distribution
+sum by (region) (rate(http_requests_total{status=~"5.."}[1h]))
+
+# 4. Check if correlated with deployments
+# Look at deploy timestamps
+kubectl rollout history deployment/api
+```
+
+## Interview Questions
+
+### Q1: What is an error budget and why does it matter?
+
+**A**: An error budget is the amount of unreliability you're willing to accept in a given period. For a 99.9% SLO over 30 days, the error budget is 43.8 minutes.
+
+Error budgets matter because:
+1. They create a concrete "currency" for reliability decisions
+2. They allow data-driven prioritization (features vs reliability)
+3. They provide objective thresholds for actions (halt deployments at 50% consumed)
+4. They prevent both over-engineering (redundancy for redundancy's sake) and under-investing (always shipping features)
+
+The key insight is that the budget self-regulates: when budget is healthy, ship features; when budget depletes, focus on reliability.
+
+### Q2: How do you calculate error budget burn rate?
+
+**A**: Burn rate compares actual error rate to permitted error rate:
+
+```
+Burn Rate = Actual Error Rate / Permitted Error Rate
+
+Where:
+- Permitted Error Rate = (1 - SLO) / Window Duration
+- Actual Error Rate = (1 - Measured Availability) / Measurement Duration
+
+Example: 99.5% actual, 99.9% SLO, 1-hour measurement, 30-day window
+
+Permitted per minute = 0.001 / (30 × 24 × 60) = 0.00000023
+Actual per minute = 0.005 / 60 = 0.000083
+Burn Rate = 0.000083 / 0.00000023 = 361
+
+This means we're burning 361× faster than allowed.
+At this rate, we'd exhaust the monthly budget in about 1 hour.
+```
+
+### Q3: What actions should you take as error budget depletes?
+
+**A**: I implement tiered policies:
+
+| Budget Remaining | Status | Action |
+|-----------------|--------|--------|
+| 75-100% | Healthy | Normal operations, feature development allowed |
+| 50-75% | Warning | Increased monitoring, review pending changes |
+| 25-50% | At Risk | Halt non-critical deployments, investigate |
+| 0-25% | Critical | Freeze all deployments, all-hands on reliability |
+| 0% | Breached | Emergency mode, customer communication |
+
+The key is having predefined policies so decisions are made in advance, not under pressure during incidents.
+
+### Q4: How do you handle error budget when deploying risky changes?
+
+**A**: Riskier changes warrant more budget caution:
+
+```yaml
+deployment_policy:
+  standard_deployment:
+    budget_threshold: 50%  # Can deploy if >50% budget remaining
+    requirements: "Standard monitoring, team available for rollback"
+    
+  risky_deployment:
+    budget_threshold: 75%  # Need >75% budget remaining
+    requirements:
+      - "Enhanced monitoring"
+      - "Expedited rollback capability"
+      - "Additional reviewer approval"
+      
+  high_risk_deployment:
+    budget_threshold: 90%  # Need >90% budget remaining
+    requirements:
+      - "Load test in staging"
+      - "Canary deployment (1% → 10% → 100%)"
+      - "On-call engineer dedicated to monitoring"
+```
+
+The idea is that riskier changes should only happen when you have more safety margin.
+
+### Q5: How do you communicate error budget status to stakeholders?
+
+**A**: Regular, clear communication is essential:
+
+**Weekly update** (Slack/email):
+```
+API Service Error Budget Status
+Week of 2024-01-15
+───────────────────────────────────
+Budget Remaining: 72%
+Weekly Burn: 8%
+Burn Rate: 0.8x (healthy)
+Projected Month-End: 99.91% (meets SLO)
+
+Status: ✓ On Track
+Next Week Focus: Normal feature development
+```
+
+**Critical update** (when budget drops below 50%):
+```
+⚠️ API Error Budget Alert
+───────────────────────────────────
+Budget Remaining: 48%
+Status: At Risk
+
+Action Taken: Non-critical deployments halted
+Investigation: Database latency spike (being addressed)
+ETA to Recovery: 4-6 hours
+
+Team: All available engineers focused on reliability
+```
+
+## Cheat Sheet
+
+### Error Budget Quick Reference
+
+| SLO Target | Monthly Budget | Daily Budget | Hourly Budget |
+|------------|----------------|--------------|---------------|
+| 99% | 7.3 hours | 1.68 hours | 14.4 minutes |
+| 99.5% | 3.65 hours | 50.4 minutes | 3.6 minutes |
+| 99.9% | 43.8 minutes | 1.44 minutes | 3.6 seconds |
+| 99.95% | 21.9 minutes | 43.2 seconds | 1.8 seconds |
+| 99.99% | 4.4 minutes | 8.6 seconds | 0.36 seconds |
+| 99.999% | 26 seconds | 0.86 seconds | 0.04 seconds |
+
+### Burn Rate Thresholds
+
+```
+Burn Rate > 1.0:  Consuming budget faster than allowed
+Burn Rate = 1.0:  On target to exhaust at end of window
+Burn Rate < 1.0:  Consuming budget slower than allowed
+
+For 30-day SLO:
+- Burn rate 360x in 1h = 50% budget consumed
+- Burn rate 14.4x in 1h = 50% budget consumed in 6h
+```
+
+### Key Formulas
+
+```python
+# Error budget in minutes
+error_budget_minutes = (1 - slo) * days * 24 * 60
+
+# Burn rate
+burn_rate = actual_error_rate / permitted_error_rate
+permitted_error_rate = (1 - slo) / (window_hours * 60)
+
+# Time to exhaustion
+hours_to_exhaust = remaining_budget / (burn_rate - 1) * base_rate
+
+# Budget remaining %
+remaining_pct = (remaining_minutes / total_budget_minutes) * 100
+```
+
+### Alert Thresholds (Multi-Window)
+
+| Window | Burn Rate | Meaning | Severity |
+|--------|-----------|---------|----------|
+| 1 hour | > 360x | 50% in 1 hour | Critical |
+| 1 hour | > 14.4x | 50% in 6 hours | Warning |
+| 6 hours | > 60x | 50% in 6 hours | Warning |
+| 6 hours | > 14.4x | 50% in 24 hours | Warning |
+| Multi-window | Both > 14.4x | Sustained burn | Critical |
+
+## Related Topics
+
+- [SLO](./slo.mdx) — Setting objectives and targets
+- [SLI](./sli.mdx) — Measuring service behavior
+- [SLA](./sla.mdx) — Customer commitments
+- [Monitoring](./monitoring.mdx) — Tracking error budget
+- [Alerting](./alerting.mdx) — Alerting on budget depletion
+- [Incident Management](./incident-management.mdx) — Responding to budget emergencies

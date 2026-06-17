@@ -1,0 +1,477 @@
+# Load Balancing
+
+## Overview
+
+Load balancing distributes traffic across multiple servers to optimize resource utilization, maximize throughput, and ensure availability. In production, load balancers are critical infrastructure—they sit at the edge, making decisions about where traffic goes, how to handle failures, and how to maintain performance during traffic spikes. Understanding the difference between Layer 4 (transport) and Layer 7 (application) load balancing, and when to use each, is fundamental to designing scalable systems.
+
+Layer 4 load balancers (TCP/UDP) operate on connection-level, forwarding packets without inspecting content. They're fast, simple, and work for any protocol. Layer 7 load balancers (HTTP/HTTPS) inspect application data, enabling content-based routing, path rewrites, and per-request decisions. Modern load balancers often do both (NGINX can proxy at L4 or L7, AWS ALB is L7, NLB is L4).
+
+This page covers load balancing algorithms, health checks, session persistence, and production configurations on NGINX, HAProxy, and cloud load balancers.
+
+## When To Use
+
+- **Horizontally scaling services**: Distributing traffic across multiple instances
+- **High availability**: Removing single points of failure
+- **Blue-green deployments**: Shifting traffic gradually between versions
+- **Multi-region routing**: Directing users to nearest datacenter
+- **DDoS protection**: Absorbing traffic spikes at the edge
+
+## When NOT To Use
+
+- **Low-latency, single-instance setups**: Overhead isn't justified
+- **Internal services with known capacity**: Direct routing may suffice
+- **Simple failover only**: DNS-based failover with health checks may be simpler
+
+## Core Concepts
+
+### Layer 4 vs Layer 7 Load Balancing
+
+**L4 Load Balancing** (TCP/UDP):
+- Routes based on IP address and port
+- Does not inspect HTTP headers or content
+- Maintains connection affinity (source IP matters for NAT)
+- Lower latency, higher throughput
+- Works for any protocol (MySQL, Redis, SMTP)
+
+**L7 Load Balancing** (HTTP/HTTPS):
+- Routes based on URL path, headers, cookies
+- Can modify requests (rewrite, add headers)
+- Terminate TLS, handle SSL offload
+- Session persistence via cookies
+- More CPU intensive, but more flexible
+
+```
+L4 Load Balancer (e.g., AWS NLB):
+Client → [NLB: 10.0.0.1:80] → [Server1: 10.0.0.5:8080]
+                           → [Server2: 10.0.0.6:8080]
+                           → [Server3: 10.0.0.7:8080]
+
+L7 Load Balancer (e.g., AWS ALB):
+Client → [ALB: api.example.com] → /users → [user-service:10.0.0.5:8080]
+                              → /orders → [order-service:10.0.0.6:8080]
+                              → /api/* → [api-gateway:10.0.0.7:8080]
+```
+
+### Load Balancing Algorithms
+
+**Round Robin**: Distributes requests sequentially. Simple, works well when servers have similar capacity.
+
+**Least Connections**: Routes to server with fewest active connections. Better for varying request durations.
+
+**IP Hash**: Hash of client IP determines server. Provides session affinity without cookies. Problem: servers joining/leaving causes rebalancing.
+
+**Weighted**: Assign weights to servers. Routes proportionally. Useful for gradual rollout or capacity differences.
+
+**Least Response Time**: Routes to server with lowest (active connections + response time). AWS NLB supports this.
+
+**Random**: Random selection. Simple but effective for stateless services.
+
+```bash
+# NGINX upstream algorithms
+upstream backend {
+    # Default: round robin
+    server 10.0.0.5:8080;
+    server 10.0.0.6:8080;
+}
+
+upstream backend_least_conn {
+    least_conn;  # Least connections
+    server 10.0.0.5:8080;
+    server 10.0.0.6:8080;
+}
+
+upstream backend_weighted {
+    server 10.0.0.5:8080 weight=3;  # 3x traffic
+    server 10.0.0.6:8080 weight=1;
+}
+
+upstream backend_ip_hash {
+    ip_hash;  # Session affinity by IP
+    server 10.0.0.5:8080;
+    server 10.0.0.6:8080;
+}
+```
+
+### Health Checks
+
+Health checks verify backend availability. Poor health checks cause flapping (false positives) or undetected failures.
+
+**TCP connect**: Simplest. Opens TCP connection to backend. If connection succeeds, backend is healthy.
+
+**HTTP/HTTPS health check**: Sends GET request, checks for 2xx response. More reliable—verifies application responds correctly.
+
+**HTTPS health check**: Same as HTTP but over TLS. Verifies TLS termination works.
+
+**Custom health check**: TCP connection + specific response (for non-HTTP services).
+
+```bash
+# NGINX health check (with premium module or passive)
+upstream backend {
+    server 10.0.0.5:8080;
+    server 10.0.0.6:8080;
+    server 10.0.0.7:8080 backup;  # Failover only
+}
+
+# HAProxy health check
+backend http_back
+    option httpchk GET /health
+    http-check expect status 200
+    server s1 10.0.0.5:8080 check inter 3s fall 3 rise 2
+    server s2 10.0.0.6:8080 check inter 3s fall 3 rise 2
+
+# AWS ALB health check
+aws elbv2 register-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:... \
+  --targets Id=i-xxx Id=i-yyy \
+  --health-check-interval-seconds 30 \
+  --health-check-path /health \
+  --health-check-protocol HTTP \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 2
+```
+
+### Session Persistence (Sticky Sessions)
+
+Session persistence ensures requests from a client go to the same backend. Essential for stateful applications.
+
+**Cookie-based**: Load balancer sets cookie, routes based on value.
+
+**Source IP affinity**: Hash of client IP determines backend. Simple but problematic with shared IPs (NAT, proxies).
+
+**Application-controlled**: Application sets session cookie, load balancer reads it.
+
+```bash
+# NGINX sticky cookie
+upstream backend {
+    sticky cookie srv_id expires=1h domain=.example.com path=/;
+    server 10.0.0.5:8080;
+    server 10.0.0.6:8080;
+}
+
+# HAProxy cookie-based
+backend http_back
+    cookie SERVERID insert indirect nocache
+    server s1 10.0.0.5:8080 cookie s1
+    server s2 10.0.0.6:8080 cookie s2
+
+# AWS ALB sticky sessions
+aws elbv2 create-target-group \
+  --name api-targets \
+  --protocol HTTP \
+  --port 8080 \
+  --target-type instance \
+  --vpc-id vpc-xxx \
+  --health-check-path /health \
+  -- stickiness-app-cookie-cookie-name JSESSIONID \
+  -- stickiness-type application \
+  -- stickiness-lb-cookie-duration-seconds 86400
+```
+
+## Real Production Example
+
+### NGINX L7 Load Balancer Configuration
+
+```nginx
+http {
+    # Define upstream with health checks
+    upstream api_backend {
+        least_conn;  # Least connections algorithm
+        
+        server 10.0.0.5:8080 weight=3 max_fails=3 fail_timeout=30s;
+        server 10.0.0.6:8080 weight=3 max_fails=3 fail_timeout=30s;
+        server 10.0.0.7:8080 weight=2 max_fails=3 fail_timeout=30s;
+        server 10.0.0.8:8080 backup;  # Failover only
+        
+        keepalive 64;  # Connection pooling to backends
+    }
+    
+    upstream static_backend {
+        ip_hash;  # Consistent hashing for static assets
+        server 10.0.1.5:8080;
+        server 10.0.1.6:8080;
+    }
+    
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+        
+        ssl_certificate /etc/ssl/certs/api.example.com.crt;
+        ssl_certificate_key /etc/ssl/private/api.example.com.key;
+        
+        # Rate limiting
+        limit_req_zone $binary_remote_addr zone=api_limit:10m rate=100r/s;
+        
+        location /api/ {
+            limit_req zone=api_limit burst=200 nodelay;
+            
+            proxy_pass http://api_backend;
+            proxy_http_version 1.1;
+            
+            # Proxy headers
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Request-ID $request_id;
+            
+            # Timeouts
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+            
+            # Buffering
+            proxy_buffering on;
+            proxy_buffer_size 4k;
+            proxy_buffers 8 4k;
+            
+            # Health check (for upstream)
+            proxy_next_upstream error timeout http_502;
+        }
+        
+        location /static/ {
+            proxy_pass http://static_backend;
+            proxy_cache static_cache;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+    }
+}
+```
+
+### AWS ALB Configuration
+
+```bash
+# Create Application Load Balancer
+aws elbv2 create-load-balancer \
+  --name api-alb \
+  --subnets subnet-xxx subnet-yyy \
+  --security-groups sg-xxx \
+  --scheme internet-facing
+
+# Create target group
+aws elbv2 create-target-group \
+  --name api-targets \
+  --protocol HTTP \
+  --port 8080 \
+  --vpc-id vpc-xxx \
+  --target-type instance \
+  --health-check-path /health \
+  --health-check-interval-seconds 10 \
+  --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 2 \
+  --matcher HttpCode=200
+
+# Register targets
+aws elbv2 register-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:.../targetgroup/api-targets/xxx \
+  --targets InstanceId=i-xxx InstanceId=i-yyy
+
+# Create HTTPS listener
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:.../app/api-alb/xxx \
+  --protocol HTTPS \
+  --port 443 \
+  --certificates CertificateArn=arn:aws:acm:.../certificate/xxx \
+  --ssl-policy ELBSecurityPolicy-TLS13-1-2-2021-06 \
+  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:.../targetgroup/api-targets/xxx
+
+# Add path-based routing
+aws elbv2 create-rule \
+  --listener-arn arn:aws:elasticloadbalancing:.../app/api-alb/xxx/listener/yyy \
+  --priority 100 \
+  --conditions Field=path-pattern,Values="/api/*" \
+  --actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:.../targetgroup/api-targets/xxx
+```
+
+### HAProxy Configuration
+
+```bash
+# /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    maxconn 4096
+    user haproxy
+    group haproxy
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    ssl-default-bind-options no-sslv3 no-tlsv10 no-tlsv11
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    timeout connect 5000ms
+    timeout client 50000ms
+    timeout server 50000ms
+
+# Frontend
+frontend http_front
+    bind *:80
+    bind *:443 ssl crt /etc/ssl/certs/api.example.com.pem
+    http-redirect scheme https code 301 if !{ ssl_fc }
+    
+    default_backend api_backend
+
+# Backend
+backend api_backend
+    balance roundrobin
+    option httpchk GET /health
+    http-check expect status 200
+    
+    server api1 10.0.0.5:8080 check inter 3s fall 3 rise 2
+    server api2 10.0.0.6:8080 check inter 3s fall 3 rise 2
+    server api3 10.0.0.7:8080 check inter 3s fall 3 rise 2 backup
+    
+    # Rate limiting
+    stick-table type ip size 100k expire 30s
+    acl rate_limited src_http_req_rate(gt 100)
+    http-request deny if rate_limited
+```
+
+## CLI Examples
+
+```bash
+# Test backend health
+curl -f http://10.0.0.5:8080/health || echo "Backend DOWN"
+
+# NGINX status (requires stub_status)
+curl http://localhost/nginx_status
+# Active connections: 42
+# server accepts handled requests
+#   12345 12345 54321
+# Reading: 2 Writing: 3 Waiting: 37
+
+# HAProxy stats (enable with stats uri)
+curl http://localhost:8404/stats
+
+# AWS ALB target health
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:.../targetgroup/api/xxx
+
+# Check NLB target health
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:.../targetgroup/nlb-tg/xxx \
+  --targets Id=10.0.0.5 Id=10.0.0.6
+
+# Test load distribution
+for i in {1..10}; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" http://lb.example.com/api/health; done
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `nginx -t` | Test config | `nginx -t && nginx -s reload` |
+| `haproxy -c` | Check config | `haproxy -c -f /etc/haproxy/haproxy.cfg` |
+| `ss -tlnp` | Check listeners | `ss -tlnp \| grep -E "80\|443"` |
+| `curl` | Test backends | `curl http://backend:8080/health` |
+| `aws elbv2` | ALB/NLB ops | `describe-load-balancers` |
+
+## Monitoring
+
+### Load Balancer Metrics
+
+```bash
+# NGINX metrics (prometheus)
+# nginx_connections_active
+# nginx_connections_reading/writing/waiting
+# nginx_requests_total
+# nginx_upstream_bytes_total
+# nginx_upstream_response_time_seconds
+
+# HAProxy metrics (stats socket)
+# show stat
+# show info
+
+# Prometheus queries
+sum(rate(nginx_http_requests_total[5m])) by (status)
+histogram_quantile(0.99, sum(rate(nginx_http_request_duration_seconds_bucket[5m])) by (le))
+nginx_upstream_server_response_time_seconds{upstream="api_backend"}
+```
+
+### Alerting Thresholds
+
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| Backend failures | >1% | >5% |
+| Latency p99 | >500ms | >2s |
+| Connection queue | >10 | >50 |
+| Backend response 5xx | >1% | >5% |
+
+## Security
+
+### Load Balancer Security
+
+```bash
+# Restrict access to load balancer only
+# Security group: allow 80/443 from 0.0.0.0/0
+# Backend security group: allow from LB security group only
+
+# TLS termination at LB
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:...;
+ssl_prefer_server_ciphers off;
+
+# IP-based access control
+acl allowed_ips src 10.0.0.0/8 192.168.0.0/16
+http-request deny if !allowed_ips
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 502 Bad Gateway | All backends down | Check backend health, restart |
+| 503 Service Unavailable | LB at capacity | Scale out, rate limit |
+| Inconsistent responses | No session persistence | Enable sticky sessions |
+| High latency | Slow backend | Optimize backend, scale |
+| One backend getting all traffic | Hash imbalance | Check ip_hash distribution |
+| SSL errors | Cert chain, SNI | Check SSL config |
+
+## Interview Questions
+
+**Q1: What's the difference between L4 and L7 load balancing? When would you choose each?**
+
+A: L4 (TCP/UDP) load balancers operate at transport layer, forwarding packets based on IP and port. They don't inspect content, so lower latency and higher throughput. Good for non-HTTP protocols (MySQL, Redis), or when you need simple distribution with minimal overhead. L7 (HTTP/HTTPS) load balancers inspect application data—URLs, headers, cookies. This enables: path-based routing (/api vs /web), cookie-based persistence, request rewriting, per-request rate limiting, and WAF integration. Choose L7 when you need routing logic based on content, or when TLS termination at LB is needed. Choose L4 when performance is critical, or protocol isn't HTTP.
+
+**Q2: What is consistent hashing and why is it useful for load balancing?**
+
+A: Consistent hashing maps keys (e.g., user IDs) to servers using a hash ring. When a server is added/removed, only keys mapped to that server redistribute—unlike simple hash(key) % N where all keys might redistribute. This minimizes disruption during scaling events. Used with ip_hash in NGINX or session affinity in general. Tradeoff: uneven distribution possible with few keys/servers; use virtual nodes to balance. For more advanced, use Ketama or other consistent hashing algorithms with replication factors.
+
+**Q3: How do you handle session state in a load-balanced environment?**
+
+A: Options: (1) Stateless services—store session in shared cache (Redis, Memcached) or database. LB can route any request to any backend; (2) Session affinity (sticky sessions)—route same client to same backend. Simple but fragile (backend failure loses session); (3) Client-side session—JWT or encrypted cookie contains session data. No server storage, but size and security concerns. Best practice: stateless services with shared storage. Avoid in-memory session affinity in production—makes deployments and scaling painful.
+
+## Cheat Sheet
+
+### Load Balancing Algorithms
+
+| Algorithm | Use Case | Notes |
+|-----------|----------|-------|
+| Round Robin | Equal capacity | Default, simple |
+| Least Connections | Varying durations | Route to least busy |
+| IP Hash | Session affinity | Consistent hashing |
+| Weighted | Capacity differences | Weight traffic |
+| Least Response Time | Performance-critical | AWS NLB support |
+
+### NGINX Upstream Configuration
+
+```nginx
+upstream backend {
+    least_conn;  # or round_robin, ip_hash, hash $cookie_jsessionid
+    server 10.0.0.5:8080 weight=3 max_fails=3 fail_timeout=30s;
+    server 10.0.0.6:8080 weight=3 max_fails=3 fail_timeout=30s;
+    server 10.0.0.7:8080 backup;  # Failover only
+    keepalive 32;  # Connection pooling
+}
+```
+
+## Related Topics
+
+- [Reverse Proxy](./reverse-proxy) — NGINX/HAProxy reverse proxy
+- [HTTPS](./https) — TLS termination at LB
+- [VPC](./vpc) — Cloud networking
+- [Observability](./observability) — LB metrics

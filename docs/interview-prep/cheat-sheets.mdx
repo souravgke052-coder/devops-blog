@@ -1,0 +1,850 @@
+---
+sidebar_position: 11
+title: "DevOps Cheat Sheets"
+description: "Quick reference guides for Linux, networking, Kubernetes, GCP, Terraform, Docker, Git, and GitOps"
+---
+
+# DevOps Cheat Sheets
+
+## Overview
+
+This section provides dense, practical quick reference for the most common operations in each technology area. These cheat sheets are designed for real-world use during interviews and on the job.
+
+---
+
+## Linux Cheat Sheet
+
+### Essential System Commands
+
+```bash
+# Process management
+ps aux                          # All processes with details
+ps -ef                          # Full format listing
+top -Hp <pid>                   # Threads for specific PID
+kill -15 <pid>                  # Graceful termination
+kill -9 <pid>                   # Force kill
+pkill -f <pattern>              # Kill by pattern
+nice -n 10 <command>            # Run with priority (lower = higher priority)
+renice -n 10 -p <pid>           # Change priority of running process
+
+# Memory
+free -h                         # Human-readable memory
+cat /proc/meminfo               # Detailed memory info
+vmstat 1                        # Virtual memory stats (1s interval)
+smem                            # Memory by process (if installed)
+
+# Disk
+df -h                           # Disk usage (human-readable)
+du -sh *                        # Size of all files/dirs in current dir
+iostat -xz 1                    # I/O stats (extended, 1s interval)
+iotop                           # Interactive I/O monitor
+lsof +D /path                   # Files open by processes using /path
+
+# CPU
+uptime                          # Load average
+mpstat -P ALL 1                 # Per-CPU stats
+perf top                        # Real-time CPU profiling
+tload                           # Terminal load graph
+```
+
+### Network Diagnostics
+
+```bash
+# Connection troubleshooting
+ss -tulpn                       # Listening sockets (all, with PID)
+ss -ti state established        # TCP info with BBR/cwnd
+netstat -anp | grep ESTABLISHED # Active connections
+nc -zv host port                # Test connectivity
+timeout 5 curl -v host:port     # Timed connection test
+
+# Packet capture
+tcpdump -i any port 443 -w /tmp/capture.pcap     # Capture to file
+tcpdump -i any -nn 'tcp[tcpflags] == tcp-syn'    # SYN packets only
+tcpdump -r /tmp/capture.pcap | grep 10.0.0.1     # Read from file
+
+# Routing
+ip route show                   # Show routes
+ip route get 8.8.8.8            # Route for specific IP
+traceroute -T -p 443 host       # TCP traceroute
+mtr host                        # Continuous traceroute with stats
+
+# DNS
+dig +short example.com          # Quick A record lookup
+nslookup -type=MX example.com   # MX records
+host -a example.com             # Full DNS lookup
+timeout 3 curl -H "Host: example.com" IP         # Test with Host header
+```
+
+### Systemd & Services
+
+```bash
+# Service management
+systemctl status <service>      # Check status
+systemctl restart <service>     # Restart service
+systemctl enable --now <service>  # Enable and start
+journalctl -u <service> -n 100  # Last 100 log lines
+journalctl -u <service> --since "1 hour ago"  # Recent logs
+journalctl -f -u <service>      # Follow logs
+
+# Service file debugging
+systemctl show <service>        # All service properties
+systemctl edit <service>        # Edit override
+systemctl daemon-reload         # Reload systemd configs
+```
+
+### Kernel & Module Management
+
+```bash
+# Modules
+lsmod                          # Loaded modules
+modprobe -r <module>           # Unload module
+modprobe <module>              # Load module
+modinfo <module>               # Module info
+
+# Sysctl
+sysctl -a                       # All parameters
+sysctl -w net.ipv4.tcp_fastopen=3  # Set temp value
+echo 1 > /proc/sys/net/ipv4/ip_forward  # Enable forwarding
+
+# Limits
+ulimit -n                       # Open files limit (soft)
+cat /proc/PID/limits           # Limits for specific process
+prlimit --pid <PID> --nofile=65536  # Set limits
+```
+
+### Useful One-Liners
+
+```bash
+# Find largest directories
+du -ah / | sort -rh | head -20
+
+# Find files modified in last 24h
+find / -type f -mtime -1 2>/dev/null
+
+# Kill all processes for user
+pkill -u username
+
+# TCP connection states
+ss -tan | awk '{print $1}' | sort | uniq -c
+
+# Monitor new processes
+watch -n 1 "ps aux | head -1; ps aux | grep pattern"
+
+# Disk I/O per process
+pidstat -d 1 | grep -v "^Avg"
+
+# Extract IP from log line
+cat access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head
+
+# Memory usage by user
+ps aux | awk '{sum[$1]+=$6} END {for (u in sum) print u, sum[u]/1024/1024 "GB"}'
+```
+
+---
+
+## Networking Cheat Sheet
+
+### Common Ports Reference
+
+| Port | Service | Notes |
+|------|---------|-------|
+| 22 | SSH | Secure Shell |
+| 25 | SMTP | Mail submission |
+| 53 | DNS | Both TCP/UDP |
+| 80 | HTTP | Unencrypted web |
+| 443 | HTTPS | TLS encrypted web |
+| 3306 | MySQL | Default MySQL |
+| 5432 | PostgreSQL | Default PostgreSQL |
+| 6379 | Redis | No auth by default |
+| 9200 | Elasticsearch | Default API |
+| 27017 | MongoDB | Default |
+| 3000 | Grafana/Dev tools | Common default |
+| 5672 | RabbitMQ | AMQP |
+| 9092 | Kafka | PLAINTEXT |
+| 9093 | Kafka | SSL |
+| 2379 | etcd | Client API |
+| 2380 | etcd | Peer API |
+| 6443 | Kubernetes API | Secure |
+| 10250 | Kubelet API |authenticated |
+| 10251 | kube-scheduler | |
+| 10252 | kube-controller | |
+| 2375/2376 | Docker | Plain/SSL |
+
+### IPTables Quick Reference
+
+```bash
+# List rules
+iptables -L -n -v                           # Verbose listing
+iptables -L -n --line-numbers               # With line numbers
+iptables -t nat -L -n -v                    # NAT table
+
+# Common operations
+iptables -A INPUT -p tcp --dport 443 -j ACCEPT        # Allow HTTPS
+iptables -A INPUT -p tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT  # Allow SSH from internal
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT  # Allow established
+iptables -A INPUT -j DROP                               # Default drop
+
+# NAT / Port forwarding
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+# Stateful firewall basics
+iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+```
+
+### Network Namespace Commands
+
+```bash
+# Create and use namespace
+ip netns add myns
+ip netns exec myns bash
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns myns
+
+# Inside namespace
+ip netns exec myns ip addr add 10.0.0.1/24 dev veth1
+ip netns exec myns ip link set veth1 up
+
+# List namespaces
+ip netns list
+ls /var/run/netns/
+```
+
+---
+
+## Kubernetes Cheat Sheet
+
+### Core kubectl Commands
+
+```bash
+# Cluster info
+kubectl cluster-info                  # Cluster endpoints
+kubectl version --short               # Client and server version
+kubectl config current-context        # Current context
+kubectl api-resources                # All API resources
+kubectl explain <resource>           # Resource documentation
+
+# Workloads
+kubectl get pods -o wide             # List pods with details
+kubectl get pods -l app=myapp        # Filter by label
+kubectl get pods --show-labels        # Show all labels
+kubectl describe pod <name>          # Pod details and events
+kubectl logs <pod> -f                # Follow logs
+kubectl logs <pod> --previous        # Previous container logs
+kubectl exec -it <pod> -- /bin/sh    # Shell into pod
+kubectl top pods                     # Resource usage
+
+# Deployments
+kubectl rollout status deploy/<name>            # Watch rollout
+kubectl rollout history deploy/<name>           # View history
+kubectl rollout undo deploy/<name>              # Rollback
+kubectl rollout undo deploy/<name> --to-revision=3  # To specific revision
+kubectl scale deploy/<name> --replicas=5        # Scale
+kubectl set image deploy/<name> app=image:v2    # Update image
+
+# Troubleshooting
+kubectl get events --sort-by=.lastTimestamp     # Recent events
+kubectl logs -l app=myapp --tail=100 | grep ERROR  # Filtered logs
+kubectl debug <pod> -it --image=busybox          # Debug pod
+kubectl cp <pod>:/path/to/file ./local/         # Copy from pod
+kubectl port-forward pod/<name> 8080:80         # Port forward
+
+# Apply and create
+kubectl apply -f manifest.yaml                  # Apply config
+kubectl apply -f ./dir/                         # Apply dir
+kubectl delete -f manifest.yaml                 # Delete resources
+kubectl replace -f manifest.yaml                # Replace
+kubectl create deployment myapp --image=myapp   # Create deployment
+kubectl expose deployment myapp --port=80       # Create service
+
+# Context and namespace
+kubectl config use-context <context>            # Switch context
+kubectl config set-context --current --namespace=myns  # Set namespace
+kubectl get all -n myns                         # All in namespace
+```
+
+### Helm Commands
+
+```bash
+# Helm basics
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+helm search repo <chart>
+
+# Install and manage
+helm install my-release bitnami/nginx
+helm upgrade my-release bitnami/nginx --set image.tag=v2
+helm rollback my-release 1
+helm list
+helm values my-release > values.yaml
+
+# Show rendered templates
+helm template my-release bitnami/nginx
+helm template my-release bitnami/nginx --debug --dry-run
+```
+
+### Kubernetes YAML Quick Reference
+
+```yaml
+# Minimal Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+    - name: myapp
+      image: myapp:latest
+      ports:
+        - containerPort: 8080
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "250m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 10
+```
+
+### Common Labels and Annotations
+
+```yaml
+# Common labels
+app.kubernetes.io/name: myapp
+app.kubernetes.io/instance: myapp-prod
+app.kubernetes.io/version: "1.0.0"
+app.kubernetes.io/component: backend
+app.kubernetes.io/part-of: my-service
+
+# Common annotations
+prometheus.io/scrape: "true"
+prometheus.io/port: "9090"
+```
+
+### Networking Quick Reference
+
+```bash
+# Service types
+kubectl expose deploy/myapp --type=ClusterIP --port=80    # Internal only
+kubectl expose deploy/myapp --type=NodePort --port=80     # Node port
+kubectl expose deploy/myapp --type=LoadBalancer --port=80 # Cloud LB
+
+# Port mappings reference
+# NodePort: 30000-32767 (configurable)
+# ClusterIP: internal cluster IP (from service-cidr)
+# LoadBalancer: Cloud provider LB integration
+
+# Network policies
+kubectl get networkpolicies
+kubectl get networkpolicies -o yaml > np.yaml
+```
+
+---
+
+## GCP Cheat Sheet
+
+### Essential gcloud Commands
+
+```bash
+# Auth and config
+gcloud auth login                    # Login
+gcloud auth activate-service-account --key-file=key.json
+gcloud config set project my-project
+gcloud config set compute/region us-central1
+gcloud config list                   # Show current config
+gcloud organizations list            # List organizations
+
+# Compute
+gcloud compute instances list
+gcloud compute instances describe my-instance --zone=us-central1-a
+gcloud compute ssh my-instance --zone=us-central1-a
+gcloud compute scp file.txt my-instance:/tmp/ --zone=us-central1-a
+
+# GKE
+gcloud container clusters get-credentials my-cluster --region=us-central1
+gcloud container images list-tags gcr.io/my-project/my-image
+gcloud container clusters resize my-cluster --node-pool=default-pool --size=5
+
+# Storage
+gsutil ls gs://my-bucket/
+gsutil cp file.txt gs://my-bucket/
+gsutil mv gs://my-bucket/old/* gs://my-bucket/new/
+gsutil rm -r gs://my-bucket/prefix/
+
+# IAM
+gcloud projects add-iam-policy-binding my-project \
+  --member="serviceAccount:sa@my-project.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# Networking
+gcloud compute networks list
+gcloud compute firewall-rules list
+gcloud compute routes list
+```
+
+### GKE kubectl Context Setup
+
+```bash
+# Get credentials for cluster
+gcloud container clusters get-credentials my-cluster \
+  --region=us-central1 \
+  --project=my-project
+
+# Internal IP (for private clusters)
+gcloud container clusters get-credentials my-cluster \
+  --region=us-central1 \
+  --internal-ip
+
+# List clusters
+gcloud container clusters list
+
+# Update cluster
+gcloud container clusters update my-cluster \
+  --region=us-central1 \
+  --enable-autoscaling \
+  --min-nodes=2 \
+  --max-nodes=10 \
+  --node-pool=default-pool
+```
+
+### Common Service Ports (GCP)
+
+| Service | Port | GCP Component |
+|---------|------|---------------|
+| Cloud SQL | 5432 | PostgreSQL |
+| Cloud SQL | 3306 | MySQL |
+| Cloud Memorystore | 6379 | Redis |
+| Cloud Run | 8080 | HTTP |
+| GKE Ingress | 80/443 | HTTP(S) LB |
+| Cloud Functions | 8080 | HTTP |
+
+### IAM Roles Quick Reference
+
+```bash
+# Compute
+roles/compute.admin           # Full compute access
+roles/compute.instanceAdmin   # VM management
+roles/container.clusterAdmin  # GKE management
+
+# Storage
+roles/storage.admin           # Full storage
+roles/storage.objectAdmin     # Object storage
+
+# Kubernetes
+roles/container.developer     # K8s developer
+roles/container.clusterViewer # Read-only cluster
+
+# Network
+roles/compute.networkAdmin    # Network management
+roles/compute.securityAdmin   # Firewall rules
+```
+
+---
+
+## Terraform Cheat Sheet
+
+### Essential Commands
+
+```bash
+# Init and plan
+terraform init                      # Initialize
+terraform init -upgrade             # Upgrade providers
+terraform plan -out=tfplan          # Plan and save
+terraform show                      # Show current state
+terraform show -json                # JSON state
+
+# Apply and destroy
+terraform apply                     # Apply with prompt
+terraform apply -auto-approve       # No prompt
+terraform apply tfplan              # Apply saved plan
+terraform destroy                   # Destroy
+terraform destroy -target=resource  # Destroy specific
+
+# State management
+terraform state list                # List resources
+terraform state show <resource>     # Show resource
+terraform state mv <old> <new>      # Rename
+terraform state rm <resource>       # Remove from state
+terraform state pull > state.tf     # Pull remote state
+terraform state push state.tf       # Push state
+
+# Import
+terraform import <resource> <id>    # Import existing
+
+# Workspaces
+terraform workspace list            # List workspaces
+terraform workspace new prod        # Create
+terraform workspace select prod     # Switch
+terraform workspace show            # Current
+```
+
+### Common HCL Patterns
+
+```hcl
+# Variable with validation
+variable "environment" {
+  type        = string
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Must be dev, staging, or prod."
+  }
+}
+
+# Local values
+locals {
+  name = "${var.environment}-${var.app_name}"
+  common_tags = {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }
+}
+
+# Conditional
+resource "aws_instance" "app" {
+  count = var.instance_count > 0 ? var.instance_count : 1
+  ami   = var.environment == "prod" ? var.prod_ami : var.dev_ami
+}
+
+# For_each
+resource "aws_security_group" "app" {
+  for_each = toset(["web", "api", "db"])
+  name     = "${var.environment}-${each.value}"
+}
+
+# Functions
+lookup(var.map, var.key, "default")
+fileexists("config.json")
+formatdate("YYYY-MM-DD", timestamp())
+uuidv5("ns:DNS", "example.com")
+```
+
+### Module Structure
+
+```
+module/
+├── main.tf          # Resources
+├── variables.tf     # Input vars
+├── outputs.tf       # Output values
+├── versions.tf      # Provider versions
+└── README.md        # Documentation
+```
+
+---
+
+## Docker Cheat Sheet
+
+### Common Commands
+
+```bash
+# Build and run
+docker build -t myapp:v1 .                    # Build
+docker build -t myapp:v1 --build-arg VER=1    # With args
+docker run -d -p 8080:80 myapp:v1            # Run detached
+docker run -it myapp:v1 /bin/sh              # Interactive
+docker-compose up -d                          # Compose up
+docker-compose down                            # Compose down
+docker-compose logs -f                         # Follow logs
+
+# Inspect and debug
+docker ps -a                                  # All containers
+docker logs -f <container>                    # Follow logs
+docker exec -it <container> /bin/sh          # Shell
+docker inspect <container>                    # Full details
+docker stats                                  # Live stats
+docker diff <container>                        # File changes
+
+# Cleanup
+docker system prune -a                        # Remove all unused
+docker image prune -a                         # Remove unused images
+docker container prune                         # Remove stopped containers
+docker volume prune                            # Remove unused volumes
+
+# Images
+docker images                                 # List images
+docker rmi myapp:v1                           # Remove image
+docker tag myapp:v1 myrepo/myapp:v2          # Tag
+docker push myrepo/myapp:v1                   # Push
+docker pull myrepo/myapp:v1                   # Pull
+```
+
+### Dockerfile Best Practices
+
+```dockerfile
+# Multi-stage build
+FROM node:18 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+
+FROM node:18-slim AS production
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+USER node  # Non-root user
+CMD ["node", "dist/index.js"]
+
+# .dockerignore
+node_modules
+.git
+.env*
+*.log
+dist
+```
+
+### Docker Compose Example
+
+```yaml
+version: "3.8"
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_HOST=db
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  db:
+    image: postgres:14
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
+```
+
+---
+
+## Git Cheat Sheet
+
+### Essential Commands
+
+```bash
+# Basics
+git init
+git clone <url>
+git status
+git add .
+git commit -m "message"
+git push
+
+# Branching
+git branch                              # List branches
+git branch -a                           # All branches
+git checkout -b feature/new-feature     # Create and switch
+git switch main                         # Switch to main
+git merge feature/branch                # Merge into current
+
+# Update and sync
+git fetch --all
+git pull origin main                    # Pull and rebase
+git rebase main                         # Rebase onto main
+
+# Stash
+git stash                               # Stash changes
+git stash list
+git stash pop                           # Apply and drop
+git stash apply                         # Apply and keep
+
+# History and search
+git log --oneline --graph -20           # Visual history
+git log --author="name"                # Filter by author
+git log --since="2024-01-01"           # Filter by date
+git log -p file.txt                    # File history with diff
+git blame file.txt                     # Line-by-line blame
+git show <commit>:path/to/file         # File at commit
+
+# Cleanup
+git clean -fd                           # Untracked files
+git reset --soft HEAD~1                # Uncommit
+git reset --hard HEAD~1                # Uncommit and unstage
+```
+
+### Useful Aliases
+
+```bash
+# Add to ~/.gitconfig
+[alias]
+    st = status
+    co = checkout
+    br = branch
+    ci = commit
+    unstage = reset HEAD --
+    last = log -1 HEAD
+    visual = log --graph --oneline --decorate --all
+    amend = commit --amend --no-edit
+```
+
+### Troubleshooting
+
+```bash
+# Recover lost commits
+git reflog                              # Show all refs
+git checkout -b recovery <commit-hash>
+
+# Fix detached HEAD
+git checkout main
+
+# Resolve merge conflicts
+git mergetool                          # Use diff tool
+git add resolved-file.txt
+git commit -m "Merge resolved"
+
+# Remove file from history (careful!)
+git filter-branch --tree-filter 'rm -f password.txt' HEAD
+git push --force
+
+# Sync forked repo
+git remote add upstream <original-repo-url>
+git fetch upstream
+git merge upstream/main
+```
+
+---
+
+## GitOps Cheat Sheet (ArgoCD + Flux)
+
+### ArgoCD Commands
+
+```bash
+# CLI installation
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+
+# Authentication
+argocd login --core                       # Use kubeconfig
+argocd login argocd.example.com --username admin --password $PASS
+
+# App management
+argocd app list
+argocd app get my-app
+argocd app sync my-app                    # Force sync
+argocd app rollback my-app 1              # Rollback to revision
+argocd app history my-app                 # Show sync history
+argocd app delete my-app                  # Delete app
+
+# Sync operations
+argocd app set my-app --sync-policy automated
+argocd app unset my-app --sync-policy
+argocd app patch my-app --patch '{"spec": {"syncPolicy": {"automated": {}}}}' --type merge
+```
+
+### Flux Commands
+
+```bash
+# Install
+flux install --components=source-controller,kustomize-controller
+
+# Sources
+flux create source git my-app \
+  --url=https://github.com/org/repo \
+  --branch=main \
+  --interval=1m \
+  --export > sources/my-app.yaml
+
+flux get sources git
+
+# Kustomizations
+flux create kustomization my-app \
+  --source=GitRepository/my-app \
+  --path="./deploy" \
+  --prune=true \
+  --interval=1m \
+  --export > kustomizations/my-app.yaml
+
+flux get kustomizations
+flux reconcile kustomization my-app --with-source
+
+# Notifications
+flux create alert my-alert \
+  --provider-ref=slack \
+  --event-severity=info \
+  --export
+```
+
+### Common GitOps Patterns
+
+```yaml
+# ArgoCD Application
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/org/infra
+    targetRevision: main
+    path: apps/my-app/production
+    kustomize:
+      images:
+        - my-app=ghcr.io/org/my-app:v1.2.3
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+---
+
+## Quick Reference Tables
+
+### CPU Saturation Indicators
+
+| Command | Healthy | Warning | Critical |
+|---------|---------|---------|----------|
+| `uptime` load | < CPU cores | CPU cores - 2 | > CPU cores |
+| `mpstat 1` %idle | > 70% | 30-70% | < 30% |
+| `vmstat 1` r column | < 2 | 2-4 | > 4 |
+
+### Memory Pressure Indicators
+
+| Command | Healthy | Warning | Critical |
+|---------|---------|---------|----------|
+| `free -h` available | > 20% | 10-20% | < 10% |
+| `vmstat 1` si/so | 0 | < 10 | > 10 |
+| `cat /proc/meminfo` Inactive | Growing | Steady | — |
+
+### Disk I/O Indicators
+
+| Command | Healthy | Warning | Critical |
+|---------|---------|---------|----------|
+| `iostat -xz 1` %util | < 60% | 60-80% | > 80% |
+| `iostat -xz 1` await | < 10ms | 10-50ms | > 50ms |
+| `iostat -xz 1` avgqu-sz | < 1 | 1-4 | > 4 |
+
+---
+
+## Related Topics
+
+- [Linux Questions](./linux-questions.mdx)
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [GCP Questions](./gcp-questions.mdx)
+- [Terraform Questions](./terraform-questions.mdx)
+- [CI/CD Questions](./cicd-questions.mdx)

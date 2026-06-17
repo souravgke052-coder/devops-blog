@@ -1,0 +1,403 @@
+# Network Observability
+
+## Overview
+
+Network observability is the ability to understand network behavior through metrics, logs, and traces. In production, you need to know: Is the network performing well? Where is latency? Are there packet losses? Is the network secure? Without observability, you're flying blind when incidents occur.
+
+Modern network observability combines multiple data sources: kernel metrics (via /proc, node_exporter), packet captures (tcpdump, sFlow), flow logs (VPC Flow Logs, NetFlow/IPFIX), and distributed tracing. This page covers what to measure, how to measure it, and how to correlate data for effective debugging.
+
+## When To Use
+
+- **Proactive monitoring**: Catch issues before users notice
+- **Incident investigation**: Correlate events, identify root cause
+- **Capacity planning**: Understand traffic trends
+- **SLA verification**: Ensure network meets targets
+
+## When NOT to Use
+
+- **Development only**: May not need full observability
+- **Minimal overhead**: Too much data can be noise
+
+## Core Concepts
+
+### Key Network Metrics
+
+**Throughput**: Bytes per second, packets per second. Measure at multiple layers: interface, socket, application.
+
+```bash
+# Interface throughput
+ip -s link show eth0
+# rx: bytes packets errors dropped
+# tx: bytes packets errors dropped
+
+# Calculate throughput rate
+# Previous: rx=1000000 at t=0
+# Current: rx=2000000 at t=1
+# Throughput = (2000000-1000000) / 1 = 1MB/s
+```
+
+**Latency**: Round-trip time (RTT), per-request latency. Critical for user experience.
+
+```bash
+# Basic latency
+ping -c 10 8.8.8.8
+
+# Per-hop latency
+traceroute 8.8.8.8
+# Or: mtr 8.8.8.8 (combines ping + traceroute)
+```
+
+**Packet Loss**: Percentage of packets lost. High loss degrades TCP throughput.
+
+```bash
+# Ping to detect loss
+ping -c 1000 10.0.0.1
+
+# TCP retransmits
+ss -ti dst 10.0.0.1
+# Look for: retr 0
+# Higher = more retransmissions
+```
+
+**Connection States**: Number of connections in each state. Too many TIME_WAIT = port exhaustion risk.
+
+```bash
+# Connection state summary
+ss -s
+# Total: 145 (established 42, time-wait 89)
+
+# Detailed by state
+ss -ant | awk '{print $1}' | sort | uniq -c | sort -rn
+```
+
+### Flow Logs
+
+Flow logs capture metadata about network traffic (who talked to whom, when, how much).
+
+**AWS VPC Flow Logs**:
+```
+2 123456789012 eni-0d1e2f3a4b5c6d7e8 10.0.0.5 10.0.1.10 54321 80 TCP 6 1500 1500 1620147600 1620147660 ACCEPT OK
+2 123456789012 eni-0d1e2f3a4b5c6d7e8 10.0.0.5 10.0.1.10 54321 80 TCP 6 1500 1500 1620147600 1620147660 REJECT OK
+```
+
+Fields: version, account, interface, srcaddr, dstaddr, srcport, dstport, protocol, packets, bytes, start, end, action, status
+
+```bash
+# Create VPC Flow Logs
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids vpc-xxx \
+  --traffic-type ALL \
+  --log-destination-type cloud-watch-logs \
+  --log-group-name /aws/vpc/flow-logs \
+  --deliver-logs-permission-arn arn:aws:iam::xxx:role/FlowLogsRole
+
+# Query with Athena
+# SELECT srcaddr, dstaddr, SUM(packets) as packets
+# FROM vpc_flow_logs
+# WHERE action = 'ACCEPT'
+# GROUP BY srcaddr, dstaddr
+# ORDER BY packets DESC
+```
+
+### eBPF for Network Observability
+
+eBPF allows running custom programs in the kernel for efficient packet inspection and metrics.
+
+```bash
+# bpftrace for network analysis
+bpftrace -e 'tracepoint:net:netif_receive_skb { @["process"] = count(); }'
+
+# bpftrace for TCP events
+bpftrace -e '
+  tracepoint:inet_sock_set_state {
+    if (args->family == AF_INET && args->protocol == 6) {
+      @states[args->newstate] = count();
+    }
+  }
+'
+
+# Cilium Hubble (Kubernetes service mesh observability)
+# Automatically traces all network connections
+kubectl get pods -n kube-system -l k8s-app=hubble-relay
+hubble observe --protocol tcp --port 443
+
+# Sample Cilium network policy with observability
+# cilium hubble enable
+```
+
+## Real Production Example
+
+### Prometheus Network Metrics
+
+```yaml
+# node_exporter network collector (/proc/net/dev, /proc/net/snmp)
+# Metrics exposed:
+# node_network_receive_bytes_total{device="eth0"}
+# node_network_transmit_bytes_total{device="eth0"}
+# node_network_receive_packets_total{device="eth0"}
+# node_network_receive_errors_total{device="eth0"}
+# node_network_receive_drop_total{device="eth0"}
+# node_netstat_Tcp_InSegs, node_netstat_Tcp_OutSegs
+# node_netstat_Tcp_RetransSegs
+
+# Prometheus queries for network dashboard
+- name: network
+  rules:
+    - record: network:interface_receive_bytes:rate1m
+      expr: rate(node_network_receive_bytes_total[1m])
+    
+    - record: network:interface_transmit_bytes:rate1m
+      expr: rate(node_network_transmit_bytes_total[1m])
+    
+    - record: network:tcp_retransmit_rate:rate1m
+      expr: rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m])
+    
+    - record: network:established_connections
+      expr: node_netstat_Tcp_CurrEstab
+```
+
+### Grafana Dashboard
+
+```json
+{
+  "panels": [
+    {
+      "title": "Network Throughput",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(node_network_receive_bytes_total{device=~'eth0|ens.*'}[5m]) * 8", "legendFormat": "{{device}} Rx"},
+        {"expr": "rate(node_network_transmit_bytes_total{device=~'eth0|ens.*'}[5m]) * 8", "legendFormat": "{{device}} Tx"}
+      ]
+    },
+    {
+      "title": "TCP Connections by State",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "node_netstat_Tcp_CurrEstab", "legendFormat": "Established"},
+        {"expr": "node_netstat_Tcp_TimeWait", "legendFormat": "Time-Wait"}
+      ]
+    },
+    {
+      "title": "TCP Retransmission Rate",
+      "type": "gauge",
+      "targets": [
+        {"expr": "rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m]) * 100"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "green"},
+              {"value": 1, "color": "yellow"},
+              {"value": 2, "color": "red"}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+### AWS Network Monitoring
+
+```bash
+# CloudWatch metrics for NAT Gateway
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/NATGateway \
+  --metric-name BytesIn \
+  --dimensions Name=NatGatewayId,Value=nat-xxx \
+  --start-time 2024-01-01T00:00:00 \
+  --end-time 2024-01-02T00:00:00 \
+  --period 300 \
+  --statistics Average
+
+# CloudWatch for ALB
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ApplicationELB \
+  --metric-name TargetResponseTime \
+  --dimensions Name=LoadBalancer,Value=app/api-alb/xxx \
+  --start-time 2024-01-01T00:00:00 \
+  --end-time 2024-01-02T00:00:00 \
+  --period 300 \
+  --statistics Average
+```
+
+## CLI Examples
+
+```bash
+# Interface stats
+ip -s link show eth0
+ip -s link show
+cat /proc/net/dev
+
+# TCP stats
+ss -s
+cat /proc/net/snmp | grep Tcp
+netstat -s | grep -i tcp
+
+# Latency
+ping -c 10 8.8.8.8
+ping6 -c 10 2001:4860:4860::8888
+
+# Path analysis
+traceroute -m 30 8.8.8.8
+mtr -n 8.8.8.8
+tracepath 8.8.8.8
+
+# Bandwidth testing
+iperf3 -s  # Server
+iperf3 -c server.example.com -P 4 -t 30  # Client, 4 parallel streams
+
+# Throughput monitoring
+nethogs -d 1 eth0  # Per-process bandwidth
+iftop -i eth0       # Top talkers
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `ss -s` | Socket stats summary | `ss -s` |
+| `ip -s link` | Interface stats | `ip -s link show eth0` |
+| `ping` | Latency measurement | `ping -c 10 host` |
+| `traceroute` | Path analysis | `traceroute host` |
+| `iperf3` | Bandwidth testing | `iperf3 -s` |
+| `tcpdump` | Packet capture | `tcpdump -i eth0 port 80` |
+
+## Monitoring
+
+### Key Alerts
+
+```yaml
+# Prometheus alerts
+groups:
+  - name: network
+    interval: 30s
+    rules:
+      - alert: HighTCPRetransmissionRate
+        expr: rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TCP retransmission rate > 1%"
+      
+      - alert: HighNetworkInterfaceErrors
+        expr: rate(node_network_receive_errors_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High network interface error rate"
+      
+      - alert: ConntrackTableNearFull
+        expr: node_nf_conntrack_entries / node_nf_conntrack_entries_max > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connection tracking table > 80% full"
+```
+
+### Latency SLOs
+
+| Metric | SLO Target | Alert Threshold |
+|--------|------------|-----------------|
+| HTTP p50 latency | &lt;50ms | >100ms |
+| HTTP p99 latency | &lt;200ms | >500ms |
+| DNS resolution | &lt;20ms | >100ms |
+| TCP connection establishment | &lt;30ms | >100ms |
+| Packet loss | &lt;0.1% | >1% |
+
+## Security
+
+### Network Security Monitoring
+
+```bash
+# Watch for port scans
+tcpdump -i any -c 100 'tcp[tcpflags] = tcp-syn' 2>/dev/null | \
+  awk '{print $5}' | cut -d. -f1-4 | sort | uniq -c | sort -rn | head
+
+# Watch for unusual protocols
+tcpdump -i any -c 100 2>/dev/null | awk '{print $NF}' | grep -v '^[0-9]' | sort | uniq -c | sort -rn
+
+# IDS (Snort/Suricata)
+# snort -c /etc/snort/snort.conf -i eth0 -A console
+```
+
+## Cost Optimization
+
+Network monitoring can be expensive:
+
+- **Flow logs**: CloudWatch charges for log ingestion and storage
+- **Packet captures**: Storage costs for pcap files
+- **Metrics granularity**: Higher resolution = more cost
+
+```bash
+# Optimize:
+# - Sample flow logs (not 100% of traffic)
+# - Use sampling rate in tcpdump: -m 100 (1% sample)
+# - Aggregate metrics before storing
+# - Use tiered storage (hot/warm/cold)
+```
+
+## Troubleshooting
+
+### Network Performance Issues
+
+| Symptom | Metric to Check | Tool |
+|---------|----------------|------|
+| High latency | RTT, latency percentiles | ping, mtr |
+| Low throughput | bytes/sec, bandwidth | iftop, nethogs |
+| Packet loss | retransmits, drops | ss -ti, tcpdump |
+| Connection failures | connection states | ss -ant |
+| DNS slowness | query time | dig, dnstop |
+
+## Interview Questions
+
+**Q1: What network metrics would you monitor for a production web service?**
+
+A: Metrics I'd monitor: (1) Throughput—bytes in/out per second, requests per second. Identify bandwidth saturation. (2) Latency—p50/p95/p99 response times, DNS resolution time. Correlate with user experience. (3) TCP stats—established connections, TIME_WAIT (suggests connection churn), retransmission rate (high = network issues). (4) Errors—interface errors, packet drops, connection failures. (5) Connection tracking—usage vs max (avoid exhaustion). (6) Per-service metrics—request rate, error rate per endpoint. I'd use node_exporter for infrastructure metrics, application logs for request-level data, and VPC Flow Logs for network-level analysis.
+
+**Q2: How would you detect a network performance degradation?**
+
+A: Detection approach: (1) Alerting on thresholds—latency p99 >500ms, error rate >1%, retransmit rate >2%. (2) Correlation—look for co-occurring metric changes. High CPU + high softirq = kernel bottleneck. Packet loss + high RTT = network congestion. (3) Historical comparison—compare current vs baseline (same time last week). Significant deviation triggers investigation. (4) Distributed tracing—identify which service is slow. If one service's latency spiked while others didn't, that service has the issue. (5) Packet capture—tcpdump during incident to see actual packets. Look for retransmits, duplicate ACKs, window shrinking.
+
+## Cheat Sheet
+
+### Key Metrics to Monitor
+
+| Category | Metrics | Tool/Source |
+|----------|---------|-------------|
+| Throughput | rx/tx bytes, packets | `/proc/net/dev`, node_exporter |
+| Latency | RTT, request latency | ping, application logs |
+| Errors | drops, errors, retransmits | `ip -s link`, `ss -ti` |
+| Connections | established, time-wait | `ss -s` |
+| DNS | query time, failure rate | dig, prometheus |
+| Flow | bytes, packets by IP/port | VPC Flow Logs |
+
+### Prometheus Network Metrics
+
+```promql
+# Interface throughput
+rate(node_network_receive_bytes_total[5m])
+rate(node_network_transmit_bytes_total[5m])
+
+# TCP stats
+node_netstat_Tcp_CurrEstab
+rate(node_netstat_Tcp_RetransSegs[5m])
+rate(node_netstat_Tcp_InSegs[5m])
+
+# Connection states
+node_netstat_Tcp_TimeWait
+node_netstat_Tcp_CloseWait
+```
+
+## Related Topics
+
+- [Debugging](./debugging) — Packet capture and analysis
+- [Observability](./observability) — Monitoring tools
+- [Firewall](./firewall) — Connection tracking
+- [VPC](./vpc) — VPC Flow Logs

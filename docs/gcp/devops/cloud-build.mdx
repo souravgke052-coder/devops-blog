@@ -1,0 +1,745 @@
+# Cloud Build
+
+## Overview
+
+Google Cloud Build is a fully managed CI/CD platform that executes builds on Google Cloud infrastructure. It integrates with source repositories, artifact registries, and deployment targets. Cloud Build supports container builds, non-container builds, and parallel task execution with pay-per-second pricing.
+
+## When To Use
+
+- Building container images
+- CI/CD pipeline automation
+- Deploying to GKE, Cloud Run, or Firebase
+- Multi-step build pipelines
+- Testing and quality checks
+- Binary compilation
+
+## When NOT To Use
+
+- Simple file copying (use gsutil)
+- Long-running massive builds (consider self-hosted)
+- Windows container builds (not supported)
+- Very high-frequency builds (< 1 min intervals)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Cloud Build                            │
+├─────────────────────────────────────────────────────────────┤
+│  Components:                                                │
+│  ├── Build Trigger (event-driven)                          │
+│  ├── Build Worker (managed environment)                    │
+│  ├── Build Config (cloudbuild.yaml)                        │
+│  └── Cloud Build API                                       │
+├─────────────────────────────────────────────────────────────┤
+│  Environments:                                              │
+│  ├── Standard (default, 2-48 CPU)                         │
+│  └── High-performance (96 CPU, 624 GB RAM)                │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  ├── 120 build-minutes/day free                           │
+│  └── $0.0034/min after                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Build Trigger
+Automates builds based on source events (push, PR, etc.).
+
+### Build Config
+YAML file defining build steps, artifacts, and options.
+
+### Build Step
+Individual action in a build (run Docker container).
+
+### Builder
+Pre-built containers for common tasks (docker, gcloud, npm, etc.).
+
+### Worker Pool
+Dedicated infrastructure for sensitive builds.
+
+## Real Production Example
+
+**Full CI/CD Pipeline with Testing and Deployment**
+
+```hcl
+# Terraform configuration for Cloud Build setup
+
+# Enable APIs
+resource "google_project_service" "cloudbuild" {
+  service = "cloudbuild.googleapis.com"
+}
+
+resource "google_project_service" "artifact" {
+  service = "artifactregistry.googleapis.com"
+}
+
+resource "google_project_service" "run" {
+  service = "run.googleapis.com"
+}
+
+# Create artifact registry repository
+resource "google_artifact_registry_repository" "app" {
+  location      = "us-central1"
+  repository_id = "app"
+  format       = "DOCKER"
+}
+
+# Create service account for Cloud Build
+resource "google_service_account" "cloudbuild_sa" {
+  account_id = "cloudbuild-sa"
+  display_name = "Cloud Build Service Account"
+}
+
+# Grant necessary roles to Cloud Build SA
+resource "google_project_iam_member" "build_roles" {
+  count = length([
+    "roles/container.developer",
+    "roles/run.admin",
+    "roles/artifactregistry.writer",
+    "roles/secretmanager.secretAccessor",
+    "roles/logging.logWriter",
+    "roles/storage.objectViewer",
+  ])
+  
+  project = var.project
+  role    = element([
+    "roles/container.developer",
+    "roles/run.admin",
+    "roles/artifactregistry.writer",
+    "roles/secretmanager.secretAccessor",
+    "roles/logging.logWriter",
+    "roles/storage.objectViewer",
+  ], count.index)
+  member  = "serviceAccount:${google_service_account.cloudbuild_sa.email}"
+}
+
+# Build trigger for main branch
+resource "google_cloudbuild_trigger" "main_branch_trigger" {
+  name        = "main-branch-build"
+  description = "Build and deploy on main branch push"
+  
+  github {
+    owner = "my-org"
+    repo  = "my-app"
+    push {
+      branch = "^main$"
+    }
+  }
+  
+  service_account = google_service_account.cloudbuild_sa.id
+  
+  filename = "cloudbuild.yaml"
+  
+  substitutions = {
+    _REGION     = "us-central1"
+    _SERVICE_NAME = "my-app"
+  }
+  
+  tags = ["deploy", "production"]
+}
+
+# Build trigger for PR
+resource "google_cloudbuild_trigger" "pr_trigger" {
+  name        = "pr-build"
+  description = "Build and test on pull request"
+  
+  github {
+    owner = "my-org"
+    repo  = "my-app"
+    pull_request {
+      branch = "^main$"
+    }
+  }
+  
+  service_account = google_service_account.cloudbuild_sa.id
+  
+  filename = "cloudbuild.yaml"
+  
+  substitutions = {
+    _REGION     = "us-central1"
+    _SERVICE_NAME = "my-app"
+    _BUILD_TYPE = "pr"
+  }
+  
+  tags = ["test", "pull-request"]
+}
+
+# Build trigger for release tags
+resource "google_cloudbuild_trigger" "release_trigger" {
+  name        = "release-build"
+  description = "Build and deploy on release tags"
+  
+  github {
+    owner = "my-org"
+    repo  = "my-app"
+    push {
+      tag = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    }
+  }
+  
+  service_account = google_service_account.cloudbuild_sa.id
+  
+  filename = "cloudbuild.yaml"
+  
+  substitutions = {
+    _REGION     = "us-central1"
+    _SERVICE_NAME = "my-app"
+    _BUILD_TYPE = "release"
+  }
+  
+  tags = ["deploy", "release"]
+}
+
+# Cloud Build worker pool for sensitive builds
+resource "google_cloudbuild_worker_pool" "secure_pool" {
+  name     = "secure-pool"
+  location = "us-central1"
+  
+  display_name = "Secure build pool"
+  description  = "Isolated worker pool for sensitive builds"
+  
+  network {
+    egress_settings {
+      egress_nat_ip_configuration {
+        google_compute_firewall_rules = true
+      }
+    }
+  }
+  
+  annotations = {
+    environment = "secure"
+  }
+}
+```
+
+### cloudbuild.yaml
+
+```yaml
+# Cloud Build Configuration
+# Build, test, and deploy application
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE_NAME: my-app
+  _IMAGE: $_REGION-docker.pkg.dev/$PROJECT_ID/app/$_SERVICE_NAME
+
+options:
+  logging: GCS_ONLY
+  machineType: E2_HIGHCPU_8
+  dynamic_substitutions: true
+  volumes:
+    - name: 'npm'
+      path: '/root/.npm'
+    - name: 'cache'
+      path: '/root/.cache'
+
+steps:
+  # Prepare environment
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-auth'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud auth configure-docker $_REGION-docker.pkg.dev
+
+  # Run tests
+  - name: 'node:18'
+    id: 'test'
+    entrypoint: 'npm'
+    args:
+      - 'ci'
+    env:
+      - 'CI=true'
+    volumes:
+      - name: 'npm'
+        path: '/root/.npm'
+      - name: 'cache'
+        path: '/root/.cache'
+
+  - name: 'node:18'
+    id: 'lint'
+    entrypoint: 'npm'
+    args:
+      - 'run'
+      - 'lint'
+    waitFor: ['-']  # Run in parallel with test
+    env:
+      - 'CI=true'
+
+  - name: 'node:18'
+    id: 'unit-tests'
+    entrypoint: 'npm'
+    args:
+      - 'run'
+      - 'test:unit'
+    waitFor: ['-']
+    env:
+      - 'CI=true'
+
+  - name: 'node:18'
+    id: 'integration-tests'
+    entrypoint: 'npm'
+    args:
+      - 'run'
+      - 'test:integration'
+    waitFor: ['test', 'lint']
+    env:
+      - 'CI=true'
+
+  # Build container image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build'
+    args:
+      - 'build'
+      - '-t'
+      - '$_IMAGE:$COMMIT_SHA'
+      - '-t'
+      - '$_IMAGE:latest'
+      - '--cache-from'
+      - '$_IMAGE:latest'
+      - '--build-arg'
+      - 'BUILD_VERSION=$COMMIT_SHA'
+      - '.'
+    waitFor: ['-']  # Run in parallel with tests
+
+  # Security scan
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'container-analysis'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud artifacts docker describe $_IMAGE:$COMMIT_SHA --show-discovery-results || echo "No vulnerabilities found"
+    waitFor: ['build']
+
+  # Push images
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-sha'
+    args:
+      - 'push'
+      - '$_IMAGE:$COMMIT_SHA'
+    waitFor: ['container-analysis']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-latest'
+    args:
+      - 'push'
+      - '$_IMAGE:latest'
+    waitFor: ['push-sha']
+
+  # Deploy to staging (PR builds)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-staging'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '$_SERVICE_NAME-staging'
+      - '--image=$_IMAGE:$COMMIT_SHA'
+      - '--region=$_REGION'
+      - '--tag=staging'
+      - '--allow-unauthenticated'
+    waitFor: ['push-sha']
+    condition: '$_BUILD_TYPE == "pr"'
+
+  # Deploy to production (main/release builds)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-production'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '$_SERVICE_NAME'
+      - '--image=$_IMAGE:$COMMIT_SHA'
+      - '--region=$_REGION'
+      - '--allow-unauthenticated'
+      - '--tag=$COMMIT_SHA'
+    waitFor: ['push-sha']
+    condition: '$_BUILD_TYPE != "pr"'
+
+  # Notify completion (for main/release)
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'notify-success'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "Build completed successfully"
+        echo "Commit: $COMMIT_SHA"
+        echo "Image: $_IMAGE:$COMMIT_SHA"
+    waitFor: ['deploy-production', 'deploy-staging']
+    condition: '$_BUILD_TYPE != "pr"'
+
+images:
+  - '$_IMAGE:$COMMIT_SHA'
+  - '$_IMAGE:latest'
+
+tags:
+  - '$_SERVICE_NAME'
+  - '$_BUILD_TYPE'
+
+timeout: '1800s'
+```
+
+## CLI Examples
+
+```bash
+# Submit build from local Dockerfile
+gcloud builds submit --tag us-central1-docker.pkg.dev/my-project/my-repo/my-image:tag .
+
+# Submit build with cloudbuild.yaml
+gcloud builds submit --config=cloudbuild.yaml .
+
+# Submit build with substitutions
+gcloud builds submit --config=cloudbuild.yaml \
+  --substitutions=_REGION=us-east1,_ENV=prod .
+
+# Run build without source (from config only)
+gcloud builds submit --config=cloudbuild.yaml --no-source
+
+# List builds
+gcloud builds list --limit=50
+
+# Describe build
+gcloud builds describe BUILD_ID
+
+# Cancel build
+gcloud builds cancel BUILD_ID
+
+# Create trigger
+gcloud builds triggers create github \
+  --repo-name=my-repo \
+  --repo-owner=my-org \
+  --branch-pattern="^main$" \
+  --build-config=cloudbuild.yaml
+
+# Create trigger with substitution
+gcloud builds triggers create github \
+  --repo-name=my-repo \
+  --repo-owner=my-org \
+  --tag-pattern="^v[0-9.]+$" \
+  --build-config=cloudbuild.yaml \
+  --substitutions=_VERSION='$(tag)'
+
+# Delete trigger
+gcloud builds triggers delete TRIGGER_ID
+
+# View build logs
+gcloud builds log BUILD_ID
+
+# Use worker pool
+gcloud builds submit --config=cloudbuild.yaml \
+  --worker-pool=projects/my-project/locations/us-central1/workerPools/my-pool
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# GitHub trigger
+resource "google_cloudbuild_trigger" "trigger" {
+  name        = "github-trigger"
+  description = "GitHub push trigger"
+  
+  github {
+    owner = "my-org"
+    repo  = "my-repo"
+    push {
+      branch = "^main$"
+    }
+  }
+  
+  filename       = "cloudbuild.yaml"
+  service_account = google_service_account.cloudbuild_sa.id
+  
+  substitutions = {
+    _REGION = "us-central1"
+  }
+}
+
+# Manual trigger
+resource "google_cloudbuild_trigger" "manual" {
+  name        = "manual-trigger"
+  description = "Manual trigger"
+  
+  trigger_template {
+    branch_pattern = "^main$"
+    repo_name      = "my-repo"
+  }
+  
+  filename       = "cloudbuild.yaml"
+  service_account = google_service_account.cloudbuild_sa.id
+}
+
+# Worker pool
+resource "google_cloudbuild_worker_pool" "pool" {
+  name     = "secure-pool"
+  location = "us-central1"
+  
+  display_name = "Secure Pool"
+  description  = "For sensitive builds"
+  
+  network {
+    egress_settings {
+      egress_nat_ip_configuration {
+        google_compute_firewall_rules = true
+      }
+    }
+  }
+}
+```
+
+## Common Commands
+
+```bash
+# Submit and manage builds
+gcloud builds submit [--tag=TAG] [--config=FILE] [--substitutions=K=V]
+gcloud builds list [--limit=N]
+gcloud builds describe BUILD_ID
+gcloud builds cancel BUILD_ID
+gcloud builds log BUILD_ID
+
+# Triggers
+gcloud builds triggers create TRIGGER_TYPE [flags]
+gcloud builds triggers list
+gcloud builds triggers delete TRIGGER_ID
+gcloud builds triggers run TRIGGER_ID
+
+# Worker pools
+gcloud builds worker-pools create POOL --location=LOC
+gcloud builds worker-pools list
+```
+
+## Monitoring
+
+### Build Metrics
+- Build duration
+- Build success/failure rate
+- Build step timing
+- Queue time
+
+### Cloud Monitoring
+```bash
+# Create build failure alert
+gcloud monitoring policies create \
+  --display-name="Build Failure Alert" \
+  --condition-display-name="Build failure rate > 10%" \
+  --condition-filter='resource.type="cloudbuild" AND metric.type="cloudbuild.googleapis.com/builds/failure_count"' \
+  --condition-threshold-value=0.1 \
+  --notification-channels=CHANNEL_ID
+
+# View build metrics
+gcloud monitoring metrics list --filter="resource.type=cloudbuild"
+```
+
+### Logs
+```bash
+# View build logs
+gcloud builds log BUILD_ID
+
+# View in Cloud Logging
+gcloud logging read "resource.type=cloud_build"
+```
+
+## Security
+
+### Service Account Permissions
+```bash
+# Cloud Build SA typically needs
+roles/logging.logWriter
+roles/monitoring.metricWriter
+roles/artifactregistry.writer
+roles/secretmanager.secretAccessor
+# Plus roles for deployment targets (run.admin, container.developer, etc.)
+```
+
+### VPC Configuration
+```bash
+# Use private pool for VPC access
+gcloud builds worker-pools create private-pool \
+  --location=us-central1 \
+  --display-name="Private Pool"
+
+gcloud builds submit --config=cloudbuild.yaml \
+  --worker-pool=projects/my-project/locations/us-central1/workerPools/private-pool
+```
+
+### Secret Management
+```bash
+# Use Secret Manager for secrets
+# Access in build:
+gcloud secrets versions access --secret=MY_SECRET latest
+
+# In cloudbuild.yaml:
+- name: 'bash'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      export API_KEY=$$(gcloud secrets versions access --secret=API_KEY latest)
+      # Use API_KEY
+```
+
+## Cost Optimization
+
+### Pricing
+- 120 free minutes/day
+- $0.0034/minute after free tier
+- High-memory machine: $0.01/min
+- High-CPU machine: $0.007/min
+
+### Optimization Tips
+```yaml
+# Use caching
+steps:
+  - name: 'docker'
+    args: ['build', '--cache-from', 'image:tag', ...]
+
+# Use smaller machine for simple builds
+options:
+  machineType: 'E2_SMALL'
+
+# Parallelize independent steps
+- name: 'node'
+  id: 'lint'
+  waitFor: ['-']  # Run immediately
+```
+
+## Troubleshooting
+
+### Build Failures
+```bash
+# View logs
+gcloud builds log BUILD_ID
+
+# Check build status
+gcloud builds describe BUILD_ID
+
+# Check trigger configuration
+gcloud builds triggers describe TRIGGER_ID
+
+# Verify service account permissions
+gcloud projects get-iam-policy my-project \
+  --filter="bindings.members:${CLOUDBUILD_SA}"
+```
+
+### Timeout Issues
+```bash
+# Increase timeout
+gcloud builds submit --timeout=3600s
+
+# In cloudbuild.yaml:
+timeout: '3600s'
+
+# Optimize build steps
+# Use caching
+# Parallelize independent steps
+```
+
+### Permission Denied
+```bash
+# Check service account roles
+gcloud projects get-iam-policy my-project
+
+# Verify trigger SA has required roles
+gcloud builds triggers describe TRIGGER_ID
+```
+
+## Interview Questions
+
+**Q: How does Cloud Build caching work?**
+A: Cloud Build caches layer by storing intermediate images. Use `--cache-from` to pull previous image layers. In Dockerfile, use multi-stage builds. Cloud Build also caches steps by default when using `waitFor: ['-']` and the same step runs again.
+
+**Q: What is the difference between standard and private worker pools?**
+A: Standard pools use shared infrastructure. Private worker pools provide dedicated machines in your VPC for better security, network access, and compliance requirements. Private pools also support custom machine types.
+
+**Q: How do you handle secrets in Cloud Build?**
+A: Store secrets in Secret Manager with the Cloud Build SA as a principal. In cloudbuild.yaml, retrieve secrets using `gcloud secrets versions access`. Use `$$` to prevent echo expansion.
+
+**Q: What triggers are available in Cloud Build?**
+A: GitHub/GitHub Enterprise pushes and pull requests, Cloud Source Repository pushes, Pub/Sub triggers, Manual triggers (via API), and scheduled triggers via Cloud Scheduler.
+
+**Q: How do you optimize Cloud Build performance?**
+A: Use `--cache-from` for Docker layers, parallelize independent steps with `waitFor: ['-']`, use smaller machine types for simple builds, implement Docker layer caching in Dockerfile, and use remote build caching with `--disk-size` optimization.
+
+## Cheat Sheet
+
+```yaml
+# Basic cloudbuild.yaml
+steps:
+  - name: 'docker'
+    args: ['build', '-t', 'IMAGE', '.']
+images: ['IMAGE']
+
+# With substitutions
+substitutions:
+  _ENV: prod
+steps:
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args: ['run', 'deploy', 'SERVICE', '--image', 'IMAGE', '--region', '$_REGION']
+
+# Parallel steps
+- name: 'node'
+  id: 'lint'
+  waitFor: ['-']
+- name: 'node'
+  id: 'test'
+  waitFor: ['-']
+```
+
+```bash
+# Submit build
+gcloud builds submit --config=cloudbuild.yaml --tag=IMAGE:TAG
+
+# Create trigger
+gcloud builds triggers create github \
+  --repo-name=REPO --repo-owner=OWNER \
+  --branch-pattern="^main$" \
+  --build-config=cloudbuild.yaml
+```
+
+## Labs
+
+### Lab 1: Container CI/CD Pipeline
+Build complete CI/CD pipeline.
+1. Create Cloud Build trigger
+2. Configure Artifact Registry
+3. Implement build/test/deploy steps
+4. Add notification on failure
+5. Set up build caching
+
+### Lab 2: Secure Build Environment
+Implement secure builds.
+1. Create private worker pool
+2. Configure VPC connectivity
+3. Set up service account with minimal permissions
+4. Implement Secret Manager integration
+5. Enable audit logging
+
+### Lab 3: Multi-Environment Deployment
+Deploy to multiple environments.
+1. Configure triggers per branch
+2. Implement environment-specific substitutions
+3. Add approval gates for production
+4. Configure rollout strategy
+5. Monitor deployments
+
+## Related Services
+
+- **Artifact Registry**: Container image storage
+- **Cloud Run**: Serverless deployment target
+- **GKE**: Kubernetes deployment
+- **Secret Manager**: Secret storage
+- **Cloud Build**: Build automation
+- **Cloud Monitoring**: Build observability

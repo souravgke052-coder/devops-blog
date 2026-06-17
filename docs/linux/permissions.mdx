@@ -1,0 +1,461 @@
+---
+sidebar_position: 7
+description: Linux file permissions, ACLs, special bits (SUID/SGID/Sticky), umask, and ownership management.
+---
+
+# File Permissions
+
+## Overview
+
+File permissions are the foundation of Linux security. Every file has an owner (user), a group, and three permission sets: owner, group, and other (everyone else). Each set has read (r), write (w), and execute (x) permissions. Understanding permission arithmetic, special bits, and Access Control Lists (ACLs) is essential for securing systems and debugging "permission denied" errors.
+
+The permission model extends beyond basic owner/group/other with SUID (Set User ID), SGID (Set Group ID), and the sticky bit. SUID allows a program to run with the owner's privileges, SGID with the group's, and the sticky bit protects files in a directory from deletion by non-owners. ACLs provide finer-grained control, allowing permissions for specific users or groups beyond the owner/group/other model.
+
+## When To Use
+
+- Securing application files and directories
+- Debugging "Permission denied" errors
+- Configuring shared directories for multiple groups
+- Setting up service accounts with minimal privileges
+- Container filesystem security
+
+## When NOT To Use
+
+- When the application layer handles auth (containerized microservices)
+- When using capabilities instead of SUID binaries
+
+## Core Concepts
+
+### Permission Notation
+
+**Symbolic notation:**
+```bash
+rwx rwx rwx
+|   |   └── Other permissions
+|   └────── Group permissions
+└────────── Owner permissions
+```
+
+**Octal notation:**
+```bash
+4 = read (r)
+2 = write (w)
+1 = execute (x)
+
+rwx = 4+2+1 = 7
+r-- = 4+0+0 = 4
+rw- = 4+2+0 = 6
+r-x = 4+0+1 = 5
+```
+
+### chmod - Changing Permissions
+
+```bash
+# Symbolic notation
+chmod u+rwx file              # Add read/write/execute for owner
+chmod g+rx file               # Add read/execute for group
+chmod o-rwx file              # Remove all for others
+chmod a+x file                # Add execute for all (owner, group, other)
+chmod ug=rw,o=r file          # Set owner/group to rw, others to r
+
+# Octal notation
+chmod 644 file                # rw-r--r-- (owner rw, group r, other r)
+chmod 755 file                # rwxr-xr-x (owner rwx, group rx, other rx)
+chmod 600 file                # rw------- (owner rw only)
+chmod 700 file                # rwx------ (owner rwx only)
+
+# Recursive (directories)
+chmod -R 755 /opt/myapp       # Apply to all files and directories
+chmod -R og-w /opt/myapp      # Remove write from group and other
+
+# Only directories (don't affect files)
+find /opt/myapp -type d -exec chmod 755 {} \;
+find /opt/myapp -type f -exec chmod 644 {} \;
+```
+
+### chown - Changing Owner/Group
+
+```bash
+# Change owner
+chown deploy file
+
+# Change owner:group
+chown deploy:www-data file
+
+# Change group only
+chown :www-data file
+chgrp www-data file
+
+# Recursive
+chown -R deploy:www-data /var/www
+
+# Preserve group on copy (use -p flag)
+cp -p file1 file2
+cp -a file1 file2              # Archive mode (preserves everything)
+```
+
+### Special Bits
+
+**SUID (Set User ID) - octal 4:**
+When an executable with SUID runs, it executes as the file owner, not the calling user.
+
+```bash
+chmod u+s /usr/bin/passwd      # SUID on passwd lets users change their password
+ls -l /usr/bin/passwd
+# -rwsr-xr-x 1 root root ... /usr/bin/passwd
+# Note the 's' in owner execute position
+```
+
+**SGID (Set Group ID) - octal 2:**
+Files: execute as the file's group. Directories: new files inherit the directory's group.
+
+```bash
+chmod g+s /usr/bin/myapp
+ls -l /usr/bin/myapp
+# -rwxr-sr-x 1 root root ... /usr/bin/myapp
+
+# Directory SGID: files inherit group
+mkdir /data/shared
+chgrp developers /data/shared
+chmod 2775 /data/shared        # SGID + rwxrwxr-x
+# New files get group=developers automatically
+```
+
+**Sticky Bit - octal 1:**
+On directories, only the owner of a file can delete or rename it (even if others have write permission).
+
+```bash
+chmod +t /tmp                  # or chmod 1777
+ls -ld /tmp
+# drwxrwxrwt 12 root root ... /tmp
+# Note the 't' in other execute position
+```
+
+### Access Control Lists (ACLs)
+
+```bash
+# Show ACL
+getfacl /shared/file
+
+# Set ACL for user
+setfacl -m u:deploy:rw /shared/file
+
+# Set ACL for group
+setfacl -m g:developers:rx /shared
+
+# Remove ACL entry
+setfacl -x u:deploy /shared/file
+
+# Remove all ACLs
+setfacl -b /shared/file
+
+# Copy ACLs
+getfacl file1 | setfacl --set-file=- file2
+
+# Default ACLs (for new files in directory)
+setfacl -m d:u:deploy:rw /shared      # New files get deploy:rw
+setfacl -m d:g:developers:rx /shared  # New directories get developers:rx
+
+# Recursive ACL
+setfacl -R -m u:deploy:rwX /shared    # X = execute only if already executable
+```
+
+### umask
+
+umask defines which permission bits are *removed* from newly created files/directories.
+
+```bash
+# Default umask (typically 0022)
+umask
+# 0022 means subtract 022 from 666 = 644 (files) or 777 = 755 (dirs)
+
+# Change umask for session
+umask 0027                          # Owner full, group read, others none
+
+# Permanent (bashrc)
+echo "umask 0027" >> ~/.bashrc
+
+# For service files (systemd)
+# In unit file:
+Environment="UMASK=0027"
+
+# In /etc/login.defs (login shells)
+UMASK 027
+```
+
+### Default Permissions
+
+| Type | Default Mode | With umask 022 |
+|------|-------------|----------------|
+| File | 666 | 644 (rw-r--r--) |
+| Directory | 777 | 755 (rwxr-xr-x) |
+
+## Real Production Example
+
+Configuring a shared application directory with proper permissions:
+
+```bash
+#!/bin/bash
+# setup-app-permissions.sh
+
+set -euo pipefail
+
+APP_DIR="/opt/myapp"
+APP_USER="myapp"
+APP_GROUP="myapp"
+DEPLOY_GROUP="deployers"
+DATA_DIR="${APP_DIR}/data"
+LOG_DIR="${APP_DIR}/logs"
+UPLOAD_DIR="${APP_DIR}/uploads"
+
+# Create application user (no login, no home)
+useradd --system \
+    --no-create-home \
+    --shell /sbin/nologin \
+    --user-group \
+    ${APP_USER}
+
+# Create deployers group
+groupadd --system deployers 2>/dev/null || true
+
+# Create directory structure
+mkdir -p ${APP_DIR}/{bin,config,data,logs,uploads}
+mkdir -p /var/log/myapp
+
+# Application binaries (readable by all, writable by deployers)
+chown root:${DEPLOY_GROUP} ${APP_DIR}/bin
+chmod 750 ${APP_DIR}/bin
+chmod 750 ${APP_DIR}/config
+
+# Data directory (app user only)
+chown ${APP_USER}:${APP_USER} ${DATA_DIR}
+chmod 700 ${DATA_DIR}
+
+# Logs (app writes, deployers read)
+ln -sf /var/log/myapp ${APP_DIR}/logs
+chown ${APP_USER}:${DEPLOY_GROUP} /var/log/myapp
+chmod 750 /var/log/myapp
+setfacl -m d:g:deployers:rx /var/log/myapp
+
+# Upload directory (writable by app, listable by deployers)
+chown ${APP_USER}:${APP_USER} ${UPLOAD_DIR}
+chmod 755 ${UPLOAD_DIR}
+
+# Setfacl for specific user access
+setfacl -R -m u:deployer1:rwX ${DATA_DIR}
+setfacl -R -m u:deployer2:rwX ${DATA_DIR}
+
+# Verify
+getfacl ${APP_DIR}
+stat ${APP_DIR}
+```
+
+## CLI Examples
+
+```bash
+# View permissions
+ls -la /path/to/file
+stat /path/to/file
+
+# Change permissions
+chmod 644 file
+chmod u+x file
+chmod -R 755 directory
+
+# Change owner/group
+chown user:group file
+chgrp group file
+
+# ACL operations
+getfacl file
+setfacl -m u:user:rw file
+setfacl -m g:group:rx directory
+setfacl -x u:user file
+
+# Check special bits
+ls -l /usr/bin/passwd         # Should have s in owner execute
+ls -ld /tmp                   # Should have t in other execute
+ls -ld /shared                # Check SGID on directory
+
+# Numeric mode with special bits
+chmod 4755 file               # SUID
+chmod 2755 directory          # SGID
+chmod 1777 /tmp               # Sticky
+chmod 3775 directory          # SGID + sticky
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `chmod` | Change permissions | `chmod 755 file` |
+| `chown` | Change owner:group | `chown user:group file` |
+| `chgrp` | Change group | `chgrp group file` |
+| `getfacl` | Show ACL | `getfacl file` |
+| `setfacl` | Set ACL | `setfacl -m u:user:rw file` |
+| `umask` | Show/set umask | `umask 0027` |
+
+## Monitoring
+
+```bash
+# Find files with SUID
+find / -perm -4000 -type f 2>/dev/null
+
+# Find files with SGID
+find / -perm -2000 -type f 2>/dev/null
+
+# World-writable files (dangerous)
+find / -perm -0002 -type f 2>/dev/null
+
+# Files with no owner (orphaned)
+find / -nouser -o -nogroup 2>/dev/null
+
+# Check directory permissions (sticky bit)
+ls -ld /tmp /var/tmp
+
+# Compare effective permissions with ACL
+getfacl file
+# Compare with:
+ls -l file
+```
+
+## Security
+
+**Dangerous permission patterns:**
+
+```bash
+# World-writable files - anyone can modify
+chmod 666 /etc/passwd          # CRITICAL VULNERABILITY
+
+# SUID binaries with shells - privilege escalation
+chmod 4755 /bin/bash           # CRITICAL VULNERABILITY
+
+# Unprotected sensitive files
+chmod 777 /etc/shadow          # CRITICAL VULNERABILITY
+```
+
+**Hardening practices:**
+
+```bash
+# Remove SUID from unnecessary binaries
+chmod u-s /usr/bin/game-over 2>/dev/null || true
+
+# Common SUID binaries to keep (minimal set)
+# passwd, su, sudo, pkexec, mount, umount, sulogin, gpasswd
+
+# Audit SUID binaries regularly
+find / -perm -4000 -type f -exec md5sum {} \; > /var/tmp/suid-list.txt
+# Compare against known-good list
+
+# Set sticky bit on shared directories
+chmod +t /shared/directory
+
+# Enforce ACLs for sensitive data
+setfacl -R -m u:app:rwX,u:deployer:rwX /sensitive/directory
+setfacl -R -m d:u:app:rwX,d:u:deployer:rwX /sensitive/directory
+
+# Immutable files (even root can't modify without removing attr)
+chattr +i /etc/passwd
+lsattr /etc/passwd             # Show attributes
+chattr -i /etc/passwd          # Remove immutable
+```
+
+## Troubleshooting
+
+**"Permission denied" on file you own:**
+
+```bash
+# Check directory permissions (need x to traverse)
+ls -ld /parent/directory
+# Must have execute bit to access children
+
+# Check ACLs
+getfacl file
+
+# Check extended attributes
+lsattr file
+```
+
+**ACL masks affecting permissions:**
+
+```bash
+# ACL mask limits effective permissions
+# If mask is r--, even setting rw- gives only r--
+setfacl -m m::r-- directory
+
+# Remove mask to fix
+setfacl -m m::rwx directory
+```
+
+**Copying permissions:**
+
+```bash
+# cp -p preserves permissions but may not preserve ACLs
+cp -p file1 file2
+# Verify
+getfacl file1
+getfacl file2
+
+# Use getfacl | setfacl for ACL preservation
+getfacl file1 | setfacl --set-file=- file2
+```
+
+## Interview Questions
+
+1. **What's the difference between permission bits and ACLs?**
+
+Permission bits (owner/group/other rwx) are the traditional UNIX model — simple, limited to one owner and one group. ACLs extend this to allow multiple specific users and groups with individual permissions. When both exist, ACLs take precedence. `getfacl` shows both; effective permissions are the union of permission bits and ACL entries subject to the ACL mask.
+
+2. **How does the sticky bit work on directories?**
+
+On directories, the sticky bit restricts deletion: only the file's owner, the directory's owner, or root can rename or delete files within the directory, regardless of write permissions. This is why /tmp has it — any user can create files but cannot delete others' files.
+
+3. **What happens when you set SUID on a script?**
+
+Most modern Linux systems ignore SUID on shell scripts due to security vulnerabilities (race conditions in /proc). Use binary executables for SUID programs. If you need SUID behavior for scripts, use a wrapper binary with sudo rules instead.
+
+4. **A file has permissions 0640 but getfacl shows additional entries. What's the effective permission for user 'other'?**
+
+The effective permission for 'other' is still 0 (no access) from the permission bits. However, if there's an ACL entry for 'other' via specific user (`u:other:rw`), that overrides the 'other' permission bits. Check `getfacl` output for masked permissions.
+
+5. **What's the difference between chmod 755 and chmod 0755?**
+
+In most shells, no difference — leading zeros are ignored. However, the leading zero indicates the special bits (SUID=4, SGID=2, Sticky=1). So chmod 4755 sets SUID + 755, while chmod 2755 sets SGID + 755, and chmod 755 is just 0+755 (no special bits).
+
+## Cheat Sheet
+
+```
+# Permission notation
+rwx = 7, rw- = 6, r-x = 5, r-- = 4, --- = 0
+
+# chmod
+chmod 644 file          # rw-r--r--
+chmod 755 dir           # rwxr-xr-x
+chmod 600 key           # rw-------
+chmod +x file           # Add execute
+chmod -R 755 dir        # Recursive
+
+# chown
+chown user file
+chown user:group file
+chown :group file       # Change group only
+chown -R user:group dir # Recursive
+
+# ACLs
+getfacl file            # Show ACL
+setfacl -m u:user:rw file
+setfacl -m g:group:rx dir
+setfacl -m d:u:user:rw dir   # Default (new files)
+setfacl -b file         # Remove all ACLs
+
+# Special bits
+chmod u+s file          # SUID
+chmod g+s dir           # SGID
+chmod +t /dir           # Sticky
+```
+
+## Related Topics
+
+- [Users and Groups](./users-and-groups) — User management
+- [Security](./security) — Permission hardening
+- [Processes](./processes) — Process permissions and ownership

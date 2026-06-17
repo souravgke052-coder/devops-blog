@@ -1,0 +1,424 @@
+---
+sidebar_position: 5
+description: Linux filesystem hierarchy, /proc, /sys, /dev, mounting, and filesystem types for production systems.
+---
+
+# Linux Filesystem
+
+## Overview
+
+The Linux filesystem follows the Filesystem Hierarchy Standard (FHS) — understanding it is essential for navigating systems, debugging issues, and knowing where configuration files, logs, and application data belong. Three pseudo-filesystems (/proc, /sys, /dev) are particularly important for DevOps engineers as they provide kernel and hardware visibility.
+
+/proc contains runtime system information — process IDs, CPU info, memory, interrupt routing. Every running process has a directory under /proc/&lt;PID&gt;. /sys exports kernel data structures for hardware and driver visibility, used heavily in containers and cloud environments. /dev contains device files — block devices for storage, character devices for terminals, and pseudo-devices like /dev/null.
+
+Understanding inodes is fundamental: files are not names, they are inode numbers. The name is just a directory entry pointing to the inode. Two files can share an inode (hard links). When you delete a file, you're removing the directory entry; the inode is released when no links remain.
+
+## When To Use
+
+- Debugging disk space issues
+- Understanding process resource usage
+- Configuring storage and mounts
+- Container filesystem isolation
+- Hardware device access
+
+## When NOT To Use
+
+- Directly editing /proc or /sys (use sysctl, echo to specific files only)
+- Modifying device files without understanding them
+
+## Core Concepts
+
+### Filesystem Hierarchy Standard (FHS)
+
+```
+/bin           Essential command binaries (legacy, /usr/bin is preferred)
+/boot          Boot loader, kernels, initramfs
+/dev           Device files (block, character, pseudo)
+/etc           System configuration files
+/home          User home directories
+/lib           Shared libraries, kernel modules (/lib/modules)
+/media         Removable media mount points
+/mnt           Temporary mount points
+/opt           Optional/third-party software
+/proc          Virtual filesystem for kernel runtime info
+/root          Root user's home
+/run           Runtime data (PID files, sockets)
+/sbin          Essential system binaries
+/srv           Data for services (web, git, etc.)
+/sys           Virtual filesystem for kernel/hardware data
+/tmp           Temporary files (often tmpfs)
+/usr           User programs, libraries, documentation
+/var           Variable data (logs, spools, caches)
+/swapfile     Swap file (not under /var)
+```
+
+### Understanding /proc
+
+```bash
+# Process information
+ls /proc/                  # Lists PIDs + kernel info
+ls -la /proc/self/         # Symbolic links to current process
+cat /proc/self/cmdline     # Null-separated command line
+cat /proc/self/environ     # Null-separated environment
+
+# System information
+cat /proc/cpuinfo          # CPU型号、特性、cache
+cat /proc/meminfo          # Memory usage, see MemAvailable vs MemFree
+cat /proc/uptime           # Seconds since boot, idle seconds
+cat /proc/loadavg          # Load average (1,5,15 min)
+cat /proc/diskstats        # Disk I/O statistics
+cat /proc/net/dev          # Network interface counters
+
+# Kernel parameters (same as sysctl)
+cat /proc/sys/net/ipv4/tcp_fin_timeout
+
+# Modify sysctl values
+echo 30 > /proc/sys/net/ipv4/tcp_fin_timeout  # Temporary
+```
+
+### Understanding /sys
+
+```bash
+# Block devices
+ls /sys/block/
+
+# Device details
+cat /sys/block/sda/size              # Size in sectors
+cat /sys/block/sda/device/model       # Disk model
+
+# PCIe device info
+ls /sys/bus/pci/devices/
+
+# Device driver binding
+ls /sys/bus/pci/drivers/
+
+# Kernel module parameters
+ls /sys/module/nf_conntrack/parameters/
+cat /sys/module/nf_conntrack/parameters/hashsize
+```
+
+### Understanding /dev
+
+```bash
+# Block devices (storage)
+ls -la /dev/sd*
+ls -la /dev/nvme*
+
+# Character devices
+ls -la /dev/tty
+ls -la /dev/pts/        # Pseudo-terminals
+
+# Device mapper
+ls -la /dev/mapper/
+
+# Null, zero, random
+cat /dev/urandom | head -c 32 | xxd  # Generate random bytes
+
+# Find device by major:minor
+ls -la /dev/null        # 1:3
+```
+
+### Inodes and Disk Structure
+
+```bash
+# Show inode usage
+df -i
+
+# Show inode info for file
+stat /etc/passwd
+
+# Find files by inode
+find / -inum 123456
+
+# Find files with high link count (hard links)
+find / -type f -links +1 -printf '%n %p\n'
+
+# Create hard link
+ln /path/to/source /path/to/destination
+
+# Create symbolic link
+ln -s /path/to/target /path/to/link
+```
+
+### Filesystem Types
+
+| Type | Characteristics | Use Case |
+|------|----------------|----------|
+| ext4 | Default, journaling, extents | General purpose |
+| xfs | High performance, large files | High-throughput workloads |
+| btrfs | Copy-on-write, snapshots, checksums | Data-heavy, backup |
+| zfs | Enterprise-grade, compression, replication | NAS, storage servers |
+| tmpfs | RAM-backed, volatile | /run, /tmp in containers |
+
+```bash
+# Create filesystem
+mkfs.ext4 /dev/sdb1
+mkfs.xfs /dev/sdb1
+mkfs.btrfs /dev/sdb1
+
+# Filesystem check
+fsck.ext4 -f /dev/sdb1
+xfs_repair /dev/sdb1
+btrfs check /dev/sdb1
+
+# Tune ext4 options
+tune2fs -o journal_data_writeback /dev/sdb1
+tune2fs -E mount_opts=extended_attributes /dev/sdb1
+```
+
+### Mounting
+
+```bash
+# Mount basics
+mount /dev/sdb1 /mnt/data
+mount -o ro,noexec /dev/sdb1 /mnt/data
+
+# Mount with specific filesystem
+mount -t xfs /dev/sdb1 /mnt/data
+
+# Remount (change options)
+mount -o remount,noatime /
+
+# Bind mount
+mount --bind /opt/data /var/www/data
+
+# Show mounts
+mount
+cat /proc/mounts
+findmnt
+
+# UUID mount (in /etc/fstab)
+UUID=abc123 /mnt/data ext4 defaults 0 2
+
+# Label mount
+LABEL=data /mnt/data ext4 defaults 0 2
+
+# Unmount (lazy unmount if busy)
+umount /mnt/data
+umount -l /mnt/data
+```
+
+## Real Production Example
+
+Setting up a robust data partition with proper mount options:
+
+```bash
+#!/bin/bash
+# setup-data-partition.sh
+
+set -euo pipefail
+
+DEVICE="/dev/sdb"
+PARTITION="${DEVICE}1"
+MOUNT_POINT="/data"
+MOUNT_OPTIONS="defaults,noatime,nodiratime,nosuid,nodev"
+
+# Partition (GPT)
+parted ${DEVICE} --align optimal --script \
+    mklabel gpt \
+    mkpart primary xfs 0% 100% \
+    set 1 none
+
+# Create filesystem
+mkfs.xfs -L data ${PARTITION}
+
+# Get UUID
+UUID=$(blkid -s UUID -o value ${PARTITION})
+
+# Add to fstab with proper options
+cat >> /etc/fstab <<EOF
+# Data partition
+UUID=${UUID} ${MOUNT_POINT} xfs ${MOUNT_OPTIONS} 0 2
+EOF
+
+# Create mount point with correct permissions
+mkdir -p ${MOUNT_POINT}
+chmod 755 ${MOUNT_POINT}
+
+# Mount
+mount ${MOUNT_POINT}
+
+# Set ownership
+chown root:root ${MOUNT_POINT}
+chmod 755 ${MOUNT_POINT}
+
+# Verify
+df -h ${MOUNT_POINT}
+mount | grep ${MOUNT_POINT}
+```
+
+## CLI Examples
+
+```bash
+# Disk space
+df -h                    # Human-readable
+df -i                    # Inode usage
+du -sh /var/log/*        # Directory sizes
+du -shx /var/log/        # Exclude other filesystems
+ncdu -x /                # Interactive disk usage
+
+# Mount info
+findmnt
+mount | grep /dev
+cat /proc/mounts
+cat /etc/fstab
+
+# Filesystem info
+blkid                    # UUIDs and types
+lsblk -f                 # Block device tree
+fdisk -l /dev/sda        # Partition table
+parted /dev/sda print    # Detailed partition info
+
+# Filesystem check
+fsck -N /dev/sda1        # Dry run
+fsck.ext4 -p /dev/sda1   # Automatic repair
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `df -h` | Filesystem usage | Check disk space |
+| `du -sh` | Directory size | `du -sh /var/log` |
+| `mount` | Show mounts | `mount \| grep sda` |
+| `umount` | Unmount | `umount /mnt/data` |
+| `blkid` | Block device IDs | Get UUIDs |
+| `lsblk` | Block device tree | Visual layout |
+| `mkfs.ext4` | Create ext4 | `mkfs.ext4 /dev/sdb1` |
+| `fsck` | Filesystem check | `fsck /dev/sdb1` |
+
+## Monitoring
+
+```bash
+# Real-time disk I/O
+iostat -x 1
+iotop -o
+
+# Space usage trends
+watch -n 5 'df -h / /data /var'
+
+# Large directories
+find /var -type d -exec du -sh {} \; 2>/dev/null | sort -rh | head -20
+
+# Files changing frequently
+inotifywait -m -r /var/log/ 2>/dev/null || auditd
+
+# Disk health (SMART)
+smartctl -a /dev/sda
+smartctl -H /dev/sda
+```
+
+## Security
+
+- **nosuid**: Don't honor setuid bit on files
+- **nodev**: Don't interpret character or block special devices
+- **noexec**: Don't allow execution of binaries
+- **ro**: Read-only mount for safety
+
+Container /tmp security:
+```bash
+# Mount tmpfs for containers
+mount -t tmpfs -o nosuid,noexec,nodev tmpfs /container/tmp
+
+# Restrict /proc in containers
+mount -t proc proc /proc
+mount -o remount,hidepid=2 /proc
+```
+
+## Troubleshooting
+
+**"No space left on device" but df shows space:**
+
+```bash
+# Check inode usage
+df -i
+# If inodes exhausted, find files with many small files
+find / -type f -printf '%i\n' | sort | uniq -c | sort -rn | head
+
+# Find deleted but held files
+lsof +L1
+```
+
+**Filesystem mounted read-only:**
+
+```bash
+# Remount rw
+mount -o remount,rw /
+
+# Check for errors
+dmesg | tail
+fsck -y /dev/sda1
+```
+
+**"Device is busy" on umount:**
+
+```bash
+# Find what's using it
+lsof +D /mnt/data
+fuser -mv /mnt/data
+
+# Lazy unmount
+umount -l /mnt/data
+```
+
+## Interview Questions
+
+1. **What happens when you delete an open file?**
+
+The directory entry is removed. The inode's link count decrements. The file's data blocks are freed when the link count reaches zero AND no processes have the file open. The file appears deleted in `ls` but data persists until the last process closes it and the filesystem reclaims the blocks. Use `lsof +L1` to find deleted-but-open files consuming space.
+
+2. **How does tmpfs work and when should you use it?**
+
+tmpfs creates a filesystem in memory (or swap if memory pressure exists). It's volatile — contents disappear on reboot. Use it for /run, /tmp in containers, build caches, or any data that doesn't need persistence. Performance is excellent since it's RAM-backed. Size can be fixed with `size=` mount option; defaults to half of RAM.
+
+3. **What's the difference between hard links and symbolic links?**
+
+Hard links are directory entries pointing directly to the same inode. They must be on the same filesystem. Original and link are indistinguishable — deleting one doesn't delete the other until all links are gone. Symbolic links are special files containing a path string. They can span filesystems, can point to non-existent targets (dangling symlink), and can point to directories. Hard links don't work across filesystems; symlinks do.
+
+4. **How would you recover from a corrupted filesystem?**
+
+Boot to rescue mode or use live CD. Unmount the filesystem. Run `fsck.ext4 -f -y /dev/sdXN` (or xfs_repair for XFS). Check dmesg for hardware errors indicating underlying disk issue. If journal replay fails, may need `fsck.ext4 -j external-journal`. If superblock is corrupted, use `mke2fs -S` to rewrite superblocks. Always have backups before recovery operations.
+
+5. **Why does /proc/meminfo show both MemFree and MemAvailable? What's the difference?**
+
+MemFree is completely unused RAM. MemAvailable is the amount of memory available for new processes without swapping — it accounts for reclaimable page cache and inode caches. In modern kernels, MemAvailable ≤ MemFree + reclaimable memory. Before MemAvailable existed (kernel < 3.14), you had to estimate available memory manually.
+
+## Cheat Sheet
+
+```
+# Disk space
+df -h                    # Human-readable usage
+df -i                    # Inode usage
+du -sh /path/*           # Directory sizes
+
+# Mounting
+mount /dev/sdb1 /mnt
+umount /mnt
+findmnt /mnt
+
+# Filesystem creation
+mkfs.ext4 /dev/sdb1
+mkfs.xfs /dev/sdb1
+
+# UUID management
+blkid
+tune2fs -U <uuid> /dev/sdb1
+
+# Key /proc entries
+/proc/meminfo           # Memory info
+/proc/cpuinfo           # CPU info
+/proc/loadavg           # Load average
+/proc/&lt;PID&gt;/           # Process info
+
+# Key /sys entries
+/sys/block/            # Block devices
+/sys/class/net/        # Network interfaces
+/sys/module/           # Loaded modules
+```
+
+## Related Topics
+
+- [Storage](./storage) — LVM, RAID, disk management
+- [Memory](./memory) — Swap, OOM handling
+- [Permissions](./permissions) — File permissions, ACLs
+- [Monitoring](./monitoring) — Disk I/O monitoring

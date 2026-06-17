@@ -1,0 +1,749 @@
+---
+title: "Kubernetes DaemonSets"
+description: "Complete guide to Kubernetes DaemonSets - running one pod on every node for node-level operations"
+sidebar_position: 13
+---
+
+# Kubernetes DaemonSets
+
+## Overview
+
+A **DaemonSet** ensures that all (or specific) nodes in a cluster run a copy of a specific Pod. As nodes are added to the cluster, Pods are added to them. When nodes are removed from the cluster, those Pods are garbage collected. DaemonSets are ideal for node-level operations like log collection, monitoring agents, and network plugins.
+
+## When to Use
+
+- **Log collection** - Fluentd, Logstash, Fluent Bit daemons
+- **Monitoring agents** - Prometheus node exporter, Datadog, New Relic
+- **Network plugins** - CNI plugins like Calico, Cilium
+- **Storage provisioners** - Ceph, GlusterFS node daemons
+- **Node-level services** - kernel updates, security agents
+- **Cluster maintenance** - certificate rotation, cleanup jobs
+
+## When NOT to Use
+
+- **Application workloads** that need specific replica counts - use Deployments
+- **Per-pod scheduling** based on resources - use Deployments with node affinity
+- **Running on specific nodes only** - use node selectors with Deployments
+- **Jobs that need to run once** - use Jobs
+
+## Core Concepts
+
+### DaemonSet Scheduling
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        DaemonSet Scheduling                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Default Scheduler:                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Scheduler places DaemonSet pods on nodes that need them            │   │
+│  │  - Respects node affinity                                           │   │
+│  │  - Respects taints/tolerations                                      │   │
+│  │  - Won't schedule on nodes with unschedulable:true                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Node Affinity:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Schedule only on specific nodes:                                    │   │
+│  │  affinity:                                                          │   │
+│  │    nodeAffinity:                                                    │   │
+│  │      requiredDuringSchedulingIgnoredDuringExecution:                │   │
+│  │        nodeSelectorTerms:                                           │   │
+│  │        - matchExpressions:                                          │   │
+│  │          - key: disktype                                            │   │
+│  │            operator: In                                             │   │
+│  │            values: [ssd]                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### DaemonSet vs Deployment
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     DaemonSet vs Deployment                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  DaemonSet:                                                                  │
+│  - One pod per node (or matching nodes)                                     │
+│  - No manual replica count                                                   │
+│  - New nodes automatically get daemon pods                                  │
+│  - Deleted when node is removed                                              │
+│                                                                              │
+│  Deployment:                                                                 │
+│  - Fixed or autoscaled replica count                                        │
+│  - May not run on all nodes                                                 │
+│  - New pods scheduled based on resources                                    │
+│  - Self-healing: recreates deleted pods                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production Logging DaemonSet
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: production
+  labels:
+    k8s-app: fluent-bit
+    version: v2.1.0
+  annotations:
+    description: "Fluent Bit log collection daemonset"
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluent-bit
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  revisionHistoryLimit: 10
+  template:
+    metadata:
+      labels:
+        k8s-app: fluent-bit
+        version: v2.1.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2020"
+        prometheus.io/path: /api/v1/metrics/prometheus
+    spec:
+      serviceAccountName: fluent-bit
+      serviceAccount: fluent-bit
+      terminationGracePeriodSeconds: 30
+      
+      dnsPolicy: ClusterFirstWithHostNet
+      hostNetwork: true  # Required for some CNI plugins
+      dnsConfig:
+        nameservers:
+        - 10.0.0.10
+        searches:
+        - production.svc.cluster.local
+        - svc.cluster.local
+        options:
+        - name: ndots
+          value: "2"
+      
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      
+      initContainers:
+      - name: set-ownership
+        image: fluent/fluent-bit:2.1.0
+        command:
+        - sh
+        - -c
+        - |
+          chown -R fluent:fluent /var/log /fluent-bit/etc /buffers
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsUser: 0
+          runAsNonRoot: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluent-bit-config
+          mountPath: /fluent-bit/etc
+        - name: buffers
+          mountPath: /buffers
+      
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:2.1.0
+        imagePullPolicy: Always
+        
+        ports:
+        - name: metrics
+          containerPort: 2020
+          hostPort: 2020
+          protocol: TCP
+        - name: api
+          containerPort: 2021
+          protocol: TCP
+        
+        resources:
+          requests:
+            cpu: 50m
+            memory: 50Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: HOST_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 2021
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: 2021
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: fluent-bit-config
+          mountPath: /fluent-bit/etc
+        - name: buffers
+          mountPath: /buffers
+        - name: ca-certificates
+          mountPath: /etc/ssl/certs
+          readOnly: true
+      
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: fluent-bit-config
+        configMap:
+          name: fluent-bit-config
+      - name: buffers
+        hostPath:
+          path: /var/log/fluent-bit-buffers
+          type: DirectoryOrCreate
+      - name: ca-certificates
+        configMap:
+          name: ca-certificates
+      
+      tolerations:
+      - operator: Exists  # Schedule on all nodes including master
+
+---
+# Service account for Fluent Bit
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: production
+
+---
+# RBAC for Fluent Bit
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit
+rules:
+- apiGroups: [""]
+  resources:
+  - namespaces
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources:
+  - nodes
+  - pods
+  verbs: ["get"]
+- apiGroups: ["coordination.k8s.io"]
+  resources:
+  - leases
+  verbs: ["get", "create", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit
+roleRef:
+  kind: ClusterRole
+  name: fluent-bit
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: fluent-bit
+  namespace: production
+
+---
+# Fluent Bit ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: production
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5
+        Log_Level     info
+        Daemon        off
+        Parsers_File  parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2021
+        Health_Check  On
+    
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*.log
+        Parser            docker
+        Tag               kube.*
+        Refresh_Interval  5
+        Mem_Buf_Limit     50MB
+        Skip_Long_Lines   On
+        DB                /var/log/fluent-bit.db
+    
+    [OUTPUT]
+        Name   cloudwatch
+        Match  *
+        region us-central1
+        log_group_name /aws/eks/production/fluentbit
+        auto_create_group true
+        log_stream_prefix fluent-bit-
+        retry_limit 2
+```
+
+### Monitoring Agent DaemonSet
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true  # Required for some metrics
+      securityContext:
+        runAsUser: 0
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.6.1
+        args:
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        - --path.rootfs=/host
+        - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/pods/.+)($|/)
+        ports:
+        - containerPort: 9100
+          hostPort: 9100
+          name: metrics
+        resources:
+          requests:
+            cpu: 100m
+            memory: 50Mi
+          limits:
+            cpu: 200m
+            memory: 100Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host
+          readOnly: true
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+      tolerations:
+      - operator: Exists
+```
+
+## YAML Examples
+
+### DaemonSet with Node Selection
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ssd-monitor
+spec:
+  selector:
+    matchLabels:
+      app: ssd-monitor
+  template:
+    metadata:
+      labels:
+        app: ssd-monitor
+    spec:
+      # Only schedule on nodes with ssd label
+      nodeSelector:
+        disktype: ssd
+      containers:
+      - name: monitor
+        image: my-ssd-monitor:latest
+      tolerations:
+      # Also tolerate NoSchedule taints on GPU nodes
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+```
+
+### DaemonSet with Affinity
+
+```yaml
+spec:
+  affinity:
+    # Don't schedule on control plane nodes
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/control-plane
+            operator: DoesNotExist
+    # Spread evenly across zones
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: logging-agent
+          topologyKey: topology.kubernetes.io/zone
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create DaemonSet
+kubectl apply -f daemonset.yaml
+
+# List DaemonSets
+kubectl get daemonsets
+kubectl get ds
+
+# Get DaemonSet details
+kubectl get daemonset fluent-bit -n production -o yaml
+
+# Describe DaemonSet
+kubectl describe daemonset fluent-bit -n production
+
+# Scale DaemonSet (updates template, affects all nodes)
+# Note: DaemonSet replicas is controlled by matching nodes
+kubectl patch daemonset fluent-bit -p '{"spec":{"template":{"spec":{"containers":[{"name":"fluent-bit","resources":{"limits":{"cpu":"1"}}}]}}}}'
+
+# Delete DaemonSet
+kubectl delete daemonset fluent-bit -n production
+```
+
+### DaemonSet Operations
+
+```bash
+# Get pods created by DaemonSet
+kubectl get pods -l k8s-app=fluent-bit -n production
+
+# Check which nodes have daemon pods
+kubectl get pods -n production -l k8s-app=fluent-bit -o wide
+
+# Check DaemonSet rollout
+kubectl rollout status daemonset/fluent-bit -n production
+
+# Restart DaemonSet pods
+kubectl rollout restart daemonset/fluent-bit -n production
+
+# Check DaemonSet history
+kubectl rollout history daemonset/fluent-bit -n production
+```
+
+### Debugging
+
+```bash
+# Check why daemon wasn't scheduled on a node
+kubectl describe node node-name | grep -A 5 "Taints"
+
+# Check DaemonSet status
+kubectl get daemonset -n production
+
+# Check pods not scheduled
+kubectl get pods -n production --field-selector spec.nodeName==""
+
+# Force restart on all nodes
+kubectl rollout restart daemonset/fluent-bit -n production
+```
+
+## Common Commands
+
+```bash
+# Create daemonset from command
+kubectl create daemonset my-daemon --image=my-daemon:latest
+
+# Generate YAML
+kubectl create daemonset my-daemon --image=my-daemon:latest --dry-run=client -o yaml
+
+# Update image
+kubectl set image daemonset/my-daemon daemon=my-daemon:v2
+
+# Check nodes with daemon pods
+kubectl get pods -o wide | grep my-daemon
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| daemon_set_status_desired_number_scheduled | Nodes that should run daemon |
+| daemon_set_status_number_available | Nodes running daemon |
+| daemon_set_status_number_misscheduled | Nodes that shouldn't run daemon |
+| daemon_set_status_updated_number_scheduled | Nodes with updated version |
+
+### Prometheus Queries
+
+```promql
+# Nodes missing daemons
+daemon_set_status_desired_number_scheduled > daemon_set_status_number_available
+
+# DaemonSet coverage
+daemon_set_status_number_available / daemon_set_status_desired_number_scheduled
+```
+
+## Security
+
+### RBAC for DaemonSet Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: daemonset-manager
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+```
+
+### Security Considerations
+
+```yaml
+# DaemonSets often need elevated permissions
+# Common patterns:
+spec:
+  # Host network access
+  hostNetwork: true
+  
+  # Access to host processes
+  hostPID: true
+  
+  # Access to host filesystem
+  volumes:
+  - name: host-root
+    hostPath:
+      path: /
+  
+  # Tolerate all taints
+  tolerations:
+  - operator: Exists
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Daemon not scheduled | Node selector/toleration mismatch | Check node labels, taints |
+| Daemon not on some nodes | Taints without tolerations | Add tolerations |
+| High resource usage | Too many logging agents | Optimize configurations |
+| Daemon crashes | Configuration error | Check logs, verify config |
+
+### Diagnostic Commands
+
+```bash
+# Check DaemonSet status
+kubectl get daemonset -A
+
+# Check which nodes have daemons
+kubectl get pods -l k8s-app=my-app -o wide
+
+# Check missing daemons
+kubectl get daemonset my-daemon -n production -o jsonpath='{.status}'
+
+# Check node taints
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints[*].key}{"\n"}{end}'
+
+# Check events
+kubectl get events --field-selector involvedObject.name=my-daemon
+
+# Debug scheduling
+kubectl describe daemonset my-daemon -n production
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a DaemonSet?**
+A: A DaemonSet ensures that all (or specific) nodes in a cluster run a copy of a specific Pod. As nodes are added, pods are added. As nodes are removed, pods are garbage collected.
+
+**Q: When would you use a DaemonSet?**
+A: Use DaemonSets for node-level operations like log collection, monitoring agents, network plugins, storage provisioners, and any workload that must run on every node.
+
+**Q: How does DaemonSet scheduling work?**
+A: The scheduler places DaemonSet pods on nodes that need them, respecting node affinity, taints, and tolerations. It won't schedule on unschedulable nodes.
+
+### Intermediate Questions
+
+**Q: What is the difference between DaemonSet and Deployment replica count?**
+A: DaemonSet doesn't have a replica count - it ensures one pod runs on each matching node. Deployment has an explicit replica count that can be scaled manually or via HPA.
+
+**Q: Can DaemonSets use PodDisruptionBudgets?**
+A: Yes, but they typically have minAvailable set to match the number of nodes, ensuring at least one daemon runs per allowed disruption.
+
+### Advanced Questions
+
+**Q: How would you run a DaemonSet only on specific nodes?**
+A: Use nodeSelector to match specific labels, node affinity for complex selection, or taints/tolerations for dedicated nodes.
+
+**Q: How do you handle DaemonSet updates?**
+A: DaemonSets support rolling updates with maxUnavailable. New pods are created on nodes before old ones are terminated (configurable).
+
+## Cheat Sheet
+
+### DaemonSet YAML Template
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: my-daemon
+spec:
+  selector:
+    matchLabels:
+      app: my-daemon
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: my-daemon
+    spec:
+      # Node selection
+      nodeSelector:
+        node-type: worker
+      tolerations:
+      - operator: Exists
+      
+      containers:
+      - name: daemon
+        image: my-daemon:latest
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+```
+
+### Essential Commands
+
+```bash
+# Create
+kubectl apply -f daemonset.yaml
+
+# List
+kubectl get daemonsets
+kubectl get ds
+
+# Describe
+kubectl describe ds my-daemon
+
+# Update
+kubectl set image daemonset/my-daemon daemon=my-daemon:v2
+
+# Rollout
+kubectl rollout status daemonset/my-daemon
+kubectl rollout restart daemonset/my-daemon
+
+# Delete
+kubectl delete daemonset my-daemon
+```
+
+### DaemonSet Update Strategies
+
+| Strategy | Behavior |
+|----------|----------|
+| RollingUpdate | Update pods one by one |
+| OnDelete | Only update when manually replaced |
+
+## Related Topics
+
+- [Deployments](./deployments) - Stateless workloads
+- [Pods](./pods) - Pod specifications
+- [Monitoring](./observability) - Monitoring agents
+- [Security](./security) - DaemonSet security

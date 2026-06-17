@@ -1,0 +1,331 @@
+---
+sidebar_position: 3
+title: Intermediate Path
+description: DevOps learning path for intermediate practitioners
+---
+
+# Intermediate DevOps Practitioner
+
+## Target Audience
+
+This path is for:
+- DevOps engineers with 1-2 years experience
+- System administrators moving to DevOps
+- Developers who know the basics and want depth
+- Anyone who has completed the Beginner Path
+
+**You should know**: Linux basics, containers, basic cloud concepts, Git
+
+**You don't need**: Production-scale systems experience, advanced architecture knowledge
+
+## Estimated Duration
+
+| Learning Mode | Duration |
+|---------------|----------|
+| Part-time (10-15 hrs/week) | 16-20 weeks |
+| Full-time (25-30 hrs/week) | 8-10 weeks |
+| Accelerated (40+ hrs/week) | 4-5 weeks |
+
+## Prerequisites
+
+### Required Before Starting
+- [ ] Linux command line proficiency
+- [ ] Container fundamentals (Docker)
+- [ ] Basic cloud platform experience (GCP, AWS, or Azure)
+- [ ] Git workflow mastery
+- [ ] Basic CI/CD pipeline creation
+- [ ] [Completed Beginner Path](/learning-paths/beginner) or equivalent knowledge
+
+### Recommended
+- Basic networking knowledge
+- One programming language
+- Basic security concepts
+
+---
+
+## Phase 1: Advanced Linux Administration
+
+### Read
+- [Linux Process Management](/docs/linux/process-management)
+- [Linux Networking](/docs/linux/networking)
+- [Linux System Monitoring](/docs/linux/monitoring)
+- [Linux Performance Tuning](/docs/linux/performance)
+
+### Practice
+- Complete [Linux Labs 3-5](/labs/linux-labs) (Log Management, Disk Management, Systemd)
+- Practice advanced process control (cgroups, namespaces)
+- Configure log rotation and monitoring
+- Set up disk quotas and LVM
+
+### Validate
+```bash
+# Can you perform these tasks?
+systemctl edit nginx --full  # Override unit file
+journalctl -u nginx -n 50 --since "1 hour ago"
+lsof -i :80 && netstat -tlnp | grep 80
+vgcreate && lvcreate && mkfs.ext4
+```
+
+**Checkpoint**: Configure a production-grade Linux server with monitoring, logging, and systemd service
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Phase 2: Kubernetes Mastery
+
+### Read
+- [Kubernetes Architecture](/docs/kubernetes/architecture)
+- [Kubernetes Core Concepts](/docs/kubernetes/core-concepts)
+- [Kubernetes Networking](/docs/kubernetes/networking)
+- [Kubernetes Storage](/docs/kubernetes/storage)
+
+### Practice
+- Set up local Kubernetes (minikube or kind)
+- Complete [Kubernetes Labs 1-2](/labs/kubernetes-labs) (Pods/Deployments, Services/Networking)
+- Complete [Kubernetes Labs 3-4](/labs/kubernetes-labs) (ConfigMaps/Secrets, Persistent Storage)
+- Deploy a multi-tier application to Kubernetes
+- Configure Ingress and network policies
+
+### Validate
+```bash
+# Can you perform these tasks?
+kubectl create deployment --image=nginx --replicas=3
+kubectl expose deployment nginx --port=80 --type=LoadBalancer
+kubectl exec -it pod-name -- /bin/sh
+kubectl scale deployment app --replicas=10
+kubectl rollout status deployment app
+kubectl set image deployment/app app=image:v2
+```
+
+**Checkpoint**: Deploy a production-ready application with ConfigMaps, Secrets, Ingress, and persistent storage
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 3: Advanced Infrastructure as Code
+
+### Read
+- [Terraform State Management](/docs/terraform/state)
+- [Terraform Modules](/docs/terraform/modules)
+- [Terraform Best Practices](/docs/terraform/best-practices)
+- [Terraform with GCP](/docs/gcp/terraform)
+
+### Practice
+- Complete [Terraform Labs 2-4](/labs/terraform-labs) (Variables, Remote Backend, Modules)
+- Refactor Terraform code into reusable modules
+- Set up remote state with GCS backend
+- Use workspaces for environment management
+- Implement module versioning
+
+### Validate
+```bash
+# Can you perform these tasks?
+terraform workspace new prod
+terraform import google_compute_instance.existing RESOURCE_ID
+terraform get && terraform init -backend=true
+terraform state mv old new
+tfsec . && checkov -d .
+```
+
+**Checkpoint**: Structure production Terraform codebase with modules, remote state, and CI validation
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Phase 4: Advanced CI/CD and GitOps
+
+### Read
+- [GitOps](/docs/cicd/gitops)
+- [ArgoCD](/docs/cicd/argocd)
+- [CI/CD Best Practices](/docs/cicd/best-practices)
+- [Deployment Strategies](/docs/cicd/deployment)
+
+### Practice
+- Complete [CI/CD Labs 2-4](/labs/cicd-labs) (Advanced GitHub Actions, GitLab CI, ArgoCD)
+- Implement matrix builds and caching strategies
+- Set up ArgoCD with GitOps workflow
+- Create deployment pipelines with multiple environments
+- Implement blue-green or canary deployments
+
+### Validate
+```bash
+# Can you perform these tasks?
+# Create reusable workflow
+# Configure Docker layer caching
+# Set up ArgoCD Application
+# Implement progressive delivery
+# Manage secrets in CI/CD
+```
+
+**Checkpoint**: Build a complete GitOps pipeline with ArgoCD managing production deployments
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 5: Monitoring and Observability
+
+### Read
+- [Observability Fundamentals](/docs/monitoring/observability)
+- [Prometheus](/docs/monitoring/prometheus)
+- [Grafana](/docs/monitoring/grafana)
+- [Logging Best Practices](/docs/logging/overview)
+
+### Practice
+- Deploy Prometheus and Grafana
+- Complete [SRE Labs 1](/labs/sre-labs) (SLO and Error Budget)
+- Complete [SRE Labs 3](/labs/sre-labs) (Observability)
+- Instrument an application with custom metrics
+- Create comprehensive monitoring dashboards
+- Set up alerting with Alertmanager
+
+### Validate
+```bash
+# Can you perform these tasks?
+# Create Prometheus queries (rate, histogram_quantile)
+# Design Grafana dashboards
+# Define SLO and calculate error budget
+# Configure Alertmanager routes
+# Read logs and traces
+```
+
+**Checkpoint**: Implement comprehensive observability for a Kubernetes application with SLO tracking
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 6: Security Foundations
+
+### Read
+- [DevOps Security](/docs/security/overview)
+- [Container Security](/docs/security/container)
+- [Kubernetes Security](/docs/kubernetes/security)
+- [Secret Management](/docs/security/secrets)
+
+### Practice
+- Implement security scanning in CI/CD
+- Configure Pod Security Policies
+- Use secrets management (HashiCorp Vault or cloud KMS)
+- Implement network policies
+- Enable RBAC in Kubernetes
+
+### Validate
+```bash
+# Can you perform these tasks?
+trivy image myapp:latest
+kubectl exec -it pod -- env | grep -i secret  # Should show nothing
+kubectl auth can-i get pods --as=system:serviceaccount:default:default
+vault kv get secret/myapp
+```
+
+**Checkpoint**: Implement end-to-end security for a Kubernetes application
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Phase 7: Cloud Networking
+
+### Read
+- [VPC and Networking](/docs/networking/vpc)
+- [DNS Management](/docs/networking/dns)
+- [Load Balancing](/docs/networking/load-balancing)
+- [Cloud DNS](/docs/networking/dns-management)
+
+### Practice
+- Complete [Networking Labs 1-3](/labs/networking-labs) (Interface Config, DNS, Firewall)
+- Create custom VPC with subnets
+- Configure VPN or Cloud Interconnect
+- Set up internal load balancing
+- Implement DNSSEC
+
+### Validate
+```bash
+# Can you perform these tasks?
+gcloud compute networks create custom-vpc
+gcloud compute firewalls create allow-http --target-tags=http-server
+gcloud compute forwarding-rules list
+kubectl get ingress && describe ingress
+```
+
+**Checkpoint**: Design and implement a secure multi-tier network architecture
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Portfolio Projects
+
+Complete these projects to build your portfolio:
+
+### Project 1: Production Kubernetes Deployment
+Deploy a production-grade application on Kubernetes:
+- Multi-environment (dev/staging/prod)
+- ArgoCD GitOps management
+- Comprehensive monitoring
+- Security hardening
+
+**Deliverables**: GitOps repo + working deployment + monitoring dashboards
+
+### Project 2: Immutable Infrastructure Pipeline
+Build complete infrastructure pipeline:
+- Terraform modules for reusable components
+- Remote state with team access
+- CI/CD with security scanning
+- Automated testing
+
+**Deliverables**: Terraform module library + pipeline configuration
+
+### Project 3: Multi-Cloud Disaster Recovery
+Design DR infrastructure:
+- Active-passive setup
+- Automated failover
+- RTO/RPO documentation
+- Regular backup testing
+
+**Deliverables**: Architecture diagram + Terraform code + runbook
+
+---
+
+## Certification Alignment
+
+This path prepares you for:
+
+| Certification | Notes |
+|--------------|-------|
+| [GCP Professional Cloud Architect](https://cloud.google.com/certification/cloud-architect) | Primary certification for this path |
+| [CKA (Kubernetes Administrator)](https://www.cncf.io/certification/cka/) | After completing Kubernetes section |
+| [HashiCorp Terraform Associate](https://www.hashicorp.com/certification/terraform-associate) | If not already certified |
+| [CKS (Kubernetes Security)](https://www.cncf.io/certification/cks/) | After completing security section |
+
+---
+
+## Time Estimates Summary
+
+| Phase | Part-time | Full-time |
+|-------|-----------|-----------|
+| 1. Advanced Linux | 3 weeks | 1.5 weeks |
+| 2. Kubernetes | 4 weeks | 2 weeks |
+| 3. Advanced IaC | 3 weeks | 1.5 weeks |
+| 4. CI/CD and GitOps | 4 weeks | 2 weeks |
+| 5. Observability | 4 weeks | 2 weeks |
+| 6. Security | 3 weeks | 1.5 weeks |
+| 7. Cloud Networking | 3 weeks | 1.5 weeks |
+| **Total** | **16-20 weeks** | **8-10 weeks** |
+
+---
+
+## Next Steps
+
+After completing this path:
+
+1. **Deepen**: Continue with [Advanced Path](/learning-paths/advanced)
+2. **Specialize**: Focus on specific [Role-Based Path](/learning-paths/role-based)
+3. **Certify**: Schedule your CKA or PCA exam
+4. **Lead**: Mentor beginners, contribute to documentation
+
+**Join the community**: Share progress in our Discord #intermediate-path channel

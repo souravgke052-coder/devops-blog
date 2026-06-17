@@ -1,0 +1,392 @@
+# Packet Flow Through Linux
+
+## Overview
+
+Understanding how packets flow through the Linux kernel is essential for debugging connectivity issues, optimizing performance, and implementing features like traffic shaping and firewalling. Packets traverse multiple hooks, tables, and queues from network interface to application socket.
+
+This page traces packet flow through netfilter, routing, traffic control (tc), and into sockets. Understanding this flow explains why certain firewall rules work the way they do and where to intercept packets for filtering or manipulation.
+
+## When To Use
+
+- **Debugging connectivity**: Understanding where packets get dropped
+- **Firewall rule placement**: Knowing which chain to use
+- **Traffic shaping**: Using tc with netfilter
+- **Performance tuning**: Identifying bottlenecks
+
+## When NOT to Use
+
+- **Simple firewall rules**: You don't need full flow understanding
+- **Application development**: Socket API handles this
+
+## Core Concepts
+
+### Packet Flow Diagram
+
+```
+                    ┌──────────────────────────────────────┐
+                    │           PACKET RECEIVED             │
+                    │            (NIC interrupt)            │
+                    └──────────────┬───────────────────────┘
+                                   │
+                    ┌──────────────▼───────────────────────┐
+                    │        NIC Driver Ring Buffer         │
+                    │         (sk_buff allocation)          │
+                    └──────────────┬───────────────────────┘
+                                   │
+                    ┌──────────────▼───────────────────────┐
+                    │       netfilter: PREROUTING          │
+                    │    (DNAT, mangle, connection track)   │
+                    └──────────────┬───────────────────────┘
+                                   │
+                    ┌──────────────▼───────────────────────┐
+                    │         Routing Decision             │
+                    │   (IP stack: local delivery? fwd?)    │
+                    └──────────────┬───────────────────────┘
+                                   │
+              ┌────────────────────┴────────────────────┐
+              │                                         │
+   ┌──────────▼──────────┐                 ┌────────────▼────────────┐
+   │      FORWARD        │                 │         INPUT           │
+   │  netfilter: FORWARD │                 │   netfilter: INPUT      │
+   │   (mangle, filter)  │                 │    (mangle, filter)     │
+   └──────────┬──────────┘                 └────────────┬────────────┘
+              │                                         │
+              │                                         │
+   ┌──────────▼──────────────────────┐    ┌────────────▼────────────┐
+   │         tc (qdisc/class/filter) │    │     Socket Buffer       │
+   │         (traffic control)       │    │   (delivered to app)    │
+   └──────────┬──────────────────────┘    └─────────────────────────┘
+              │
+   ┌──────────▼─────────────┐
+   │   netfilter: POSTROUTING│
+   │    (SNAT, mangle)       │
+   └──────────┬─────────────┘
+              │
+   ┌──────────▼─────────────┐
+   │        NIC Driver       │
+   └──────────┬─────────────┘
+              │
+                    ┌──────────────▼───────────────────────┐
+                    │           PACKET TRANSMITTED         │
+                    └──────────────────────────────────────┘
+```
+
+### Packet Processing for Outgoing Traffic
+
+```
+Application (socket write)
+    │
+    ▼
+Socket Buffer (sk_buff)
+    │
+    ▼
+┌─────────────────────────────────────┐
+│         OUTPUT chain                │
+│   netfilter: OUTPUT                 │
+│   (mangle, nat, filter)             │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│       Routing Decision              │
+│   (where to send this packet?)      │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│       POSTROUTING chain             │
+│   netfilter: POSTROUTING            │
+│   (SNAT, MASQUERADE, mangle)        │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│         tc (traffic control)        │
+│   qdisc, shaping, scheduling        │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+         NIC Driver → Wire
+```
+
+### Understanding /proc/net/snmp
+
+```bash
+cat /proc/net/snmp
+# Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams
+#     1           64      1234567     0           0           54321
+
+# Ip: forwarding enabled? packets forwarded? etc.
+
+cat /proc/net/netstat | awk 'NR==1'
+# Ip: Forwarding DefaultTTL InReceives InHdrErrors
+# Tcp: RtoAlgorithm RtoMax RtoMin...
+
+# Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors
+# UdpLite: ...
+
+# Sctp: CurrEstab ActiveEstabs PassiveEstabs ... (if SCTP enabled)
+```
+
+## Real Production Example
+
+### Capturing Packets at Different Points
+
+```bash
+# Capture at eth0 (before netfilter)
+tcpdump -i eth0 -nn port 80
+
+# Capture at any interface (sees after PREROUTING)
+tcpdump -i any -nn port 80
+
+# Capture with iptables MARK (for tc)
+# Add mark to packets matching rule:
+iptables -t mangle -A PREROUTING -p tcp --dport 80 -j MARK --set-mark 1
+
+# Use tcpdump with magic to see mark
+tcpdump -i any -e -nn 'tcp[13] & 4 != 0'  # Doesn't show marks
+
+# Better: use nftables with meta mark
+nft add rule ip mangle PREROUTING tcp dport 80 meta mark set 1
+
+# Then verify with:
+cat /proc/net/netfilter/ip_conntrack | head
+```
+
+### Traffic Shaping with tc
+
+```bash
+# Show qdisc
+tc qdisc show
+# qdisc pfifo_fast 0: dev eth0 root refcnt 2 bands 3 priomap  1 2 2 2 1 2 0 0 0 0 0 0 0 0 0 0
+
+# Add HTB qdisc for bandwidth limiting
+tc qdisc add dev eth0 root handle 1: htb default 10
+
+# Create class (limit to 10Mbps)
+tc class add dev eth0 parent 1: classid 1:10 htb rate 10mbit ceil 10mbit
+
+# Add filter to mark matching traffic
+tc filter add dev eth0 protocol ip parent 1: handle 1 fw flowid 1:10
+
+# Use iptables to mark packets
+iptables -t mangle -A OUTPUT -p tcp --dport 80 -j MARK --set-mark 1
+
+# Now TCP port 80 traffic is rate-limited to 10Mbps
+```
+
+### XDP (eBPF) Packet Processing
+
+```bash
+# XDP (eXpress Data Path) runs in NIC driver, before netfilter
+# Much faster, used for DDoS mitigation, load balancing
+
+# Check if XDP is available
+ip link show eth0
+# Should show "xdp" in features
+
+# Attach XDP program
+ip link set eth0 xdp object /path/to/xdp program.o section prog
+
+# View XDP stats
+ip -s link show dev eth0
+# xdp: <XDP>
+# xdp_drop: 0
+# xdp_pass: 123456
+# xdp_redirect: 0
+
+# Common XDP use cases:
+# - Drop malicious traffic early (before kernel processing)
+# - Redirect packets to different queue
+# - Simple load balancing
+```
+
+## CLI Examples
+
+```bash
+# Trace packet flow
+iptables -t raw -A PREROUTING -j TRACE
+iptables -t nat -A POSTROUTING -j TRACE
+# Enable with: echo 1 > /proc/sys/net/netfilter/nf_log_all_netns
+# Logs appear in /var/log/kern.log or journalctl
+
+# Check which interface packet arrives/departs
+ip link show
+ethtool -S eth0
+
+# View netfilter hook registration
+cat /proc/net/netfilter/nfhooks
+# Or: nft list hooks
+
+# View connection tracking
+conntrack -L | head
+cat /proc/net/nf_conntrack | head
+
+# tc (traffic control)
+tc qdisc show
+tc class show dev eth0
+tc filter show dev eth0
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `iptables -t raw -j TRACE` | Trace packets | `echo 1 > /proc/sys/net/netfilter/nf_log_all_netns` |
+| `tc qdisc show` | Show qdisc | `tc qdisc show dev eth0` |
+| `conntrack -L` | Conntrack | `conntrack -L -p tcp` |
+| `cat /proc/net/snmp` | IP/TCP/UDP stats | `grep -E "Ip:|Tcp:"` |
+
+## Monitoring
+
+### Kernel Network Stats
+
+```bash
+# IP statistics
+cat /proc/net/snmp | grep "^Ip:"
+# InReceives, InHdrErrors, InAddrErrors, ForwDatagrams, InDiscards
+
+# TCP statistics
+cat /proc/net/snmp | grep "^Tcp:"
+# ActiveOpens, PassiveOpens, EstabResets, CurrEstab
+
+# UDP statistics
+cat /proc/net/snmp | grep "^Udp:"
+# InDatagrams, NoPorts, InErrors, OutDatagrams
+
+# Detailed stats
+cat /proc/net/netstat
+
+# Per-NIC statistics
+cat /proc/net/dev
+ip -s link show
+ethtool -S eth0
+```
+
+### Performance Metrics
+
+```bash
+# SoftIRQ utilization
+mpstat -I SUM 1
+# Or: watch -n 1 'cat /proc/softirqs | grep NET'
+
+# If softirq > 50% of CPU, network is bottleneck
+# Consider: RPS (Receive Packet Steering), RFS (Receive Flow Steering)
+# Enable with: echo 4 > /sys/class/net/eth0/queues/rx-0/rps_cpus
+
+# Ring buffer size
+ethtool -g eth0
+# Increase if drops:
+ethtool -G eth0 rx 4096 tx 4096
+```
+
+## Security
+
+### Security Considerations
+
+```bash
+# Disable if not needed:
+# IP forwarding (router mode)
+sysctl -w net.ipv4.ip_forward=0
+
+# Proxy ARP
+sysctl -w net.ipv4.conf.all.proxy_arp=0
+
+# Source routing (security risk)
+sysctl -w net.ipv4.conf.all.accept_source_route=0
+sysctl -w net.ipv6.conf.all.accept_source_route=0
+
+# ICMP redirects
+sysctl -w net.ipv4.conf.all.accept_redirects=0
+sysctl -w net.ipv6.conf.all.accept_redirects=0
+
+# Reverse path filtering (anti-spoofing)
+sysctl -w net.ipv4.conf.all.rp_filter=1
+```
+
+## Troubleshooting
+
+### Packet Drop Debugging
+
+```bash
+# 1. Check interface errors
+ip -s link show eth0
+# Look for: errors, drops, overruns
+
+# 2. Check ring buffer
+ethtool -S eth0 | grep -E "rx_dropped|tx_dropped|errors"
+
+# 3. Check softirq saturation
+mpstat 1
+# Look for high %irq or %soft
+
+# 4. Check firewall drops
+iptables -L -v -n | grep -E "Chain|policy=DROP"
+# Add LOG rule before DROP to see what's being blocked
+
+# 5. Check conntrack table full
+wc -l /proc/net/nf_conntrack
+cat /proc/sys/net/netfilter/nf_conntrack_max
+# If close, increase: sysctl -w net.netfilter.nf_conntrack_max=1048576
+
+# 6. Trace packet path
+iptables -t raw -A PREROUTING -j TRACE
+# Check syslog for TRACE output
+```
+
+## Interview Questions
+
+**Q1: Walk through a packet received on eth0, destined for local port 80.**
+
+A: (1) NIC receives frame, DMA to ring buffer, generates interrupt. (2) Driver allocates sk_buff, hands to kernel network stack. (3) netfilter PREROUTING: raw/connection tracking/mangle tables process packet. DNAT could change destination here. (4) Routing: IP stack checks destination. Local IP? Forward? Drop? For local delivery, routing says "local." (5) netfilter INPUT: mangle, filter tables. iptables INPUT chain. Firewall rules apply here. (6) Socket buffer: TCP processing (if TCP). Socket receives data. (7) Application reads from socket via recv().
+
+**Q2: What's the difference between PREROUTING and POSTROUTING in netfilter?**
+
+A: PREROUTING runs before routing decision for incoming packets. Used for DNAT (port forwarding). POSTROUTING runs after routing decision for outgoing packets. Used for SNAT/MASQUERADE (outbound NAT). For locally-generated packets, PREROUTING is skipped on input path. For forwarding, PREROUTING and POSTROUTING run but not INPUT/OUTPUT. For local delivery, PREROUTING runs then routing then INPUT. For local generation, OUTPUT runs then routing then POSTROUTING.
+
+**Q3: How does tc (traffic control) interact with netfilter?**
+
+A: TC runs after netfilter POSTROUTING for outgoing packets, before packet leaves NIC. Packets pass through: netfilter (mangle, nat, filter) → routing decision → tc (qdisc/class/filter) → NIC. This means firewall marks set by iptables can be used by tc for classification. Example: mark HTTP traffic with iptables, then use tc to rate-limit marked traffic. TC can also delay, drop, or queue packets (e.g., for token bucket shaping).
+
+## Cheat Sheet
+
+### Netfilter Hook Order
+
+```
+Incoming packet:
+PREROUTING → Routing → INPUT → Local App
+
+Forwarded packet:
+PREROUTING → Routing → FORWARD → POSTROUTING
+
+Outgoing packet (local):
+Local App → OUTPUT → Routing → POSTROUTING
+```
+
+### tc qdisc Types
+
+| qdisc | Purpose |
+|-------|---------|
+| pfifo_fast | Default, 3-band priority queue |
+| fq | Fair Queueing (good for HTTP) |
+| fq_codel | Fair Queueing + CoDel AQM |
+| htb | Hierarchical Token Bucket (shaping) |
+| netem | Network emulator (testing) |
+| sfq | Stochastic Fair Queueing |
+
+### Key Files
+
+| File | Content |
+|------|---------|
+| `/proc/net/snmp` | IP, ICMP, TCP, UDP statistics |
+| `/proc/net/netstat` | Extended network stats |
+| `/proc/net/dev` | Per-device statistics |
+| `/proc/net/nf_conntrack` | Connection tracking table |
+| `/proc/sys/net/netfilter/*` | nf sysctls |
+
+## Related Topics
+
+- [Firewall](./firewall) — iptables/nftables
+- [NAT](./nat) — NAT in packet flow
+- [Routing](./routing) — Routing decision
+- [Observability](./observability) — Network metrics

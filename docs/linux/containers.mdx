@@ -1,0 +1,508 @@
+---
+sidebar_position: 20
+description: Linux containers — cgroups, namespaces, Docker, containerd, Podman, and container security for production workloads.
+---
+
+# Linux Containers
+
+## Overview
+
+Containers are the fundamental unit of deployment in modern infrastructure. But containers are not magic — they are built on Linux kernel primitives: namespaces for isolation and cgroups for resource control. Understanding what happens underneath the container surface is what separates engineers who can debug production issues from those who cannot.
+
+A container is a process (or group of processes) that runs in a modified view of the system — its own network stack, mount points, process tree, hostname, and user IDs. This isolation is achieved through Linux namespaces. Resource limits (CPU, memory, I/O) are enforced through cgroups. The layered filesystem (overlay2) allows efficient storage of container images. And the container runtime (containerd, runc) orchestrates all of this.
+
+Docker popularized containers, but the ecosystem has evolved. containerd is the industry-standard container runtime (the CNCF-incubating project that Docker donated). Podman offers a daemonless, rootless alternative. Kubernetes uses containerd or CRI-O as its CRI (Container Runtime Interface) implementation. Understanding the full stack — from kernel primitives to high-level tooling — is essential for running containers in production.
+
+## When To Use
+
+- Application packaging and deployment
+- Microservices architecture
+- CI/CD pipeline isolation
+- Development environment consistency
+- Multi-version dependency management
+- Horizontal scaling of stateless services
+
+## When NOT To Use
+
+- Long-running stateful workloads that need bare-metal performance (containers add overhead)
+- Real-time systems with hard latency requirements
+- When the isolation boundary is insufficient (use VMs for untrusted workloads)
+- Windows-specific applications (use Windows containers or a Windows host)
+
+## Core Concepts
+
+### Namespaces
+
+Namespaces partition kernel resources so that processes in different namespaces see different values. Linux provides 8 namespace types:
+
+| Namespace | Flag | Isolates |
+|-----------|------|----------|
+| PID | CLONE_NEWPID | Process IDs |
+| Network | CLONE_NEWNET | Network devices, ports, routing |
+| Mount | CLONE_NEWNS | Mount points |
+| UTS | CLONE_NEWUTS | Hostname, domain name |
+| IPC | CLONE_NEWIPC | System V IPC, POSIX queues |
+| User | CLONE_NEWUSER | User and group IDs |
+| Cgroup | CLONE_NEWCGROUP | Cgroup root directory |
+| Time | CLONE_NEWTIME | Boot and monotonic clocks |
+
+```bash
+# View namespaces of a container process
+ls -la /proc/$(pgrep -f nginx)/ns/
+# lr-xr-xr-x 1 root root 0 ... pid:[4026531840]
+# lr-xr-x 1 root root 0 ... net:[4026531992]
+# lr-xr-x 1 root root 0 ... mnt:[4026531841]
+# ...
+
+# Enter a namespace (requires CAP_SYS_ADMIN)
+nsenter --target <PID> --pid --net --mount
+
+# List all namespaces on the system
+ls /var/run/netns/
+ip netns list
+
+# Create a network namespace (for testing)
+ip netns add testns
+ip netns exec testns ip link list
+ip netns del testns
+```
+
+### cgroups
+
+Control groups (cgroups) limit and account for system resources used by groups of processes. cgroups v2 (unified hierarchy) is the modern standard:
+
+```bash
+# cgroups v2 hierarchy
+# /sys/fs/cgroup/
+#   system.slice/
+#   user.slice/
+#   /sys/fs/cgroup/user.slice/user-1000.slice/
+
+# View cgroup of a process
+cat /proc/$(pgrep -f nginx)/cgroup
+# 0::/system.slice/nginx.service
+
+# Check memory limits
+cat /sys/fs/cgroup/system.slice/nginx.service/memory.max
+# 536870912 = 512MB
+
+# Check CPU limits
+cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max
+# 100000 100000 = 1 CPU (quota 100ms per period)
+
+# Set limits (runtime)
+echo 536870912 > /sys/fs/cgroup/system.slice/test.service/memory.max
+echo 200000 100000 > /sys/fs/cgroup/system.slice/test.service/cpu.max
+# quota=200000µs per period=100000µs = 2 full CPUs
+
+# Monitor cgroup resource usage
+cat /sys/fs/cgroup/system.slice/nginx.servicememory.current
+cat /sys/fs/cgroup/system.slice/nginx.service/cpu.stat
+```
+
+### Storage Drivers
+
+```bash
+# Check current storage driver
+docker info | grep "Storage Driver"
+# overlay2 (recommended for most)
+
+# How overlay2 works:
+# layer1 (base image): /var/lib/docker/overlay2/<id>/diff/
+# layer2 (added layer): /var/lib/docker/overlay2/<id>/diff/
+# merged view: /var/lib/docker/overlay2/<id>/merged/ (what container sees)
+# lower file (read-only): /var/lib/docker/overlay2/<id>/lower/
+# upper file (writable): /var/lib/docker/overlay2/<id>/upper/
+# work dir: /var/lib/docker/overlay2/<id>/work/
+
+# For production: use overlay2, not devicemapper (old default on RHEL)
+# devicemapper has performance issues and complexity
+```
+
+### Container Networking
+
+```bash
+# Docker networking models
+# bridge (default): container on private subnet, host NATs
+# host: container shares host's network namespace
+# overlay: containers across multiple hosts (Swarm)
+# macvlan: container gets MAC address on physical network
+
+# Check Docker bridge
+ip link show docker0
+iptables -t nat -L -n | grep DOCKER
+ip addr show docker0
+
+# Inspect container network namespace
+docker inspect <container-id> --format '{{.NetworkSettings.SandboxKey}}'
+nsenter --target <PID> --net --ipc --mount ip addr
+
+# Port publishing
+docker run -p 8080:80 nginx  # host:8080 → container:80
+docker run -p 127.0.0.1:8080:80 nginx  # only localhost access
+```
+
+### Runc and Container Runtime Architecture
+
+```
+Docker → containerd → containerd-shim → runc → container process
+                         ↓ (daemon)     (no daemon, exits)
+                      (stays running)
+```
+
+- **runc**: Low-level runtime that creates and runs containers according to OCI spec. It exits after container starts.
+- **containerd-shim**: Keeps the container running after runc exits. Allows runc upgrade without restarting containers.
+- **containerd**: Daemon that manages container lifecycle, images, storage. Exposed via gRPC (CRI).
+- **containerd**: Full container management platform with an API. Docker donated it to CNCF.
+- **Docker (the daemon)**: Orchestrates containerd, handles build/push/pull, Dockerfiles, Compose.
+
+## Real Production Example
+
+Running a production web application with proper resource limits, security hardening, and logging:
+
+```bash
+# === Dockerfile for production app ===
+# FROM golang:1.22-alpine AS builder
+# WORKDIR /build
+# COPY go.mod go.sum ./
+# RUN go mod download
+# COPY . .
+# RUN CGO_ENABLED=0 GOOS=linux go build -ldflags='-w -s' -o app
+#
+# # Minimal runtime image
+# FROM scratch
+# COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# COPY --from=builder /build/app /app
+# COPY --from=builder /build/configs/ /config/
+# USER 1000:1000
+# ENTRYPOINT ["/app"]
+
+# === Docker Compose for development ===
+cat > docker-compose.yml <<'EOF'
+version: "3.9"
+
+services:
+  app:
+    image: myapp:1.2.3
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - DATABASE_URL=postgres://user:pass@db:5432/app
+      - LOG_LEVEL=info
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M,mode=1777
+    networks:
+      - backend
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: app
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d app"]
+      interval: 10s
+    networks:
+      - backend
+
+volumes:
+  pgdata:
+
+networks:
+  backend:
+    driver: bridge
+EOF
+
+# === Production run with explicit resource limits ===
+docker run -d \
+    --name myapp \
+    --restart unless-stopped \
+    --memory 512m \
+    --memory-reservation 128m \
+    --cpus 1.0 \
+    --cpuset-cpus "0-3" \
+    --network backend \
+    --pids-limit 100 \
+    --log-driver json-file \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
+    --read-only \
+    --tmpfs /tmp:size=64M,mode=1777,noexec,nosuid,nodev \
+    --security-opt no-new-privileges:true \
+    --cap-drop ALL \
+    --user 1000:1000 \
+    -e DATABASE_URL=postgres://user:pass@db:5432/app \
+    -e GOMAXPROCS=1 \
+    myapp:1.2.3
+
+# === Podman (rootless) equivalent ===
+podman run -d \
+    --name myapp \
+    --memory 512m \
+    --cpus 1.0 \
+    --user 1000:1000 \
+    --uidmap 0:0:1 \
+    --uidmap 1:1000:65536 \
+    --subgidname containers \
+    localhost/myapp:1.2.3
+```
+
+## CLI Examples
+
+```bash
+# Docker
+docker info | grep -E "Storage Driver|Kernel Version"
+docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+docker stats --no-stream
+docker inspect <container> --format '{{.HostConfig.Binds}}'
+docker logs --tail 100 -f <container>
+docker exec -it <container> sh
+docker diff <container>   # changes to filesystem
+
+# containerd CLI (ctr)
+ctr images list
+ctr containers list
+ctr tasks start <container>
+ctr tasks exec --exec-id bash <container> bash
+
+# nerdctl (containerd CLI, Docker-compatible)
+nerdctl run -d --name nginx nginx:alpine
+nerdctl ps
+
+# BuildKit (fast builds)
+DOCKER_BUILDKIT=1 docker build -t myapp .
+docker build --progress=plain -t myapp .  # debug builds
+
+# Build secrets (keep API keys out of layers)
+docker build --secret id=npm_token,env=NPM_TOKEN .
+
+# Multi-stage build
+docker build -t myapp:latest --target production .
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `docker run -d --name app --memory 512m` | Run with limits |
+| `docker stats --no-stream` | Resource usage |
+| `docker exec -it container sh` | Shell into container |
+| `docker logs -f container` | Follow logs |
+| `docker inspect container` | Full config |
+| `docker system df` | Disk usage |
+| `docker builder prune` | Clear build cache |
+| `podman run --security-opt no-new-privileges` | Rootless run |
+| `ctr images pull docker.io/library/nginx:latest` | Pull image |
+| `nerdctl build -t myapp .` | Build image |
+
+## Monitoring
+
+```bash
+# container-level metrics (cAdvisor → Prometheus)
+curl -s http://localhost:8090/metrics | grep container_memory
+
+# Docker stats (real-time)
+docker stats $(docker ps --format '{{.Names}}')
+
+# Per-container cgroup metrics
+CONTAINER_ID=$(docker inspect --format '{{.Id}}' nginx)
+cat /sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope/memory.stat
+
+# Network stats per container
+cat /sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope/net_cls.stat
+
+# Alerting on OOM kills
+dmesg | grep "killed process"
+# or:
+journalctl -k | grep oom
+
+# Prometheus cAdvisor exporter (for Kubernetes):
+# - job_name: 'cadvisor'
+#   static_config:
+#     targets: ['localhost:8090']
+```
+
+## Security
+
+**Defense in depth for containers:**
+
+```bash
+# 1. Non-root user (required)
+docker run --user 1000:1000 myapp
+
+# 2. Drop all capabilities
+docker run --cap-drop ALL myapp
+
+# 3. Add only necessary capabilities
+docker run --cap-drop ALL --cap-add NET_BIND_SERVICE myapp
+
+# 4. Read-only rootfs
+docker run --read-only myapp
+
+# 5. No new privileges
+docker run --security-opt no-new-privileges:true myapp
+
+# 6. seccomp (Docker default blocks ~44 syscalls)
+docker run --security-opt seccomp=profile.json myapp
+# Default profile: /usr/share/containerd/seccomp.json
+
+# 7. AppArmor/SELinux
+docker run --security-opt apparmor=profile-name myapp  # Ubuntu
+docker run --security-opt label=type:container_file_t myapp  # RHEL/SELinux
+
+# 8. Image signing (Cosign)
+cosign verify --certificate-identity-regexp ".*@example.com" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  myregistry/myapp:latest
+
+# 9. Image scanning (Trivy)
+trivy image --severity HIGH,CRITICAL myapp:latest
+trivy image --fail-on-CRITICAL myapp:latest
+
+# 10. Distroless base images (minimal attack surface)
+# FROM gcr.io/distroless/static-debian12
+# COPY --from=builder /app /app
+# CMD ["/app"]
+```
+
+## Troubleshooting
+
+**Container won't start (permission denied):**
+```bash
+# Check user namespace remapping
+podman inspect --format '{{.HostConfig.UsernsMode}}' container
+
+# Check SELinux/AppArmor
+getenforce
+aa-status
+
+# Common issue: host directory not accessible
+# Fix: either change ownership, use :Z flag, or set selinux label
+docker run -v /host/data:/container/data:Z myapp
+```
+
+**Container using too much memory:**
+```bash
+# Hard limit
+docker update --memory 512m container_name
+
+# Check OOM kills
+dmesg | grep oom
+docker inspect --format '{{.State.OOMKilled}}' container
+
+# Enable memory swap limit (cgroup v2)
+# echo 536870912 > /sys/fs/cgroup/system.slice/docker-<id>.scope/memory.max
+```
+
+**Networking issues:**
+```bash
+# DNS resolution broken
+docker exec container cat /etc/resolv.conf
+# If host uses systemd-resolved: add 8.8.8.8 as fallback in daemon.json
+
+# Can't reach other containers
+docker network inspect bridge
+# Check if containers on same network: docker network connect network container
+
+# Port not accessible
+# Check: -p flag, --iptables=false, firewalld, host firewall
+# Test from host: curl localhost:8080
+# Test from container: docker exec container curl localhost:80
+```
+
+## Interview Questions
+
+1. **What is the difference between a container and a VM? What does and does not get isolated?**
+
+VMs virtualize hardware and run a full OS kernel. Containers share the host kernel but provide OS-level isolation via namespaces. VMs are fully isolated (separate kernels); containers share the kernel (same kernel, different views). What gets isolated: PID tree, network stack, mount points, hostname, IPC, user IDs, cgroup, and optionally time. What is shared: kernel, kernel modules, syscalls, hardware. This means container escapes are theoretically more severe (kernel exploit = host compromise) than VM escapes, but containers have a much smaller attack surface.
+
+2. **How does the overlay2 filesystem work, and why is it preferred over devicemapper?**
+
+overlay2 layers multiple directories (lower, upper, merged). The lower layer is read-only (base image). The upper layer is writable (container changes). The merged view shows the union of both, with the upper layer taking precedence. When a file is read from lower, it is copied up to upper first (copy-up) before modification. overlay2 is preferred because: (1) It works on any filesystem (ext4, xfs, btrfs), not requiring block devices; (2) It handles many layers efficiently (up to 500 layers vs devicemapper's complexity); (3) It has better performance; (4) It uses less disk space for many containers sharing the same base image.
+
+3. **What are cgroups v2 controllers, and how do they differ from cgroups v1?**
+
+cgroups v2 (since kernel 4.5, default since RHEL 9) uses a unified hierarchy — all controllers are under a single tree. cgroups v1 had separate hierarchies per controller. Controllers: cpu (time sharing), cpu.io (I/O bandwidth), memory (memory limits), pids (process count), io (I/O operations), etc. cgroups v2 provides: better hierarchy, unified controller management, thread-mode support (taskset within a cgroup), and more predictable behavior. Key difference for production: with cgroups v2, setting memory limit automatically limits pids, unlike cgroups v1 where you had to set both.
+
+4. **What happens when a container exceeds its memory limit?**
+
+With cgroups v2 memory controller, when a container reaches its memory.max limit, the kernel triggers a synchronous OOM kill of processes in that cgroup — it will not swap or wait. The OOM kill is visible in `dmesg`, in the container's `docker inspect` (OOMKilled=true), and in `journalctl -k`. The container may restart if it has a restart policy. To debug: check `docker stats` for memory usage, `cat /proc/meminfo` inside the container vs host, and `dmesg` for OOM messages.
+
+5. **How would you secure a container running a production workload?**
+
+Multiple layers: (1) Minimal base image (distroless, scratch with static binary, or alpine only if verified); (2) Run as non-root (user 1000:1000 or similar); (3) Drop all capabilities (`--cap-drop ALL`), add only what's needed (`--cap-add NET_BIND_SERVICE`); (4) Read-only root filesystem (`--read-only`); (5) tmpfs for writable temp space; (6) Resource limits (memory, CPU, PIDs); (7) Security profiles: seccomp (default is good), AppArmor/SELinux where appropriate; (8) No new privileges (`--security-opt no-new-privileges`); (9) Image signing and verification; (10) Regular scanning for CVEs (Trivy, Grype); (11) Log monitoring and alerting; (12) Use read-only volumes for configs, tmpfs for transient data.
+
+## Cheat Sheet
+
+```bash
+# Run with security
+docker run -d \
+  --name production-app \
+  --user 1000:1000 \
+  --memory 512m \
+  --cpus 0.5 \
+  --pids-limit 100 \
+  --read-only \
+  --tmpfs /tmp:size=64M,mode=1777 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  -e ENV=value \
+  myapp:latest
+
+# Inspect
+docker inspect container
+docker stats --no-stream container
+docker diff container
+cat /proc/$(docker inspect --format '{{.State.Pid}}' container)/cgroup
+
+# Manage
+docker update --memory 1g container
+docker system prune -af
+docker builder prune --keep-storage 10GB
+
+# Security scan
+trivy image --severity HIGH,CRITICAL myapp:latest
+cosign verify myregistry/myapp:latest
+
+# Rootless Podman
+podman run --userns=keep-id --security-opt no-new-privileges=true myapp
+```
+
+## Related Topics
+
+- [Processes](./processes) — Process isolation
+- [Memory](./memory) — Memory limits and OOM
+- [Networking](./networking) — Container networking
+- [Security](./security) — Container security hardening
+- [Performance](./performance) — Container resource tuning
+- [Monitoring](./monitoring) — Container metrics

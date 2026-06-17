@@ -1,0 +1,541 @@
+# Identity-Aware Proxy (IAP)
+
+## Overview
+
+Google Cloud Identity-Aware Proxy provides zero-trust access control for applications without requiring a VPN. It enforces IAM-based access policies, integrates with Cloud Armor for additional security, and supports authentication via Google accounts or Identity Platform. IAP creates a perimeter around GCE, GKE, Cloud Run, and External Application Load Balancer resources.
+
+## When To Use
+
+- Zero-trust access for internal applications
+- Replacing VPN for admin access
+- Conditional access based on identity/device
+- Auditing access to internal tools
+- Compliance requirements (no direct SSH/RDP)
+
+## When NOT To Use
+
+- Public-facing applications (use Cloud Armor instead)
+- Machine-to-machine API access (use service accounts)
+- Network-level filtering (use VPC firewall rules)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Identity-Aware Proxy                   │
+├─────────────────────────────────────────────────────────────┤
+│  Protected Resources:                                       │
+│  ├── VM instances (TCP forwarding)                         │
+│  ├── GKE clusters (IAP for GKE)                           │
+│  ├── Cloud Run/Firebase Hosting                           │
+│  └── External Application LB                              │
+├─────────────────────────────────────────────────────────────┤
+│  Authentication:                                           │
+│  ├── Google accounts                                      │
+│  ├── Identity Platform (external IdP)                     │
+│  ├── Service accounts (API access)                        │
+│  └── Multi-factor authentication                          │
+├─────────────────────────────────────────────────────────────┤
+│  Access Control:                                           │
+│  ├── IAM-based policies                                   │
+│  ├── Device access context                                │
+│  ├── IP-based allowlist (deprecated)                      │
+│  └── Conditional IAM policies                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### IAP
+Proxy that intercepts traffic and enforces access policies.
+
+### Tunnel
+Encrypted tunnel from client to protected resource.
+
+### Access Level
+Conditions for allowing access (device policy, IP range, etc.).
+
+### Context-Aware Access
+Access decisions based on user identity and device state.
+
+## Real Production Example
+
+**Zero-Trust Access for Internal Applications**
+
+```hcl
+# Terraform configuration for IAP setup
+
+# Enable APIs
+resource "google_project_service" "iap" {
+  service = "iap.googleapis.com"
+}
+
+# Configure IAP for GCE instance
+resource "google_compute_instance" "admin_vm" {
+  name         = "admin-server"
+  machine_type = "e2-medium"
+  zone         = "us-central1-a"
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+  
+  network_interface {
+    network    = google_compute_network.private.id
+    subnetwork = google_compute_subnet.private.id
+    
+    # No external IP - only accessible via IAP
+  }
+  
+  labels = {
+    managed_by = "terraform"
+    environment = "production"
+  }
+}
+
+# Firewall rule to allow IAP
+resource "google_compute_firewall" "iap_access" {
+  name        = "allow-iap-access"
+  network     = google_compute_network.private.id
+  
+  # Only allow traffic from IAP
+  source_ranges = ["35.235.240.0/20"]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "3389"]
+  }
+  
+  target_tags = ["admin-server"]
+}
+
+# Enable IAP on the instance
+resource "google_iap_tunnel_iam_member" "instance_access" {
+  zone         = google_compute_instance.admin_vm.zone
+  instance     = google_compute_instance.admin_vm.name
+  role         = "roles/iap.tunnelResourceAccessor"
+  member       = "user:admin@company.com"
+  
+  # Members here can SSH/RDP via IAP
+}
+
+# IAP for GKE cluster
+resource "google_container_cluster" "private_cluster" {
+  name     = "private-cluster"
+  location = "us-central1"
+  
+  network    = google_compute_network.private.id
+  subnetwork = google_compute_subnet.private.id
+  
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false  # Allow private master endpoint
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+  
+  # Only allow master access from IAP
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_block   = "35.235.240.0/20"
+      display_name = "IAP"
+    }
+  }
+  
+  workload_identity_config {
+    workload_pool = "${var.project}.svc.id.goog"
+  }
+  
+  ip_allocation_policy {
+    cluster_ipv4_cidr_block  = "/16"
+    services_ipv4_cidr_block = "/22"
+  }
+}
+
+# Enable IAP for GKE
+resource "google_iap_brand" "project_brand" {
+  name        = "project-brand"
+  support_email = "support@company.com"
+  application_title = "Internal Applications"
+  
+  # This creates OAuth consent screen
+}
+
+resource "google_iap_web_iam_member" "gke_access" {
+  project = var.project
+  zone    = google_container_cluster.private_cluster.location
+  cluster = google_container_cluster.private_cluster.name
+  
+  role   = "roles/iap.webServiceViewer"
+  member = "user:developer@company.com"
+}
+
+# IAP for Cloud Run
+resource "google_cloud_run_service_iam_member" "iap_access" {
+  project  = var.project
+  region   = "us-central1"
+  service  = google_cloud_run_service.backend.name
+  
+  role   = "roles/iap.webServiceViewer"
+  member = "domain:company.com"  # All company users
+}
+
+# IAP for App Engine
+resource "google_iap_app_engine_iam_member" "app_access" {
+  project = var.project
+  service = google_app_engine_application.app.service.id
+  
+  role   = "roles/iap.webServiceViewer"
+  member = "user:developer@company.com"
+}
+
+# Cloud Armor integration with IAP
+resource "google_compute_security_policy" "iap_security" {
+  name        = "iap-security-policy"
+  description = "Additional security for IAP-protected resources"
+  
+  rule {
+    action      = "deny(403)"
+    description = "Block TOR exit nodes"
+    priority    = 100
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('sourceiplist-known-malicious-ips')"
+      }
+    }
+  }
+}
+
+resource "google_iap_web_iam_member" "cloudarmor_access" {
+  project = var.project
+  brand   = google_iap_brand.project_brand.name
+  
+  role   = "roles/iap.webServiceViewer"
+  member = "user:user@company.com"
+}
+
+# Access levels for conditional access
+resource "google_access_context_manager_access_level" "corporate_device" {
+  name = "corporateDeviceAccess"
+  title = "Corporate Device Access"
+  
+  basic {
+    conditions {
+      device_policy {
+        require_corp_corporate_device = true
+      }
+      regions = ["US"]
+    }
+  }
+}
+
+resource "google_access_context_manager_access_level" "vpn_only" {
+  name = "vpnAccess"
+  title = "VPN Access Level"
+  
+  basic {
+    conditions {
+      ip_subnetworks = ["10.0.0.0/8"]
+    }
+  }
+}
+
+# IAP settings
+resource "google_iap_settings" "iap_settings" {
+  project = var.project
+  
+  tcp_forwarding_level         = "ENABLED"
+  iam_login_ssh_certificate_level = "NOT_ALLOWED"
+}
+```
+
+## CLI Examples
+
+```bash
+# Enable IAP for a GCE instance
+gcloud compute instances add-iam-policy-binding my-instance \
+  --zone=us-central1-a \
+  --member=user:user@company.com \
+  --role=roles/iap.tunnelResourceAccessor
+
+# Enable IAP for GKE
+gcloud container clusters add-iam-policy-binding my-cluster \
+  --region=us-central1 \
+  --member=user:user@company.com \
+  --role=roles/iap.tunnelResourceAccessor
+
+# SSH via IAP
+gcloud compute ssh my-instance \
+  --zone=us-central1-a \
+  --tunnel-through-iap
+
+# SSH via IAP with specific user
+gcloud compute ssh user@my-instance \
+  --zone=us-central1-a \
+  --tunnel-through-iap
+
+# RDP via IAP (Windows)
+gcloud compute start-iap-tunnel my-windows-instance \
+  --zone=us-central1-a \
+  --port=3389
+
+# SCP file via IAP
+gcloud compute scp my-instance:/path/to/file ./local-path \
+  --zone=us-central1-a \
+  --tunnel-through-iap
+
+# Check IAP status
+gcloud iap settings describe --project=my-project
+
+# Enable/disable IAP
+gcloud iap settings update --project=my-project \
+  --tcp-forwarding-level=ENABLED
+
+# Access levels
+gcloud access-context-manager access-levels list
+gcloud access-context-manager access-levels describe corporateDeviceAccess
+
+# OAuth consent (setup)
+gcloud iap oauth-brands list
+gcloud iap oauth-brands describe BRAND_NAME
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# IAM for IAP access to instance
+resource "google_iap_tunnel_iam_member" "instance_member" {
+  zone      = "us-central1-a"
+  instance  = "my-instance"
+  role      = "roles/iap.tunnelResourceAccessor"
+  member    = "user:admin@company.com"
+}
+
+# IAM for GKE access
+resource "google_iap_tunnel_iam_member" "gke_member" {
+  project = "my-project"
+  zone    = "us-central1"
+  cluster = "my-cluster"
+  role    = "roles/iap.tunnelResourceAccessor"
+  member  = "user:developer@company.com"
+}
+
+# IAM for Cloud Run
+resource "google_cloud_run_service_iam_member" "iap_member" {
+  project = "my-project"
+  region  = "us-central1"
+  service = "my-service"
+  role    = "roles/iap.webServiceViewer"
+  member  = "domain:company.com"
+}
+
+# Access level
+resource "google_access_context_manager_access_level" "device" {
+  name = "corporateDeviceAccess"
+  title = "Corporate Device"
+  
+  basic {
+    conditions {
+      device_policy {
+        require_corp_corporate_device = true
+      }
+    }
+  }
+}
+```
+
+## Common Commands
+
+```bash
+# GCE access
+gcloud compute instances add-iam-policy-binding INSTANCE --zone=ZONE [flags]
+gcloud compute ssh INSTANCE --zone=ZONE --tunnel-through-iap
+
+# GKE access
+gcloud container clusters add-iam-policy-binding CLUSTER --region=REGION [flags]
+
+# Cloud Run access
+gcloud run services add-iam-policy-binding SERVICE --region=REGION [flags]
+
+# Settings
+gcloud iap settings describe
+gcloud iap settings update [flags]
+
+# Access levels
+gcloud access-context-manager access-levels create NAME [flags]
+gcloud access-context-manager access-levels list
+```
+
+## Monitoring
+
+### Key Metrics
+- Access attempts (allowed/denied)
+- Authentication events
+- Tunnel connections
+
+### Cloud Monitoring
+```bash
+# IAP access logs
+gcloud logging read "resource.type=iap_googleapis_com" --limit=50
+
+# Create access alert
+gcloud monitoring policies create \
+  --display-name="IAP Access Alert" \
+  --condition-filter='resource.type="iap_googleapis_com" AND metric.type="iap.googleapis.com/tunnel/accepted_count"' \
+  --condition-threshold-value=10000 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### IAM Roles
+| Role | Access Level |
+|------|--------------|
+| iap.tunnelResourceAccessor | SSH/RDP to instances |
+| iap.webServiceViewer | Access through IAP LB |
+| iap.webServiceServiceViewer | View IAP settings |
+| iap.admin | Full IAP admin |
+
+### Best Practices
+```bash
+# Enable IAP for all internal resources
+# Remove direct SSH/RDP access
+# Use Workload Identity for GKE
+# Enable device management
+# Use context-aware access
+```
+
+## Cost
+
+IAP is free for:
+- TCP forwarding (SSH/RDP)
+- Context-Aware Access
+- Access Context Manager (first 5 levels free)
+
+## Troubleshooting
+
+### Access Denied
+```bash
+# Check IAM permissions
+gcloud compute instances get-iam-policy my-instance --zone=us-central1-a
+
+# Verify user is in correct project
+gcloud projects get-iam-policy my-project \
+  --filter="bindings.members:user@company.com"
+
+# Check IAP is enabled
+gcloud iap settings describe --project=my-project
+```
+
+### SSH via IAP Fails
+```bash
+# Verify firewall allows IAP
+gcloud compute firewall-rules list --filter="sourceRanges:35.235.240.0/20"
+
+# Check instance has no public IP
+gcloud compute instances describe my-instance --zone=us-central1-a \
+  --format="yaml(networkInterfaces[0].accessConfigs)"
+
+# Test IAP connectivity
+gcloud compute ssh my-instance --zone=us-central1-a \
+  --tunnel-through-iap --dry-run
+```
+
+### GKE Access Issues
+```bash
+# Check master authorized networks
+gcloud container clusters describe my-cluster --region=us-central1 \
+  --format="yaml(masterAuthorizedNetworks)"
+
+# Verify IAP can reach master
+# Master should not have public IP
+```
+
+## Interview Questions
+
+**Q: How does IAP implement zero-trust security?**
+A: IAP verifies user identity before allowing access, regardless of network location. It removes the concept of "inside" vs "outside" the network. Every request is authenticated and authorized based on IAM policies.
+
+**Q: What is the difference between IAP and traditional VPN?**
+A: VPN creates a tunnel and grants broad network access. IAP provides per-application access with identity-based policies. VPN trusts anyone on the tunnel; IAP verifies each access attempt.
+
+**Q: What is context-aware access?**
+A: Context-aware access evaluates additional conditions beyond identity: device compliance (managed/corporate device), geographic location, and IP ranges. Access levels define these conditions in Access Context Manager.
+
+**Q: How does IAP work with GKE?**
+A: IAP for GKE secures the Kubernetes API server. It replaces direct master access with authenticated requests through IAP. Master authorized networks should be set to IAP's IP range (35.235.240.0/20).
+
+**Q: What audit capabilities does IAP provide?**
+A: IAP logs all access attempts including user identity, resource accessed, timestamp, and result. These logs are available in Cloud Logging and can be exported to SIEM for analysis.
+
+## Cheat Sheet
+
+```bash
+# Enable IAP access
+gcloud compute instances add-iam-policy-binding INSTANCE \
+  --zone=ZONE \
+  --member=user:EMAIL \
+  --role=roles/iap.tunnelResourceAccessor
+
+# SSH via IAP
+gcloud compute ssh INSTANCE --zone=ZONE --tunnel-through-iap
+
+# RDP via IAP
+gcloud compute start-iap-tunnel INSTANCE --zone=ZONE --port=3389
+
+# GKE access
+gcloud container clusters add-iam-policy-binding CLUSTER \
+  --region=REGION \
+  --member=user:EMAIL \
+  --role=roles/iap.tunnelResourceAccessor
+
+# Cloud Run access
+gcloud run services add-iam-policy-binding SERVICE \
+  --region=REGION \
+  --member=user:EMAIL \
+  --role=roles/iap.webServiceViewer
+```
+
+## Labs
+
+### Lab 1: Zero-Trust SSH Access
+Replace direct SSH with IAP.
+1. Create private VM with no external IP
+2. Configure firewall to allow only IAP
+3. Grant IAP access to users
+4. Test SSH via IAP
+5. Audit access logs
+
+### Lab 2: GKE Access Control
+Secure GKE master access.
+1. Create private GKE cluster
+2. Enable IAP access control
+3. Configure master authorized networks
+4. Grant developer access via IAP
+5. Test cluster access
+
+### Lab 3: Context-Aware Access
+Implement device-based access.
+1. Create Access Context Manager policy
+2. Define corporate device access level
+3. Apply to IAP-protected resources
+4. Test with compliant/non-compliant devices
+5. Monitor access patterns
+
+## Related Services
+
+- **Cloud Armor**: WAF and DDoS protection
+- **VPC Firewall**: Network-level rules
+- **Access Context Manager**: Conditional access policies
+- **Cloud Identity**: Device management
+- **Identity Platform**: External IdP integration

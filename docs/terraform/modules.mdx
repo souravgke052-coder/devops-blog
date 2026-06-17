@@ -1,0 +1,960 @@
+# Terraform Modules
+
+## Overview
+
+Modules are reusable Terraform configurations that package resources, variables, and outputs together. They enable code reuse, abstraction, and organization. Every Terraform configuration is a module - the root module - and can call child modules to build complex infrastructure.
+
+## When To Use
+
+- **Reusable infrastructure patterns**: Deploy identical configurations across environments
+- **Team collaboration**: Share infrastructure patterns between teams
+- **Abstraction**: Hide complexity behind simple interfaces
+- **Organization**: Break large configurations into manageable pieces
+
+## When NOT To Use
+
+- **Single-use resources**: If a resource is used only once, a module adds unnecessary indirection
+- **Premature abstraction**: Don't abstract until pattern is clear and stable
+
+## Core Concepts
+
+### Module Structure
+
+```
+modules/
+└── networking/
+    ├── main.tf          # Resources
+    ├── variables.tf     # Input variables
+    ├── outputs.tf       # Output values
+    ├── versions.tf      # Version constraints
+    └── README.md        # Documentation
+```
+
+### Calling Modules
+
+```hcl
+module "name" {
+  source = "./modules/networking"
+  
+  # Input variables
+  vpc_cidr = "10.0.0.0/16"
+  project_id = var.project_id
+}
+
+# Accessing outputs
+module.name.output_name
+```
+
+## Real Production Example
+
+### VPC Module
+
+```hcl
+# modules/networking/vpc/main.tf
+
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "CIDR range for VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "subnets" {
+  description = "List of subnet configurations"
+  type = list(object({
+    name          = string
+    cidr          = string
+    region        = string
+    private       = bool
+    description   = string
+  }))
+}
+
+variable "secondary_ranges" {
+  description = "Secondary IP ranges for subnets"
+  type = map(list(object({
+    ip_cidr_range = string
+    range_name    = string
+  })))
+  default = {}
+}
+
+variable "enable_flow_logs" {
+  description = "Enable VPC Flow Logs"
+  type        = bool
+  default     = true
+}
+
+variable "routing_mode" {
+  description = "Routing mode: REGIONAL or GLOBAL"
+  type        = string
+  default     = "REGIONAL"
+}
+
+locals {
+  common_labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    module      = "networking"
+  }
+}
+
+# VPC Network
+resource "google_compute_network" "vpc" {
+  name                    = "vpc-${var.environment}"
+  auto_create_subnetworks = false
+  description             = "Custom VPC for ${var.environment} environment"
+  
+  routing_mode = var.routing_mode
+  
+  mtu = 1460  # Enable jumbo frames
+  
+  private_ip_google_access = true
+  
+  # Enable Delete Protection for prod
+  delete_protection = var.environment == "prod" ? "PROTECTED" : "UNPROTECTED"
+  
+  labels = local.common_labels
+}
+
+# Firewall Rules
+resource "google_compute_firewall" "allow_internal" {
+  name        = "allow-internal-${var.environment}"
+  network     = google_compute_network.vpc.id
+  direction   = "INGRESS"
+  priority    = 65534
+  source_ranges = ["10.0.0.0/8"]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "icmp"
+  }
+  
+  enableLogging = var.enable_flow_logs
+  
+  timeouts {
+    create = "10m"
+    delete = "10m"
+  }
+}
+
+resource "google_compute_firewall" "allow_ssh" {
+  name        = "allow-ssh-${var.environment}"
+  network     = google_compute_network.vpc.id
+  direction   = "INGRESS"
+  priority    = 1000
+  source_ranges = var.allowed_cidr_blocks
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+  
+  target_tags = ["ssh-enabled"]
+}
+
+# Subnets
+resource "google_compute_subnetwork" "subnets" {
+  for_each = { for subnet in var.subnets : subnet.name => subnet }
+  
+  name          = each.value.name
+  ip_cidr_range = each.value.cidr
+  network       = google_compute_network.vpc.id
+  region        = each.value.region
+  
+  description = each.value.description
+  
+  private_ip_google_access = each.value.private ? true : false
+  
+  # Secondary ranges
+  dynamic "secondary_ip_range" {
+    for_each = lookup(var.secondary_ranges, each.value.name, [])
+    content {
+      ip_cidr_range = secondary_ip_range.value.ip_cidr_range
+      range_name    = secondary_ip_range.value.range_name
+    }
+  }
+  
+  # Flow logs
+  dynamic "log_config" {
+    for_each = var.enable_flow_logs ? [1] : []
+    content {
+      aggregation_interval = "INTERVAL_10_MIN"
+      flow_sampling        = 0.5
+      metadata             = "INCLUDE_ALL_METADATA"
+    }
+  }
+  
+  labels = merge(local.common_labels, {
+    subnet_name = each.value.name
+  })
+}
+
+# Cloud Router and Cloud NAT
+resource "google_compute_router" "router" {
+  name    = "router-${var.environment}"
+  network = google_compute_network.vpc.id
+  region  = var.subnets[0].region
+  
+  bgp {
+    asn = 65001
+  }
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "nat-${var.environment}"
+  router                             = google_compute_router.router.name
+  region                             = var.subnets[0].region
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+  
+  nat_ip_allocate_option = "AUTO_ONLY"
+  
+  min_ports_per_vm = 32
+  
+  udp_idle_timeout_sec  = 60
+  icmp_idle_timeout_sec = 60
+  tcp_established_idle_timeout_sec = 1200
+  tcp_transitory_idle_timeout_sec  = 30
+  
+  log_config {
+    filter = "TRANSLATIONS_ONLY"
+    log_level = "INFO"
+  }
+}
+
+# Private Google Access for VPC
+resource "google_compute_global_forwarding_rule" "private" {
+  name       = "private-googleapis-${var.environment}"
+  target     = google_compute_target_http_proxy.private.id
+  port_range = "80"
+  
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  ip_version            = "IPV4"
+  
+  # Only used for private VIP
+}
+
+resource "google_compute_target_http_proxy" "private" {
+  name        = "private-googleapis-${var.environment}"
+  url_map     = google_compute_url_map.private.id
+  description = "Private Google APIs"
+}
+
+resource "google_compute_url_map" "private" {
+  name            = "private-googleapis-${var.environment}"
+  default_service = google_compute_backend_service.private.id
+  
+  host_rule {
+    hosts        = ["private.googleapis.com"]
+    path_matcher = "paths"
+  }
+  
+  path_matcher {
+    name            = "paths"
+    default_service = google_compute_backend_service.private.id
+    
+    path_rule {
+      paths   = ["/*"]
+      service = google_compute_backend_service.private.id
+    }
+  }
+}
+
+resource "google_compute_backend_service" "private" {
+  name        = "private-googleapis-${var.environment}"
+  protocol    = "HTTP"
+  port_name   = "http"
+  timeout_sec = 30
+  
+  backend {
+    group           = google_compute_region_network_endpoint_group.neg.id
+    balancing_mode  = "RATE"
+    max_rate_per_endpoint = 1000
+  }
+}
+
+resource "google_compute_region_network_endpoint_group" "neg" {
+  name                  = "private-googleapis-${var.environment}"
+  network_endpoint_type = "PRIVATE_SUBNETWORK"
+  subnetwork           = google_compute_subnetwork.subnets[var.subnets[0].name].id
+}
+
+# Outputs
+output "vpc_id" {
+  description = "VPC network ID"
+  value       = google_compute_network.vpc.id
+}
+
+output "vpc_name" {
+  description = "VPC network name"
+  value       = google_compute_network.vpc.name
+}
+
+output "vpc_self_link" {
+  description = "VPC network self link"
+  value       = google_compute_network.vpc.self_link
+}
+
+output "subnet_ids" {
+  description = "Map of subnet names to IDs"
+  value       = { for name, subnet in google_compute_subnetwork.subnets : name => subnet.id }
+}
+
+output "subnet_self_links" {
+  description = "Map of subnet names to self links"
+  value       = { for name, subnet in google_compute_subnetwork.subnets : name => subnet.self_link }
+}
+
+output "subnet_regions" {
+  description = "Map of subnet names to regions"
+  value       = { for name, subnet in google_compute_subnetwork.subnets : name => subnet.region }
+}
+
+output "router_id" {
+  description = "Cloud Router ID"
+  value       = google_compute_router.router.id
+}
+
+output "nat_ip" {
+  description = "NAT IP address"
+  value       = google_compute_router_nat.nat.nat_ip
+}
+```
+
+### Compute Instance Template Module
+
+```hcl
+# modules/compute/instance-template/main.tf
+
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+
+variable "name_prefix" {
+  description = "Name prefix for resources"
+  type        = string
+}
+
+variable "machine_type" {
+  description = "Machine type"
+  type        = string
+  default     = "e2-medium"
+}
+
+variable "source_image" {
+  description = "Source image for boot disk"
+  type        = string
+  default     = "debian-cloud/debian-11"
+}
+
+variable "disk_size_gb" {
+  description = "Boot disk size in GB"
+  type        = number
+  default     = 50
+}
+
+variable "disk_type" {
+  description = "Boot disk type"
+  type        = string
+  default     = "pd-ssd"
+}
+
+variable "service_account_email" {
+  description = "Service account email"
+  type        = string
+}
+
+variable "subnetwork" {
+  description = "Subnetwork self link"
+  type        = string
+}
+
+variable "subnetwork_project" {
+  description = "Subnetwork project (for Shared VPC)"
+  type        = string
+  default     = ""
+}
+
+variable "startup_script" {
+  description = "Startup script content"
+  type        = string
+  default     = ""
+}
+
+variable "tags" {
+  description = "Network tags"
+  type        = list(string)
+  default     = []
+}
+
+variable "labels" {
+  description = "Additional labels"
+  type        = map(string)
+  default     = {}
+}
+
+variable "preemptible" {
+  description = "Use preemptible instances"
+  type        = bool
+  default     = false
+}
+
+variable "enable_confidential_compute" {
+  description = "Enable confidential compute"
+  type        = bool
+  default     = false
+}
+
+variable "spot" {
+  description = "Use spot instances"
+  type        = bool
+  default     = false
+}
+
+variable "gpu_type" {
+  description = "GPU type (if any)"
+  type        = string
+  default     = ""
+}
+
+variable "gpu_count" {
+  description = "Number of GPUs"
+  type        = number
+  default     = 0
+}
+
+variable "min_cpu_platform" {
+  description = "Minimum CPU platform"
+  type        = string
+  default     = ""
+}
+
+variable "metadata" {
+  description = "Additional metadata"
+  type        = map(string)
+  default     = {}
+}
+
+locals {
+  common_labels = merge({
+    environment = var.environment
+    managed_by  = "terraform"
+    module      = "instance-template"
+  }, var.labels)
+  
+  default_metadata = {
+    enable-oslogin = "TRUE"
+    block-project-ssh-keys = "TRUE"
+  }
+}
+
+resource "google_compute_instance_template" "template" {
+  name        = "${var.name_prefix}-template-${var.environment}"
+  description = "Instance template for ${var.environment}"
+  
+  machine_type = var.machine_type
+  
+  # Confidential VM
+  confidential_instance_config {
+    enable_confidential_compute = var.enable_confidential_compute
+  }
+  
+  # Shielded VMs
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+  
+  scheduling {
+    on_host_maintenance = "MIGRATE"
+    automatic_restart   = true
+    preemptible         = var.preemptible
+    
+    dynamic "scheduling" {
+      for_each = var.spot ? [1] : []
+      content {
+        preemptible         = true
+        automatic_restart   = false
+        on_host_maintenance = "TERMINATE"
+        instance_termination_action = "STOP"
+      }
+    }
+  }
+  
+  # Service account
+  service_account {
+    email  = var.service_account_email
+    scopes = ["cloud-platform"]
+  }
+  
+  # Disk configuration
+  disk {
+    source_image = var.source_image
+    auto_delete  = true
+    boot         = true
+    
+    disk_size_gb = var.disk_size_gb
+    disk_type    = var.disk_type
+    
+    encryption_key = var.disk_encryption_key
+  }
+  
+  # Network interface
+  network_interface {
+    subnetwork    = var.subnetwork
+    subnetwork_project = var.subnetwork_project != "" ? var.subnetwork_project : var.project_id
+    
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+  
+  # GPU
+  dynamic "guest_accelerators" {
+    for_each = var.gpu_count > 0 ? [1] : []
+    content {
+      accelerator_type  = var.gpu_type
+      accelerator_count = var.gpu_count
+    }
+  }
+  
+  labels = local.common_labels
+  
+  metadata = merge(local.default_metadata, var.metadata, {
+    startup-script = var.startup_script
+  })
+  
+  tags = concat(var.tags, ["http-server", "https-server"])
+  
+  # Minimum CPU platform
+  min_cpu_platform = var.min_cpu_platform != "" ? var.min_cpu_platform : null
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+variable "disk_encryption_key" {
+  description = "Customer-managed encryption key"
+  type        = string
+  default     = ""
+}
+
+output "self_link" {
+  description = "Instance template self link"
+  value       = google_compute_instance_template.template.self_link
+}
+
+output "name" {
+  description = "Instance template name"
+  value       = google_compute_instance_template.template.name
+}
+```
+
+## CLI Examples
+
+### Module Operations
+
+```bash
+# Initialize modules
+terraform init
+
+# Get modules
+terraform get
+
+# Get specific version
+terraform get -version=1.0.0
+
+# Update modules
+terraform get -update
+
+# List modules
+terraform providers
+
+# Module tree
+terraform graph -type=plan | jq '.'
+```
+
+### Module Publishing
+
+```bash
+# Tag module version
+git tag v1.0.0
+git push origin v1.0.0
+
+# Terraform Registry publishing
+# Push to GitHub, add README, document inputs/outputs
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform init` | Initialize and download modules |
+| `terraform get` | Download/update modules |
+| `terraform get -update` | Update module versions |
+| `terraform providers` | Show required providers |
+
+## Best Practices
+
+### 1. Keep Modules Focused
+
+```hcl
+# Good: Focused module
+module "vpc" {
+  source = "./modules/vpc"
+  # Only VPC-related config
+}
+
+# Good: Focused module
+module "compute" {
+  source = "./modules/compute"
+  # Only compute-related config
+}
+```
+
+### 2. Version Modules
+
+```hcl
+# Pin to version
+module "vpc" {
+  source  = "github.com/org/terraform-gcp-vpc?ref=v1.2.0"
+}
+
+# Or use registry
+module "vpc" {
+  source  = "terraform-google-modules/network/google"
+  version = "~> 6.0"
+}
+```
+
+### 3. Use Consistent Interface
+
+```hcl
+# modules/networking/vpc/variables.tf
+variable "project_id" { ... }
+variable "environment" { ... }
+variable "vpc_cidr" { ... }
+
+# modules/networking/vpc/outputs.tf
+output "vpc_id" { ... }
+output "subnet_ids" { ... }
+```
+
+### 4. Document Everything
+
+```markdown
+# modules/networking/vpc/README.md
+
+# VPC Module
+
+Creates a custom VPC network with subnets, firewall rules, and Cloud NAT.
+
+## Usage
+
+```hcl
+module "vpc" {
+  source = "github.com/org/terraform-vpc?ref=v1.0.0"
+  
+  project_id = "my-project"
+  environment = "prod"
+  vpc_cidr   = "10.0.0.0/16"
+}
+```
+
+## Inputs
+
+| Name | Description | Type | Required |
+|------|-------------|------|----------|
+| project_id | GCP Project ID | string | Yes |
+| environment | Environment name | string | Yes |
+
+## Outputs
+
+| Name | Description |
+|------|-------------|
+| vpc_id | VPC network ID |
+| subnet_ids | Map of subnet names to IDs |
+```
+
+### 5. Use Terratest for Module Testing
+
+```go
+// modules/networking/vpc/test/vpc_test.go
+package test
+
+import (
+    "testing"
+    "github.com/gruntwork-io/terratest/modules/terraform"
+    "github.com/stretchr/testify/assert"
+)
+
+func TestVPCModule(t *testing.T) {
+    terraformOptions := &terraform.Options{
+        TerraformDir: "../",
+        Vars: map[string]interface{}{
+            "project_id":  "test-project",
+            "environment": "test",
+            "vpc_cidr":    "10.0.0.0/16",
+        },
+    }
+    
+    defer terraform.Destroy(t, terraformOptions)
+    terraform.InitAndApply(t, terraformOptions)
+    
+    vpcID := terraform.Output(t, terraformOptions, "vpc_id")
+    assert.NotEmpty(t, vpcID)
+}
+```
+
+## Module Registry vs Local Modules
+
+### Terraform Registry
+
+```hcl
+# Public registry
+module "vpc" {
+  source  = "terraform-google-modules/network/google"
+  version = "~> 6.0"
+  
+  project_id   = var.project_id
+  network_name = "my-vpc"
+  
+  subnets = [
+    {
+      subnet_name   = "subnet-01"
+      subnet_ip     = "10.0.0.0/24"
+      subnet_region = "us-central1"
+    },
+  ]
+}
+
+# Private registry
+module "vpc" {
+  source  = "app.terraform.io/my-org/vpc/google"
+  version = "1.0.0"
+}
+```
+
+### Local Modules
+
+```hcl
+# Relative path
+module "vpc" {
+  source = "./modules/vpc"
+}
+
+# GitHub
+module "vpc" {
+  source = "github.com/org/terraform-vpc"
+}
+
+# GitHub with ref
+module "vpc" {
+  source  = "github.com/org/terraform-vpc?ref=v1.2.0"
+}
+
+# GitLab
+module "vpc" {
+  source = "git::https://gitlab.com/org/terraform-vpc.git?ref=v1.0.0"
+}
+```
+
+## Monitoring / State Management
+
+### Module State
+
+```bash
+# State reflects module hierarchy
+terraform state list
+# module.vpc.google_compute_network.vpc
+# module.compute.google_compute_instance.instance
+
+# Pull state
+terraform state pull
+
+# Move module resources
+terraform state mv google_compute_instance.server module.compute.google_compute_instance.server
+```
+
+## Security
+
+### Module Security
+
+```hcl
+# Pin sources to specific versions
+module "vpc" {
+  source = "github.com/org/terraform-vpc?ref=v1.2.0"
+}
+
+# Use checksums for verification
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+```
+
+### Access Control
+
+```hcl
+# Use service accounts with minimal permissions
+variable "service_account_email" {
+  type        = string
+  description = "Service account with minimal permissions"
+}
+```
+
+## Cost Optimization
+
+### Module Resource Optimization
+
+```hcl
+# Environment-based sizing
+variable "instance_sizes" {
+  type = map(object({
+    machine_type = string
+    disk_size    = number
+  }))
+  
+  default = {
+    dev = {
+      machine_type = "e2-medium"
+      disk_size    = 20
+    }
+    prod = {
+      machine_type = "e2-standard-2"
+      disk_size    = 50
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+### Module Not Found
+
+```bash
+# Error: Module not found
+# Solution: Initialize with terraform init
+terraform init
+
+# Update modules
+terraform get -update
+```
+
+### Module Version Conflict
+
+```bash
+# Error: Provider version mismatch
+# Solution: Update versions
+terraform init -upgrade
+```
+
+### Module State Issues
+
+```bash
+# Move resources to module
+terraform state mv google_compute_instance.server module.compute.google_compute_instance.server
+```
+
+## Interview Questions
+
+### Q1: What is a Terraform module?
+**A:** A reusable collection of Terraform resources, variables, and outputs that can be called multiple times with different parameters.
+
+### Q2: What's the difference between root module and child module?
+**A:** The root module is the main configuration that Terraform applies. Child modules are called from the root module with the `module` block.
+
+### Q3: How do you pass outputs between modules?
+**A:** Using `terraform_remote_state` data source, or by calling a module and accessing outputs via `module.NAME.output_name`.
+
+### Q4: When should you create a module?
+**A:** When infrastructure patterns are repeated, need sharing between teams, or when abstraction improves maintainability.
+
+### Q5: How do you version modules?
+**A:** Use version constraints with registry modules, git tags/refs for GitHub sources, or semantic versioning.
+
+### Q6: Can modules call other modules?
+**A:** Yes, modules can call other modules to create nested module hierarchies.
+
+### Q7: How do you test Terraform modules?
+**A:** Using Terratest, terraform validate, and plan review. For integration testing, apply in isolated environment.
+
+### Q8: What's the purpose of outputs in modules?
+**A:** Outputs expose values from module resources for use by the calling configuration, such as resource IDs, IPs, or connection strings.
+
+## Cheat Sheet
+
+### Module Structure
+```
+module/
+├── main.tf
+├── variables.tf
+├── outputs.tf
+├── versions.tf
+└── README.md
+```
+
+### Calling Modules
+```hcl
+module "name" {
+  source  = "path|git|registry"
+  version = "1.0.0"  # For registry
+  
+  # Variables
+  project_id = var.project_id
+}
+
+# Access output
+module.name.output_name
+```
+
+### Module Registry Sources
+```hcl
+# Public
+source = "terraform-google-modules/network/google"
+
+# Private
+source = "app.terraform.io/org/module/google"
+
+# GitHub
+source = "github.com/org/repo//path?ref=v1.0.0"
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Terraform fundamentals
+- [Variables](./variables.mdx) - Variable patterns
+- [Resources](./resources.mdx) - Resource configuration
+- [State](./state.mdx) - State management
+- [Testing](./testing.mdx) - Module testing
+- [CI/CD](./cicd.mdx) - CI/CD integration

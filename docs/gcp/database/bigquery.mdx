@@ -1,0 +1,711 @@
+# BigQuery
+
+## Overview
+
+Google BigQuery is a serverless, highly scalable data warehouse that enables super-fast SQL queries against massive datasets. It uses columnar storage and tree architecture for querying petabytes in seconds. BigQuery separates storage and compute, allowing independent scaling and cost optimization. ML built-in enables predictive analytics directly in the data warehouse.
+
+## When To Use
+
+- Data warehousing and business intelligence
+- Analytics on large datasets (> 10 GB)
+- Ad-hoc SQL queries on raw data
+- Data lake queries (using external tables)
+- Streaming analytics (with streaming insert pricing)
+- Machine learning with BigQuery ML
+- Time-series analytics and trends
+
+## When NOT To Use
+
+- Real-time transactional workloads (use Cloud SQL)
+- Millisecond-latency requirements
+- OLTP workloads
+- Small datasets with complex joins
+- Simple key-value lookups
+- File storage needs (use Cloud Storage)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       BigQuery                               │
+├─────────────────────────────────────────────────────────────┤
+│  Storage:                                                   │
+│  ├── Columnar storage (Capacitor format)                   │
+│  ├── Automatic compression                                 │
+│  ├── Managed storage (Cold/Hot tiers)                      │
+│  └── External tables (Cloud Storage, Sheets)               │
+├─────────────────────────────────────────────────────────────┤
+│  Compute:                                                   │
+│  ├── On-demand (per byte scanned)                          │
+│  ├── Flat-rate (reserved slots)                            │
+│  └── BI Engine (in-memory acceleration)                    │
+├─────────────────────────────────────────────────────────────┤
+│  ML:                                                        │
+│  ├── BigQuery ML (SQL-based ML)                            │
+│  └── Vertex AI integration                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Dataset
+Container for tables and views. Acts as a namespace for tables.
+
+### Table
+Data organized in rows and columns. Types: native, external, logical views.
+
+### Slot
+Virtual CPU for query execution. On-demand uses slot-based pricing.
+
+### Partitioning
+Dividing tables into segments based on date/timestamp or integer range.
+
+### Clustering
+Sorting data by column values for improved query performance.
+
+### Streaming Insert
+Real-time data insertion at $0.010/200 MB.
+
+## Real Production Example
+
+**Marketing Analytics Data Warehouse**
+
+```hcl
+# Terraform configuration for BigQuery analytics platform
+
+# Create dataset for marketing data
+resource "google_bigquery_dataset" "marketing" {
+  dataset_id    = "marketing_analytics"
+  friendly_name = "Marketing Analytics"
+  description   = "Marketing campaign analytics and attribution data"
+  location      = "US"
+  
+  default_table_expiration_ms     = null  # No expiration
+  default_partition_expiration_ms = null
+  
+  labels = {
+    environment = "production"
+    team        = "marketing"
+    cost_center = "marketing"
+  }
+  
+  access {
+    role          = "OWNER"
+    special_group = "projectWriters"
+  }
+  
+  access {
+    role          = "READER"
+    special_group = "projectReaders"
+  }
+}
+
+# User events table (partitioned by date, clustered)
+resource "google_bigquery_table" "user_events" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  table_id   = "user_events"
+  
+  deletion_protection   = true
+  useLegacySQL         = false
+  
+  time_partitioning {
+    type  = "DAY"
+    field = "event_date"
+  }
+  
+  clustering = ["user_id", "platform"]
+  
+  schema = file("${path.module}/schemas/user_events.json")
+}
+
+# Sessions table
+resource "google_bigquery_table" "sessions" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  table_id   = "sessions"
+  
+  deletion_protection = true
+  
+  time_partitioning {
+    type  = "DAY"
+    field = "session_date"
+  }
+  
+  clustering = ["user_id"]
+  
+  schema = file("${path.module}/schemas/sessions.json")
+}
+
+# External table for Cloud Storage data
+resource "google_bigquery_table" "campaign_data" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  table_id   = "campaign_data"
+  
+  external_data_configuration {
+    source_format = "PARQUET"
+    source_uris   = ["gs://marketing-bucket/campaigns/*.parquet"]
+    
+    hive_partitioning_options {
+      mode          = "AUTO"
+      source_uri_prefix = "gs://marketing-bucket/campaigns/"
+    }
+    
+    autodetect = false
+    schema = <<-EOF
+      [
+        {"name": "campaign_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "campaign_name", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "channel", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "spend", "type": "NUMERIC", "mode": "NULLABLE"},
+        {"name": "impressions", "type": "INT64", "mode": "NULLABLE"},
+        {"name": "clicks", "type": "INT64", "mode": "NULLABLE"}
+      ]
+    EOF
+  }
+  
+  deletion_protection = false
+}
+
+# Routine for UDF
+resource "google_bigquery_routine" "calculate_roi" {
+  dataset_id      = google_bigquery_dataset.marketing.dataset_id
+  routine_id      = "calculate_roi"
+  routine_type    = "FUNCTION"
+  
+  language = "JAVASCRIPT"
+  
+  routine_definition = <<-EOF
+    // Calculate ROI given revenue and cost
+    function calculateROI(revenue, cost) {
+      if (!revenue || !cost || cost === 0) return null;
+      return ((revenue - cost) / cost) * 100;
+    }
+  EOF
+  
+  arguments {
+    name          = "revenue"
+    data_type     = "NUMERIC"
+    argument_mode = "IN"
+  }
+  
+  arguments {
+    name          = "cost"
+    data_type     = "NUMERIC"
+    argument_mode = "IN"
+  }
+  
+  return_type = "NUMERIC"
+}
+
+# ML Model for customer lifetime value prediction
+resource "google_bigquery_table" "clv_model" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  table_id   = "clv_model"
+  # Note: Model creation requires DDL, typically done via query
+}
+
+# Row-level security on customer table
+resource "google_bigquery_table" "customer_data" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  table_id   = "customer_data"
+  
+  schema = <<-EOF
+    [
+      {"name": "customer_id", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "email", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "customer_tier", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "revenue", "type": "NUMERIC", "mode": "NULLABLE"}
+    ]
+  EOF
+  
+  row_access_policy {
+    name        = "tier_based_access"
+    filter_predicate = "customer_tier IN ('premium', 'enterprise') OR session_user() CONTAINS '@company.com'"
+  }
+}
+
+# IAM for BigQuery
+resource "google_bigquery_dataset_iam_member" "analyst_read" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  role       = "roles/bigquery.dataViewer"
+  member     = "group:analysts@company.com"
+}
+
+resource "google_bigquery_dataset_iam_member" "data scientist" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  role       = "roles/bigquery.dataEditor"
+  member     = "serviceAccount:ml-pipeline@project.iam.gserviceaccount.com"
+}
+
+resource "google_bigquery_dataset_iam_member" "dashboard_service" {
+  dataset_id = google_bigquery_dataset.marketing.dataset_id
+  role       = "roles/bigquery.dataViewer"
+  member     = "serviceAccount:dashboard@project.iam.gserviceaccount.com"
+}
+```
+
+## CLI Examples
+
+```bash
+# Create dataset
+gcloud bigquery datasets create my_dataset \
+  --location=US \
+  --description="My analytics dataset"
+
+# Create table with schema
+gcloud bigquery mk-table my_dataset.my_table \
+  --schema=id:INTEGER,name:STRING,created_at:TIMESTAMP
+
+# Load data from Cloud Storage
+gcloud bigquery load \
+  --source_format=CSV \
+  --location=US \
+  my_dataset.users \
+  gs://my-bucket/users.csv \
+  --schema=id:INTEGER,name:STRING,email:STRING
+
+# Query from command line
+gcloud bigquery query \
+  --use_legacy_sql=false \
+  "SELECT * FROM my_dataset.users LIMIT 10"
+
+# Query with parameters
+gcloud bigquery query \
+  --parameter=date_value:STRING:2024-01-15 \
+  "SELECT * FROM events WHERE DATE(event_time) = @date_value"
+
+# Export to Cloud Storage
+gcloud bigquery export \
+  my_project:my_dataset.orders \
+  gs://my-bucket/exports/orders_$(date +%Y%m%d).csv
+
+# Create partitioned table
+gcloud bigquery mk-table my_dataset.events \
+  --schema=event_id:STRING,event_time:TIMESTAMP,data:STRING \
+  --time_partitioning-type=DAY \
+  --time_partitioning-field=event_time
+
+# Create clustered table
+gcloud bigquery mk-table my_dataset.events \
+  --schema=event_id:STRING,customer_id:STRING,event_type:STRING \
+  --clustering-fields=customer_id,event_type
+
+# Update dataset labels
+gcloud bigquery datasets update my_dataset \
+  --location=US \
+  --update-labels=environment:production,cost_center:analytics
+
+# Copy table
+gcloud bigquery cp my_dataset.source_table my_dataset.dest_table
+
+# Create view
+gcloud bigquery mk-view my_dataset.active_users_view \
+  "SELECT * FROM my_dataset.users WHERE status = 'active'"
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Basic dataset
+resource "google_bigquery_dataset" "analytics" {
+  dataset_id    = "analytics"
+  friendly_name = "Analytics Dataset"
+  description   = "Main analytics dataset"
+  location      = "US"
+  
+  default_table_expiration_ms = 604800000  # 7 days
+  default_partition_expiration_ms = 2592000000  # 30 days
+  
+  labels = {
+    environment = "production"
+  }
+}
+
+# Partitioned and clustered table
+resource "google_bigquery_table" "events" {
+  dataset_id = google_bigquery_dataset.analytics.dataset_id
+  table_id   = "events"
+  
+  deletion_protection = true
+  useLegacySQL        = false
+  
+  time_partitioning {
+    type  = "DAY"
+    field = "event_date"
+  }
+  
+  clustering = ["customer_id", "event_type"]
+  
+  schema = <<-EOF
+    [
+      {"name": "event_id", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "event_date", "type": "DATE", "mode": "REQUIRED"},
+      {"name": "customer_id", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "event_type", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "properties", "type": "JSON", "mode": "NULLABLE"},
+      {"name": "amount", "type": "NUMERIC", "mode": "NULLABLE"}
+    ]
+  EOF
+}
+
+# External table
+resource "google_bigquery_table" "external_sales" {
+  dataset_id = google_bigquery_dataset.analytics.dataset_id
+  table_id   = "external_sales"
+  
+  external_data_configuration {
+    source_format = "PARQUET"
+    source_uris   = ["gs://sales-bucket/sales/*.parquet"]
+    
+    autodetect = false
+  }
+  
+  schema = <<-EOF
+    [
+      {"name": "sale_id", "type": "STRING"},
+      {"name": "product_id", "type": "STRING"},
+      {"name": "amount", "type": "NUMERIC"},
+      {"name": "sale_date", "type": "DATE"}
+    ]
+  EOF
+}
+
+# IAM
+resource "google_bigquery_dataset_iam_member" "viewer" {
+  dataset_id = google_bigquery_dataset.analytics.dataset_id
+  role       = "roles/bigquery.dataViewer"
+  member     = "group:analytics-viewers@company.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Dataset operations
+gcloud bigquery datasets create DATASET [--location=LOCATION]
+gcloud bigquery datasets list
+gcloud bigquery datasets describe DATASET
+gcloud bigquery datasets update DATASET [flags]
+
+# Table operations
+gcloud bigquery mk-table PROJECT:DATASET.TABLE [--schema=SCHEMA]
+gcloud bigquery rm TABLE
+gcloud bigquery cp SRC DST
+
+# Query
+gcloud bigquery query [SQL] [--use_legacy_sql]
+
+# Load/Export
+gcloud bigquery load DST SOURCE [--schema=SCHEMA]
+gcloud bigquery export TABLE BUCKET
+
+# Reservation (slot management)
+gcloud bigquery reservations create RESERVATION --slot-count=100 --location=US
+gcloud bigquery reservations assign --reservation_id=ID --job_id=JOB_ID
+```
+
+## Monitoring
+
+### Key Metrics
+- **Bytes processed**: Query data scanned
+- **Bytes stored**: Storage consumption
+- **Query count**: Number of queries
+- **Query latency**: Execution time (P50, P90, P99)
+- **Slot usage**: Reserved vs on-demand consumption
+- **Streaming insert rows**: Real-time ingestion rate
+- **Table size**: Per-table storage
+
+### Cost Monitoring
+
+```bash
+# Query cost estimation before execution
+gcloud bigquery query \
+  --dry-run \
+  "SELECT COUNT(*) FROM large_table"
+
+# View cost in Cloud Monitoring
+gcloud monitoring metrics list --filter="metric.type:bigquery"
+
+# Create budget alert
+gcloud billing budgets create \
+  --billing-account=BILLING_ACCOUNT \
+  --display-name="BigQuery Budget" \
+  --threshold-amount=10000 \
+  --notification-channels=CHANNEL_ID
+
+# Estimate query cost via API
+bq query --nouse_cache --dry_run "SELECT * FROM table"
+```
+
+### Query Performance
+
+```sql
+-- Explain query plan
+EXPLAIN SELECT * FROM table WHERE date = '2024-01-01';
+
+-- Check table statistics
+SELECT * FROM `region-us`.INFORMATION_SCHEMA.TABLE_STORAGE
+ORDER BY total_rows DESC;
+
+-- Query history
+SELECT * FROM `region-us`.INFORMATION_SCHEMA.QUERY_HISTORY
+ORDER BY start_time DESC
+LIMIT 10;
+```
+
+## Security
+
+### Dataset Access Control
+```bash
+# Grant dataset-level access
+gcloud bigquery datasets add-iam-policy-binding my_dataset \
+  --member=user:analyst@company.com \
+  --role=roles/bigquery.dataViewer
+
+# Grant at project level
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:admin@company.com \
+  --role=roles/bigquery.admin
+```
+
+### Column-level Security
+```sql
+-- Create view with column masking
+CREATE VIEW safe_customers AS
+SELECT
+  customer_id,
+  -- Mask email for non-admin users
+  CASE 
+    WHEN SESSION_USER() LIKE '%@admin.%' THEN email
+    ELSE CONCAT(LEFT(email, 2), '***', RIGHT(email, 4))
+  END AS email,
+  name
+FROM customers;
+
+-- Row-level security via policy tags
+CREATE TABLE customers (
+  customer_id STRING,
+  email STRING,
+  ssn STRING OPTIONS (policy_tags = ['confidential'])
+);
+```
+
+### Authorized Views
+```sql
+-- Create view in separate dataset for restricted access
+CREATE VIEW restricted_orders AS
+SELECT order_id, customer_id, total
+FROM orders
+WHERE customer_id IN (
+  SELECT customer_id FROM allowed_customers WHERE user_email = SESSION_USER()
+);
+```
+
+## Cost Optimization
+
+### Query Cost Reduction
+```sql
+-- Select only needed columns
+SELECT customer_id, order_date, total  -- Instead of SELECT *
+
+-- Use partitioning filters
+WHERE DATE(event_time) BETWEEN '2024-01-01' AND '2024-01-31'  -- Filters partitions
+
+-- Use clustering fields in WHERE
+WHERE customer_id = '123' AND event_type = 'purchase'  -- Uses clustering
+
+-- Avoid SELECT *
+EXPLAIN 
+SELECT * FROM large_table;  -- Scans entire table
+
+EXPLAIN 
+SELECT id, name FROM large_table;  -- Scans only needed columns
+```
+
+### Partitioning Strategy
+```sql
+-- Partition by date for time-series data
+CREATE TABLE events (
+  event_date DATE,
+  event_time TIMESTAMP,
+  data STRING
+)
+PARTITION BY DATE(event_time)
+CLUSTER BY customer_id;
+
+-- Use clustering for commonly filtered columns
+-- Cluster columns should have high cardinality
+-- Order: highest cardinality first
+```
+
+### Storage Tiers
+```bash
+# Hot storage (active tables): $0.02/GB
+# Long-term storage (>90 days): automatic tiering to $0.01/GB
+
+# Minimize table scanning
+gcloud bigquery tables update dataset.table \
+  --expiration=2592000000  # 30 days
+```
+
+### Slot Management
+```bash
+# For predictable workloads, use flat-rate
+gcloud bigquery reservations create \
+  --project=my-project \
+  --location=US \
+  --slot-count=100 \
+  --ignore-idle-slots=false \
+  my-reservation
+
+# Assign commitment to reservation
+gcloud bigquery reservations commit \
+  --project=my-project \
+  --location=US \
+  --slot-count=100 \
+  --plan=ANNUAL
+```
+
+## Troubleshooting
+
+### Query Timeouts
+```bash
+# Increase timeout
+gcloud bigquery query --timeout=600 "SELECT ..."
+
+# Optimize query (see Cost Optimization section)
+# Consider partitioning/clustering
+# Use LIMIT with ORDER BY to reduce sort
+```
+
+### Quota Exceeded
+```bash
+# Check current quotas
+gcloud bigquery quotas describe --service=bigquery.googleapis.com
+
+# Request quota increase
+gcloud beta bigquery quotas set \
+  --project=my-project \
+  --service=bigquery.googleapis.com \
+  --metric=QueriesPerDay \
+  --requested-limit=100000
+
+# Or via console: IAM & Admin > Quotas
+```
+
+### Partition/Cluster Issues
+```sql
+-- Check partition info
+SELECT 
+  table_name,
+  partition_id,
+  total_rows,
+  size_bytes
+FROM `region-us`.INFORMATION_SCHEMA.PARTITIONS
+WHERE table_name = 'events'
+ORDER BY partition_id DESC;
+
+-- Recreate table with better partitioning
+CREATE OR REPLACE TABLE events CLUSTER BY customer_id AS
+SELECT * FROM events;
+```
+
+### Streaming Insert Performance
+```bash
+# Check streaming stats
+SELECT 
+  SUM(row_count) as total_rows,
+  SUM(byte_count) as total_bytes
+FROM `region-us`.INFORMATION_SCHEMA.STORAGE
+WHERE table_name LIKE '%streaming%';
+
+# Batch writes for better performance
+# Buffer records and flush every 1MB or 1000 rows
+```
+
+## Interview Questions
+
+**Q: What is the difference between partitioning and clustering in BigQuery?**
+A: Partitioning splits a table into segments based on a column (date or integer), allowing queries to skip irrelevant partitions. Clustering sorts data by specified columns within each partition, improving performance for filtered queries. Partitioning is required for time-based pruning; clustering provides additional sort optimization.
+
+**Q: How does BigQuery pricing work?**
+A: On-demand pricing charges $5.00 per TB of data scanned. Flat-rate pricing provides reserved slots at ~$1,700/month per slot. Storage costs $0.02/GB/month, dropping to $0.01/GB after 90 days. Queries that don't touch tables (metadata queries) have lower costs.
+
+**Q: When should you use external tables vs native tables?**
+A: Use native tables for frequently queried data requiring BigQuery optimization. Use external tables for data that lives in other systems (Cloud Storage, Bigtable, Google Sheets), for ETL pipelines, or for data that shouldn't be duplicated. External queries have different performance characteristics.
+
+**Q: How does BigQuery handle concurrent queries?**
+A: BigQuery uses a slot-based execution model. On-demand queries share a global slot pool (2000 slots per project). Reserved slots guarantee capacity for critical workloads. Queries compete for available slots; excess queries queue.
+
+**Q: What are the limitations on UPDATE/DELETE operations?**
+A: DML operations (UPDATE, DELETE, MERGE) work within partition boundaries for partitioned tables and have size limits. Use MERGE for upsert patterns. Large-scale DML may be slow; consider recreating tables instead.
+
+**Q: How do you implement row-level security in BigQuery?**
+A: Use views with SESSION_USER() to filter rows based on the query user. For column-level security, use CASE statements to mask sensitive data. Authorized views provide another security pattern. Policy tags enable data governance integration.
+
+## Cheat Sheet
+
+```bash
+# Query
+gcloud bigquery query "SELECT * FROM dataset.table LIMIT 10"
+
+# Load data
+gcloud bigquery load dataset.table gs://bucket/data.csv --schema=id:INTEGER,name:STRING
+
+# Partitioned table
+gcloud bigquery mk-table dataset.events \
+  --schema=event_id:STRING,event_date:DATE,data:STRING \
+  --time_partitioning-type=DAY \
+  --time_partitioning-field=event_date
+
+# Clustered table
+gcloud bigquery mk-table dataset.events \
+  --clustering-fields=customer_id,event_type
+
+# IAM
+gcloud bigquery datasets add-iam-policy-binding dataset \
+  --member=user:email --role=roles/bigquery.dataViewer
+```
+
+## Labs
+
+### Lab 1: Analytics Pipeline
+Build a complete analytics pipeline.
+1. Create partitioned event table
+2. Set up Dataflow for streaming ingestion
+3. Create aggregated materialized views
+4. Build reporting queries
+5. Set up cost monitoring
+
+### Lab 2: Machine Learning with BigQuery ML
+Predict customer churn.
+1. Create features table
+2. Train logistic regression model
+3. Evaluate model performance
+4. Generate predictions
+5. Operationalize scoring pipeline
+
+### Lab 3: Data Governance
+Implement comprehensive data governance.
+1. Classify data with policy tags
+2. Implement column-level security
+3. Set up row-level access policies
+4. Audit data access patterns
+5. Create data lineage tracking
+
+## Related Services
+
+- **Dataflow**: Streaming and batch data processing
+- **Cloud Storage**: Data lake storage
+- **Vertex AI**: Advanced ML with AutoML
+- **Looker**: BI and dashboarding
+- **Pub/Sub**: Real-time data ingestion
+- **Bigtable**: Time-series at massive scale

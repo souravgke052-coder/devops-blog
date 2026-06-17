@@ -1,0 +1,745 @@
+# Terraform State
+
+## Overview
+
+Terraform state is a critical component that maps your configuration to real-world infrastructure. It stores resource metadata, relationships, and current attribute values. Understanding state management is essential for production-grade Terraform deployments.
+
+## When To Use
+
+- **Every Terraform operation**: State is required for `plan`, `apply`, and `destroy`
+- **Team collaboration**: Remote state enables concurrent operations without conflicts
+- **Disaster recovery**: Versioned state allows rollback to previous configurations
+- **Cross-environment references**: State sharing enables module dependencies
+
+## When NOT To Use
+
+- **Local state only for teams**: Never use local state in a team environment
+- **Version control for state**: State files contain sensitive data and should never be committed to Git
+
+## Core Concepts
+
+### State File Structure
+
+```json
+{
+  "version": 4,
+  "terraform_version": "1.5.0",
+  "serial": 1,
+  "lineage": "xxxx-xxxx-xxxx-xxxx",
+  "outputs": {},
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "google_compute_instance",
+      "name": "web_server",
+      "provider": "provider[\"registry.terraform.io/hashicorp/google\"]",
+      "instances": [
+        {
+          "schema_version": 6,
+          "attributes": {
+            "id": "projects/my-project/zones/us-central1-a/instances/web-server",
+            "name": "web-server",
+            "machine_type": "e2-medium",
+            "zone": "us-central1-a"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### State Locking
+
+Prevents concurrent modifications that could corrupt state:
+
+```bash
+# State is locked during any write operation
+# Lock info stored alongside state file
+terraform apply
+# Acquires lock
+# Performs operation
+# Releases lock
+```
+
+### State Serialization
+
+```hcl
+# Each apply increments serial number
+# Detects concurrent modification
+# lineage = unique ID for state file identity
+```
+
+## Real Production Example
+
+### GCS Backend with Full Configuration
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "my-project-terraform-state-prod"
+    prefix = "networking"
+    
+    # Encryption
+    encryption_key = google_kms_key.terraform_state_key.id
+    
+    # State file versioning enabled on bucket
+  }
+}
+
+# KMS Key for State Encryption
+resource "google_kms_key_ring" "tf_keyring" {
+  name     = "tf-keyring-${var.environment}"
+  location = "global"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_kms_key" "terraform_state_key" {
+  name         = "tf-state-key-${var.environment}"
+  key_ring     = google_kms_key_ring.tf_keyring.key_ring
+  purpose      = "ENCRYPT_DECRYPT"
+  
+  rotation_period = "7776000s"  # 90 days
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# GCS Bucket for State
+resource "google_storage_bucket" "terraform_state" {
+  name          = "${var.project_id}-terraform-state-${var.environment}"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  versioning {
+    enabled = true  # Keep state history
+  }
+  
+  encryption {
+    default_kms_key_name = google_kms_key.terraform_state_key.id
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 30  # Keep state versions for 30 days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# IAM for State Bucket
+resource "google_storage_bucket_iam_member" "terraform_state" {
+  bucket = google_storage_bucket.terraform_state.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.terraform_service_account}"
+}
+```
+
+### S3 Backend with DynamoDB Locking (AWS Alternative)
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state-prod"
+    key            = "networking/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "terraform-state-locks"
+    
+    # SSE-KMS encryption
+    kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/xxxx-xxxx"
+  }
+}
+
+# DynamoDB Table for State Locking
+resource "aws_dynamodb_table" "terraform_state_locks" {
+  name         = "terraform-state-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+  
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+  
+  server_side_encryption {
+    enabled = true
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+## HCL Examples
+
+### Remote State Data Source
+
+```hcl
+# Reference state from another environment
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-project-terraform-state-prod"
+    prefix = "network"
+  }
+}
+
+# Use outputs from remote state
+resource "google_compute_instance" "app_server" {
+  name         = "app-server"
+  network_interface {
+    network    = data.terraform_remote_state.network.outputs.vpc_network_id
+    subnetwork = data.terraform_remote_state.network.outputs.private_subnet_id
+  }
+}
+
+# Access outputs
+locals {
+  vpc_id     = data.terraform_remote_state.network.outputs.vpc_network_id
+  db_host    = data.terraform_remote_state.database.outputs.private_ip
+}
+```
+
+### State Import
+
+```hcl
+# Import existing infrastructure
+resource "google_compute_instance" "existing_server" {
+  # Initially empty - populated by import command
+}
+
+# Import with target
+resource "google_sql_database_instance" "existing_db" {
+  name = "imported-database"
+}
+```
+
+```bash
+terraform import google_compute_instance.existing_server \
+  projects/my-project/zones/us-central1-a/instances/existing-server
+
+terraform import module.vpc.google_compute_network.vpc \
+  projects/my-project/global/networks/vpc-name
+```
+
+## CLI Examples
+
+### State Operations
+
+```bash
+# Initialize with backend
+terraform init
+
+# List all resources in state
+terraform state list
+
+# Show specific resource
+terraform state show google_compute_instance.web_server
+
+# Show resource in module
+terraform state show module.mig.google_compute_instance_template.template
+
+# Pull state (remote to local)
+terraform state pull > local-state.tfstate
+
+# Push state (local to remote)
+terraform state push local-state.tfstate
+
+# Rename resource
+terraform state mv google_compute_instance.old google_compute_instance.new
+
+# Move to module
+terraform state mv google_compute_instance.server module.server
+
+# Remove from state (orphan resource)
+terraform state rm google_compute_instance.orphaned
+
+# Force unlock (emergency only)
+terraform force-unlock <lock-id>
+```
+
+### State Lock Troubleshooting
+
+```bash
+# Check current lock
+terraform apply
+# Error: Error acquiring the state lock
+
+# View lock info
+terraform state pull | jq '.metadata'
+
+# Force unlock after verifying no other operations
+terraform force-unlock <lock-id-from-error>
+
+# Verify unlock
+terraform plan
+```
+
+### State Versioning (GCS)
+
+```bash
+# List state versions
+gsutil ls -a gs://my-project-terraform-state/networking/
+
+# View specific version
+gsutil cat gs://my-project-terraform-state/networking/default.2024-01-15T10:30:00.0~1
+
+# Restore previous version
+gsutil cp gs://my-project-terraform-state/networking/default.2024-01-15T10:30:00.0~1 /tmp/terraform.tfstate
+terraform state push /tmp/terraform.tfstate
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform state list` | List all resources in state |
+| `terraform state show <resource>` | Show resource details |
+| `terraform state mv <src> <dst>` | Rename or move resources |
+| `terraform state rm <resource>` | Remove resource from state |
+| `terraform state pull` | Pull remote state to local |
+| `terraform state push` | Push local state to remote |
+| `terraform force-unlock <id>` | Force release state lock |
+| `terraform import <addr> <id>` | Import existing infrastructure |
+
+## Best Practices
+
+### 1. Always Use Remote Backend
+
+```hcl
+# versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "project-terraform-state"
+    prefix = "prod"
+  }
+}
+```
+
+### 2. Enable State Encryption
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "project-terraform-state"
+    encryption_key = google_kms_key.terraform_state_key.id
+  }
+}
+```
+
+### 3. Enable State Versioning
+
+```bash
+# GCS bucket versioning
+gsutil versioning set on gs://project-terraform-state
+
+# S3 bucket versioning
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+  
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+```
+
+### 4. Separate State Per Environment
+
+```hcl
+# environments/prod/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "prod"  # Different prefix per environment
+  }
+}
+
+# environments/dev/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-project-terraform-state"
+    prefix = "dev"
+  }
+}
+```
+
+### 5. State File Access Control
+
+```hcl
+# IAM for Terraform service account
+resource "google_project_iam_member" "tf_state_admin" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.terraform.email}"
+}
+
+# Restrict bucket access
+resource "google_storage_bucket_iam_member" "tf_state" {
+  bucket = google_storage_bucket.terraform_state.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.terraform_service_account}"
+  
+  condition {
+    title       = "terraform-state-access"
+    expression  = "resource.name.startsWith(\"projects/${var.project_id}/buckets/${google_storage_bucket.terraform_state.name}\")"
+  }
+}
+```
+
+## Monitoring / State Management
+
+### State Change Audit
+
+```bash
+# Enable Cloud Audit Logs for GCS
+resource "google_project_service" "logging" {
+  project = var.project_id
+  service = "logging.googleapis.com"
+}
+
+# Cloud Storage audit logs are automatically created
+# Filter logs for state changes
+gcloud logging read \
+  'resource.type="gcs_bucket" AND resource.labels.bucket_name="my-project-terraform-state"' \
+  --project=my-project
+```
+
+### State Metrics
+
+```bash
+# Monitor state file size (shouldn't grow excessively)
+gsutil du -s gs://my-project-terraform-state/
+
+# Count resources
+terraform state list | wc -l
+
+# Check for drift
+terraform plan -detailed-exitcode
+```
+
+### State Backup Automation
+
+```hcl
+# Cloud Function to backup state on each apply
+resource "google_cloud_scheduler_job" "state_backup" {
+  name        = "backup-terraform-state"
+  schedule    = "0 */6 * * *"  # Every 6 hours
+  time_zone   = "UTC"
+  
+  http_target {
+    uri         = "https://cloudfunctions.googleapis.com/v2/projects/${var.project_id}/locations/us-central1/functions/copy-state"
+    http_method = "POST"
+  }
+}
+```
+
+## Security
+
+### State Contains Sensitive Data
+
+```bash
+# State may contain:
+# - Resource passwords
+# - Private keys
+# - API tokens
+# - Connection strings
+
+# NEVER commit state to version control
+echo "*.tfstate" >> .gitignore
+echo "*.tfstate.*" >> .gitignore
+
+# Pre-commit hook to prevent accidental commits
+# .git/hooks/pre-commit
+if git diff --cached --name-only | grep -q "\.tfstate"; then
+  echo "ERROR: Cannot commit state files"
+  exit 1
+fi
+```
+
+### Encryption at Rest
+
+```hcl
+# GCS with CMEK
+resource "google_storage_bucket" "terraform_state" {
+  encryption {
+    default_kms_key_name = google_kms_key.terraform_state_key.id
+  }
+}
+
+# S3 with SSE-KMS
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+  
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_key_id = aws_kms_key.terraform_state.arn
+      sse_algorithm = "aws:kms"
+    }
+  }
+}
+```
+
+### Encryption in Transit
+
+```bash
+# GCS always uses HTTPS
+# S3 backend supports encryption
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state"
+    key            = "prod/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    acl            = "private"
+  }
+}
+```
+
+### Access Controls
+
+```hcl
+# Least privilege for state access
+resource "google_project_iam_member" "tf_developer_state" {
+  project = var.project_id
+  role    = "roles/storage.objectViewer"  # Read-only for developers
+  
+  member = "user:developer@company.com"
+}
+
+resource "google_project_iam_member" "tf_ci_state" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"  # Full access for CI/CD
+  
+  member = "serviceAccount:ci@project.iam.gserviceaccount.com"
+}
+```
+
+## Cost Optimization
+
+### State Storage Costs
+
+```bash
+# GCS storage costs (approximate)
+# Standard: $0.020/GB/month
+# State files are typically small (<1MB)
+
+# Minimize state size
+terraform {
+  backend "gcs" {
+    # Prefix by environment, not by resource
+    # Consolidate related resources in same state
+  }
+}
+
+# Prune old state versions
+resource "google_storage_bucket" "terraform_state" {
+  lifecycle_rule {
+    condition {
+      age = 30  # Delete versions older than 30 days
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+```
+
+### State Operations
+
+```bash
+# Efficient state operations
+# Avoid large state files
+# Split infrastructure into modules with separate state
+
+# Good: Separate state per concern
+# - network/terraform.tfstate
+# - compute/terraform.tfstate  
+# - database/terraform.tfstate
+
+# Bad: Single monolithic state
+# - prod/terraform.tfstate (500+ resources)
+```
+
+## Troubleshooting
+
+### State Lock Timeout
+
+```
+Error: Error acquiring the state lock: condition not met
+```
+
+**Solution:**
+```bash
+# 1. Wait and retry (lock may be released)
+terraform plan
+
+# 2. Check if another operation is stuck
+# Via GCS
+gsutil cat gs://bucket/prefix/.terraform.lock.info
+
+# 3. Force unlock (ONLY if no other operations running)
+terraform force-unlock <lock-id>
+
+# 4. Manual intervention (GCS)
+# Delete .terraform.lock.info from bucket
+gsutil rm gs://bucket/prefix/.terraform.lock.info
+```
+
+### State Drift
+
+```bash
+# Detect drift
+terraform plan -detailed-exitcode
+# Exit code 2 = drift detected
+
+# Refresh state
+terraform refresh
+
+# Review differences
+terraform show
+
+# Sync state with actual infrastructure
+terraform apply -auto-approve -refresh-only
+```
+
+### Corrupted State
+
+```bash
+# 1. Pull current state
+terraform state pull > state.backup.tfstate
+
+# 2. Restore from version
+gsutil cp gs://bucket/prefix/default.2024-01-15T10:00:00.0~1 state.restore.tfstate
+
+# 3. Push restored state
+terraform state push state.restore.tfstate
+
+# 4. Verify
+terraform plan
+```
+
+### State File Not Found
+
+```bash
+# Error: No state file was found
+# Solution: Initialize with correct backend
+terraform init -backend-config="bucket=my-bucket"
+terraform init -backend-config="prefix=prod"
+```
+
+### Large State Performance
+
+```bash
+# Split large state into modules
+terraform state mv google_compute_instance.server module.server
+
+# Verify state size
+terraform state list | wc -l
+# > 1000 resources = consider splitting
+
+# Optimize with -target flag
+terraform plan -target=module.database
+```
+
+## Interview Questions
+
+### Q1: What is Terraform state and why is it needed?
+**A:** State is a JSON file that maps configuration to actual resources. It tracks resource IDs, dependencies, and current attribute values. Required because cloud APIs don't expose full resource graphs - state acts as the source of truth for what exists.
+
+### Q2: Why shouldn't state be committed to Git?
+**A:** State may contain sensitive data (passwords, keys), it creates merge conflicts in teams, and local state doesn't support locking. Use remote backend instead.
+
+### Q3: How does state locking work in GCS?
+**A:** GCS doesn't support object locking natively. Terraform creates a `.terraform.lock.info` file when acquiring a lock and deletes it when releasing. Lock is considered held if the file exists and is older than expected timeout.
+
+### Q4: How do you recover from a corrupted state file?
+**A:** Use state versioning to restore previous version: `gsutil cp gs://bucket/prefix/default.2024-01-15T10:00:00.0~1 terraform.tfstate`, then `terraform state push`.
+
+### Q5: What is state serialization and lineage?
+**A:** Serial number increments on each apply - used to detect concurrent modifications. Lineage is a UUID assigned at state creation - identifies the state's identity.
+
+### Q6: How do you handle sensitive data in state?
+**A:** Mark variables as `sensitive = true`, enable encryption at rest and in transit, use remote backend with proper IAM, never commit to version control.
+
+### Q7: What's the difference between `terraform refresh` and `terraform apply -refresh-only`?
+**A:** `terraform refresh` updates state only without making changes. `terraform apply -refresh-only` updates state and highlights differences without planning changes.
+
+### Q8: How do you manage state in a team?
+**A:** Use remote backend with state locking, separate state per environment, restrict access via IAM, enable versioning for rollback capability.
+
+## Cheat Sheet
+
+### State Management Commands
+```bash
+# List resources
+terraform state list
+
+# Show resource
+terraform state show RESOURCE
+
+# Move/rename
+terraform state mv SOURCE DEST
+
+# Remove from state
+terraform state rm RESOURCE
+
+# Pull state
+terraform state pull > file.tfstate
+
+# Push state
+terraform state push file.tfstate
+
+# Force unlock
+terraform force-unlock LOCK_ID
+
+# Import
+terraform import ADDRESS ID
+```
+
+### Backend Configuration
+```hcl
+terraform {
+  backend "gcs" {
+    bucket         = "my-state-bucket"
+    prefix         = "env/prod"
+    encryption_key = "kms-key-id"
+  }
+}
+```
+
+### Remote State Data Source
+```hcl
+data "terraform_remote_state" "network" {
+  backend = "gcs"
+  config = {
+    bucket = "my-state-bucket"
+    prefix = "network"
+  }
+}
+
+# Access output
+data.terraform_remote_state.network.outputs["vpc_id"]
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Terraform fundamentals
+- [Backend](./backend.mdx) - State backend configuration
+- [Remote State](./remote-state.mdx) - Cross-environment state
+- [Workspaces](./workspaces.mdx) - Environment isolation
+- [Secrets](./secrets.mdx) - Secrets management
+- [CI/CD](./cicd.mdx) - Terraform in pipelines

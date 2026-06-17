@@ -1,0 +1,909 @@
+---
+sidebar_position: 3
+---
+
+# Linux Troubleshooting Guide
+
+## Overview
+
+Linux is the foundation of most production infrastructure. Whether you're debugging a bare-metal server, a virtual machine, or a container host, understanding Linux troubleshooting fundamentals is essential for any DevOps engineer.
+
+This guide covers the complete toolkit: from basic process inspection to advanced kernel tracing with BPF. Real production scenarios demonstrate how these tools work together to isolate and resolve problems.
+
+## When To Use
+
+- **System Performance Issues**: High CPU, memory exhaustion, disk I/O bottlenecks
+- **Service Failures**: Service won't start, crashes on launch, memory errors
+- **Network Problems**: Connection issues, packet loss, interface errors
+- **Kernel Issues**: Hardware failures, driver problems, OOM conditions
+- **Resource Contention**: Competition between processes for CPU, memory, or I/O
+
+## When NOT To Use
+
+- **Application Logic Bugs**: These require application-level debugging (tracing, logs)
+- **Container-Specific Issues**: Use Kubernetes troubleshooting for container orchestration
+- **Cloud API Issues**: Use cloud provider CLI tools (gcloud, aws, az)
+- **Network Design Problems**: These require network topology analysis
+
+## Core Concepts / Methodology
+
+### Linux Diagnostics Philosophy
+
+Linux provides rich interfaces for observing system behavior:
+
+- **Virtual Filesystem (/proc, /sys)**: Real-time kernel and process state
+- **Device Drivers**: Expose hardware metrics through sysfs
+- **Tracing Infrastructure**: ftrace, perf, eBPF for kernel and user-space tracing
+- **Logging Subsystems**: journald, syslog for centralized logging
+
+**Rule of Thumb:** If something is happening on a Linux system, you can observe it with the right tool.
+
+### Understanding Linux Process States
+
+```
+     ┌────────────────────────────────────────────────────────┐
+     │                    PROCESS STATES                      │
+     ├────────────────────────────────────────────────────────┤
+     │                                                        │
+     │   R - Running or Runnable                               │
+     │       │                                                │
+     │       ▼                                                │
+     │   S - Interruptible Sleep (waiting for event)          │
+     │       │                                                │
+     │       ├── Can be interrupted by signals                │
+     │       └── Check: ps aux 's' state                      │
+     │                                                        │
+     │   D - Uninterruptible Sleep (usually I/O)              │
+     │       │                                                │
+     │       ├── Will NOT respond to signals                   │
+     │       └── Check: disk I/O, NFS, hardware               │
+     │                                                        │
+     │   Z - Zombie (terminated but not reaped)               │
+     │       │                                                │
+     │       └── Check: parent process, kill parent           │
+     │                                                        │
+     │   T - Stopped (by job control signal)                  │
+     │       │                                                │
+     │       └── Check: stopped background jobs               │
+     │                                                        │
+     └────────────────────────────────────────────────────────┘
+```
+
+### Memory Management Fundamentals
+
+Understanding memory is critical for troubleshooting:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      MEMORY LAYERS                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Virtual Memory                                             │
+│  ├── Process Address Space                                  │
+│  │   ├── Code (.text)                                       │
+│  │   ├── Data (.data, .bss)                                 │
+│  │   ├── Heap (dynamic allocations)                        │
+│  │   └── Stack (function calls, local variables)           │
+│  │                                                          │
+│  └── Kernel Space                                           │
+│      ├── Kernel code and data                               │
+│      └── Per-process kernel state                           │
+│                                                             │
+│  Physical Memory                                            │
+│  ├── Free memory                                            │
+│  ├── Cached (file-backed pages)                            │
+│  ├── Buffers (metadata)                                    │
+│  └── Active (anon pages, executables)                      │
+│                                                             │
+│  SWAP                                                       │
+│  └── Disk space used when RAM exhausted                    │
+│      ⚠️ Swap usage = system under memory pressure           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Diagnostic Commands / Tools
+
+### System Resource Monitoring
+
+#### `top` - Process and System Overview
+
+```bash
+top -bn1 | head -20
+# Output:
+# top - 14:32:01 up 45 days,  2:15,  3 users,  load average: 2.45, 1.83, 1.72
+# Tasks: 245 total,   1 running, 244 sleeping,   0 stopped,   0 zombie
+# Cpu(s): 12.5%us,  3.2%sy,  0.0%ni, 82.1%id,  2.2%wa,  0.0%hi,  0.0%si,  0.0%st
+# MiB Mem :  15868.9 total,   2345.2 free,   8432.1 used,   5091.6 buff/cache
+# MiB Swap:   2048.0 total,   1876.3 free,    171.7 used.  10234.8 avail Mem
+
+# Sort by memory usage
+top -o %MEM
+
+# Sort by CPU usage
+top -o %CPU
+
+# View specific user's processes
+top -u www-data
+```
+
+**Key Metrics:**
+- `load average`: 1-minute, 5-minute, 15-minute load
+- `%wa`: I/O wait - indicates disk bottleneck
+- `%id`: CPU idle - low idle = CPU bound
+- `avail Mem`: Available memory (includes caches)
+
+#### `vmstat` - Virtual Memory Statistics
+
+```bash
+vmstat 1 5
+# Output:
+# procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+#  r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+#  3  0      0 2458292  98248 5342168    0    0    42   112   42   89  5  2 93  0  0
+#  2  0      0 2451234  98248 5342168    0    0     0     0  156  234  8  1 91  0  0
+
+# Interpretation:
+# r: run queue (processes waiting for CPU)
+# b: processes in uninterruptible sleep
+# si/so: swap in/out (high values = memory pressure)
+# cs: context switches (high = many processes)
+```
+
+#### `iostat` - I/O Statistics
+
+```bash
+iostat -x 1 3
+# Output:
+# Linux 5.4.0-42-generic (server)     06/16/2026     _x86_64_        (4 CPU)
+
+# avg-cpu:  %user   %nice %system %iowait  %steal   %idle
+#            4.52    0.00    1.23    2.31    0.00   91.94
+
+# Device:         r/s     w/s     rkB/s     wkB/s  rrqm/s  wrqm/s  %rrqm %wrmqm ... 
+# sda             2.00    5.00    80.00    200.00    0.00    0.00   0.00   0.00  ...
+# sdb             0.00    0.00     0.00      0.00    0.00    0.00   0.00   0.00  ...
+
+# Key metrics:
+# %util: >80% = I/O saturation
+# w/s, r/s: I/O operations per second
+# avgrq-sz: average request size
+# avgqu-sz: average queue length (>2 = bottleneck)
+```
+
+#### `free` - Memory Usage
+
+```bash
+free -h
+# Output:
+#               total        used        free      shared  buff/cache   available
+# Mem:           15Gi       8.4Gi       2.4Gi       45Mi       4.8Gi        6.2Gi
+# Swap:         2.0Gi       172Mi       1.8Gi
+
+# Key insight:
+# available = free + buff/cache - (low water mark)
+# This is what new allocations can use without swapping
+```
+
+### Network Analysis
+
+#### `ss` - Socket Statistics (Modern Replacement for netstat)
+
+```bash
+# Show all listening ports
+ss -tulnp
+
+# Show established connections
+ss -tnp | grep ESTAB
+
+# Summary of connection states
+ss -s
+# Output:
+# Total: 156 (kernel 158)
+# TCP:   42 (estab 12, closed 2, orphaned 0, synrecv 0, timewait 0)
+
+# Show connections to specific host
+ss dst 10.0.0.5
+
+# Show processes using network
+ss -tlnp
+```
+
+#### `lsof` - List Open Files
+
+```bash
+# Show all files opened by process
+lsof -p 1234
+
+# Show network connections for process
+lsof -i -a -p 1234
+
+# Show what process is using port 443
+lsof -i :443
+
+# Show all network files
+lsof -i -n -P
+
+# Check for file descriptor exhaustion
+lsof | wc -l
+cat /proc/$(pgrep -f nginx)/limits | grep "Max open files"
+```
+
+### Process Analysis
+
+#### `strace` - System Call Tracing
+
+```bash
+# Attach to running process, show all system calls
+strace -p 1234
+
+# Trace specific system calls (network here)
+strace -p 1234 -e trace=network
+
+# Trace file operations
+strace -p 1234 -e trace=file
+
+# Show time spent in calls
+strace -p 1234 -T
+
+# Follow fork'd children
+strace -p 1234 -f
+
+# Save trace to file for analysis
+strace -p 1234 -o /tmp/trace.log -ff
+```
+
+**Real strace output example:**
+```
+write(1, "Hello, World!\n", 14)         = 14 <0.000052>
+openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3 <0.000089>
+read(3, "# hosts file\n127.0.0.1 localhost\n"..., 4096) = 267 <0.000034>
+close(3)                                = 0 <0.000015>
+```
+
+The time in `<>` shows how long each call took.
+
+#### `perf` - Performance Monitoring
+
+```bash
+# Record CPU stack traces for 30 seconds
+perf record -a -g -- sleep 30
+
+# Generate flame graph (requires flamegraph tools)
+perf script | stackcollapse-perf.pl | flamegraph.pl > /tmp/profile.svg
+
+# List available performance events
+perf list
+
+# Top CPU consumers
+perf top -a
+
+# Hardware counters
+perf stat -e instructions,cycles,cache-misses -- ls
+```
+
+### Kernel and System Logs
+
+#### `dmesg` - Kernel Ring Buffer
+
+```bash
+# Show all messages
+dmesg
+
+# Show with human-readable timestamps
+dmesg -T
+
+# Show only errors
+dmesg -T | grep -i error
+
+# Watch in real-time
+dmesg -w
+
+# Find OOM killer messages
+dmesg -T | grep -i "killed process"
+# Example output:
+# [Mon Jun 16 14:32:01 2026] Out of memory: Killed process 1234 (java) total-vm:8292344kB, anon-rss:4096128kB, file-rss:0kB
+```
+
+#### `journalctl` - Systemd Journal
+
+```bash
+# View all logs for a service
+journalctl -u nginx
+
+# Follow logs in real-time
+journalctl -u nginx -f
+
+# Logs since specific time
+journalctl --since "1 hour ago"
+
+# Logs between times
+journalctl --since "2026-06-16 10:00" --until "2026-06-16 11:00"
+
+# Priority (0=emerg, 3=err, 6=info)
+journalctl -p err
+
+# Show kernel messages
+journalctl -k
+
+# Show previous boot (after crash)
+journalctl -b -1
+
+# Compact output
+journalctl --no-pager -o short-iso
+
+# Verify disk space used by logs
+journalctl --disk-usage
+```
+
+### BPF and bpftrace
+
+BPF (Berkeley Packet Filter) and bpftrace provide powerful kernel tracing:
+
+```bash
+# One-liner: syscalls by process
+bpftrace -e 'tracepoint:syscalls:sys_enter_* { @[comm] = count(); }'
+
+# One-liner: disk I/O latency
+bpftrace -e 'kprobe:vfs_read { @start = nsecs; } kretprobe:vfs_read { @ = hist(nsecs - @start); }'
+
+# One-liner: allocation failures
+bpftrace -e 'tracepoint:kmem:mm_page_alloc { if (args->nid == -1) @ = count(); }'
+
+# One-liner: process execution time
+bpftrace -e 'tracepoint:sched:sched_process_exec { time("%H:%M:%S syscall %evt %args\n"); }'
+```
+
+### `/proc` Filesystem
+
+The proc filesystem exposes kernel data:
+
+```bash
+# CPU information
+cat /proc/cpuinfo
+
+# Memory information
+cat /proc/meminfo
+
+# Process status
+cat /proc/1234/status
+
+# Process maps (memory regions)
+cat /proc/1234/maps
+
+# Process syscall (running process)
+cat /proc/1234/syscall
+
+# System uptime
+cat /proc/uptime
+
+# Load average
+cat /proc/loadavg
+```
+
+## Real Production Scenarios
+
+### Scenario 1: High CPU Usage from Rogue Process
+
+**Symptom:** Server load average spiked to 15, all services slow, users complaining.
+
+**Diagnostic Commands:**
+```bash
+# Check overall CPU state
+top -bn1
+# Output:
+# Cpu(s): 98.5%us,  1.2%sy,  0.0%ni,  0.3%id,  0.0%wa,  0.0%hi,  0.0%si,  0.0%st
+#   PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+# 23456 webapp    20   0 5123456 2.3g  123456 S 850.0 15.2   1234:56 python3
+
+# Identify which process
+ps aux --sort=-%cpu | head -10
+
+# Check what process is doing
+strace -p 23456 -c
+# After 10 seconds, Ctrl+C to see summary:
+# % time     seconds  usecs/call     calls    errors syscall
+# ------ ----------- ----------- --------- --------- ----------------
+#  99.8    9.985000           100     99850           read
+
+# Check open files (suspect reading from network)
+lsof -p 23456 | head -20
+```
+
+**Root Cause:** A Python scraper had an infinite loop calling `read()` on a socket with no data, burning CPU in a tight loop without yielding.
+
+**Fix:**
+```bash
+# Kill the process
+kill -TERM 23456
+# If graceful shutdown doesn't work:
+kill -9 23456
+
+# Verify load returns to normal
+uptime
+# Output: load average: 0.45, 0.62, 0.78
+```
+
+**Prevention:**
+- Set CPU limits via cgroups
+- Implement timeout in application code
+- Add process monitoring with automatic restart
+
+---
+
+### Scenario 2: Disk Full Due to Log Explosion
+
+**Symptom:** Service failing to write logs, containers unable to start, database writes failing.
+
+**Diagnostic Commands:**
+```bash
+# Check disk usage
+df -h
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/sda1       100G   98G    2G  98% /
+
+# Find largest directories
+du -sh /* 2>/dev/null | sort -h | tail -10
+# Output:
+# /var     45G
+# /tmp     30G
+# /opt     20G
+
+# Find large files in /var
+find /var -type f -size +100M -exec ls -lh {} \;
+# Output:
+# -rw-r----- 1 rootadm  15G Jun 16 14:00 /var/log/nginx/access.log
+# -rw-r----- 1 rootadm  12G Jun 16 14:00 /var/log/nginx/error.log
+
+# Check for many small files (inode exhaustion)
+df -i
+# Inodes filesystem      Size  Used Avail Use% Mounted on
+# Inodes /dev/sda1       6.5M    6.5M     0 100% /
+```
+
+**Root Cause:** Logrotate configuration was missing for nginx, and access logging was writing to a file growing at 10GB/day due to a DDoS attack.
+
+**Fix:**
+```bash
+# Stop the service writing logs
+systemctl stop nginx
+
+# Truncate the log file (don't delete - keep file handle)
+truncate -s 100M /var/log/nginx/access.log
+
+# Or compress and start fresh
+gzip /var/log/nginx/access.log
+systemctl start nginx
+
+# Clean up archived logs
+journalctl --vacuum-size=100M
+
+# Verify space freed
+df -h
+```
+
+**Prevention:**
+```bash
+# Configure logrotate for nginx
+cat /etc/logrotate.d/nginx
+/var/log/nginx/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    prerotate
+        if [ -d /etc/logrotate.d/httpd-prerotate ]; then \
+            run-parts /etc/logrotate.d/httpd-prerotate; \
+        fi
+    endscript
+    postrotate
+        invoke-rc.d nginx rotate > /dev/null 2>&1
+    endscript
+}
+```
+
+---
+
+### Scenario 3: Network Latency Spike
+
+**Symptom:** Application logs show latency increasing, but CPU and memory are normal.
+
+**Diagnostic Commands:**
+```bash
+# Check for packet loss and latency
+ping -c 10 api.internal
+# PING api.internal (10.0.5.10) 56(84) bytes of data.
+# 64 bytes from 10.0.5.10: icmp_seq=1 ttl=64 time=0.5 ms
+# 64 bytes from 10.0.5.10: icmp_seq=5 ttl=64 time=150.2 ms  ← Latency spike!
+# 64 bytes from 10.0.5.10: icmp_seq=6 ttl=64 time=152.1 ms  ← Confirmed!
+
+# Check network interface errors
+ip -s link show eth0
+# RX: bytes packets errors dropped overrun mcast
+#     123456789 1234567 0       0       0
+# TX: bytes packets errors dropped carrier collsns
+#     987654321 987654    0      1234    0    ← TX drops!
+
+# Check connection tracking table (NAT)
+conntrack -L | wc -l
+# 500000  ← Very high!
+
+# Check for NIC ring buffer issues
+ethtool -g eth0
+# Ring parameters for eth0:
+# Pre-set maximums:
+# RX:             4096
+# RX Mini:        0
+# RX Jumbo:       0
+# TX:             4096
+# Current settings:
+# RX:             256    ← Too small!
+# TX:             256
+```
+
+**Root Cause:** Connection tracking table was full (500k connections), causing connection tracking delay. Additionally, NIC ring buffer was too small, causing packet drops.
+
+**Fix:**
+```bash
+# Increase connection tracking limit
+echo 1000000 > /proc/sys/net/netfilter/nf_conntrack_max
+sysctl -w net.netfilter.nf_conntrack_max=1000000
+
+# Increase NIC ring buffer
+ethtool -G eth0 rx 4096 tx 4096
+
+# Make persistent
+echo "options eth0 rx=4096 tx=4096" > /etc/modprobe.d/igb.conf
+```
+
+**Prevention:**
+- Monitor connection tracking table size
+- Set up alerting when conntrack approaches limit
+- Size ring buffers appropriately for workload
+
+---
+
+### Scenario 4: OOM Kill Event Recovery
+
+**Symptom:** Container was killed, application restarted automatically, users experienced brief outage.
+
+**Diagnostic Commands:**
+```bash
+# Check for OOM killer events
+dmesg -T | grep -E "killed process|Out of memory"
+# Output:
+# [Mon Jun 16 10:32:15 2026] Out of memory: Killed process 5678 (java) total-vm:8292344kB, anon-rss:4096128kB, file-rss:0kB
+
+# Check container metrics before restart
+crictl stats 5678abc
+# (shows memory usage spike before kill)
+
+# Check application logs for the crash
+docker logs 5678abc --tail 100
+# Output:
+# java.lang.OutOfMemoryError: Java heap space
+#     at java.util.Arrays.copyOf(Arrays.java)
+#     at java.util.ArrayList.grow(ArrayList.java:)
+
+# Check memory limits on container
+kubectl describe pod myapp-xyz | grep -A 10 "Limits"
+# Limits:
+#   memory: 512Mi
+#   cpu: 500m
+# Requests:
+#   memory: 256Mi
+#   cpu: 100m
+
+# Check node memory pressure
+kubectl describe node worker-1 | grep -A 5 "Memory"
+# Allocatable:
+#   memory: 16234567Ki
+# Allocated resources:
+#   memory: 15000000Ki  (92% allocated)
+```
+
+**Root Cause:** Java application had JVM heap set to 2GB but container memory limit was 512MB. When heap exceeded limit, Linux OOM killer terminated the process.
+
+**Fix:**
+```bash
+# Temporarily increase memory limit
+kubectl patch deployment myapp -p '{"spec":{"template":{"spec":{"containers":[{"name":"myapp","resources":{"limits":{"memory":"4Gi"}}}]}}}}'
+
+# For immediate fix without restart:
+kubectl set resources deployment myapp --limits=memory=4Gi
+
+# Update application JVM settings
+env:
+  - name: JAVA_OPTS
+    value: "-Xmx2g -Xms2g"
+# And set container limit to >= 3Gi (JVM heap + native memory + OS)
+```
+
+**Prevention:**
+- Set container memory limit >= JVM heap + 1GB overhead
+- Use `-XX:+UseContainerSupport` in JVM 10+
+- Monitor memory usage trends, not just current value
+- Set up pre-OOM alerting
+
+---
+
+### Scenario 5: System Hang Diagnosis
+
+**Symptom:** Server unresponsive to SSH, no console output, but power light on. Hard reboot required.
+
+**Diagnostic Commands:**
+*Note: These must be run before the hang or recovered from crash dump*
+
+```bash
+# After reboot, check logs for clues
+journalctl -b -1 --no-pager | tail -100
+
+# Check for kernel panic
+dmesg | grep -E "panic|Oops|Bug"
+# Output:
+# [  123.456789] BUG: unable to handle kernel NULL pointer dereference at 0000000000000020
+# [  123.456890] IP: [<ffffffff81234567>] proc_sys_call+0x20/0x50
+
+# Check for hardware errors
+dmesg | grep -iE "hardware error|memory error|pci error|bus error"
+
+# Check disk for issues
+dmesg | grep -iE "sd[a-z]|disk|ata|scsi"
+
+# Enable NMI watchdog for future hangs
+echo 1 > /proc/sys/kernel/nmi_watchdog
+```
+
+**Root Cause:** Kernel bug in a third-party driver caused a kernel panic when handling a specific I/O pattern. The driver had not been updated in 2 years and was incompatible with kernel 5.15+.
+
+**Fix:**
+```bash
+# Update problematic driver
+apt-get update && apt-get install -y driver-updates
+
+# If no update available, blacklist module
+echo "blacklist problematic_module" > /etc/modprobe.d/blacklist.conf
+
+# Update kernel
+apt-get install linux-image-generic-hwe-22.04
+
+# Reboot
+reboot
+```
+
+**Prevention:**
+- Keep kernel and drivers updated
+- Enable kernel panic watchdog
+- Use crash dump configuration for post-mortem analysis
+- Test driver compatibility before kernel updates
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Service Won't Start
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: CHECK SERVICE STATUS                                │
+├─────────────────────────────────────────────────────────────┤
+│ $ systemctl status nginx                                    │
+│ ● nginx.service - A high performance web server            │
+│    Loaded: loaded (/lib/systemd/system/nginx.service)      │
+│    Active: failed (Result: exit-code) since Mon 2026...   │
+│                                                              │
+│ Result: Note the "Active" state and any error message      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK LOGS                                          │
+├─────────────────────────────────────────────────────────────┤
+│ $ journalctl -u nginx --no-pager --lines=50                 │
+│                                                              │
+│ Look for:                                                    │
+│ - Address already in use (port conflict)                    │
+│ - Permission denied (file access)                          │
+│ - Configuration error (syntax check failed)                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: VALIDATE CONFIGURATION                              │
+├─────────────────────────────────────────────────────────────┤
+│ $ nginx -t                                                   │
+│ nginx: [emerg] still could not bind()                       │
+│                                                              │
+│ If config is valid but still fails:                         │
+│ $ ss -tulnp | grep :80                                      │
+│ Find what's using port 80                                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK DEPENDENCIES                                  │
+├─────────────────────────────────────────────────────────────┤
+│ $ systemctl status postgresql                               │
+│ Is the database running?                                     │
+│ Can nginx connect to upstream?                              │
+│ $ curl localhost:5000/health                                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 5: TRY STARTING MANUALLY                               │
+├─────────────────────────────────────────────────────────────┤
+│ $ /usr/sbin/nginx -g "daemon off;"                          │
+│                                                              │
+│ More verbose output helps identify issues                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: High System Load
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: IDENTIFY LOAD TYPE                                  │
+├─────────────────────────────────────────────────────────────┤
+│ $ uptime                                                     │
+│ $ top                                                       │
+│                                                              │
+│ High user CPU? → Application bug or high traffic            │
+│ High system CPU? → Kernel/driver issue or I/O               │
+│ High I/O wait?  → Disk bottleneck or NFS issue              │
+│ High idle?      → Process blocking (check D state)          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: FIND RESOURCE-CONSUMING PROCESSES                   │
+├─────────────────────────────────────────────────────────────┤
+│ $ ps aux --sort=-%cpu | head                               │
+│ $ htop (interactive)                                        │
+│                                                              │
+│ Focus on processes with %CPU > 100% (multi-threaded)        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: INVESTIGATE SUSPICIOUS PROCESS                      │
+├─────────────────────────────────────────────────────────────┤
+│ # What files does it have open?                            │
+│ $ lsof -p <pid>                                            │
+│                                                              │
+│ # What system calls is it making?                          │
+│ $ strace -p <pid> -c  # summary                            │
+│ $ strace -p <pid>  # live                                  │
+│                                                              │
+│ # What is in its memory?                                   │
+│ $ cat /proc/<pid>/maps                                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK FOR EXTERNAL CAUSES                          │
+├─────────────────────────────────────────────────────────────┤
+│ # Network issues?                                          │
+│ $ ss -s                                                    │
+│                                                              │
+│ # Disk I/O?                                                │
+│ $ iostat -x 1                                              │
+│                                                              │
+│ # Memory pressure?                                         │
+│ $ vmstat 1                                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error Message | Cause | Fix |
+|--------------|-------|-----|
+| `Permission denied` | Wrong file ownership or mode | `chown user:group file; chmod 640 file` |
+| `Too many open files` | File descriptor limit reached | Increase `ulimit -n`, check `max-open-files` |
+| `Address already in use` | Port occupied by another process | `ss -tulnp \| grep :PORT`, kill or reconfigure |
+| `No space left on device` | Disk full | `df -h`, remove files, configure log rotation |
+| `Cannot allocate memory` | Memory exhausted or OOM | Check `dmesg \| grep -i oom`, add swap or memory |
+| `Segmentation fault` | Application crash, possibly memory corruption | Check `dmesg`, run with debugger |
+| `I/O error` | Disk failure or NFS timeout | Check `dmesg`, run `smartctl -a`, check NFS |
+| `Connection refused` | Nothing listening on port | Verify service running, check firewall |
+
+## Monitoring / Log Analysis
+
+### Key Metrics to Monitor
+
+| Metric | Warning Threshold | Critical Threshold |
+|--------|-------------------|-------------------|
+| Load Average | > CPU cores | > 2x CPU cores |
+| CPU User | > 80% | > 95% |
+| Memory Used | > 85% | > 95% |
+| Swap Used | > 10% | > 50% |
+| Disk Used | > 80% | > 90% |
+| Disk I/O Wait | > 20% | > 50% |
+| Established Connections | > 80% of limit | > 95% of limit |
+
+### Log Analysis Commands
+
+```bash
+# Real-time error monitoring
+journalctl -f -p err
+
+# Search for patterns across all logs
+grep -r "ERROR" /var/log/services/ | awk -F: '{print $1}' | sort | uniq
+
+# Find all 5xx errors in access log
+awk '$9 >= 500 {print $7, $9}' /var/log/nginx/access.log | sort | uniq -c
+
+# Correlate timestamps during incident
+grep "2026-06-16 14:3" /var/log/*.log | sort
+```
+
+## Interview Questions
+
+### Question 1: System Resource Analysis
+
+**Q:** A server has 99% CPU usage but your application is single-threaded. How do you utilize all 8 cores?
+
+**A:** The application needs to be modified to use multiple processes or threads. Options include:
+1. Running multiple instances with a load balancer
+2. Using multi-threading if the runtime supports it
+3. Using worker processes (like Nginx/Apache do)
+4. Horizontal scaling across multiple servers
+
+**Follow-up:** How do you limit CPU usage of a runaway process?
+```bash
+# Using cgroups v2
+cgcreate -g cpu:/limited
+echo 50000 > /sys/fs/cgroup/limited/cpu.max
+echo <pid> > /sys/fs/cgroup/limited/cgroup.procs
+```
+
+### Question 2: Memory Debugging
+
+**Q:** How do you diagnose a memory leak in a production Linux server?
+
+**A:**
+1. Establish baseline: `free -h` and `ps aux` at known good state
+2. Monitor over time: compare memory growth without corresponding process count growth
+3. Identify leaking process: `ps aux --sort=-rss | head`
+4. For Java: enable GC logs, use `jmap` to capture heap dumps
+5. For C/C++: use `valgrind --leak-check=full`
+6. For any process: `cat /proc/<pid>/smaps` shows detailed memory regions
+
+### Question 3: System Hang Recovery
+
+**Q:** Server is completely unresponsive. SSH times out, console shows nothing. What do you do?
+
+**A:**
+1. If IPMI/iLO/DRAC available: capture hardware status, trigger NMI (Non-Maskable Interrupt) for crash dump
+2. Wait - sometimes it recovers from momentary freeze
+3. Physical access: check power, network link lights, hard reset button
+4. After recovery: check `journalctl -b -1` for previous boot logs, `dmesg | grep -i panic`
+5. Enable NMI watchdog to catch future hangs: `echo 1 > /proc/sys/kernel/nmi_watchdog`
+6. Configure kdump for kernel crash dumps
+
+## Cheat Sheet
+
+| Command | Purpose | Key Flag |
+|---------|---------|----------|
+| `top` | Process monitor | `-p PID` to watch specific process |
+| `htop` | Enhanced top | Interactive, color-coded |
+| `vmstat` | Memory/CPU stats | `vmstat 1` for continuous |
+| `iostat` | Disk I/O | `-x` for extended stats |
+| `free` | Memory | `-h` for human-readable |
+| `ss` | Network sockets | `-tulnp` for listening |
+| `lsof` | Open files | `-i :PORT` for port lookup |
+| `strace` | System calls | `-p PID -c` for summary |
+| `perf` | CPU profiling | `perf top` for live |
+| `dmesg` | Kernel logs | `-T` for timestamps |
+| `journalctl` | Systemd logs | `-u SERVICE` for unit |
+| `tcpdump` | Packet capture | `-i ETH0 -w FILE` |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [Methodology](./methodology) - Systematic debugging approach
+- [Network Troubleshooting](./network-troubleshooting) - Network-specific debugging
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - Container orchestration
+- [Common Issues](./common-issues) - Frequently occurring problems

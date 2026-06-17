@@ -1,0 +1,639 @@
+# Managed Instance Groups (MIG)
+
+## Overview
+
+Managed Instance Groups (MIGs) provide high availability and autoscaling for groups of identical VM instances. A MIG ensures that the desired number of instances are running and healthy, automatically replacing failed instances and distributing instances across zones for resilience. They are the foundation for running scalable, reliable workloads on Compute Engine.
+
+MIGs work with instance templates to define the configuration for each instance in the group. When you update a MIG (e.g., change the machine type or image), it performs a rolling update that gradually replaces instances with new ones, ensuring continuous availability. MIGs also support stateful workloads through stateful disks and IPs, making them suitable for databases and stateful applications.
+
+Understanding MIGs is essential for building production systems on Compute Engine. They provide the automation needed to maintain availability and scale without manual intervention, forming the backend for load balancers and the foundation for auto-scaling web applications and APIs.
+
+## When To Use
+
+- **Highly available applications**: Multiple instances across zones with automatic healing
+- **Auto-scaling workloads**: Web applications, APIs, batch processing
+- **Rolling updates**: Deploy new versions without downtime
+- **Load balancer backends**: Distribute traffic across multiple instances
+- **Stateful applications**: Databases with persistent disks
+- **Mission-critical workloads**: Automatic instance replacement on failures
+
+## When NOT To Use
+
+- **Single instance workloads**: MIGs add complexity for single VMs
+- **Heterogeneous workloads**: Use separate MIGs for different configurations
+- **Truly stateless microservices**: Consider Cloud Run for simpler management
+- **One-time batch jobs**: Use preemptible instances or Batch
+
+## Architecture
+
+**MIG Architecture:**
+```
+Regional MIG (us-central)
+├── Zone: us-central1-a
+│   ├── Instance: instance-1 (RUNNING)
+│   ├── Instance: instance-2 (RUNNING)
+│   └── Instance: instance-3 (CREATING)
+├── Zone: us-central1-b
+│   ├── Instance: instance-4 (RUNNING)
+│   └── Instance: instance-5 (RUNNING)
+└── Zone: us-central1-c
+    └── Instance: instance-6 (RUNNING)
+
+Instance Template: web-template-v2
+└── Machine Type: e2-medium
+└── Image: my-app:v2
+```
+
+**MIG Types:**
+| Type | Coverage | Use Case |
+|------|----------|----------|
+| Regional MIG | Multiple zones | Production (recommended) |
+| Zonal MIG | Single zone | Specific zone requirements |
+
+**Autoscaling Modes:**
+| Mode | Behavior |
+|------|----------|
+| OFF | No autoscaling, fixed size |
+| ON | Scale based on metrics |
+| ONLY_SCALE_OUT | Scale up only, never scale down |
+
+## Core Concepts
+
+### Creating Instance Templates
+
+```bash
+# Basic template
+gcloud compute instance-templates create web-template \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --tags=web-server
+
+# Template with custom specs
+gcloud compute instance-templates create web-template \
+    --machine-type=n2-standard-4 \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --boot-disk-size=100GB \
+    --boot-disk-type=pd-ssd \
+    --network=prod-vpc \
+    --subnet=web-subnet \
+    --region=us-central1 \
+    --service-account=app-sa@my-project.iam.gserviceaccount.com \
+    --scopes=cloud-platform \
+    --tags=web-server \
+    --metadata=startup-script='#!/bin/bash
+      apt-get update && apt-get install -y nginx
+      systemctl start nginx'
+
+# Template with preemptible instances
+gcloud compute instance-templates create batch-template \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --preemptible \
+    --restart-on-failure
+
+# Template with GPU
+gcloud compute instance-templates create gpu-template \
+    --machine-type=a2-highgpu-1g \
+    --accelerator=type=nvidia-tesla-t4,count=1 \
+    --image-family=tf-2-11-cu113 \
+    --image-project=deeplearning-platform-release \
+    --boot-disk-size=100GB \
+    --boot-disk-type=pd-ssd
+
+# Template with custom network settings
+gcloud compute instance-templates create web-template \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --network-interface=network=prod-vpc,subnet=web-subnet,private-network-ip=10.0.1.10 \
+    --no-address
+
+# Template with reservation affinity
+gcloud compute instance-templates create web-template \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --reservation-affinity=specific \
+    --reservation=my-reservation
+
+# List templates
+gcloud compute instance-templates list
+
+# Delete template
+gcloud compute instance-templates delete web-template
+```
+
+### Creating Managed Instance Groups
+
+```bash
+# Create regional MIG
+gcloud compute instance-groups managed create web-mig \
+    --template=web-template \
+    --size=3 \
+    --region=us-central1 \
+    --distribution-policy-zones=us-central1-a,us-central1-b,us-central1-c \
+    --distribution-policy-target-shape=MULTI_ZONE
+
+# Create zonal MIG
+gcloud compute instance-groups managed create web-mig \
+    --template=web-template \
+    --size=2 \
+    --zone=us-central1-a
+
+# Create MIG with specific instance naming
+gcloud compute instance-groups managed create web-mig \
+    --template=web-template \
+    --size=3 \
+    --region=us-central1 \
+    --instance-naming-scheme=PER_MIG_INSTANCE \
+    --base-instance-name=web
+
+# Create MIG with stateful configuration
+gcloud compute instance-groups managed create stateful-mig \
+    --template=stateful-template \
+    --size=2 \
+    --region=us-central1 \
+    --stateful-disk=device-name=data-disk,source-disk=my-disk,auto-delete=never
+```
+
+### Autoscaling Configuration
+
+```bash
+# Enable autoscaling based on CPU
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --min-num-replicas=2 \
+    --max-num-replicas=10 \
+    --target-cpu-utilization=0.6 \
+    --cool-down-period=90
+
+# Autoscaling based on load balancing utilization
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --min-num-replicas=2 \
+    --max-num-replicas=10 \
+    --target-load-balancing-utilization=0.8 \
+    --cool-down-period=60
+
+# Autoscaling based on multiple metrics
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --min-num-replicas=2 \
+    --max-num-replicas=10 \
+    --scale-based-on-metric=CPU \
+    --target-cpu-utilization=0.7 \
+    --scale-based-on-metric=LOAD_BALANCER \
+    --target-load-balancing-utilization=0.8
+
+# Autoscaling with custom metrics (using cloud monitoring)
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --min-num-replicas=2 \
+    --max-num-replicas=10 \
+    --metric=custom.googleapis.com/my_app/request_count \
+    --target-custom-metric-utilization=100 \
+    --utilization-target-type=GAUGE \
+    --cool-down-period=90
+
+# Disable autoscaling
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --autoscaling-mode=OFF
+
+# Scale out only
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --autoscaling-mode=ONLY_SCALE_OUT
+```
+
+### Managing MIG Size
+
+```bash
+# Resize MIG (set exact size)
+gcloud compute instance-groups managed resize web-mig \
+    --region=us-central1 \
+    --size=5
+
+# Recreate instances (force recreation)
+gcloud compute instance-groups managed recreate-instances web-mig \
+    --region=us-central1 \
+    --instances=web-mig-abc123,web-mig-def456
+
+# Delete specific instances
+gcloud compute instance-groups managed delete-instances web-mig \
+    --region=us-central1 \
+    --instances=web-mig-abc123
+
+# List instances in MIG
+gcloud compute instance-groups managed list-managed-instances web-mig \
+    --region=us-central1
+
+# Get instance status
+gcloud compute instance-groups managed get-ancestors web-mig \
+    --zone=us-central1-a \
+    --instance=web-mig-abc123
+```
+
+### Rolling Updates
+
+```bash
+# Perform rolling update (gradual replacement with new template)
+gcloud compute instance-groups managed rolling-action restart web-mig \
+    --region=us-central1 \
+    --max-surge=1 \
+    --max-unavailable=0
+
+# Rolling restart with timing
+gcloud compute instance-groups managed rolling-action restart web-mig \
+    --region=us-central1 \
+    --min-action-duration=60s \
+    --max-surge=2 \
+    --max-unavailable=1
+
+# Update instances with new template
+gcloud compute instance-groups managed update-instances web-mig \
+    --region=us-central1 \
+    --minimal-action=replace \
+    --max-surge=2 \
+    --zone=us-central1-a
+
+# Start instance rediscovery
+gcloud compute instance-groups managed start-update web-mig \
+    --region=us-central1 \
+    --version=template=web-template-v2
+```
+
+### Health Checks
+
+```bash
+# Create health check
+gcloud compute health-checks create http http-health-check \
+    --port=80 \
+    --request-path=/healthz \
+    --check-interval=10 \
+    --timeout=5 \
+    --healthy-threshold=2 \
+    --unhealthy-threshold=3
+
+# Apply health check to MIG
+gcloud compute instance-groups managed set-health-check web-mig \
+    --region=us-central1 \
+    --health-check=http-health-check \
+    --initial-delay=60
+
+# Check instance health
+gcloud compute instance-groups managed list-managed-instances web-mig \
+    --region=us-central1 \
+    --format="table(name,status,currentAction,zone)"
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Instances per regional MIG | 2,000 |
+| Instances per zonal MIG | 1,000 |
+| Instance templates per project | 1,000 |
+| Autoscaling metrics per MIG | 5 |
+
+### Key Gotchas
+
+- **Instance templates are immutable**—create new template for changes
+- **Rolling updates take time**—plan for the total update duration
+- **Autoscaling has cool-down**—prevents oscillation, don't set too short
+- **Stateful MIGs require careful planning**—stateful disks/IPs need special handling
+- **Health check timing matters**—too aggressive will cause false failures
+- **max-surge and max-unavailable** balance speed vs availability
+- **MIG auto-healing can cause recreation**—understand health check behavior
+
+## Real Production Example
+
+Production MIG setup:
+
+```bash
+#!/bin/bash
+set -e
+
+# 1. Create network and subnets
+gcloud compute networks create prod-vpc --subnet-mode=custom
+gcloud compute networks subnets create web-subnet \
+    --network=prod-vpc --region=us-central1 --range=10.0.1.0/24
+
+# 2. Create firewall rules
+gcloud compute firewall-rules create allow-health-checks \
+    --network=prod-vpc --allow=tcp:80,tcp:443 \
+    --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+    --target-tags=web-server
+
+gcloud compute firewall-rules create allow-internal \
+    --network=prod-vpc --allow=tcp,udp,icmp --source-ranges=10.0.0.0/8
+
+# 3. Create health check
+gcloud compute health-checks create http http-hc \
+    --port=80 --request-path=/healthz --check-interval=10 --timeout=5
+
+# 4. Create instance template
+gcloud compute instance-templates create web-template-v1 \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --boot-disk-size=50GB \
+    --boot-disk-type=pd-ssd \
+    --network=prod-vpc \
+    --subnet=web-subnet \
+    --tags=web-server \
+    --metadata=startup-script='#!/bin/bash
+        apt-get update -y
+        apt-get install -y nginx
+        systemctl start nginx'
+
+# 5. Create regional MIG
+gcloud compute instance-groups managed create web-mig \
+    --template=web-template-v1 \
+    --size=3 \
+    --region=us-central1 \
+    --distribution-policy-zones=us-central1-a,us-central1-b,us-central1-c \
+    --health-check=http-hc \
+    --initial-delay=60
+
+# 6. Configure autoscaling
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --min-num-replicas=3 \
+    --max-num-replicas=20 \
+    --target-cpu-utilization=0.7 \
+    --cool-down-period=90
+
+# 7. Create load balancer (use MIG as backend)
+gcloud compute backend-services create web-backend \
+    --protocol=HTTP --port-name=http --health-checks=http-hc --global
+
+gcloud compute backend-services add-backend web-backend \
+    --instance-group=web-mig --instance-group-region=us-central1 --global
+
+gcloud compute url-maps create web-map --default-service=web-backend --global
+
+gcloud compute target-https-proxies create https-proxy \
+    --url-map=web-map --ssl-certificates=my-cert --global
+
+gcloud compute forwarding-rules create https-rule \
+    --global --target-https-proxy=https-proxy --ports=443 --address=my-ip
+
+# 8. Perform rolling update
+gcloud compute instance-templates create web-template-v2 \
+    --machine-type=n2-standard-4 \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --boot-disk-size=50GB \
+    --boot-disk-type=pd-ssd \
+    --network=prod-vpc \
+    --subnet=web-subnet \
+    --tags=web-server \
+    --metadata=startup-script='#!/bin/bash
+        apt-get update -y
+        apt-get install -y nginx
+        systemctl start nginx
+        echo "v2" > /var/www/html/version'
+
+gcloud compute instance-groups managed update-instances web-mig \
+    --region=us-central1 \
+    --version=template=web-template-v2 \
+    --minimal-action=refresh \
+    --max-surge=1 \
+    --max-unavailable=0
+```
+
+```hcl
+# Terraform: Production MIG
+resource "google_compute_instance_template" "web" {
+  name           = "web-template"
+  machine_type   = "e2-medium"
+  can_ip_forward = false
+
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 50
+    disk_type    = "pd-ssd"
+  }
+
+  network_interface {
+    network    = "prod-vpc"
+    subnetwork = "web-subnet"
+  }
+
+  tags = ["web-server"]
+
+  metadata = {
+    startup-script = <<-EOF
+      #!/bin/bash
+      apt-get update -y
+      apt-get install -y nginx
+    EOF
+  }
+}
+
+resource "google_compute_health_check" "http" {
+  name               = "http-health-check"
+  check_interval_sec = 10
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
+
+  http_health_check {
+    port               = 80
+    request_path       = "/healthz"
+  }
+}
+
+resource "google_compute_region_instance_group_manager" "web_mig" {
+  name               = "web-mig"
+  region             = "us-central1"
+  instance_template  = google_compute_instance_template.web.id
+  target_size        = 3
+
+  distribution_policy_target_shape = "MULTI_ZONE"
+  
+  health_check {
+    check_interval_sec  = 10
+    timeout_sec         = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    http_health_check {
+      port = 80
+    }
+  }
+}
+
+resource "google_compute_region_autoscaler" "web_autoscaler" {
+  name   = "web-autoscaler"
+  target = google_compute_region_instance_group_manager.web_mig.id
+  region = "us-central1"
+
+  autoscaling_policy {
+    min_replicas    = 3
+    max_replicas    = 20
+    cooldown_period = 90
+
+    cpu_utilization {
+      target = 0.7
+    }
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Instance Templates
+gcloud compute instance-templates create NAME [FLAGS]
+gcloud compute instance-templates list
+gcloud compute instance-templates delete NAME
+
+# Managed Instance Groups
+gcloud compute instance-groups managed create NAME --template=TEMPLATE --size=N --region=REG
+gcloud compute instance-groups managed resize NAME --region=REG --size=N
+gcloud compute instance-groups managed set-autoscaling NAME --region=REG [FLAGS]
+gcloud compute instance-groups managed list-managed-instances NAME --region=REG
+
+# Rolling Updates
+gcloud compute instance-groups managed update-instances NAME --region=REG --version=TEMPLATE [FLAGS]
+gcloud compute instance-groups managed rolling-action restart NAME --region=REG [FLAGS]
+
+# Health Checks
+gcloud compute health-checks create http NAME --port=80 --request-path=/healthz
+```
+
+## Terraform Example
+
+```hcl
+# Complete MIG with autoscaling
+resource "google_compute_instance_template" "app" {
+  name           = "app-template"
+  machine_type   = "e2-standard-2"
+  
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+  }
+
+  network_interface {
+    network    = "prod-vpc"
+    subnetwork = "web-subnet"
+  }
+}
+
+resource "google_compute_region_instance_group_manager" "app_mig" {
+  name              = "app-mig"
+  region            = "us-central1"
+  instance_template = google_compute_instance_template.app.id
+  target_size       = 3
+}
+
+resource "google_compute_region_autoscaler" "app" {
+  name   = "app-autoscaler"
+  target = google_compute_region_instance_group_manager.app_mig.id
+  region = "us-central1"
+
+  autoscaling_policy {
+    min_replicas    = 2
+    max_replicas    = 10
+    cooldown_period = 90
+
+    cpu_utilization {
+      target = 0.6
+    }
+  }
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create MIG | `gcloud compute instance-groups managed create NAME --template=TPL --size=N --region=REG` |
+| Resize | `gcloud compute instance-groups managed resize NAME --region=REG --size=N` |
+| Autoscaling | `gcloud compute instance-groups managed set-autoscaling NAME --region=REG [FLAGS]` |
+| List instances | `gcloud compute instance-groups managed list-managed-instances NAME --region=REG` |
+| Rolling update | `gcloud compute instance-groups managed update-instances NAME --region=REG --version=TPL` |
+
+## Monitoring
+
+```bash
+# List autoscaler status
+gcloud compute instance-groups managed describe web-mig --region=us-central1
+
+# Get instance health
+gcloud compute instance-groups managed list-managed-instances web-mig --region=us-central1
+```
+
+## Security
+
+- Use service accounts with minimal permissions
+- Apply least-privilege IAM to instance templates
+- Use shielded VMs for enhanced security
+- Enable VPC firewall rules properly
+- Use OS Login instead of SSH keys
+
+## Cost Optimization
+
+| Strategy | Savings |
+|----------|---------|
+| Committed use discounts | 60-70% |
+| Preemptible instances | 70% |
+| Rightsizing via autoscaling | 30-50% |
+| Multi-zone distribution | Better utilization |
+
+## Troubleshooting
+
+```bash
+# Instance stuck creating
+gcloud compute instance-groups managed list-managed-instances web-mig --region=REG
+
+# Autoscaling not working
+gcloud compute instance-groups managed describe web-mig --region=REG
+
+# Health check failing
+gcloud compute health-checks describe http-hc
+```
+
+## Interview Questions
+
+1. **What's the difference between regional and zonal MIGs?**
+2. **How does autoscaling work in MIGs?**
+3. **Explain rolling updates and how they maintain availability.**
+4. **How do you configure health checks for auto-healing?**
+
+## Cheat Sheet
+
+```
+# MIG Commands
+gcloud compute instance-groups managed create NAME --template=TPL --size=N --region=REG
+gcloud compute instance-groups managed resize NAME --region=REG --size=N
+gcloud compute instance-groups managed set-autoscaling NAME --region=REG --min=N --max=M --target-cpu-utilization=0.X
+gcloud compute instance-groups managed update-instances NAME --region=REG --version=template=NEW_TPL
+
+# Template Commands
+gcloud compute instance-templates create NAME [FLAGS]
+gcloud compute instance-templates list
+```
+
+## Labs
+
+1. Create instance template and MIG
+2. Configure autoscaling
+3. Perform rolling update
+4. Set up health checks
+5. Connect MIG to load balancer
+
+## Related Services
+
+- [Compute Engine](./compute-engine)
+- [Load Balancer](../network/load-balancer)
+- [GKE](./gke)
+- [Cloud Run](./cloud-run)

@@ -1,0 +1,8 @@
+{
+  "label": "SRE",
+  "position": 9,
+  "link": {
+    "type": "generated-index",
+    "description": "SLIs, SLOs, error budgets, monitoring, alerting, and incident response for cloud-native systems."
+  }
+}

@@ -1,0 +1,753 @@
+---
+title: "Kubernetes Jobs"
+description: "Complete guide to Kubernetes Jobs and CronJobs - running batch workloads and scheduled tasks"
+sidebar_position: 14
+---
+
+# Kubernetes Jobs
+
+## Overview
+
+A **Job** creates one or more Pods and ensures that a specified number of them successfully complete. Jobs are ideal for running one-time tasks like batch processing, database migrations, or report generation. For recurring jobs, use **CronJobs** which create Jobs on a schedule.
+
+## When to Use
+
+- **Batch processing** - data transformations, ETL pipelines
+- **Database migrations** - schema updates, data backfills
+- **Report generation** - daily/weekly/monthly reports
+- **One-time scripts** - cleanup tasks, backups
+- **Parallel computation** - work queue processing
+- **CI/CD pipelines** - build and deployment tasks
+
+## When NOT to Use
+
+- **Long-running services** - use Deployments
+- **Continuous workloads** - use Deployments or StatefulSets
+- **Human-triggered tasks** - consider a separate API/service
+- **Very short tasks** - overhead may exceed execution time
+
+## Core Concepts
+
+### Job Types
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Job Patterns                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Non-Parallel Job:                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  completions: 1                                                      │   │
+│  │  parallelism: 1                                                      │   │
+│  │  → Creates one pod, succeeds when it completes                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Parallel Job with Fixed Completion Count:                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  completions: 5                                                      │   │
+│  │  parallelism: 2                                                      │   │
+│  │  → Creates pods until 5 have succeeded                              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Parallel Job with Work Queue:                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  completions: (not set)                                              │   │
+│  │  parallelism: 5                                                      │   │
+│  │  → Creates up to 5 pods, job completes when any pod succeeds        │   │
+│  │    and the work queue is empty                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Job vs CronJob
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Job vs CronJob                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Job (one-time)                                                              │
+│  └──────────────────────────────────────────────────────────────────────    │
+│  │  Created → Pods run → Succeed/Fail → Job complete                     │   │
+│                                                                              │
+│  CronJob (scheduled)                                                         │
+│  └──────────────────────────────────────────────────────────────────────    │
+│  │  Schedule: * * * * *                                                   │   │
+│  │    └─ Creates Job                                                      │   │
+│  │         └─ Creates Pods → Run → Complete                              │   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### Job Controller Logic
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Job Controller Flow                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Job Created                                                              │
+│     - Set desired completions, parallelism                                   │
+│     - Job controller creates Pods                                            │
+│                                                                              │
+│  2. Pod Execution                                                            │
+│     - Create pods based on parallelism                                       │
+│     - Wait for completions                                                   │
+│                                                                              │
+│  3. Completion Check                                                         │
+│     - Count successful pods                                                  │
+│     - If completions reached → Job Succeeded                                │
+│     - If max retries reached → Job Failed                                   │
+│                                                                              │
+│  4. Cleanup                                                                  │
+│     - Keep failed/succeeded pods for debugging (TTLSecondsAfterFinished)    │
+│     - Delete pods after TTL                                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production Database Migration Job
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration-v2.3.0
+  namespace: production
+  labels:
+    app: api-service
+    version: v2.3.0
+    type: migration
+  annotations:
+    description: "Database migration for v2.3.0"
+spec:
+  # Ensure job completes successfully once
+  completions: 1
+  
+  # Run with parallelism of 1
+  parallelism: 1
+  
+  # Retry up to 3 times on failure
+  backoffLimit: 3
+  
+  # Timeout for the job
+  activeDeadlineSeconds: 600
+  
+  # TTL to clean up job after completion
+  ttlSecondsAfterFinished: 3600
+  
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: v2.3.0
+        type: migration
+    spec:
+      # Don't restart automatically
+      restartPolicy: OnFailure
+      
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+      
+      # Init container to wait for database
+      initContainers:
+      - name: wait-for-db
+        image: postgres:15-alpine
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for database to be ready..."
+          until PGPASSWORD=$DB_PASSWORD psql -h "$DB_HOST" -U "$DB_USER" -d postgres -c '\q'; do
+            echo "Database is unavailable - sleeping"
+            sleep 2
+          done
+          echo "Database is up - continuing"
+        env:
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: db-host
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: db-username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: db-password
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+      
+      containers:
+      - name: migration
+        image: gcr.io/myproject/api-service:v2.3.0
+        command: ["./run-migrations.sh"]
+        env:
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: db-host
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: db-port
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: db-name
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: db-username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: db-password
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+```
+
+### Parallel Batch Processing Job
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-processing-batch
+  namespace: production
+  labels:
+    type: batch-processing
+spec:
+  # Process 100 items
+  completions: 100
+  
+  # Process 10 items in parallel
+  parallelism: 10
+  
+  # Retry failed pods up to 5 times
+  backoffLimit: 5
+  
+  activeDeadlineSeconds: 3600
+  
+  template:
+    metadata:
+      labels:
+        type: batch-processing
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: processor
+        image: gcr.io/myproject/batch-processor:v1.0
+        command: ["./process-batch.sh"]
+        env:
+        - name: BATCH_SIZE
+          value: "10"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+```
+
+### CronJob for Daily Reports
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-report
+  namespace: production
+  labels:
+    app: reporting
+spec:
+  # Run at 2 AM daily
+  schedule: "0 2 * * *"
+  
+  # Timezone
+  timeZone: "America/New_York"
+  
+  # Concurrency policy
+  concurrencyPolicy: Forbid
+  
+  # Suspend job creation
+  suspend: false
+  
+  # Successful jobs to keep
+  successfulJobsHistoryLimit: 5
+  
+  # Failed jobs to keep
+  failedJobsHistoryLimit: 3
+  
+  # Starting deadline
+  startingDeadlineSeconds: 200
+  
+  jobTemplate:
+    metadata:
+      labels:
+        app: daily-report
+    spec:
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app: daily-report
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: report-generator
+            image: gcr.io/myproject/reporting:v2.0
+            command: ["./generate-daily-report.sh"]
+            env:
+            - name: REPORT_DATE
+              value: "$(date +\%Y-\%m-\%d)"
+            - name: OUTPUT_BUCKET
+              value: "gs://reports-bucket/daily"
+            resources:
+              requests:
+                cpu: 500m
+                memory: 512Mi
+              limits:
+                cpu: 1000m
+                memory: 2Gi
+```
+
+## YAML Examples
+
+### Basic Job
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hello-world
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: hello
+        image: busybox
+        command: ["echo", "Hello World"]
+```
+
+### Job with Multiple Parallel Pods
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: parallel-task
+spec:
+  completions: 50
+  parallelism: 10
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: task
+        image: my-task-processor:latest
+        command: ["./process.sh"]
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create Job
+kubectl apply -f job.yaml
+
+# List Jobs
+kubectl get jobs
+kubectl get job
+
+# Get Job YAML
+kubectl get job my-job -o yaml
+
+# Describe Job
+kubectl describe job my-job
+
+# Delete Job
+kubectl delete job my-job
+
+# Create CronJob
+kubectl apply -f cronjob.yaml
+
+# List CronJobs
+kubectl get cronjobs
+kubectl get cj
+
+# Get CronJob YAML
+kubectl get cronjob my-cron -o yaml
+
+# Delete CronJob
+kubectl delete cronjob my-cron
+```
+
+### Job Operations
+
+```bash
+# Watch Job progress
+kubectl get job my-job -w
+
+# Check Job status
+kubectl get job my-job -o jsonpath='{.status}'
+
+# Manual Job execution
+kubectl create job manual-job --image=busybox -- echo "manual"
+
+# Create Job from CronJob manually
+kubectl create job manual-from-cron --from=cronjob/my-cron
+
+# Scale Job (changes parallelism)
+kubectl scale job my-job --replicas=5
+
+# Suspend CronJob
+kubectl patch cronjob my-cron -p '{"spec":{"suspend":true}}'
+
+# Resume CronJob
+kubectl patch cronjob my-cron -p '{"spec":{"suspend":false}}'
+```
+
+### Debugging Jobs
+
+```bash
+# List pods for job
+kubectl get pods -l job-name=my-job
+
+# Check pod logs
+kubectl logs job/my-job
+
+# Check pod events
+kubectl describe pod <pod-name>
+
+# Check job events
+kubectl get events --field-selector involvedObject.name=my-job
+
+# Delete all completed jobs
+kubectl delete jobs -l batch.kubernetes.io/job-type=completed
+
+# Get job history (CronJob)
+kubectl get cronjob my-cron -o jsonpath='{.status.lastSuccessfulTime}'
+```
+
+## Common Commands
+
+```bash
+# Create job from command
+kubectl create job my-job --image=busybox -- echo "Hello"
+
+# Create cronjob from command
+kubectl create cronjob my-cron --image=busybox --schedule="0 * * * *" -- echo "Hourly"
+
+# Generate YAML
+kubectl create job my-job --image=my-image --dry-run=client -o yaml
+
+# Run job immediately (skip schedule)
+kubectl create job my-job --from=cronjob/my-cron
+
+# View job pods
+kubectl get pods --show-labels | grep job-name=my-job
+```
+
+## Monitoring
+
+### Job Metrics
+
+| Metric | Description |
+|--------|-------------|
+| job_created | Jobs created |
+| job_completed | Jobs completed successfully |
+| job_failed | Jobs failed |
+| kube_job_status_succeeded | Successful completions |
+| kube_job_status_failed | Failed completions |
+
+### Prometheus Queries
+
+```promql
+# Failed jobs
+count(kube_job_status_failed > 0) by (namespace, job_name)
+
+# Job completion rate
+sum(rate(kube_job_status_succeeded[5m])) / sum(rate(kube_job_status_start_time[5m]))
+
+# CronJob Missed executions
+cronjob_spec_start_time - cronjob_status_last_successful_time
+```
+
+### CronJob Management
+
+```bash
+# List CronJobs with next run time
+kubectl get cronjobs -o wide
+
+# Check CronJob history
+kubectl get jobs -l cronjob-name=my-cron
+
+# Delete old jobs from CronJob
+kubectl delete jobs -l cronjob-name=my-cron --field-selector=status.successful=1
+```
+
+## Security
+
+### RBAC for Jobs
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: job-manager
+  namespace: production
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+```
+
+### Security Context for Jobs
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    fsGroup: 10000
+  containers:
+  - name: job
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+```
+
+## Cost Optimization
+
+### Resource Requests
+
+```bash
+# Set appropriate resource requests for batch jobs
+# Consider: how long should the job run? How many parallel workers?
+```
+
+### TTL for Cleanup
+
+```yaml
+spec:
+  ttlSecondsAfterFinished: 3600  # Clean up 1 hour after completion
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Job stuck | No matching nodes, wrong image | Check nodes, image availability |
+| Pod not completing | Application error, timeout | Check logs, increase timeout |
+| Too many retries | Transient failures | Adjust backoffLimit |
+| CronJob missed | System down during schedule | Check startingDeadlineSeconds |
+
+### Diagnostic Commands
+
+```bash
+# Check job status
+kubectl get job my-job -o jsonpath='{.status}'
+
+# Check pod logs
+kubectl logs job/my-job
+
+# Check pod status
+kubectl get pods -l job-name=my-job
+
+# Describe job
+kubectl describe job my-job
+
+# Check CronJob status
+kubectl get cronjob my-cron -o jsonpath='{.status}'
+
+# List all jobs in namespace
+kubectl get jobs -n production
+
+# Check job events
+kubectl get events --field-selector involvedObject.kind=Job,involvedObject.name=my-job
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is the difference between a Job and a CronJob?**
+A: A Job runs once to completion. A CronJob creates Jobs on a schedule (like cron).
+
+**Q: What happens when a Job Pod fails?**
+A: The Job controller retries based on backoffLimit. If all retries fail, the Job is marked as failed.
+
+**Q: What is the purpose of completions and parallelism?**
+A: completions specifies how many pods must succeed for the Job to complete. parallelism specifies how many pods can run concurrently.
+
+### Intermediate Questions
+
+**Q: How does the Job controller handle parallel jobs with work queues?**
+A: The controller creates pods until any one succeeds AND the work queue is empty. No completions is specified - the job completes when no more work exists.
+
+**Q: What is the difference between restartPolicy OnFailure and Never?**
+A: OnFailure restarts the container in the same pod after failure. Never creates a new pod after failure.
+
+### Advanced Questions
+
+**Q: How would you implement a distributed computation job?**
+A: Use a work queue (Redis, RabbitMQ) where each pod fetches work. Set completions to not set (work queue determines completion). Use parallelism for concurrent workers.
+
+**Q: How do you handle CronJob overlapping executions?**
+A: Set concurrencyPolicy to Forbid (skip if running) or Replace (stop current, start new). Set successfulJobsHistoryLimit to control retention.
+
+## Cheat Sheet
+
+### Job YAML Template
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-job
+spec:
+  # Number of successful completions needed
+  completions: 5
+  
+  # Max concurrent pods
+  parallelism: 2
+  
+  # Retry limit
+  backoffLimit: 3
+  
+  # Job timeout
+  activeDeadlineSeconds: 600
+  
+  # TTL after completion
+  ttlSecondsAfterFinished: 3600
+  
+  template:
+    metadata:
+      labels:
+        app: my-job
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: job
+        image: my-image:latest
+        command: ["./run.sh"]
+```
+
+### CronJob YAML Template
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: my-cron
+spec:
+  schedule: "0 2 * * *"  # 2 AM daily
+  timeZone: "America/New_York"
+  concurrencyPolicy: Forbid  # Forbid, Allow, Replace
+  suspend: false
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: job
+            image: my-image:latest
+```
+
+### Essential Commands
+
+```bash
+# Jobs
+kubectl get jobs
+kubectl describe job my-job
+kubectl delete job my-job
+
+# CronJobs
+kubectl get cronjobs
+kubectl describe cronjob my-cron
+kubectl delete cronjob my-cron
+
+# Run job from cron
+kubectl create job --from=cronjob/my-cron
+
+# Suspend/resume cron
+kubectl patch cronjob my-cron -p '{"spec":{"suspend":true}}'
+```
+
+### Concurrency Policies
+
+| Policy | Behavior |
+|--------|----------|
+| Allow | Multiple jobs can run simultaneously |
+| Forbid | Skip if previous still running |
+| Replace | Cancel previous, start new |
+
+## Related Topics
+
+- [Deployments](./deployments) - Long-running services
+- [StatefulSets](./statefulsets) - Stateful workloads
+- [Services](./services) - Job result access

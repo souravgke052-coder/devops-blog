@@ -1,0 +1,884 @@
+---
+id: build
+title: Build Automation
+description: Multi-stage Docker builds, layer caching, build tools and CI/CD integration
+sidebar_position: 4
+---
+
+# Build Automation
+
+## Overview
+
+Build automation transforms source code into deployable artifacts through repeatable, efficient processes. Modern build systems handle compilation, dependency resolution, artifact generation, and optimization for various platforms. This guide covers Docker multi-stage builds, caching strategies, and production-grade build pipelines.
+
+## When To Use
+
+- Containerized applications requiring consistent builds
+- Polyglot projects with multiple build systems
+- Projects needing reproducible artifacts
+- Teams requiring standardized build processes
+- Compliance requiring build audit trails
+
+## When NOT To Use
+
+- Simple static websites with no compilation
+- Interpreted scripts (Python, Ruby) that run directly
+- Throwaway prototyping projects
+
+## Core Concepts
+
+### Build System Components
+
+| Component | Purpose | Examples |
+|-----------|---------|----------|
+| **Package Manager** | Dependency resolution | npm, pip, Maven, Gradle |
+| **Compiler/Transpiler** | Code transformation | gcc, tsc, webpack, esbuild |
+| **Bundler** | Asset combination | webpack, rollup, parcel |
+| **Container Builder** | Image creation | Docker, Podman, Buildah |
+| **Artifact Repository** | Artifact storage | GCR, ECR, Artifactory |
+
+### Build Optimization Principles
+
+1. **Dependency Caching**: Cache downloaded dependencies between builds
+2. **Layer Optimization**: Order Dockerfile commands from least to most frequently changing
+3. **Incremental Builds**: Only rebuild what changed
+4. **Parallel Execution**: Run independent build steps concurrently
+5. **Remote Caching**: Share cache between machines
+
+## Real Production Example
+
+### Multi-Stage Docker Build for Node.js Application
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+# ============================================
+# Stage 1: Dependencies
+# ============================================
+FROM node:20-alpine AS deps
+RUN apk add --no-cache libc6-compat
+
+WORKDIR /app
+
+# Copy only package files for dependency install
+COPY package.json package-lock.json* ./
+
+# Install dependencies
+RUN npm ci --only=production && \
+    npm cache clean --force
+
+# ============================================
+# Stage 2: Development Dependencies  
+# ============================================
+FROM node:20-alpine AS dev-deps
+RUN apk add --no-cache libc6-compat
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# ============================================
+# Stage 3: Builder
+# ============================================
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy dependencies from dev-deps
+COPY --from=dev-deps /app/node_modules ./node_modules
+
+# Copy source
+COPY . .
+
+# Environment for build
+ENV NODE_ENV=production
+
+# Type check and build
+RUN npm run typecheck && \
+    npm run build && \
+    npm prune --production
+
+# ============================================
+# Stage 4: Runner (Final Image)
+# ============================================
+FROM node:20-alpine AS runner
+
+# Security: Create non-root user
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 appuser
+
+WORKDIR /app
+
+# Copy built artifacts from builder
+COPY --from=builder --chown=appuser:nodejs /app/dist ./dist
+COPY --from=deps --chown=appuser:nodejs /app/node_modules ./node_modules
+
+# Set ownership
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+# Expose port
+EXPOSE 3000
+
+# Start application
+ENV NODE_ENV=production PORT=3000
+CMD ["node", "dist/main.js"]
+```
+
+### Multi-Stage Dockerfile for Go Application
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+# ============================================
+# Stage 1: Builder
+# ============================================
+FROM golang:1.22-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /app
+
+# Copy go mod files first for caching
+COPY go.mod go.sum* ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build with flags for security
+ARG VERSION=dev
+ARG COMMIT=sha-dev
+ARG BUILD_DATE=unknown
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="\
+      -X main.Version=${VERSION} \
+      -X main.Commit=${COMMIT} \
+      -X main.BuildDate=${BUILD_DATE} \
+      -w -s \
+      -extldflags '-static'" \
+    -o /app/api ./cmd/api
+
+# ============================================
+# Stage 2: Minimal Runtime
+# ============================================
+FROM scratch AS runtime
+
+# Import certs for HTTPS
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy binary
+COPY --from=builder /app/api /api
+
+# Copy non-root user
+COPY --from=builder /etc/passwd /etc/passwd
+COPY --from=builder /etc/group /etc/group
+
+# Create app directory
+RUN mkdir -p /app/data && chown -R appuser:appuser /app
+
+USER appuser
+WORKDIR /app
+
+# Use distroless empty base for timezone data
+ENV TZ=Etc/UTC
+
+ENTRYPOINT ["/api"]
+```
+
+### Dockerfile for Python Application
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-slim AS base
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# ============================================
+# Dependencies Stage
+# ============================================
+FROM base AS deps
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ============================================
+# Development Stage
+# ============================================
+FROM base AS development
+
+# Copy dependency installation from deps stage
+COPY --from=deps /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Install dev dependencies
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# Copy source
+COPY . .
+
+# ============================================
+# Builder Stage
+# ============================================
+FROM base AS builder
+
+# Copy dependency installation
+COPY --from=deps /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+COPY . .
+
+# Build application (e.g., compile .pyc)
+RUN python -m compileall -q /app
+
+# ============================================
+# Production Stage
+# ============================================
+FROM base AS production
+
+# Create non-root user
+RUN groupadd --gid 1000 appgroup && \
+    useradd --uid 1000 --gid 1000 --shell /bin/bash appuser
+
+# Copy dependencies
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /usr/local/bin/* /usr/local/bin/ 2>/dev/null || true
+
+# Copy application
+COPY --chown=appuser:appgroup . .
+
+# Switch to non-root user
+USER appuser
+
+# Run application
+CMD ["python", "-m", "myapp"]
+```
+
+## Configuration / Pipeline Examples
+
+### GitHub Actions Build Pipeline
+
+```yaml
+name: Build & Push
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          build-args: |
+            VERSION=${{ github.sha }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+```
+
+### Google Cloud Build
+
+```yaml
+# cloudbuild.yaml
+steps:
+  # Build with caching
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/api:latest'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/api:latest'
+      - '--build-arg'
+      - 'BUILDKIT_INLINE_CACHE=1'
+      - '.'
+    env:
+      - 'DOCKER_BUILDKIT=1'
+
+  # Push images
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/api'
+    waitFor: ['build']
+
+  # Scan for vulnerabilities
+  - name: 'gcr.io/$PROJECT_ID/trivy:latest'
+    id: 'scan'
+    args:
+      - 'image'
+      - '--exit-code'
+      - '1'
+      - '--severity'
+      - 'CRITICAL,HIGH'
+      - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+    waitFor: ['push']
+
+  # Generate SBOM
+  - name: 'aquasec/trivy:latest'
+    id: 'sbom'
+    args:
+      - 'image'
+      - '--format'
+      - 'spdx'
+      - '--output'
+      - 'sbom.spdx.json'
+      - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+    waitFor: ['build']
+
+  # Push SBOM to GCS
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'upload-sbom'
+    args:
+      - 'storage'
+      - 'cp'
+      - 'sbom.spdx.json'
+      - 'gs://$PROJECT_ID-sbom/api/$COMMIT_SHA/sbom.spdx.json'
+    waitFor: ['sbom']
+
+images:
+  - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/api:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+  dynamicSubstitutions: true
+  env:
+    - 'BUILD_DATE=$(date -Iseconds)'
+
+substitutions:
+  _SERVICE: api
+  _REGION: us-central1
+
+timeout: '1200s'
+```
+
+### Build with Gradle
+
+```yaml
+jobs:
+  build-java:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+      
+      - name: Build
+        run: ./gradlew build --no-daemon
+      
+      - name: Build Docker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          build-args: |
+            JAR_FILE=build/libs/*.jar
+          tags: ${{ env.IMAGE_TAG }}
+```
+
+### Build with Make
+
+```makefile
+# Makefile for multi-language project
+
+.PHONY: build test dockerlint docker dockerpush clean
+
+# Variables
+IMAGE_NAME = myapp
+IMAGE_TAG = $(shell git rev-parse --short HEAD)
+REGISTRY = ghcr.io
+FULL_IMAGE = $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
+
+# Go build
+build/go:
+	go build -ldflags="-s -w" -o bin/api ./cmd/api
+
+# Node build
+build/node:
+	npm ci
+	npm run build
+
+# Docker build with BuildKit
+docker:
+	DOCKER_BUILDKIT=1 docker build \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		-t $(FULL_IMAGE) .
+
+# Push with all tags
+dockerpush: docker
+	docker push $(REGISTRY)/$(IMAGE_NAME) --all-tags
+
+# Lint
+dockerlint:
+	hadolint Dockerfile
+
+# Run tests
+test:
+	go test -v -race -cover ./...
+
+# Clean
+clean:
+	rm -rf bin/
+	docker rmi $(FULL_IMAGE) || true
+```
+
+## Common Commands / Steps
+
+### Docker Build Commands
+
+```bash
+# Basic build
+docker build -t myapp:latest .
+
+# Build with BuildKit
+DOCKER_BUILDKIT=1 docker build -t myapp:latest .
+
+# Build with cache optimization
+docker build \
+  --build-arg BUILDKIT_INLINE_CACHE=1 \
+  --cache-from myapp:previous \
+  -t myapp:latest .
+
+# Multi-platform build
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t myapp:latest \
+  --push .
+
+# Build with secrets (kitten)
+docker buildx build \
+  --secret id=npmrc,src=.npmrc \
+  -t myapp:latest .
+
+# Inspect build cache
+docker buildx du
+
+# Prune build cache
+docker buildx prune --all
+```
+
+### Build Tool Commands
+
+```bash
+# npm
+npm ci                        # Clean install from lockfile
+npm run build                 # Run build script
+npm run build -- --watch     # Watch mode
+
+# Gradle
+./gradlew build               # Build project
+./gradlew build -x test       # Skip tests
+./gradlew dependencies        # Show dependencies
+./gradlew build --refresh-dependencies  # Force refresh
+
+# Maven
+mvn clean package            # Clean and build
+mvn package -DskipTests      # Skip tests
+mvn dependency:tree          # Show dependencies
+
+# Go
+go build ./...               # Build all packages
+go build -ldflags="-s -w"    # Strip debug info
+go mod tidy                  # Clean up dependencies
+```
+
+### Build Cache Commands
+
+```bash
+# Docker layer caching in CI
+docker buildx build \
+  --cache-from type=registry,ref=myapp:latest \
+  --cache-to type=registry,ref=myapp:buildcache,mode=max \
+  --push .
+
+# GitHub Actions cache
+--cache-from: type=gha
+--cache-to: type=gha,mode=max
+
+# Local cache for testing
+docker buildx build \
+  --cache-from type=local,src=./cache \
+  --cache-to type=local,dest=./cache-new \
+  -t myapp:latest .
+
+# Import/export cache
+docker buildx export ./cache.tar | gzip > cache.tar.gz
+docker buildx import --input ./cache.tar.gz
+```
+
+## Monitoring
+
+### Build Metrics
+
+| Metric | Target | Alert |
+|--------|--------|-------|
+| Build duration | < 5 min | > 10 min |
+| Build success rate | > 95% | < 90% |
+| Cache hit rate | > 80% | < 50% |
+| Image size | Minimize | Growing > 10% |
+
+### Build Monitoring Queries
+
+```promql
+# Build duration histogram
+histogram_quantile(0.95, 
+  rate(build_duration_seconds_bucket[5m])
+)
+
+# Build success rate
+sum(rate(build_total{status="success"}[5m])) /
+sum(rate(build_total[5m])) * 100
+
+# Cache efficiency
+sum(rate(cache_hits[5m])) / 
+sum(rate(cache_misses[5m])) * 100
+```
+
+### Build Log Analysis
+
+```bash
+# Find slowest build steps
+cat build.log | grep -E "step|seconds" | awk '/Step/ {s=$0} /seconds/ {print s, $0}'
+
+# Analyze layer sizes
+docker history myapp:latest --no-trunc | tail -20
+
+# Check for rebuild reasons
+docker buildx build --progress=plain 2>&1 | grep -E "CACHED|#\d+"
+```
+
+## Security
+
+### Build Security Best Practices
+
+```dockerfile
+# Use specific version tags, not 'latest'
+FROM node:20-alpine@sha256:abc123...
+
+# Run as non-root user
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 appuser
+USER appuser
+
+# Remove unnecessary packages
+RUN apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Use distroless or scratch base
+FROM gcr.io/distroless/static-debian12
+
+# No secrets in build args (use build secrets)
+RUN --mount=type=secret,id=npmrc npm ci
+```
+
+### Build Secrets Handling
+
+```dockerfile
+# Mount secret for npm install
+RUN --mount=type=secret,id=npmrc \
+    cp /run/secrets/npmrc /root/.npmrc && \
+    npm ci && \
+    rm /root/.npmrc
+```
+
+```yaml
+# GitHub Actions with secret mount
+- name: Build with secrets
+  run: docker build --secret id=npmrc .
+  env:
+    DOCKER_BUILDKIT: 1
+```
+
+### Vulnerability Scanning in Build
+
+```bash
+# Scan during build
+docker build --build-arg TRIVY_EXIT_CODE=0 -t myapp:latest .
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+RUN trivy image --severity HIGH,CRITICAL myapp:latest
+
+# CI integration
+trivy fs --scanners vuln,secret,misconfig .
+trivy image --format sarif --output trivy.sarif .
+```
+
+## Cost Optimization
+
+### Layer Caching Strategy
+
+```dockerfile
+# Order from least to most frequently changing
+COPY package*.json ./        # Dependencies first
+COPY .env* ./                # Environment files
+COPY src/ ./                 # Source code
+COPY tests/ ./               # Tests last
+
+# Separate layer per dependency type
+COPY requirements.txt ./     # System deps
+RUN pip install -r requirements.txt
+
+COPY package.json ./         # Node deps
+RUN npm ci
+```
+
+### Build Cache Optimization
+
+| Strategy | Benefit | Implementation |
+|----------|---------|----------------|
+| Inline cache | Fast pulls | `--build-arg BUILDKIT_INLINE_CACHE=1` |
+| Registry cache | Share across machines | `--cache-from` / `--cache-to` |
+| GitHub Actions cache | Free tier 10GB | `type=gha` |
+| Local cache | Offline builds | `type=local` |
+
+### Parallel Build Steps
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api
+            path: ./services/api
+          - service: worker
+            path: ./services/worker
+          - service: scheduler
+            path: ./services/scheduler
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build ${{ matrix.service }}
+        run: |
+          docker build -t myapp-${{ matrix.service }}:${{ github.sha }} \
+            ${{ matrix.path }}
+      
+      - name: Push ${{ matrix.service }}
+        run: |
+          docker push myapp-${{ matrix.service }}:${{ github.sha }}
+```
+
+### Image Size Optimization
+
+```dockerfile
+# Use alpine variants
+FROM node:20-alpine
+
+# Multi-stage to remove build tools
+FROM builder AS deps
+RUN apt-get install -y build-essential
+# ... build ...
+FROM runtime
+COPY --from=deps /app/deps /usr/local/lib
+
+# Use .dockerignore
+cat > .dockerignore << 'EOF'
+.git
+*.md
+node_modules
+tests
+*.log
+.env*
+docker-compose*.yml
+Dockerfile
+EOF
+```
+
+## Troubleshooting
+
+### Common Build Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Cache miss | Layer changed unexpectedly | Use `--cache-from` explicitly |
+| Out of disk space | Large image layers | Prune build cache, use multi-stage |
+| Build timeout | Slow network, large downloads | Use Artifactory for internal caching |
+| Permission denied | Running as root requirement | Check USER directive |
+| Layer not found | Cache cleared | Push cache before it expires |
+
+### Debug Build Commands
+
+```bash
+# Verbose build output
+DOCKER_BUILDKIT=0 docker build -t myapp:latest --progress=plain .
+
+# Inspect image layers
+docker history myapp:latest
+docker inspect myapp:latest
+
+# Check build cache
+docker buildx du
+docker buildx prune --all
+
+# Run interactive debug
+docker run -it --rm myapp:latest sh
+```
+
+### Build Failures
+
+```bash
+# Get detailed error
+docker build -t myapp:latest . 2>&1 | tail -50
+
+# Retry specific stage
+docker build --target builder -t myapp:debug .
+
+# Check layer sizes
+docker history myapp:latest --no-trunc
+```
+
+## Interview Questions
+
+### Q1: Explain multi-stage Docker builds and their benefits.
+
+**Answer:** Multi-stage builds use multiple `FROM` statements in a single Dockerfile, allowing you to copy artifacts between stages while discarding build dependencies. Benefits: 1) Smaller final images by excluding compilers and build tools, 2) Separation of concerns (build vs runtime environments), 3) Better caching through ordered COPY statements, 4) Single Dockerfile for both dev and production.
+
+### Q2: How do you optimize Docker build caching?
+
+**Answer:** Order Dockerfile instructions from least to most frequently changing: 1) Base image, 2) Package manager files (package.json, requirements.txt), 3) System dependencies, 4) Install dependencies, 5) Source code. Use `--cache-from` to leverage existing image layers. Avoid `ADD` for URLs (causes cache invalidation). Use `--mount=type=secret` for sensitive build-time files.
+
+### Q3: What's the difference between COPY and ADD?
+
+**Answer:** `COPY` is preferred - it only copies local files. `ADD` has additional features (URL downloading, tar extraction) that make behavior less predictable and can accidentally extract archives when not intended. Use `COPY` for local files; use `RUN curl` for downloading URLs.
+
+### Q4: How do you handle build secrets without exposing them?
+
+**Answer:** Use BuildKit's secret mounting: `RUN --mount=type=secret,id=npmrc npm ci`. This mounts the secret temporarily during the build step without persisting it in image layers. Alternatively, use multi-stage builds where secrets exist only in builder stage. Never use `RUN echo $SECRET` or ARG for sensitive values.
+
+### Q5: Describe your build caching strategy for CI/CD.
+
+**Answer:** Use registry cache (`--cache-from` / `--cache-to`) for sharing cache across machines. For GitHub Actions, use `type=gha` for free built-in caching. Implement pull-through registries for internal dependency caching (Artifactory). For monorepos, cache each service's dependencies separately. Prune old cache entries to manage storage costs.
+
+## Cheat Sheet
+
+```bash
+# Docker build basics
+docker build -t myapp:latest .
+docker build -t myapp:latest -f Dockerfile.prod .
+
+# Build with cache
+docker buildx build \
+  --cache-from myapp:latest \
+  --cache-to type=registry,ref=myapp:cache \
+  --push -t myapp:latest .
+
+# Multi-platform
+docker buildx build --platform linux/amd64,linux/arm64 -t myapp:latest --push .
+
+# Inspect
+docker history myapp:latest
+docker inspect myapp:latest
+
+# Build arguments
+docker build --build-arg VERSION=1.0.0 -t myapp:1.0.0 .
+
+# Secret mount
+docker build --secret id=npmrc,src=.npmrc .
+
+# Build with Make
+make build && make docker && make dockerpush
+
+# Gradle
+./gradlew build && ./gradlew bootBuildImage
+
+# Maven
+mvn clean package && docker build -t myapp .
+```
+
+## Related Topics
+
+- [CI/CD Overview](./overview.mdx)
+- [GitHub Actions](./github.mdx)
+- [Artifact Management](./artifact-management.mdx)
+- [Testing Strategies](./test.mdx)
+- [Security Scanning](./test.mdx#security-testing-types)

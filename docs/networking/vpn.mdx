@@ -1,0 +1,455 @@
+# VPN (Virtual Private Network)
+
+## Overview
+
+VPNs create encrypted tunnels over public networks, extending private networks across the internet. For DevOps, VPNs appear in multiple contexts: site-to-site connectivity (on-prem to cloud), remote access for engineers, and service mesh encryption. Understanding VPN types—IPsec, WireGuard, OpenVPN—is essential for secure infrastructure design.
+
+WireGuard has revolutionized VPN implementation with its minimal attack surface (4,000 lines vs OpenVPN's 100,000+), kernel-level integration, and modern cryptography. IPsec remains the enterprise standard for site-to-site due to hardware support. OpenVPN bridges the gap with broad compatibility but higher overhead.
+
+This page covers VPN architecture, protocols, and production configurations for Linux-based VPN solutions.
+
+## When To Use
+
+- **Site-to-site connectivity**: Connecting offices or data centers to cloud VPCs
+- **Remote access**: Engineers accessing internal resources
+- **Service mesh**: WireGuard for pod-to-pod encryption (Cilium)
+- **Cross-cloud connectivity**: AWS to GCP private connectivity
+
+## When NOT To Use
+
+- **Latency-critical paths**: VPN adds overhead (2-5ms typical)
+- **High-throughput internal networks**: Bare metal or direct interconnect
+- **Internet-facing services**: Load balancer + TLS is more efficient
+
+## Core Concepts
+
+### VPN Types
+
+**Site-to-Site VPN**: Connects entire networks. All traffic between sites encrypted. Typically IPsec. Used for on-prem to cloud connectivity.
+
+**Client-to-Site (Remote Access)**: Individual clients connect to corporate network. WireGuard, OpenVPN, or IPsec client. Used for remote workers.
+
+**Peer-to-Peer (Mesh)**: Direct encrypted connections between nodes. WireGuard excels here. Used in Kubernetes service mesh.
+
+```
+Site-to-Site:
+  On-Prem (10.0.0.0/8) ←══IPsec══→ AWS VPC (172.16.0.0/16)
+
+Client-to-Site:
+  Remote Laptop (DHCP) ←══WireGuard══→ VPN Gateway (10.8.0.0/24) ← Corporate (10.0.0.0/8)
+
+Mesh (WireGuard):
+  Node A (10.0.1.1) ←══WireGuard══→ Node B (10.0.1.2)
+                   ↕
+               Node C (10.0.1.3)
+```
+
+### WireGuard Deep Dive
+
+WireGuard is a modern VPN protocol with:
+- Modern cryptography (Curve25519, ChaCha20-Poly1305, BLAKE2s)
+- Kernel module (wireguard-linux-compat) for performance
+- Simple configuration (single file)
+- No TLS dependency
+- 4,000 lines of code (auditable)
+
+```bash
+# WireGuard installation
+apt install wireguard
+
+# Generate keys (on each peer)
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# Server configuration /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private-key>
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Client peer
+[Peer]
+PublicKey = <client-public-key>
+AllowedIPs = 10.0.0.2/32  # Only tunnel traffic for this IP
+PersistentKeepalive = 25  # NAT traversal keepalive
+
+# Client configuration (laptop)
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <client-private-key>
+DNS = 10.0.0.1  # Use VPN DNS
+
+[Peer]
+PublicKey = <server-public-key>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 10.0.0.0/24  # Route entire VPN subnet
+PersistentKeepalive = 25
+```
+
+### IPsec (Internet Protocol Security)
+
+IPsec operates at Layer 3, encrypting IP packets. Complex but standardized for enterprise.
+
+**Phase 1 (IKEv1 Main Mode or Aggressive Mode)**: Authenticates peers, establishes ISAKMP SA (security association). Uses preshared keys (PSK) or certificates.
+
+**Phase 2 (Quick Mode)**: Negotiates IPsec SA (encryption algorithm, keys). Encrypts actual data.
+
+```bash
+# StrongSwan IPsec configuration /etc/ipsec.conf
+config setup
+    charondebug="all"
+    uniqueids=never
+
+conn %default
+    ikelifetime=8h
+    keylife=1h
+    rekeymargin=3m
+    keyingtries=3
+    keyexchange=ikev2
+    authby=secret
+
+conn site-to-site
+    left=203.0.113.1           # Local public IP
+    leftsubnet=10.0.0.0/24      # Local subnet
+    right=198.51.100.1          # Remote public IP
+    rightsubnet=172.16.0.0/16   # Remote subnet
+    auto=start                  # Start on boot
+    ike=aes256-sha256-modp2048
+    esp=aes256-sha256-modp2048
+
+# /etc/ipsec.secrets
+# PSK for site-to-site
+198.51.100.1 : PSK "your-psk-secret-here"
+
+# Certificate-based (more secure)
+# : RSA "/etc/ipsec.d/private/vpn-server-key.pem"
+```
+
+### OpenVPN
+
+OpenVPN uses TLS over UDP (or TCP) for key exchange, then encrypts data channel. Flexible but heavier than WireGuard.
+
+```bash
+# Server configuration /etc/openvpn/server.conf
+port 1194
+proto udp
+dev tun
+topology subnet
+
+# Certificates
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+
+# Network
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+
+# Routing
+push "route 10.0.0.0 255.0.0.0"
+push "dhcp-option DNS 10.8.0.1"
+
+# Security
+tls-crypt ta.key  # HMAC overlay for DDoS protection
+cipher AES-256-GCM
+auth SHA256
+
+# Performance
+persist-key
+persist-tun
+```
+
+## Real Production Example
+
+### AWS Site-to-Site VPN
+
+```bash
+# Create Customer Gateway (on-prem router)
+aws ec2 create-customer-gateway \
+  --bgp-asn 65001 \
+  --public-ip 203.0.113.1 \
+  --type ipsec.1
+
+# Create Virtual Private Gateway
+aws ec2 create-vpn-gateway --type ipsec.1
+
+# Attach VGW to VPC
+aws ec2 attach-vpn-gateway \
+  --vpn-gateway-id vgw-0abc123def456 \
+  --vpc-id vpc-0abcd1234efgh5678
+
+# Create Site-to-Site VPN Connection
+aws ec2 create-vpn-connection \
+  --customer-gateway-id cgw-0xyz789abc123 \
+  --vpn-gateway-id vgw-0abc123def456 \
+  --routing-type static \
+  --static-routes-only \
+  --customer-gateway-id cgw-xxx
+
+# Configure static routes
+aws ec2 create-vpn-connection-route \
+  --vpn-connection-id vpn-xxx \
+  --destination-cidr-block 10.0.0.0/8
+
+# Download configuration
+aws ec2 get-vpn-connection-device-routes \
+  --vpn-connection-id vpn-xxx \
+  --output json
+
+# Configure on-prem router with downloaded config
+# Most vendors support Cisco, Juniper, pfSense config download
+```
+
+### WireGuard Full Tunnel with Split DNS
+
+```bash
+# Server: /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private>
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+PublicKey = <client-pub>
+AllowedIPs = 10.0.0.2/32
+
+# Client: /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <client-private>
+DNS = 10.0.0.1
+
+[Peer]
+PublicKey = <server-pub>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 10.0.0.0/24  # Split tunnel: only VPN subnet
+# AllowedIPs = 0.0.0.0/0  # Full tunnel: route all traffic
+
+# Split DNS with systemd-resolved
+# Use DNS over VPN for specific domains:
+# /etc/systemd/resolved.conf.d/wg.conf
+[Resolve]
+Domains=~internal.example.com
+DNS=10.0.0.1
+```
+
+## CLI Examples
+
+```bash
+# WireGuard management
+wg show          # Show current config and traffic
+wg show wg0      # Show specific interface
+wg set wg0 peer <pubkey> remove  # Remove peer
+wg addconf wg0 /etc/wireguard/wg0.conf  # Reload config
+
+# IPsec status
+ipsec status
+ipsec statusall
+strongswan status
+
+# OpenVPN
+openvpn --config /etc/openvpn/server.conf
+openvpn --config client.ovpn  # Client
+
+# Check VPN interface
+ip addr show wg0
+ip link show wg0
+ip route show | grep wg0
+
+# VPN logging
+journalctl -u strongswan -f
+journalctl -u openvpn@server -f
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `wg` | WireGuard management | `wg show` |
+| `ipsec` | IPsec management | `ipsec status` |
+| `openvpn` | OpenVPN | `openvpn --config` |
+| `strongswan` | IKE daemon | `strongswan status` |
+
+## Monitoring
+
+### VPN Metrics
+
+```bash
+# WireGuard
+wg show
+# Interface wg0:
+#   public key: xxx
+#   private key: (hidden)
+#   listening port: 51820
+#
+# peer: xxx
+#   endpoint: 203.0.113.1:51820
+#   allowed ips: 10.0.0.2/32
+#   latest handshake: 45 seconds ago
+#   transfer: 1.23 MiB received, 5.67 MiB sent
+
+# IPsec SA status
+ip xfrm state list
+ip xfrm policy list
+
+# Monitoring keepalives and throughput
+watch -n 5 'wg show wg0 | grep -E "transfer|handshake"'
+```
+
+## Security
+
+### VPN Security Best Practices
+
+```bash
+# WireGuard:
+# 1. Use secure key generation
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# 2. Use WireGuard's cryptokey routing (AllowedIPs)
+# Only allow traffic for specific subnets
+
+# 3. Use PersistentKeepalive for NAT traversal
+PersistentKeepalive = 25  # seconds
+
+# IPsec:
+# 1. Use certificate-based auth (not PSK)
+# 2. Disable IKEv1 (use IKEv2)
+keyexchange=ikev2
+
+# 3. Strong cipher suites
+ike=aes256-sha256-modp4096
+esp=aes256-sha256-modp4096
+
+# 4. Perfect Forward Secrecy (PFS)
+ikelifetime=8h
+keylife=1h
+
+# 5. Regular key rotation
+auto=start  # Re-establish on boot
+```
+
+## Cost Optimization
+
+### VPN Cost Comparison
+
+| Solution | Setup Cost | Monthly Cost | Notes |
+|----------|------------|--------------|-------|
+| AWS Site-to-Site VPN | Free | ~$36 (VPN hours) | $0.05/hour + data transfer |
+| AWS Client VPN | Free | ~$36 + per user | $0.005/hour per user |
+| GCP Cloud VPN | Free | ~$0 (HA VPN) | $0.05/hour + data |
+| WireGuard on EC2 | ~$10 | $10-50 | t3.micro + data |
+| Direct Connect | High | $0.03/GB | Hardware + ongoing |
+
+```bash
+# AWS VPN vs Direct Connect
+# VPN: $0.05/hour = $36/month + data transfer
+# Direct Connect: $0.03/GB + dedicated circuit (~$200/month for 1Gbps)
+
+# For <1Gbps: VPN is cheaper
+# For >1Gbps and consistent traffic: Direct Connect cheaper
+# Example: 10TB/month via VPN = $36 + $90 = $126/month
+# Example: 10TB/month via DX = $300 + $300 = $600/month (but no VPN overhead)
+```
+
+## Troubleshooting
+
+### Common VPN Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| No handshake | Firewall blocking UDP 51820 | Open firewall |
+| Handshake but no traffic | Routing issue | Check AllowedIPs |
+| Intermittent drops | NAT keepalive needed | Add PersistentKeepalive |
+| High latency | VPN overhead | Consider Direct Connect |
+| MTU issues | Fragmentation | Lower MTU, set MSS clamp |
+
+```bash
+# Debug WireGuard
+tcpdump -i wg0 -n
+tcpdump -i eth0 port 51820 -n  # See if packets arrive
+
+# Debug IPsec
+tcpdump -i any -n 'ip[9] = 50'  # ESP packets
+ip xfrm monitor
+
+# Check firewall
+iptables -L -n -v | grep wg0
+```
+
+## Interview Questions
+
+**Q1: What are the advantages of WireGuard over IPsec and OpenVPN?**
+
+A: WireGuard advantages: (1) Simpler—4,000 lines vs 100,000+ (auditable); (2) Faster—kernel module, modern crypto (ChaCha20, Curve25519); (3) More secure—no known vulnerabilities, cryptographic primitives are modern; (4) Easier to configure—single file, no complex PKI; (5) Roaming—connection survives IP changes (mobile). Disadvantages: (1) No Windows native client (still in development); (2) Not as widely deployed in enterprise; (3) No dynamic routing (static config). IPsec is still standard for site-to-site due to hardware support. OpenVPN bridges compatibility but has higher overhead.
+
+**Q2: How does WireGuard's cryptokey routing work?**
+
+A: WireGuard uses AllowedIPs to determine which public keys receive which traffic. Each peer has a list of CIDRs; packets matching those CIDRs get encrypted with that peer's public key. For example: if peer A has AllowedIPs = 10.0.0.2/32, and you send packet to 10.0.0.2, WireGuard encrypts it for peer A. This is directional and automatic. The receiving peer doesn't need configuration for source IPs—its own Interface Address determines what it accepts. This design is elegant: no explicit tunnel configuration, just cryptographic routing tables.
+
+**Q3: What's the difference between full tunnel and split tunnel VPN?**
+
+A: Full tunnel: all traffic (0.0.0.0/0) goes through VPN. Security: all traffic appears to come from VPN IP. Privacy: ISP sees only encrypted VPN traffic. Cost: all bandwidth through VPN (expensive). Split tunnel: only specific subnets go through VPN. Performance: local traffic doesn't unnecessarily traverse VPN. Risk: local network has direct access (potential data leak). Best practice: split tunnel for most use cases (only route corporate traffic through VPN). Full tunnel when privacy from local ISP matters.
+
+## Cheat Sheet
+
+### VPN Protocol Comparison
+
+| Feature | WireGuard | IPsec | OpenVPN |
+|---------|-----------|-------|---------|
+| Lines of code | ~4,000 | 500,000+ | 100,000+ |
+| Performance | Very High | High | Medium |
+| Security | Modern crypto | Good (tuned) | Good |
+| Complexity | Low | High | Medium |
+| Windows support | Limited | Native | Good |
+| NAT traversal | Built-in | IKEv2 NAT-T | Built-in |
+| Tunnel type | Mesh capable | Point-to-point | Point-to-point |
+
+### WireGuard Quick Reference
+
+```bash
+# Generate keys
+wg genkey > privatekey
+wg pubkey < privatekey > publickey
+
+# Server config
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <server-private>
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+PublicKey = <client-public>
+AllowedIPs = 10.0.0.2/32
+
+# Client config
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <client-private>
+
+[Peer]
+PublicKey = <server-public>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+```
+
+### IPsec Quick Reference
+
+```bash
+# IKEv2 (prefer over IKEv1)
+keyexchange=ikev2
+ike=aes256-sha256-modp2048
+esp=aes256-sha256-modp2048
+# Use certificates, not PSK
+```
+
+## Related Topics
+
+- [TLS](./tls) — Encryption fundamentals
+- [Firewall](./firewall) — Network security
+- [VPC](./vpc) — Cloud networking
+- [Routing](./routing) — VPN routing

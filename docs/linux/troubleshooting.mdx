@@ -1,0 +1,487 @@
+---
+sidebar_position: 22
+description: Linux troubleshooting methodology — system calls, kernel debugging, performance profiling, crash analysis, and incident response.
+---
+
+# Linux Troubleshooting
+
+## Overview
+
+Troubleshooting Linux systems in production requires a systematic methodology. The worst approach is random guessing — trying commands until something "feels right." The best approach is: measure, hypothesize, verify, fix. Every system tells you what's wrong if you know how to listen. This page teaches a repeatable methodology and the tools to execute it.
+
+The core principle: symptoms are never the root cause. High CPU is a symptom — the root cause might be a garbage collector, a runaway loop, a memory leak causing swap, or an I/O bottleneck masquerading as CPU. Fix the root cause, not the symptom. The USE method (Utilization, Saturation, Errors) applied systematically to each resource (CPU, memory, disk, network) prevents tunnel vision.
+
+Linux has extraordinary introspection capabilities — /proc filesystem, bpf/BPF, strace, perf, tcpdump, iostat. Knowing what tool answers what question, and understanding what the numbers actually mean, is the difference between engineers who can solve problems and those who open tickets.
+
+## When To Use
+
+- Production incidents and outages
+- Performance degradation investigation
+- Capacity planning based on observed behavior
+- Post-incident root cause analysis
+- Pre-production load testing failures
+
+## When NOT To Use
+
+- Troubleshooting development issues without a clear symptom (measure first)
+- Random optimization without baseline (you won't know if it helped)
+- When the system is already in a state where measurement affects the system (use sampling)
+
+## Core Concepts
+
+### Systematic Troubleshooting Methodology
+
+**Step 1: Define the symptom** — What is the user/customers experiencing? High latency? Errors? Unavailability? Write it down precisely.
+
+**Step 2: Determine scope** — Which systems are affected? One server? Multiple? All services? Users in a specific region?
+
+**Step 3: Check recent changes** — What changed recently? deployments, config changes, traffic spikes, infrastructure changes. `git log`, `/var/log/syslog`, `journalctl --since "1 hour ago"`.
+
+**Step 4: Measure resources** — Apply USE method. For each resource: is utilization high? Is there saturation? Are there errors?
+
+**Step 5: Isolate the variable** — Can you reproduce it? Can you narrow it to a specific component?
+
+**Step 6: Identify root cause** — Why is the resource being used? What process? What code path?
+
+**Step 7: Fix or mitigate** — Apply the fix. Verify it worked. Document.
+
+### Essential Tools
+
+**strace** — Trace system calls and signals:
+```bash
+# Attach to a running process
+strace -p <PID> -f                # follow forks
+strace -p <PID> -e trace=read,write -f  # only read/write syscalls
+strace -p <PID> -e trace=network    # network syscalls
+strace -p <PID> -c                # summary of syscall counts
+
+# Trace a new command
+strace -e trace=execve ls /tmp    # show only execve calls
+strace -f -o /tmp/trace.log command  # save to file
+
+# Timing info
+strace -T -p <PID>               # show time spent in each syscall
+strace -r -p <PID>               # relative timestamps
+```
+
+**perf** — Hardware and software performance measurement:
+```bash
+# CPU profiling
+perf top                         # live top-like view
+perf record -F 99 -a -g -- sleep 30  # record 30s of profiles
+perf report                      # view report
+perf report -g --stdio | head -50   # view from file
+
+# Hardware counters
+perf stat -e cycles,instructions,cache-misses ls /tmp
+
+# Trace specific events
+perf list | grep scheduler       # available scheduler events
+perf stat -e sched:sched_switch ls /tmp  # scheduler switches
+```
+
+**bpftrace** — Dynamic kernel tracing (requires linux-headers):
+```bash
+# One-liners
+bpftrace -e 'tracepoint:syscalls:sys_enter_open { printf("%s %s\n", comm, args->filename); }'
+bpftrace -e 'tracepoint:syscalls:sys_enter_read { @[comm] = count(); }'
+
+# Block I/O latency histogram
+bpftrace -e 'kprobe:blk_mq_start_request { @start = nsecs; }
+  kprobe:blk_account_io_done { @latency = hist(nsecs - @start); }'
+
+# Per-process syscall count
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
+```
+
+**tcpdump** — Packet capture:
+```bash
+# Capture on interface
+tcpdump -i eth0 -n port 80
+tcpdump -i eth0 -n host 10.0.0.1
+tcpdump -i eth0 -n -c 100 -w /tmp/capture.pcap
+
+# Read capture
+tcpdump -r /tmp/capture.pcap
+tcpdump -r /tmp/capture.pcap -A | grep -i "password\|token"
+
+# Live filter for HTTP
+tcpdump -i eth0 -n -A 'tcp[20:2] = 0x4745 or tcp[20:2] = 0x4854'  # GET or HT
+```
+
+**dmesg and journalctl** — Kernel and system logs:
+```bash
+dmesg -T                              # human timestamps
+dmesg -T -f kern,err                  # kernel errors
+dmesg | grep -i "error\|failed\|oops"
+journalctl -k -b                      # kernel log since boot
+journalctl -b -1                      # previous boot
+journalctl --since "1 hour ago" -u nginx
+journalctl -p err -b                  # errors since boot
+journalctl --list-boots               # show all boots
+```
+
+### /proc Filesystem
+
+```bash
+# Process info
+/proc/<PID>/cmdline    # command line (null-separated)
+/proc/<PID>/environ    # environment variables
+/proc/<PID>/fd/        # open file descriptors
+/proc/<PID>/maps       # memory maps
+/proc/<PID>/status     # process status (memory, threads, cgroup)
+/proc/<PID>/smaps_rollup  # memory summary
+/proc/<PID>/stack      # kernel stack trace
+/proc/<PID>/wchan      # kernel function process is sleeping in
+
+# System info
+/proc/cpuinfo          # CPU details
+/proc/meminfo          # memory statistics
+/proc/loadavg          # load average
+/proc/diskstats        # disk I/O statistics
+/proc/net/dev          # network interface stats
+/proc/net/tcp          # TCP connections (hex addresses)
+/proc/net/sockstat     # socket statistics
+/proc/sys/vm/          # virtual memory parameters
+```
+
+## Real Production Example
+
+Incident: "API is slow, 503 errors appearing." Systematic diagnosis:
+
+```bash
+# === STEP 1: DEFINE SYMPTOM ===
+# 503 = API returning errors, latency > threshold
+
+# === STEP 2: CHECK IF IT'S THE HOST ===
+uptime                           # load 8.45 on 8 cores = saturated
+vmstat 1 5                       # us:15 sy:5 wa:55 = 55% I/O wait!
+
+# === STEP 3: IDENTIFY RESOURCE ===
+iostat -xz 1 5
+# Device  r/s   w/s   rkB/s   wkB/s  await  %util
+# sda    2.10  890.45  85   45000   120ms  98.5
+# %util ~100% with very high await = disk saturated doing writes
+
+# === STEP 4: FIND THE CAUSE ===
+iotop -ao
+# Total DISK READ: ~0, Total DISK WRITE: ~45MB/s
+# TID  PRIO  USER     DISK READ  DISK WRITE  COMMAND
+# pid  HIGH  postgres   0.00 B/s  38.5 MB/s  postgres
+# pid  HIGH  app        0.00 B/s   6.2 MB/s   python
+
+# === STEP 5: INVESTIGATE POSTGRES ===
+# Is it WAL writes, checkpoints, or queries?
+sudo -u postgres psql -c "
+  SELECT wait_event_type, wait_event, state, query
+  FROM pg_stat_activity
+  WHERE state IS NOT NULL AND wait_event_type IS NOT NULL
+  LIMIT 10;
+"
+# Output likely shows: WALWrite or Checkpoint等待
+
+# Check postgres config (shared_buffers, effective_cache_size)
+cat /var/lib/postgresql/data/postgresql.conf | grep -E "^effective_cache|^shared_buffers|^wal"
+# effective_cache_size = 24GB  (should be ~75% of RAM)
+# shared_buffers = 8GB         (should be ~25% of RAM)
+
+# === STEP 6: CHECK FOR MEMORY PRESSURE ===
+free -h
+#              total        used        free      shared  buff/cache   available
+# Mem:       31.4Gi       27.5Gi       400Mi        1.0Mi       3.4Gi       1.2Gi
+# available is low — 1.2GB for a 31GB machine
+
+# Check if OOM has fired
+dmesg | grep -i oom | tail -5
+# [12345.678] Out of memory: Kill process ... score 892
+# [12345.678] postgres invoked oom-killer: ...
+
+# === STEP 7: ROOT CAUSE ===
+# Multiple postgres connections consuming memory
+# + WAL writes causing I/O
+# + OOM pressure causing disk swapping
+# Root cause: shared_buffers too high for actual workload, causing memory pressure
+
+# === STEP 8: FIX ===
+# Temporary: drop caches, reduce I/O
+sync; echo 3 > /proc/sys/vm/drop_caches
+sysctl -w vm.swappiness=10
+
+# Permanent: adjust postgres shared_buffers
+# In postgresql.conf:
+# shared_buffers = 4GB   # down from 8GB
+# effective_cache_size = 20GB  # keep ~75% of RAM for OS cache
+# wal_buffers = 64MB     # reduce
+# min_wal_size = 1GB     # reduce checkpoint frequency
+# max_wal_size = 4GB
+
+# Reload postgres
+sudo -u postgres psql -c "SELECT pg_reload_conf();"
+
+# Verify
+vmstat 1 5         # wa% should drop
+free -h            # available should increase
+iostat -xz 1       # await should drop
+
+# === STEP 9: PREVENT ===
+# Add memory monitoring alert before OOM fires
+# Add disk I/O alert before saturation
+# Review postgres memory config with pgtune
+```
+
+## CLI Examples
+
+```bash
+# Quick health check
+uptime; free -h; vmstat 1 5; df -h; iostat -xz 1 2
+
+# What's listening on a port
+ss -tulpn | grep :80
+lsof -i :80
+
+# Which process is using the most memory
+ps aux --sort=-%mem | head -10
+
+# Which file is being written to most
+iotop -ao | head -20
+
+# What's connecting to an external IP
+ss -tunap | grep 1.2.3.4
+netstat -tnp | grep 1.2.3.4
+
+# Core dump analysis
+coredumpctl list
+coredumpctl gdb <PID>
+# In gdb: bt (backtrace), info threads, p variable
+
+# kdump (kernel crash dump)
+# Enable: kdumpctl enable
+# Config: /etc/kdump.conf
+# View: crash /var/crash/*/vmcore /usr/lib/debug/vmlinux-\$(uname -r)
+
+# Systemtap for kernel tracing
+stap -e 'probe syscall.read { if (pid() == target()) printf("read(%d): %d bytes\n", pid(), count); }' -x <PID>
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `dmesg -T` | Kernel ring buffer with timestamps |
+| `journalctl -b -p err` | Boot-time errors |
+| `strace -c -p <PID>` | Syscall summary |
+| `perf top` | Live CPU profiler |
+| `bpftrace -e '...'` | One-liner tracing |
+| `tcpdump -i eth0` | Packet capture |
+| `ss -tunapl` | TCP/UDP connections |
+| `iostat -xz 1` | Disk I/O utilization |
+| `iotop -ao` | Per-process I/O |
+| `free -h` | Memory summary |
+| `vmstat 1` | CPU, memory, I/O summary |
+| `coredumpctl gdb` | Debug a crash dump |
+
+## Monitoring
+
+```bash
+# Real-time monitoring scripts
+# CPU saturation:
+while true; do
+    load=$(awk '{print $1}' /proc/loadavg)
+    cores=$(nproc)
+    echo "Load: $load / $cores = $(bc -l <<< "$load/$cores")"
+    sleep 2
+done
+
+# I/O wait detection:
+vmstat 1 | awk '{if ($16 > 30) print "HIGH IOWAIT: "$16"%"}'
+
+# Network retransmits:
+cat /proc/net/netstat | awk '/TcpExt/ {print "ListenDrops:", $59, "TCPRetransFail:", $54}'
+
+# Connection table saturation:
+ss -s
+# Total: 1450 queues, 45 partially established
+# If SYN queue is full: netstat -s | grep -i "listen"
+# net.ipv4.tcp_max_syn_backlog tuning
+
+# Detect memory leaks (growing RSS over time):
+while true; do
+    for pid in $(pgrep -f myapp); do
+        rss=$(ps -o rss= -p $pid)
+        echo "$(date): PID=$pid RSS=${rss}KB"
+    done
+    sleep 60
+done | tee /tmp/memleak.log
+```
+
+## Security
+
+**Tracing tools can expose sensitive data:**
+- `strace` captures all syscalls — passwords, tokens pass through as read buffer
+- `tcpdump` captures full packet payloads — encryption keys, session cookies
+- Limit access to these tools: `chmod 750 /usr/bin/strace /usr/bin/tcpdump`
+- Audit: `auditctl -w /usr/bin/strace -p x`
+
+**Kernel panic on production:**
+- Never reboot without capturing crash dump (`kdump`)
+- Configure: `kexec -l /boot/vmlinuz --initrd=/boot/initrd.img --command-line="..."`
+
+## Troubleshooting
+
+**System is unresponsive:**
+```bash
+# Can you ping?
+ping -c 3 127.0.0.1
+
+# Can you SSH? Can you run any command?
+# If SSH works: it's an application issue
+# If SSH hangs: kernel-level or network issue
+
+# Check dmesg (kernel errors)
+dmesg | tail -100
+
+# Is it OOM?
+dmesg | grep -i oom
+journalctl -k | grep -i oom
+
+# Is disk full?
+df -h
+# If /var/log or /tmp is full, many things break
+
+# Remote kernel debug (netconsole):
+# On target: dmesg -n 8; exec 2>/dev/null; modprobe netconsole_netdev=eth0@10.0.0.1/,
+# On debug host: nc -u -l 6666
+```
+
+**High CPU diagnosis:**
+```bash
+# 1. Which process?
+top -b -n 1 | head -20
+
+# 2. CPU breakdown (user vs system vs iowait)
+vmstat 1 5
+
+# 3. What syscalls is it making?
+strace -p <PID> -c
+# After 30 seconds: shows syscall counts
+
+# 4. What's the code path (flame graph)?
+perf record -F 99 -a -g -- sleep 30
+perf report
+
+# 5. Is it a GC? Java/Go heap?
+# Java: jstat -gc <PID>
+# Go: curl localhost:6060/debug/pprof/heap
+```
+
+**High memory diagnosis:**
+```bash
+# 1. What's consuming memory?
+ps aux --sort=-%mem | head -10
+
+# 2. Is it page cache (benign) or actual usage?
+# free shows buff/cache — this is reclaimable
+awk '/MemAvailable/ {avail=$2} /MemTotal/ {total=$2} /Cached/ {cached=$2} END {printf "Available: %.1fGB, Cached: %.1fGB\n", avail/1024/1024, cached/1024/1024}' /proc/meminfo
+
+# 3. Check slab (kernel object cache)
+cat /proc/meminfo | grep -E 'SReclaimable|SUnreclaim|Slab'
+# If SUnreclaim is huge: check for inode/dentry cache leak
+slabtop -o | head -20
+
+# 4. Memory cgroup breakdown (containers)
+for cgroup in /sys/fs/cgroup/memory.slice/*/memory.usage_in_bytes; do
+    echo "$cgroup: $(($(cat $cgroup) / 1024 / 1024))MB"
+done
+```
+
+**Network latency diagnosis:**
+```bash
+# 1. Is it DNS?
+time nslookup example.com
+# If slow: check /etc/resolv.conf, try 8.8.8.8
+
+# 2. Is it the remote host?
+ping -c 10 remote-host
+mtr remote-host
+
+# 3. Where is latency added? (local, network, remote)
+hping3 -S remote-host -p 80 -z  # incremental TTL
+# Use mtr with report mode
+
+# 4. Is it TCP retransmits?
+ss -ti remote-host:80
+# Look at: lost, retrans, rtt
+
+# 5. Capture packets to analyze
+tcpdump -i eth0 host remote-host -w /tmp/net.pcap
+tcpdump -r /tmp/net.pcap | less  # view
+# Analyze with tshark
+tshark -r /tmp/net.pcap -z io,stat,0.1 -z follow,tcp,ascii,<stream-id>
+```
+
+## Interview Questions
+
+1. **A Linux server becomes unresponsive. What is your systematic debugging process?**
+
+First: determine if it responds to anything (ping, SSH, console). If ping works but SSH doesn't, it's a user-space issue (service blocked, resources exhausted). If ping doesn't work, it's kernel or hardware. Check: (1) physical console for kernel panic messages, (2) `dmesg | tail` for OOM kills or hardware errors, (3) `df -h` for disk full (causes everything to fail), (4) `free -h` for memory exhaustion, (5) `ss -tunapl` for connection table saturation. If not obvious, use `perf top` from serial console or `bpftrace` to sample without ssh. If kernel is hung, use NMI watchdog: `echo "nmi" > /proc/sysrq-trigger` to get kernel stack traces.
+
+2. **How do you use bpftrace to profile a production system without disrupting it?**
+
+bpftrace uses BPF (Berkeley Packet Filter), which is compiled to bytecode and verified by the kernel before execution — it cannot crash the system or cause loops. It uses kprobes (dynamic kernel function tracing) and tracepoints (stable kernel APIs). For low overhead: use low-frequency sampling (`bpftrace -e '...' 1>/dev/null` only activates on events), limit the duration with timeouts (`sleep 60`), and use pre-aggregated maps (`@counts = count()`). Do NOT use infinite loops in bpftrace programs. Start with existing tools (perf, strace) — only use bpftrace when you need something they cannot provide.
+
+3. **What is the difference between strace and perf? When would you use each?**
+
+strace intercepts system calls using `ptrace` — it attaches to a process and instruments each syscall entry/exit individually. Overhead is proportional to syscall frequency — for a process doing 10,000 syscalls/second, strace adds significant overhead. perf uses hardware performance counters (PMU) and tracepoints — lower overhead for profiling, but cannot show every individual syscall. Use strace for: debugging why a specific operation fails (looking at actual syscalls and errno), understanding program behavior one execution at a time, tracing specific syscalls. Use perf for: CPU profiling (understanding where time is spent across all CPUs), hardware counter analysis (cache misses, branch mispredictions), understanding aggregate behavior.
+
+4. **A service works in development but fails in production. The error is "Too many open files." How do you investigate?**
+
+Check current limits: `ulimit -n` (soft), `ulimit -Hn` (hard). Check what the process actually has open: `ls -la /proc/<PID>/fd | wc -l`. If at limit, increase via `ulimit -n <value>` or in `/etc/security/limits.conf`. If not at limit but still failing, check `/proc/sys/fs/file-nr` (total system-wide allocated FDs) and `/proc/sys/fs/file-max` (system limit). If system limit, increase via `sysctl -w fs.file-max=<value>` and `sysctl -w fs.nr_open=<value>`. Common cause: a file descriptor leak (program opens files and doesn't close them). To find leaks: `ls -la /proc/<PID>/fd` repeatedly and see if count grows, or use `lsof -p <PID>` with timestamp comparison.
+
+5. **How would you diagnose a network performance issue where latency is high but CPU and disk are fine?**
+
+First: isolate where the latency is introduced — client, network, or server. Check: (1) DNS resolution (`time nslookup` — often forgotten cause), (2) TCP connection time (`curl -w "%{time_connect}"`), (3) TLS handshake (`curl -w "%{time_appconnect}"`), (4) first byte time (`curl -w "%{time_starttransfer"`), (5) total time. Use `ss -ti` to examine TCP state on both ends (receive window, congestion window, RTT, retransmits). Use `tcpdump` to see if packets are being delayed in transit (timestamps between packets). Check if connection tracking is causing latency (`conntrack -L` count, `/proc/net/nf_conntrack`). Use `ip route get` to verify routing. Use `iperf3` to measure raw network throughput vs latency baseline.
+
+## Cheat Sheet
+
+```bash
+# Quick diagnosis
+uptime; free -h; vmstat 1 3; iostat -xz 1 2; ss -tunapl
+
+# CPU
+strace -c -p <PID>         # syscalls
+perf top                   # live CPU
+perf record -F 99 -a -g -- sleep 30 && perf report
+
+# Memory
+ps aux --sort=-%mem | head
+cat /proc/meminfo | grep -E 'Available|Cached|SReclaim'
+smem -s rss -r | head
+
+# I/O
+iostat -xz 1 3
+iotop -ao
+blktrace -d /dev/sda -o - | blkparse -
+
+# Network
+ss -tunapl
+tcpdump -i eth0 -n port 80
+ping -c 5 host; mtr host
+
+# Tracing
+strace -p <PID> -f -e trace=network
+bpftrace -e 'tracepoint:syscalls:sys_enter_read { @[comm] = count(); }'
+
+# Logs
+dmesg -T | tail -50
+journalctl -p err -b --no-pager
+journalctl --since "1 hour ago" -u service
+```
+
+## Related Topics
+
+- [Performance](./performance) — Performance measurement and tuning
+- [Networking](./networking) — Network troubleshooting
+- [Memory](./memory) — Memory debugging
+- [Storage](./storage) — Disk I/O issues
+- [Processes](./processes) — Process debugging
+- [Security](./security) — Intrusion detection

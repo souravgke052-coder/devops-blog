@@ -1,0 +1,555 @@
+---
+sidebar_position: 2
+---
+
+# Troubleshooting Methodology
+
+## Overview
+
+Effective troubleshooting is not random guesswork—it is a systematic discipline that combines scientific inquiry, pattern recognition, and structured problem-solving. This guide establishes the methodological framework that underlies all technical troubleshooting in DevOps.
+
+Master these approaches and apply them consistently. The difference between experienced engineers and novices is not knowledge of more commands—it is the ability to systematically narrow down possibilities and identify root causes efficiently.
+
+## When To Use
+
+Apply systematic troubleshooting methodology when:
+
+- **Facing unknown or unfamiliar errors** — Follow the structured process rather than guessing
+- **Dealing with complex, multi-component systems** — Isolate fault domains systematically
+- **Investigating intermittent issues** — Create conditions to reproduce and measure
+- **Conducting post-incident analysis** — Document the reasoning path taken
+- **Onboarding new team members** — Establish consistent debugging practices
+
+## When NOT To Use
+
+Situations requiring different approaches:
+
+- **Known, documented issues** — Check runbooks first; apply known fix if criteria match
+- **Emergency rollback situations** — Execute proven rollback procedure; investigate later
+- **Security incidents** — Follow security incident response workflow, preserve evidence
+- **Simple, obvious problems** — If the fix is clear and low-risk, apply it directly
+
+## Core Concepts / Methodology
+
+### The Scientific Method for Debugging
+
+The foundation of all effective troubleshooting mirrors the scientific method:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. OBSERVE     │  Gather data without interpretation           │
+│                 │  "What exactly am I seeing?"                  │
+├─────────────────┼─────────────────────────────────────────────────┤
+│  2. STATE       │  Form a precise, testable hypothesis          │
+│     HYPOTHESIS  │  "I believe X is causing Y because..."        │
+├─────────────────┼─────────────────────────────────────────────────┤
+│  3. PREDICT     │  State expected results if hypothesis true    │
+│                 │  "If I'm right, command Z should show A"      │
+├─────────────────┼─────────────────────────────────────────────────┤
+│  4. TEST        │  Execute diagnostic commands to test          │
+│                 │  Run commands, capture output                  │
+├─────────────────┼─────────────────────────────────────────────────┤
+│  5. ANALYZE     │  Compare results to predictions               │
+│                 │  Confirm, deny, or refine hypothesis          │
+├─────────────────┼─────────────────────────────────────────────────┤
+│  6. ITERATE     │  Repeat with refined hypothesis               │
+│                 │  Each cycle narrows possibilities              │
+└─────────────────┴─────────────────────────────────────────────────┘
+```
+
+**Critical Practice:** Never skip from observation to solution. The temptation to apply "the usual fix" without proper diagnosis leads to:
+
+- Fixing symptoms rather than root causes
+- Introducing new problems
+- Missing context that would reveal the actual issue
+- Inability to document what you learned
+
+### Differential Diagnosis Approach
+
+When multiple possible causes exist, apply differential diagnosis:
+
+```
+                    ┌─────────────────────┐
+                    │   PRESENTING        │
+                    │   SYMPTOM           │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │  LIST ALL POSSIBLE  │
+                    │  CAUSES (Differentials)│
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+    ┌─────────▼─────────┐  ┌───▼───┐  ┌────────▼────────┐
+    │ ELIMINATE by      │  │Test   │  │ ELIMINATE by    │
+    │Evidence           │  │Each   │  │Evidence          │
+    │                   │  │One    │  │                  │
+    └─────────┬─────────┘  └───┬───┘  └────────┬────────┘
+              │                │                │
+              └────────────────┼────────────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │  REMAINING CAUSE(S) │
+                    │  = Root Cause(s)    │
+                    └─────────────────────┘
+```
+
+**Example Application:**
+
+Problem: Users cannot reach the application
+
+Differentials:
+1. Load balancer misconfiguration
+2. Network firewall blocking traffic
+3. Backend service crashed
+4. DNS resolution failure
+5. TLS certificate expired
+
+Testing eliminates:
+- DNS: `dig app.example.com` ✓ works
+- Service: `curl localhost:8080/health` ✓ works
+- LB: Check health check status → **FAILING**
+
+Hypothesis refined: Load balancer health checks failing, not actual service.
+
+### The 5 Whys Technique
+
+For root cause analysis, repeatedly ask "Why?" until you reach the underlying process or system failure:
+
+```
+Problem: Database queries are slow
+
+Why? → Lock contention on the users table
+Why? → Batch job updating millions of rows without batching
+Why? → Job was written quickly for migration, never optimized
+Why? → No code review requirement for migration scripts
+Why? → Team didn't establish migration script standards
+         │
+         ▼
+Root Cause: Missing standards for database migration scripts
+
+Fix: Create migration script guidelines with batch size limits,
+     add code review checklist, implement migration monitoring
+```
+
+### Fault Domain Analysis
+
+Systematically isolate where the problem exists:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    FAULT DOMAIN TREE                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │           NETWORK FAULT DOMAIN                       │  │
+│  │  • Can you ping the host?                            │  │
+│  │  • Can you establish TCP connection?                 │  │
+│  │  • DNS resolution working?                           │  │
+│  │  • Check: firewall, routing, DNS, network policy     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                          OR                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │           COMPUTE FAULT DOMAIN                       │  │
+│  │  • Is the process running?                           │  │
+│  │  • CPU utilization normal?                           │  │
+│  │  • Check: service status, resource limits            │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                          OR                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │           STORAGE FAULT DOMAIN                       │  │
+│  │  • Is data accessible?                               │  │
+│  │  • Disk space/memory available?                      │  │
+│  │  • Check: disk I/O, storage quota, locks             │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                          OR                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │           APPLICATION FAULT DOMAIN                   │  │
+│  │  • Application logs show errors?                     │  │
+│  │  • Configuration correct?                            │  │
+│  │  • Dependencies accessible?                          │  │
+│  │  • Check: app logs, config, dependency health        │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### The SRE Error Budget Approach
+
+When to debug vs. declare an incident:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    DECISION MATRIX                         │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  Issue affects < 1% of users, low severity?               │
+│  YES → Debug and fix during business hours                │
+│  NO  │                                                     │
+│      ▼                                                     │
+│  Issue affects > 1% of users OR severity is HIGH?         │
+│  YES → Declare incident, focus on mitigation first        │
+│                                                            │
+│  RECOVERY TIME OBJECTIVE (RTO) vs investigation time:     │
+│  • If RTO < time to find root cause → Mitigate first      │
+│  • If RTO > time to find root cause → Debug properly      │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Key Principle:** Sometimes the fastest fix is a restart or rollback, not a root cause analysis. Know when to pursue each path.
+
+## Diagnostic Commands / Tools
+
+### Command Categories
+
+| Category | Purpose | Key Commands |
+|----------|---------|--------------|
+| **Observation** | See what is happening now | `top`, `htop`, `ss`, `ps` |
+| **Testing** | Verify specific hypotheses | `ping`, `curl`, `nc` |
+| **Tracing** | Follow request paths | `strace`, `tcpdump`, `traceroute` |
+| **Logging** | Review historical events | `journalctl`, `dmesg`, `tail` |
+| **Metrics** | Measure performance | `vmstat`, `iostat`, `netstat` |
+
+### The Debugging Toolkit
+
+**Essential (every engineer should know by heart):**
+```bash
+# What's running and what's consuming resources?
+top -bn1
+
+# What network connections exist?
+ss -tulnp
+
+# What do logs say?
+journalctl -p err --since "1 hour ago" --no-pager
+
+# Is disk space an issue?
+df -h
+```
+
+**Intermediate (for deeper investigation):**
+```bash
+# Trace system calls of a process
+strace -p <pid> -f -e trace=network 2>&1 | head -100
+
+# Capture network packets
+tcpdump -i eth0 -w /tmp/capture.pcap host 10.0.0.1 and port 443
+
+# Check what a process has open
+lsof -p <pid>
+```
+
+**Advanced (for complex debugging):**
+```bash
+# Live BPF one-liner for syscalls
+bpftrace -e 'tracepoint:syscalls:sys_enter_open { printf("%s %s\n", comm, str(args->filename)); }'
+
+# Flame graph generation
+perf record -F 99 -a -g -- sleep 30
+```
+
+### Building Your Diagnostic Workflow
+
+1. **Start Broad, Then Narrow**
+   ```
+   Start: ss -tulnp (see all listening ports)
+   Then: ss -tulnp | grep :8080 (narrow to your service)
+   Then: strace -p <pid> (investigate specific process)
+   ```
+
+2. **Capture Baseline First**
+   ```bash
+   # Save system state before making changes
+   top -bn1 > /tmp/before-fix.txt
+   ss -tulnp > /tmp/connections.txt
+   ```
+
+3. **Compare Before and After**
+   ```bash
+   # After applying fix
+   diff /tmp/before-fix.txt <(top -bn1)
+   ```
+
+## Real Production Scenarios
+
+### Scenario 1: API Latency Spike with No Code Changes
+
+**Symptom:** API response times increased 10x without any deployments or infrastructure changes.
+
+**Diagnostic Commands:**
+```bash
+# Check system resources
+vmstat 1 10
+# procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+#  r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+#  2  0      0 1623404  98248  234568    0    0     4    12   42   89  5  2 93  0  0
+
+# Check for CPU steal (cloud environments)
+mpstat -P ALL 1 5
+
+# Check database query times
+psql -c "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
+
+# Check network I/O
+iftop -i eth0
+```
+
+**Root Cause:** A batch job on a shared database server started at 9:00 AM, consuming 80% of I/O resources and causing database query latency to spike.
+
+**Fix:**
+1. Kill or pause the batch job
+2. Reschedule it for off-peak hours
+3. Implement resourceGovernor to limit batch job I/O
+
+**Prevention:**
+- Schedule batch jobs during off-peak hours
+- Implement I/O rate limiting for batch processes
+- Add alerting on query latency percentiles
+
+---
+
+### Scenario 2: Service Starts but Rejects All Requests
+
+**Symptom:** Service shows "running" but returns 500 errors to all requests.
+
+**Diagnostic Commands:**
+```bash
+# Verify service is actually listening
+ss -tulnp | grep :8080
+
+# Test localhost connectivity
+curl -v http://localhost:8080/health
+
+# Check application logs
+tail -100 /var/log/application.log
+
+# Check for file descriptor exhaustion
+cat /proc/$(pgrep -f myservice)/limits | grep "Max open files"
+
+# Test external dependencies
+curl -v https://database.internal/ping
+```
+
+**Root Cause:** Configuration file was moved during a maintenance window, and the service started with default (empty) configuration, including an invalid database connection string.
+
+**Fix:**
+```bash
+# Restore configuration
+mv /etc/app/config.yaml.bak /etc/app/config.yaml
+
+# Restart service
+systemctl restart myservice
+```
+
+**Prevention:**
+- Validate configuration on startup (fail-fast)
+- Include config file integrity in deployment checklist
+- Implement configuration hot-reload to avoid restarts
+
+---
+
+### Scenario 3: Memory Usage Increasing Until Crash
+
+**Symptom:** Service runs fine initially, but memory usage grows linearly until the OOM killer terminates it.
+
+**Diagnostic Commands:**
+```bash
+# Observe memory growth
+watch -n 5 'ps aux | grep process-name | grep -v grep'
+
+# Check for memory leaks with heap dump
+jmap -dump:file=/tmp/heap.hprof,format=b <pid>
+
+# Analyze heap
+jhat /tmp/heap.hprof
+
+# Check GC logs
+cat /var/log/gc.log | tail -50
+
+# Monitor allocations in real-time
+bpftrace -e 'tracepoint:kmem:*alloc* { @[comm, args->bytes_alloc] = count(); }'
+```
+
+**Root Cause:** A caching layer was adding objects to a concurrent hashmap but never removing them, causing unbounded cache growth.
+
+**Fix:**
+```bash
+# Implement TTL-based cache eviction
+# Add maximum cache size limit
+# Deploy fixed version
+```
+
+**Prevention:**
+- Implement cache size limits with eviction policies
+- Monitor memory usage trends, not just current value
+- Set up alerts for memory growth rate
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Unknown Service Failure
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: GATHER CONTEXT                                     │
+│ • When did it start failing?                                │
+│ • What changed recently? (deployments, config, infra)       │
+│ • How many users/systems are affected?                     │
+│ • Are there related alerts?                                 │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: VERIFY SERVICE STATE                               │
+│ • Is the process running? systemctl status <service>       │
+│ • Is it listening on expected ports? ss -tulnp             │
+│ • Can it respond to localhost health check? curl localhost │
+│ • Are dependent services accessible?                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CHECK SYSTEM RESOURCES                             │
+│ • CPU: top or htop                                         │
+│ • Memory: free -h                                          │
+│ • Disk: df -h                                              │
+│ • Network: ss -s, iftop                                    │
+│ • Processes: ps aux | grep <name>                          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: EXAMINE LOGS                                       │
+│ • Application logs: tail -f /var/log/<app>.log             │
+│ • System logs: journalctl -u <service>                     │
+│ • Kernel: dmesg | tail                                     │
+│ • Search for ERROR, FATAL, exception patterns              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 5: ISOLATE FAULT DOMAIN                               │
+│ • Can service reach its dependencies?                      │
+│ • Can other services reach this service?                   │
+│ • Does problem reproduce in isolation?                     │
+│ • Narrow to: network / compute / storage / application     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 6: FORM HYPOTHESIS                                    │
+│ • Based on evidence, what likely causes this?              │
+│ • Rank by probability                                      │
+│ • Plan test for highest probability cause                  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 7: TEST AND ITERATE                                   │
+│ • Apply fix for most likely cause                          │
+│ • Verify fix worked                                        │
+│ • If not, test next hypothesis                             │
+│ • Document findings and resolution                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Pattern | Likely Cause | Diagnostic Approach | Fix |
+|---------|--------------|---------------------|-----|
+| **Always fails, same error** | Configuration or code bug | Compare with working environment | Roll back, fix config |
+| **Intermittent failures** | Race condition or resource exhaustion | Enable debug logging, capture failure state | Add retry logic, increase resources |
+| **Fails under load** | Resource limit or bottleneck | Load test to reproduce | Scale horizontally or vertically |
+| **Fails after time** | Memory leak or accumulation | Compare heap/memory over time | Fix leak, add restart cycle |
+| **Fails after deployment** | Code bug or incompatibility | Roll back, check diff | Fix code, test in staging |
+
+## Monitoring / Log Analysis
+
+### Structured Log Analysis
+
+Good logs answer: **Who? When? What? Where? How?**
+
+```
+# Extract structured fields
+cat /var/log/application.log | jq '. | {level, message, trace_id, duration_ms}'
+
+# Find high-latency requests
+cat /var/log/application.log | jq 'select(.duration_ms > 1000)' | wc -l
+
+# Correlate errors across services
+grep -E "ERROR|FATAL" /var/log/*.log | jq -r '"\(.service) \(.timestamp) \(.message)"'
+```
+
+### Alert on Symptoms, Not Causes
+
+```
+WRONG: Alert when disk usage > 90%
+RIGHT: Alert when disk usage increasing > 10% per hour AND < 30% remaining
+
+WRONG: Alert when CPU > 80%
+RIGHT: Alert when API latency P99 > 500ms AND CPU > 80%
+```
+
+## Interview Questions
+
+### Question 1: Systematic Debugging Process
+
+**Q:** Walk me through how you would debug a performance issue in a web application where response times have tripled over the past week.
+
+**A Framework Answer:**
+1. Establish baseline - what was "normal" last week?
+2. Identify scope - is it all endpoints or specific ones?
+3. Check resource utilization - is the app or database the bottleneck?
+4. Examine recent changes - deployments, config, traffic patterns
+5. Isolate layers - network, application, database, external services
+6. Apply scientific method - hypothesize, test, iterate
+7. Fix root cause, not symptoms
+8. Add monitoring to detect recurrence
+
+### Question 2: Handling Unknown Errors
+
+**Q:** You see an error message you've never encountered before in a critical production system. What's your approach?
+
+**A Framework Answer:**
+1. Don't panic - unknown errors are solved systematically
+2. Record the exact error message and context
+3. Search for the exact error string (error codes are searchable)
+4. Check if error is from a dependency - identify the source
+5. Check recent changes that might have introduced new errors
+6. Enable debug logging to get more detail
+7. Attempt to reproduce in lower environment
+8. If no progress, escalate with all gathered evidence
+
+### Question 3: Debugging Intermittent Issues
+
+**Q:** How do you approach debugging an issue that only happens in production, roughly 1% of the time, and cannot be reproduced?
+
+**A Framework Answer:**
+1. Add instrumentation to capture state when error occurs
+2. Implement sampling to capture traces for percentage of requests
+3. Aggregate and analyze captured data to find patterns
+4. Look for correlation with time, user segment, data characteristics
+5. Check if issue correlates with specific backends, regions, or infrastructure
+6. Consider load patterns - does issue correlate with peak traffic?
+7. Implement detailed logging for suspected failure mode
+8. Use canary deployments to isolate changes
+
+## Cheat Sheet
+
+| Principle | Description |
+|-----------|-------------|
+| **Observe First** | Gather data before forming hypothesis |
+| **Test One Thing** | Change only one variable at a time |
+| **Document Everything** | Record commands run and outputs seen |
+| **Verify Fix** | Confirm the problem is resolved, not just symptoms masked |
+| **Escalate with Evidence** | When escalating, provide all diagnostic data |
+| **Reproduce to Confirm** | Verify fix by reproducing and confirming resolution |
+| **Prevent Recurrence** | Add monitoring/automation to prevent future occurrences |
+
+## Related Topics
+
+- [Linux Troubleshooting](./linux-troubleshooting) - System-level commands and techniques
+- [Network Troubleshooting](./network-troubleshooting) - Network diagnostic approach
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - Container orchestration debugging
+- [Common Issues](./common-issues) - Frequently occurring problems and patterns

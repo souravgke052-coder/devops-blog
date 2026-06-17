@@ -1,0 +1,792 @@
+# Microservices Architecture
+
+sidebar_position: 3
+
+## Overview
+
+Microservices architecture decomposes applications into small, autonomous services that own their data and communicate via well-defined APIs. On GCP, we leverage Cloud Run, Cloud SQL, and Pub/Sub to build resilient, scalable microservices.
+
+## When To Use
+
+- Building applications that need independent deployability
+- Teams that need autonomy in technology choices
+- Services with varying scaling requirements
+- Systems requiring fault isolation
+- Applications expected to grow in complexity
+
+## When NOT To Use
+
+- Simple CRUD applications with predictable load
+- Small teams (< 5 developers) without DevOps maturity
+- When time-to-market is critical and complexity is manageable
+- Services that are tightly coupled by nature
+- When operational overhead exceeds benefits
+
+## Core Concepts
+
+### Service Design Principles
+- **Single Responsibility**: Each service owns one domain
+- **API-First**: Well-defined contracts using OpenAPI
+- **Database per Service**: No shared databases
+- **Smart Endpoints, Dumb Pipes**: Business logic in services
+- ** Decentralized Data**: Each service manages its own data
+
+### Boundaries
+- **Domain Boundaries**: Align with business capabilities
+- **Team Boundaries**: Inverse Conway Maneuver
+- **Deployment Boundaries**: Independent release cycles
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         API Gateway Layer                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    Cloud API Gateway / Apigee                    │   │
+│  │   Rate Limiting │ Authentication │ Request Routing │ Logging    │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                      ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│   Auth API    │    │  Content API  │    │   Billing API │
+│  (Cloud Run)  │    │  (Cloud Run)  │    │  (Cloud Run)  │
+│               │    │               │    │               │
+│ - OAuth2      │    │ - CRUD        │    │ - Subscriptions│
+│ - JWT tokens  │    │ - Search      │    │ - Invoicing   │
+│ - User mgmt   │    │ - Publishing  │    │ - Payment     │
+└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
+        │                    │                    │
+        └────────────────────┼────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        ▼                    ▼                    ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│  Cloud SQL    │    │  Cloud SQL    │    │ Cloud Spanner │
+│  (Users DB)   │    │ (Content DB)  │    │  (Billing)    │
+└───────────────┘    └───────────────┘    └───────────────┘
+
+        ┌─────────────────────────────────────────────────┐
+        │              Event Bus (Pub/Sub)                 │
+        │  user.created │ content.published │ payment.done │
+        └─────────────────────────────────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        ▼                    ▼                    ▼
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ Email Service │    │ Search Index  │    │ Analytics     │
+│ (Cloud Func)  │    │ (Elasticsearch│    │ (Dataflow)    │
+└───────────────┘    │  on GKE)      │    └───────────────┘
+                     └───────────────┘
+```
+
+## Real Production Example
+
+### Stripe-Style Payment Microservices
+
+Stripe processes millions of transactions daily using microservices architecture:
+
+```typescript
+// Payment Service - Cloud Run
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Health check
+app.get('/healthz', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'healthy' });
+  } catch (error) {
+    res.status(503).json({ status: 'unhealthy' });
+  }
+});
+
+// Create payment intent
+app.post('/v1/payment_intents', async (req, res) => {
+  const { amount, currency, customer_id, metadata } = req.body;
+
+  // Validate request
+  if (!amount || !currency) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Create payment intent record
+    const result = await client.query(`
+      INSERT INTO payment_intents (
+        id, amount, currency, customer_id, metadata,
+        status, created_at
+      ) VALUES (
+        gen_random_uuid(), $1, $2, $3, $4, 'requires_payment_method', NOW()
+      ) RETURNING *
+    `, [amount, currency, customer_id, JSON.stringify(metadata)]);
+
+    const paymentIntent = result.rows[0];
+
+    // Publish event for other services
+    await pubsub.topic('payment-events').publish({
+      type: 'PAYMENT_INTENT_CREATED',
+      data: {
+        id: paymentIntent.id,
+        customer_id,
+        amount,
+        currency
+      }
+    });
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      id: paymentIntent.id,
+      object: 'payment_intent',
+      amount,
+      currency,
+      status: paymentIntent.status
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Payment intent creation failed:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Confirm payment
+app.post('/v1/payment_intents/:id/confirm', async (req, res) => {
+  const { payment_method_id } = req.body;
+  const { id } = req.params;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Get payment intent
+    const intentResult = await client.query(
+      'SELECT * FROM payment_intents WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+
+    if (intentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Payment intent not found' });
+    }
+
+    const intent = intentResult.rows[0];
+
+    if (intent.status !== 'requires_payment_method') {
+      return res.status(400).json({ error: 'Invalid payment intent status' });
+    }
+
+    // Process payment (call payment processor, Stripe, etc.)
+    const processorResult = await processWithPaymentProcessor({
+      amount: intent.amount,
+      paymentMethodId: payment_method_id
+    });
+
+    if (processorResult.success) {
+      await client.query(`
+        UPDATE payment_intents
+        SET status = 'succeeded', updated_at = NOW()
+        WHERE id = $1
+      `, [id]);
+
+      await pubsub.topic('payment-events').publish({
+        type: 'PAYMENT_SUCCEEDED',
+        data: { payment_intent_id: id, processor_id: processorResult.id }
+      });
+    } else {
+      await client.query(`
+        UPDATE payment_intents
+        SET status = 'requires_payment_method', updated_at = NOW()
+        WHERE id = $1
+      `, [id]);
+    }
+
+    await client.query('COMMIT');
+
+    return res.json({ status: 'confirmed' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+export default app;
+```
+
+### Terraform for Microservices Infrastructure
+
+```hcl
+# Main.tf - Microservices Infrastructure
+
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "region" {
+  description = "GCP Region"
+  type        = string
+  default     = "us-central1"
+}
+
+# VPC for private service communication
+resource "google_compute_network" "vpc" {
+  name                    = "microservices-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "subnet" {
+  name          = "microservices-subnet"
+  network       = google_compute_network.vpc.id
+  ip_cidr_range = "10.0.0.0/24"
+  region        = var.region
+
+  private_ip_google_access = true
+}
+
+# VPC Serverless Access Connector
+resource "google_vpc_access_connector" "connector" {
+  name          = "microservices-connector"
+  region        = var.region
+  network       = google_compute_network.vpc.name
+  ip_cidr_range = "10.8.0.0/28"
+  min_instances = 2
+  max_instances = 10
+}
+
+# Cloud SQL - Auth Service Database
+resource "google_sql_database_instance" "auth_db" {
+  name             = "auth-service-db"
+  database_version = "POSTGRES_15"
+  region           = var.region
+
+  settings {
+    tier              = "db-n1-standard-2"
+    availability_type = "REGIONAL"
+    disk_autoresize   = true
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+      require_ssl     = true
+    }
+
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+    }
+
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+      record_application_tags = true
+      record_client_address   = false
+    }
+  }
+
+  deletion_protection = true
+}
+
+resource "google_sql_database" "auth_db" {
+  name     = "auth_db"
+  instance = google_sql_database_instance.auth_db.name
+}
+
+# Cloud SQL - Content Service Database
+resource "google_sql_database_instance" "content_db" {
+  name             = "content-service-db"
+  database_version = "POSTGRES_15"
+  region           = var.region
+
+  settings {
+    tier              = "db-n1-standard-4"
+    availability_type = "REGIONAL"
+    disk_autoresize   = true
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+      require_ssl     = true
+    }
+
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+    }
+  }
+
+  deletion_protection = true
+}
+
+# Cloud Run - Auth Service
+resource "google_cloud_run_v2_service" "auth_service" {
+  name     = "auth-service"
+  location = var.region
+
+  template {
+    service_account = google_service_account.auth_service.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/auth-service:latest"
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+      }
+      ports {
+        container_port = 8080
+      }
+      env {
+        name  = "DATABASE_URL"
+        value = "postgresql://${google_sql_database_instance.auth_db.connection_name}/auth_db"
+        value_from {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.database_url.name
+            version = "latest"
+          }
+        }
+      }
+    }
+
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 10
+    }
+
+    vpc_access {
+      connector = google_vpc_access_connector.connector.id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
+  }
+
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+}
+
+# IAM for service-to-service communication
+resource "google_service_account" "auth_service" {
+  account_id   = "auth-service-sa"
+  display_name = "Auth Service Account"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "auth_invoker" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.auth_service.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.auth_service.email}"
+}
+
+# Secret Manager for sensitive data
+resource "google_secret_manager_secret" "database_url" {
+  secret_id = "auth-service-database-url"
+
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "database_url" {
+  secret = google_secret_manager_secret.database_url.id
+  data   = "postgresql://user:password@hostname/auth_db?sslmode=require"
+}
+
+# Pub/Sub Topics for inter-service communication
+resource "google_pubsub_topic" "payment_events" {
+  name = "payment-events"
+}
+
+resource "google_pubsub_topic" "user_events" {
+  name = "user-events"
+}
+
+resource "google_pubsub_topic" "audit_events" {
+  name = "audit-events"
+}
+
+# Pub/Sub Subscriptions
+resource "google_pubsub_subscription" "email_payment_listener" {
+  name  = "email-service-payment-sub"
+  topic = google_pubsub_topic.payment_events.name
+
+  ack_deadline_seconds = 60
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.dead_letter.id
+    max_delivery_attempts = 5
+  }
+}
+
+resource "google_pubsub_topic" "dead_letter" {
+  name = "dead-letter-topic"
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### Service Communication Patterns
+
+#### Synchronous: REST/gRPC
+
+```typescript
+// gRPC service definition
+syntax = "proto3";
+
+package payments;
+
+service PaymentService {
+  rpc CreatePaymentIntent (CreatePaymentIntentRequest) returns (PaymentIntent);
+  rpc ConfirmPayment (ConfirmPaymentRequest) returns (PaymentConfirmation);
+  rpc GetPayment (GetPaymentRequest) returns (Payment);
+}
+
+message CreatePaymentIntentRequest {
+  int64 amount = 1;
+  string currency = 2;
+  string customer_id = 3;
+  map<string, string> metadata = 4;
+}
+```
+
+#### Asynchronous: Pub/Sub
+
+```typescript
+// Publishing events
+import { PubSub } from '@google-cloud/pubsub';
+
+const pubsub = new PubSub();
+
+app.post('/orders', async (req, res) => {
+  const order = await orderService.create(req.body);
+
+  // Async event - don't wait for consumers
+  await pubsub.topic('order-events').publish({
+    attributes: {
+      eventType: 'ORDER_CREATED',
+      timestamp: new Date().toISOString()
+    },
+    messages: [{
+      data: Buffer.from(JSON.stringify(order))
+    }]
+  });
+
+  // Return immediately
+  res.status(201).json(order);
+});
+```
+
+### Anti-patterns
+
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| Distributed Monolith | Services are deployable but tightly coupled | Define clear domain boundaries |
+| Shared Database | Coupling, scaling limits | Database per service |
+| Chatty Communication | High latency, network overhead | Batch requests, BFF pattern |
+| Shared Libraries | Coupling, version conflicts | API contracts, sidecar pattern |
+| No Ownership | Unclear responsibility | Team-aligned service ownership |
+
+## Monitoring
+
+### Distributed Tracing with Cloud Trace
+
+```typescript
+import { TraceAgent } from '@google-cloud/trace-agent';
+
+// Initialize tracing
+const traceAgent = new TraceAgent({
+  projectId: process.env.GCP_PROJECT,
+  serviceName: 'payment-service',
+  serviceVersion: process.env.VERSION
+});
+
+// Propagate trace context
+app.use((req, res, next) => {
+  const traceHeader = req.headers['x-cloud-trace-context'];
+  if (traceHeader) {
+    traceAgent.setCurrentContext(traceHeader);
+  }
+  next();
+});
+
+// Trace outgoing requests
+app.get('/v1/orders/:id', async (req, res) => {
+  const span = traceAgent.createChildSpan({ name: 'getOrder' });
+
+  try {
+    const order = await orderService.findById(req.params.id);
+    span.end();
+    res.json(order);
+  } catch (error) {
+    span.end({
+      labels: { error: error.message }
+    });
+    throw error;
+  }
+});
+```
+
+### Service Level Objectives
+
+```yaml
+# cloud-monitoring-slo.yaml
+apiVersion: monitoring/v3
+kind: ServiceLevelObjective
+metadata:
+  name: payment-service-slo
+spec:
+  service: payment-service
+  sli:
+    requestBased:
+      goodTotalRatio:
+        total: {
+          filter: |
+            resource.type="cloud_run_revision" AND
+            metric.type="run.googleapis.com/request_count" AND
+            resource.labels.service_name="payment-service"
+        }
+        good: {
+          filter: |
+            resource.type="cloud_run_revision" AND
+            metric.type="run.googleapis.com/request_count" AND
+            metric.labels.response_code_class="2xx" AND
+            resource.labels.service_name="payment-service"
+        }
+  goal: 0.999
+  windowingPeriod: 86400s
+```
+
+## Security
+
+### Service-to-Service Authentication
+
+```typescript
+// Using Workload Identity for service-to-service auth
+import { GoogleAuth } from 'google-auth-library';
+
+const auth = new GoogleAuth({
+  scopes: ['https://www.googleapis.com/auth/cloud-platform']
+});
+
+async function callContentService(orderId: string) {
+  const client = await auth.getClient();
+
+  const response = await client.request({
+    url: `https://content-service-${process.env.GCP_REGION}-run.googleapis.com/v1/orders/${orderId}`,
+    method: 'GET'
+  });
+
+  return response.data;
+}
+```
+
+### mTLS with Cloud Run
+
+```hcl
+# Terraform - Cloud Run with mTLS (where supported)
+resource "google_cloud_run_v2_service" "secure_service" {
+  name     = "secure-service"
+  location = var.region
+
+  template {
+    service_account = google_service_account.secure_service.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/secure-service:latest"
+    }
+
+    # Require encrypted traffic
+    scaling {}
+  }
+}
+
+# Network policy (when using GKE)
+resource "google_compute_network_policy" "example" {
+  name          = "example-policy"
+  project       = var.project_id
+  region        = var.region
+  network       = google_compute_network.vpc.name
+  log_level     = "LOG_ALL"
+
+  endpoint_policy {
+    action   = "ALLOW"
+    priority = 1
+
+    match {
+      version_mode = "GRPC"
+      grpc_port {
+        port = 8080
+      }
+    }
+  }
+}
+```
+
+## Cost Optimization
+
+### Per-Service Cost Allocation
+
+```hcl
+# Tag-based cost allocation
+resource "google_service_account" "service_sa" {
+  account_id = "billing-service-sa"
+}
+
+resource "google_labels_iam_member" "billing_service_labels" {
+  project = var.project_id
+  region  = var.region
+  resource = google_cloud_run_v2_service.billing_service.id
+
+  label_key   = "cost-center"
+  label_value = "billing-team"
+}
+
+# Budget alerts per service
+resource "google_billing_budget" "service_budget" {
+  budget_filter {
+    projects       = ["projects/${var.project_id}"]
+    labels {
+      key   = "service"
+      value = ["payment-service"]
+    }
+  }
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "10000"  # $10k/month limit
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.5  # Alert at 50%
+  }
+
+  alert_channel = google_billing_alert.billing-alert.id
+}
+```
+
+### Rightsizing Recommendations
+
+```bash
+# Get recommendations for Cloud Run
+gcloud recommender recommendations list \
+  --project=${PROJECT_ID} \
+  --recommender=google.cloudsql.instance Recommender \
+  --location=${REGION}
+
+# Apply recommendation
+gcloud recommender recommendations apply RECOMMENDATION_ID \
+  --project=${PROJECT_ID}
+```
+
+## Troubleshooting
+
+### Common Microservices Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| 503 after deployment | Service not ready | Check min instances, readiness probe |
+| Intermittent timeouts | Cold starts | Set min instances > 0 |
+| High latency | Database connection pool | Increase pool size or use connection proxy |
+| Memory spikes | Memory limit too low | Increase memory, check for leaks |
+| Failed pub/sub messages | Dead letter queue overflow | Check subscription errors |
+
+### Debug Commands
+
+```bash
+# View service logs
+gcloud run services logs read auth-service --region us-central1 --limit 100
+
+# Check service configuration
+gcloud run services describe auth-service --region us-central1
+
+# Test service endpoints
+curl -X POST https://auth-service-xxxx-uc.a.run.app/v1/token \
+  -H "Content-Type: application/json" \
+  -d '{"username":"test","password":"test"}'
+
+# Monitor pub/sub backlog
+gcloud pubsub subscriptions describe email-service-sub --format=json
+
+# Check Cloud SQL connections
+gcloud sql instances describe content-service-db --format=json | grep state
+```
+
+## Interview Questions
+
+### Q1: How do you handle data consistency across microservices?
+**Answer**: Use eventual consistency with event-driven patterns. Each service owns its data and publishes events. For transactions spanning services, use the Saga pattern with compensating transactions. Avoid distributed transactions (2PC) due to availability implications.
+
+### Q2: What are the key differences between REST and gRPC for service communication?
+**Answer**: REST uses JSON over HTTP/1.1, is human-readable, and widely supported. gRPC uses Protocol Buffers over HTTP/2, is binary and more efficient, supports bidirectional streaming, and provides type safety. gRPC is better for internal service-to-service communication; REST for external APIs.
+
+### Q3: How do you prevent cascading failures?
+**Answer**: Implement circuit breakers, bulkheads (resource isolation), timeouts on all outgoing calls, retry with exponential backoff, and graceful degradation. Load shedding helps protect the system when overwhelmed.
+
+### Q4: What is the strangler fig pattern and when would you use it?
+**Answer**: Gradually migrate a monolith by routing specific features to new microservices while keeping the old system running. Use it when you need to migrate incrementally, can't do a big-bang rewrite, and want to reduce risk by running both systems in parallel.
+
+### Q5: How do you manage API versioning across services?
+**Answer**: Use URL versioning (v1, v2) for major changes, header versioning for minor changes. Maintain backward compatibility within a version. Implement feature flags for gradual rollouts. Document changes via OpenAPI specifications.
+
+## Cheat Sheet
+
+```bash
+# Deploy microservice to Cloud Run
+gcloud run deploy auth-service \
+  --image gcr.io/${PROJECT_ID}/auth-service:v1 \
+  --region us-central1 \
+  --no-allow-unauthenticated \
+  --min-instances 1 \
+  --max-instances 100 \
+  --vpc-connector my-connector
+
+# Set environment variable from Secret Manager
+gcloud run services update auth-service \
+  --region us-central1 \
+  --set-secrets DATABASE_URL=database-url:latest
+
+# Grant service-to-service permissions
+gcloud run services add-iam-policy-binding content-service \
+  --member=serviceAccount:auth-service-sa@project.iam.gserviceaccount.com \
+  --role=roles/run.invoker
+
+# Test service health
+curl https://auth-service-xxxx-uc.a.run.app/healthz
+
+# Check pub/sub message backlog
+gcloud pubsub subscriptions list
+gcloud pubsub topics list
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Platform architecture introduction
+- [Serverless](./serverless.mdx) - Serverless patterns
+- [Event-Driven](./event-driven.mdx) - Async communication
+- [Multi-Region](./multi-region.mdx) - Global service deployment
+- [Security Architecture](./security-architecture.mdx) - Service mesh security

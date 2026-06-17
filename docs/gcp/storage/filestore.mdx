@@ -1,0 +1,618 @@
+# Filestore
+
+## Overview
+
+Google Cloud Filestore is a managed Network File System (NFS) service that provides high-performance file storage for workloads requiring a file system interface and shared file access. Filestore offers fully managed NFS shares that can be mounted on GCE instances and GKE pods, making it ideal for enterprise applications, media rendering, and CI/CD build agents.
+
+## When To Use
+
+- Applications requiring POSIX-compliant file system access
+- Multiple VM instances reading/writing to shared storage
+- Media rendering and video processing workflows
+- CI/CD build agents needing shared workspace
+- Database backup storage requiring file-based access
+- Home directories and shared application data
+- Content management systems with file-based assets
+
+## When NOT To Use
+
+- Object storage needs (use Cloud Storage)
+- Block storage for databases (use Persistent Disk)
+- Temporary scratch space (use local SSD)
+- Web-scale key-value workloads (use Memorystore)
+- Archival/cold storage (use Nearline/Coldline Storage)
+- High-frequency small file operations (evaluate alternatives)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Cloud Filestore                         │
+├─────────────────────────────────────────────────────────────┤
+│  Service Tiers:                                             │
+│  ├── Basic         (HDD, 2.5 TB min, 320 MB/s throughput)  │
+│  ├── High Scale    (HDD, 10 TB min, 1.2 GB/s throughput)   │
+│  ├── Enterprise    (SSD, 2.5 TB min, 1.2 GB/s throughput)  │
+│  └── Premium       (SSD, 2.5 TB min, 2.4 GB/s throughput)  │
+├─────────────────────────────────────────────────────────────┤
+│  Features:                                                  │
+│  ├── NFSv3 protocol support                                 │
+│  ├── VPC-native deployment                                 │
+│  ├── Cross-region backup (Enterprise+)                      │
+│  └── Active directory integration (Enterprise)              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Filestore Tiers
+
+| Tier | Storage Type | Min Capacity | Max Capacity | Throughput |
+|------|-------------|--------------|--------------|------------|
+| Basic | HDD | 2.5 TB | 10 TB | 320 MB/s |
+| High Scale | HDD | 10 TB | 100 TB | 1.2 GB/s |
+| Enterprise | SSD | 2.5 TB | 100 TB | 1.2 GB/s |
+| Premium | SSD | 2.5 TB | 100 TB | 2.4 GB/s |
+
+### Filestore Instance
+A Filestore instance is a managed NFS server. Each instance provides one or more file shares with configurable capacity and performance.
+
+### File Share
+The NFS export/folder accessible to clients. Named with an instance-specific name and has a specific容量.
+
+### VPC-Native
+Filestore instances are deployed within a VPC network, accessible only from within that VPC or peered VPCs.
+
+### Backup
+Point-in-time snapshots of Filestore instances stored in Cloud Storage. Available for Enterprise and Premium tiers.
+
+## Real Production Example
+
+**Media Rendering Farm with Shared Filestore**
+
+```hcl
+# Terraform configuration for media rendering infrastructure
+
+# Create VPC for Filestore connectivity
+resource "google_compute_network" "filestore_vpc" {
+  name                    = "filestore-vpc-${var.environment}"
+  auto_create_subnetworks = false
+  
+  mtu = 1460  # Optimized for NFS
+}
+
+resource "google_compute_subnetwork" "filestore_subnet" {
+  name          = "filestore-subnet-${var.environment}"
+  network       = google_compute_network.filestore_vpc.id
+  ip_cidr_range = "10.0.0.0/24"
+  region        = var.region
+  
+  private_ip_google_access = true
+  
+  secondary_ip_range {
+    range_name    = "render-workers"
+    ip_cidr_range = "10.1.0.0/16"
+  }
+}
+
+# Create Filestore instance for rendering
+resource "google_filestore_instance" "render_storage" {
+  name     = "render-storage-${var.environment}"
+  location = var.region
+  tier     = "PREMIUM"
+  
+  file_shares {
+    capacity_gb = 2560  # 2.5 TB
+    name        = "render_assets"
+  }
+  
+  networks {
+    network       = google_compute_network.filestore_vpc.id
+    modes         = ["MODE_IPV4"]
+    reserved_ip_range = "10.0.0.0/29"
+  }
+  
+  labels = {
+    environment = var.environment
+    workload    = "media-rendering"
+  }
+  
+  timeouts {
+    create = "15m"
+    update = "15m"
+  }
+}
+
+# Create Filestore backup schedule
+resource "google_filestore_backup" "render_backup" {
+  name        = "render-backup-${var.environment}"
+  location    = var.region
+  source_file_share_name = "render_assets"
+  source_instance = google_filestore_instance.render_storage.id
+  
+  description = "Daily backup of render assets"
+  
+  labels = {
+    environment = var.environment
+    backup_type = "daily"
+  }
+}
+
+# GKE nodepool with Filestore access
+resource "google_container_node_pool" "render_workers" {
+  name       = "render-workers-pool"
+  location   = var.region
+  cluster    = google_container_cluster.render_cluster.id
+  node_count = 4
+  
+  node_config {
+    machine_type = "n2-standard-32"
+    preemptible  = false
+    
+    boot_disk_kms_key = google_kms_crypto_key.filestore_kms_key.id
+    
+    service_account = google_service_account.render_worker.email
+    
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+  }
+  
+  node_network_config {
+    node_subnetwork = google_compute_subnetwork.filestore_subnet.id
+    
+    create_secondary_ranges = false
+    secondary_range_blocks = {
+      render-workers = google_compute_subnetwork.filestore_subnet.secondary_ip_range[0].range_name
+    }
+  }
+}
+
+# Kubernetes StorageClass for Filestore
+resource "kubernetes_storage_class" "filestore_premium" {
+  metadata {
+    name = "filestore-premium"
+  }
+  
+  storage_provisioner = "filestore.csi.storage.gke.io"
+  
+  parameters = {
+    tier = "PREMIUM"
+    network = google_compute_network.filestore_vpc.name
+  }
+  
+  mount_options = ["rw", "relatime", "vers=3"]
+  
+  reclaim_policy = "Retain"
+}
+```
+
+## CLI Examples
+
+```bash
+# Create a Filestore instance
+gcloud filestore instances create my-filestore \
+  --location=us-central1 \
+  --tier=PREMIUM \
+  --file-share=name=render_assets,capacity=2.5TB \
+  --network=name=filestore-vpc,reserved-ip-range=10.0.0.0/29
+
+# Create with Active Directory (Enterprise tier)
+gcloud filestore instances create my-filestore-ad \
+  --location=us-central1 \
+  --tier=ENTERPRISE \
+  --file-share=name=ad_data,capacity=2.5TB \
+  --network=name=filestore-vpc \
+  --active-directory-domain=example.com \
+  --description="Filestore with AD integration"
+
+# List Filestore instances
+gcloud filestore instances list --location=us-central1
+
+# Describe an instance
+gcloud filestore instances describe my-filestore \
+  --location=us-central1
+
+# Update instance capacity
+gcloud filestore instances update my-filestore \
+  --location=us-central1 \
+  --file-share=capacity=5TB
+
+# Delete instance
+gcloud filestore instances delete my-filestore \
+  --location=us-central1 \
+  --quiet
+
+# Create backup (Enterprise/Premium only)
+gcloud filestore backups create my-backup \
+  --location=us-central1 \
+  --instance=my-filestore \
+  --file-share=render_assets
+
+# List backups
+gcloud filestore backups list --location=us-central1
+
+# Restore from backup
+gcloud filestore instances restore \
+  --source-backup=projects/my-project/locations/us-central1/backups/my-backup \
+  --location=us-central1 \
+  --name=restored-filestore \
+  --tier=PREMIUM \
+  --file-share=name=restored_assets,capacity=2.5TB
+
+# Mount Filestore on GCE instance
+gcloud compute ssh my-instance --zone=us-central1-a -- \
+  "sudo mkdir -p /mnt/render_assets && \
+   sudo mount 10.0.0.2:/render_assets /mnt/render_assets && \
+   df -h /mnt/render_assets"
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+  }
+}
+
+# Basic Filestore instance
+resource "google_filestore_instance" "basic" {
+  name     = "basic-filestore"
+  location = var.region
+  tier     = "BASIC"
+  
+  file_shares {
+    capacity_gb = 2560
+    name        = "share1"
+  }
+  
+  networks {
+    network       = google_compute_network.filestore_vpc.name
+    modes         = ["MODE_IPV4"]
+    reserved_ip_range = "10.0.0.0/29"
+  }
+}
+
+# Premium Filestore with Kubernetes
+resource "google_filestore_instance" "premium_kubernetes" {
+  name     = "premium-filestore"
+  location = var.region
+  tier     = "PREMIUM"
+  
+  file_shares {
+    capacity_gb = 10240  # 10 TB
+    name        = "premium_share"
+  }
+  
+  networks {
+    network       = google_compute_network.filestore_vpc.name
+    modes         = ["MODE_IPV4"]
+    reserved_ip_range = "10.0.1.0/29"
+  }
+  
+  labels = {
+    environment = var.environment
+    team        = "platform"
+  }
+}
+
+# Kubernetes PersistentVolumeClaim using Filestore
+resource "kubernetes_persistent_volume_claim" "filestore_pvc" {
+  metadata {
+    name = "filestore-pvc"
+  }
+  spec {
+    access_modes       = ["ReadWriteMany"]
+    storage_class_name = "filestore-premium"
+    resources {
+      requests = {
+        storage = "100Gi"
+      }
+    }
+  }
+}
+
+# Backup configuration
+resource "google_filestore_backup" "daily_backup" {
+  count                = 7  # Weekly retention
+  name                 = "backup-${format("day-%d", count.index)}"
+  location             = var.region
+  source_file_share_name = google_filestore_instance.premium_kubernetes.file_shares[0].name
+  source_instance      = google_filestore_instance.premium_kubernetes.id
+  
+  labels = {
+    retention_day = count.index
+  }
+}
+```
+
+## Common Commands
+
+```bash
+# Instance management
+gcloud filestore instances create NAME --location=LOC [flags]
+gcloud filestore instances list --location=LOC
+gcloud filestore instances describe NAME --location=LOC
+gcloud filestore instances update NAME --location=LOC [flags]
+gcloud filestore instances delete NAME --location=LOC
+
+# Backup management
+gcloud filestore backups create NAME --instance=INSTANCE --location=LOC
+gcloud filestore backups list --location=LOC
+gcloud filestore backups describe NAME --location=LOC
+gcloud filestore backups delete NAME --location=LOC
+
+# Restore
+gcloud filestore instances restore --source-backup=BACKUP --location=LOC [flags]
+```
+
+## Monitoring
+
+### Key Metrics
+- **NFS operations per second**: Read/write/create/delete rates
+- **NFS latency**: Average operation duration
+- **Storage capacity**: Used vs. total capacity
+- **Network bytes**: Throughput in/out
+- **Cache hit ratio**: For Enterprise tier
+
+### Cloud Monitoring Integration
+
+```bash
+# View Filestore metrics in Cloud Monitoring
+gcloud monitoring metrics list --filter="resource.type=filestore_instance"
+
+# Create alert for low capacity
+gcloud monitoring policies create \
+  --display-name="Filestore Capacity Alert" \
+  --condition-display-name="Capacity > 80%" \
+  --condition-filter='resource.type="filestore_instance" AND metric.type="filestore.googleapis.com/nfs/server/capacity_used_ratio"' \
+  --condition-threshold-value=0.8 \
+  --notification-channels=CHANNEL_ID
+
+# Read specific metrics
+gcloud monitoring metrics read \
+  "filestore.googleapis.com/nfs/server/operations" \
+  --filter='resource.instance_name="my-filestore"'
+```
+
+### NFS Client Monitoring
+
+```bash
+# Enable NFS stat collection on client
+echo 1 | sudo tee /proc/fs/nfsfs/tracing
+
+# Monitor NFS operations
+nfsiostat 1
+
+# Monitor NFS server statistics
+nfsstat -s
+```
+
+## Security
+
+### Network Security
+```bash
+# Filestore uses VPC for isolation
+# Ensure VPC firewall rules restrict access
+
+# Allow only specific instance ranges
+gcloud compute firewall-rules create allow-filestore-nfs \
+  --network=filestore-vpc \
+  --allow=tcp:2049,udp:2049 \
+  --source-ranges=10.0.0.0/24 \
+  --target-tags=filestore-clients
+```
+
+### IAM Permissions
+```bash
+# Required roles for Filestore management
+# roles/file.editor - Create/update/delete instances
+# roles/file.viewer - Read-only access
+
+# Service account for Filestore access
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:render-worker@my-project.iam.gserviceaccount.com \
+  --role=roles/file.editor
+```
+
+### Encryption
+- Default: Google-managed encryption at rest
+- CMEK: Not directly supported (use storage-class encryption in GKE)
+
+### Best Practices
+```bash
+# Use dedicated VPC for Filestore
+# Implement subnet-level firewall rules
+# Use service accounts with minimal permissions
+# Enable VPC Service Controls for additional perimeter
+# Regular backups to cross-region storage
+```
+
+## Cost Optimization
+
+### Tier Selection Guide
+| Workload | Recommended Tier |
+|----------|-----------------|
+| Dev/Test environments | Basic |
+| CI/CD build agents | High Scale |
+| Media rendering (HD) | Enterprise |
+| Media rendering (4K+) | Premium |
+| Database workloads | Not recommended |
+
+### Capacity Planning
+```bash
+# Monitor usage to right-size
+gcloud monitoring metrics read \
+  "filestore.googleapis.com/nfs/server/capacity_used" \
+  --filter='resource.instance_name="my-filestore"' \
+  --period=86400
+
+# Resize as needed (no downtime)
+gcloud filestore instances update my-filestore \
+  --location=us-central1 \
+  --file-share=capacity=5TB
+```
+
+### Backup Cost Management
+```bash
+# Backup costs are based on Cloud Storage pricing
+# ~$0.020/GB for Standard Storage
+# Use lifecycle policies to move to Nearline after 30 days
+
+# Delete old backups
+gcloud filestore backups delete backup-name --location=us-central1 --quiet
+```
+
+## Troubleshooting
+
+### Mount Failures
+```bash
+# Check if instance is running
+gcloud filestore instances describe my-filestore --location=us-central1
+
+# Verify network connectivity
+gcloud compute ssh my-instance --zone=us-central1-a -- \
+  "ping -c 3 10.0.0.2"
+
+# Check firewall rules
+gcloud compute firewall-rules list --filter="network:filestore-vpc"
+
+# Verify NFS port is open
+gcloud compute ssh my-instance --zone=us-central1-a -- \
+  "nc -zv 10.0.0.2 2049"
+
+# Common mount syntax
+sudo mount -t nfs -o vers=3 10.0.0.2:/render_assets /mnt/render_assets
+```
+
+### Performance Issues
+```bash
+# Check network bandwidth
+gcloud compute ssh my-instance --zone=us-central1-a -- \
+  "iperf3 -c 10.0.0.2"
+
+# Monitor NFS operations
+gcloud compute ssh my-instance --zone=us-central1-a -- \
+  "nfsiostat 1 10"
+
+# Check for network congestion
+gcloud compute ssh my-instance --zone=us-central1-a -- \
+  "netstat -i | grep eth0"
+
+# Increase NFS read/write buffer sizes
+sudo mount -t nfs -o vers=3,rsize=1048576,wsize=1048576 \
+  10.0.0.2:/render_assets /mnt/render_assets
+```
+
+### Permission Denied Errors
+```bash
+# Check Unix permissions on mount
+ls -la /mnt/render_assets/
+
+# Remount with root squash disabled (if needed for admin)
+sudo mount -t nfs -o vers=3,no_root_squash \
+  10.0.0.2:/render_assets /mnt/render_assets
+
+# Check NFS export permissions
+gcloud filestore instances describe my-filestore --location=us-central1
+```
+
+### Instance Creation Fails
+```bash
+# Check quota limits
+gcloud filestore instances list --location=us-central1
+
+# Verify reserved IP range availability
+gcloud compute addresses list --filter="region:us-central1"
+
+# Check service availability in region
+gcloud filestore locations list
+```
+
+## Interview Questions
+
+**Q: What is the difference between Filestore and Persistent Disk?**
+A: Persistent Disk provides block storage that attaches to a single VM. Filestore provides NFS-based file storage accessible from multiple VMs simultaneously. Filestore is POSIX-compliant while Persistent Disk requires filesystem formatting within the VM.
+
+**Q: When would you choose Enterprise over Premium Filestore?**
+A: Enterprise includes Active Directory integration for Windows workloads and cross-region backup capability. Premium offers higher throughput (2.4 GB/s vs 1.2 GB/s). Choose Enterprise for AD-managed environments or cross-region DR; Premium for maximum Linux-based performance.
+
+**Q: How does Filestore handle high availability?**
+A: Enterprise and Premium tiers use regional deployment with synchronous replication within the region. Basic and High Scale are single-zone. Enterprise supports cross-region backups for disaster recovery. There's no automatic failover between zones.
+
+**Q: What are the NFS version support limitations?**
+A: Filestore supports NFSv3 only. NFSv4.1 is not supported. This affects some advanced features like parallel NFS (pNFS).
+
+**Q: How do you connect GKE pods to Filestore?**
+A: Use the Filestore CSI driver (`filestore.csi.storage.gke.io`). Create a StorageClass with the tier and network parameters, then use PersistentVolumeClaim with `ReadWriteMany` access mode.
+
+**Q: What is the minimum capacity for each Filestore tier?**
+A: Basic: 2.5 TB, High Scale: 10 TB, Enterprise: 2.5 TB, Premium: 2.5 TB. All tiers support up to 100 TB maximum.
+
+**Q: Can Filestore data be encrypted with customer-managed keys?**
+A: Filestore uses Google-managed encryption by default. Direct CMEK support is not available, but you can use GKE's CSI driver with GKE-managed CMEK for workloads running in Kubernetes.
+
+## Cheat Sheet
+
+```bash
+# Create Filestore
+gcloud filestore instances create NAME \
+  --location=REGION --tier=TIER \
+  --file-share=name=SHARE,capacity=SIZE \
+  --network=name=VPC,reserved-ip-range=RANGE
+
+# Mount on Linux
+sudo mount -t nfs -o vers=3 IP:/share_name /mount/point
+
+# Kubernetes PVC
+# Use StorageClass: filestore.csi.storage.gke.io
+# AccessMode: ReadWriteMany
+
+# Backup/Restore
+gcloud filestore backups create BACKUP --instance=INSTANCE --location=REGION
+gcloud filestore instances restore --source-backup=BACKUP --location=REGION [flags]
+
+# Update capacity
+gcloud filestore instances update NAME --location=REGION --file-share=capacity=NEWSIZE
+```
+
+## Labs
+
+### Lab 1: Shared Storage for Build Agents
+Set up Filestore for CI/CD build agents requiring shared workspace.
+1. Create Enterprise Filestore instance
+2. Configure dedicated VPC network
+3. Mount on multiple GCE build agents
+4. Benchmark with parallel file operations
+5. Implement backup schedule
+
+### Lab 2: GKE Integration
+Deploy stateful application with Filestore backing.
+1. Create GKE cluster in Filestore VPC
+2. Install Filestore CSI driver
+3. Create StorageClass with Filestore parameters
+4. Deploy application with PVC
+5. Verify ReadWriteMany access from multiple pods
+
+### Lab 3: Media Rendering Workflow
+Build shared storage for video rendering pipeline.
+1. Create Premium Filestore instance (10 TB)
+2. Configure high-throughput networking
+3. Mount on render worker nodes
+4. Test concurrent read performance
+5. Implement backup and restore procedures
+
+## Related Services
+
+- **Persistent Disk**: Block storage for single-VM use cases
+- **Cloud Storage**: Object storage for archival and distribution
+- **Local SSD**: Highest performance, ephemeral storage
+- **Memorystore**: In-memory caching
+- **GKE**: Kubernetes integration via CSI driver
+- **Compute Engine**: VM instances for mounting Filestore

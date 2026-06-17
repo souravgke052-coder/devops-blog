@@ -1,0 +1,391 @@
+# Network Debugging
+
+## Overview
+
+Network debugging is the systematic process of identifying and resolving network connectivity issues. In production, network problems manifest as: can't reach service, slow responses, intermittent failures, or complete outage. Effective debugging requires a methodical approach—layer by layer, eliminating possibilities—plus the right tools.
+
+This page covers the debugging toolkit: tcpdump for packet capture, ss/netstat for socket analysis, traceroute/mtr for path analysis, and systematic debugging workflows.
+
+## When To Use
+
+- **Incident investigation**: Identifying root cause of connectivity issues
+- **Performance tuning**: Finding sources of latency
+- **Security analysis**: Detecting attacks, investigating breaches
+- **Integration testing**: Verifying network configuration
+
+## When NOT to Use
+
+- **Production debugging without reason**: Capturing packets has overhead
+- **When application has better tools**: Application logs may be clearer
+
+## Core Concepts
+
+### Systematic Debugging Approach
+
+**Step 1: Define the problem**
+- Can you reproduce it?
+- What fails: reachability, latency, data integrity?
+- Single host, multiple hosts, or all?
+
+**Step 2: Check layer by layer**
+- Layer 1/2: Physical, link (cable, switch, VLAN)
+- Layer 3: IP connectivity (can you ping gateway?)
+- Layer 4: Transport (can you reach the port?)
+- Layer 7: Application (does the service respond correctly?)
+
+**Step 3: Narrow down**
+- Isolate variables (change one thing at a time)
+- Compare working vs non-working
+- Check recent changes (deployment, config)
+
+### tcpdump Fundamentals
+
+```bash
+# Basic capture
+tcpdump -i eth0                    # Capture on interface
+tcpdump -i any                     # Capture on all interfaces
+tcpdump -nn                        # Don't resolve names
+tcpdump -v                         # Verbose
+tcpdump -c 100                     # Capture 100 packets
+
+# Expression: host, port, protocol
+tcpdump host 10.0.0.5              # Specific host
+tcpdump port 80                    # Port 80
+tcpdump net 10.0.0.0/24           # Network
+tcpdump 'tcp[tcpflags] & tcp-syn != 0'  # SYN packets
+
+# BPF syntax for advanced filtering
+# tcp[13] = 2 means SYN flag
+# tcp[13] & 2 != 0 = SYN set
+# tcp[13] = 16 = ACK flag
+# tcp[13] = 18 = SYN-ACK
+```
+
+### Reading tcpdump Output
+
+```
+14:23:41.194372 IP (tos 0x0, ttl 64, id=54321, offset=0, flags[DF], proto TCP (6), length 60)
+    10.0.0.5.42345 > 93.184.216.34.80: Flags [S], cksum 0xabcd, seq 1000:1060, win 65535,
+    options [mss 1460, sackOK, TS val 100 ecr 0, nop, wscale 10], length 0
+```
+
+Fields:
+- Timestamp
+- IP (layer 3 protocol)
+- TOS, TTL, ID, flags, offset, protocol
+- Source IP.port > Dest IP.port
+- TCP flags [SYN], checksum, sequence numbers
+- TCP options (MSS, SACK, Window scale)
+- Payload length
+
+### ss vs netstat
+
+```bash
+# ss is modern, faster replacement for netstat
+ss -tuln                 # TCP/UDP listening sockets
+ss -ti                   # TCP socket info (include timing)
+ss -s                    # Summary
+ss -antp                 # All, numeric, TCP, process
+
+# Socket states
+ss -ant state established | wc -l
+
+# Timer info with ss -ti
+ss -ti dst 10.0.0.5:443
+# ts sack ecn inflight:0/0 pacing_rate 10.1Mbps retrans:0/0
+# ts: timestamps enabled
+# sack: SACK enabled
+# ecn: ECN enabled
+# inflight: unacknowledged bytes
+# retrans: retransmission count
+
+# netstat (legacy)
+netstat -rnv                    # Routing table
+netstat -anp                    # All connections with process
+netstat -s                      # Protocol statistics
+netstat -i                       # Interface statistics
+```
+
+## Real Production Example
+
+### Debugging HTTP Latency
+
+```bash
+# 1. Check if problem is DNS, TCP, or application
+curl -w "@curl-format.txt" -o /dev/null -s https://api.example.com
+
+# curl-format.txt:
+#     time_namelookup: %{time_namelookup}\n
+#     time_connect: %{time_connect}\n
+#     time_appconnect: %{time_appconnect}\n
+#     time_pretransfer: %{time_pretransfer}\n
+#     time_starttransfer: %{time_starttransfer}\n
+#     time_total: %{time_total}\n
+
+# time_appconnect includes TLS handshake
+# If high, TLS is slow (check certificate chain, cipher)
+
+# 2. Capture tcpdump during request
+tcpdump -i any -nn 'host api.example.com and port 443' -w /tmp/api.pcap &
+
+# 3. Make the request
+curl https://api.example.com/api/endpoint
+
+# 4. Stop capture
+kill %1
+
+# 5. Analyze in Wireshark or with tcpdump
+tcpdump -r /tmp/api.pcap -nn -v
+
+# Look for:
+# - Retransmissions (packet 3 arrived after packet 4)
+# - Duplicate ACKs
+# - High latency between packets
+```
+
+### Debugging Connection Failures
+
+```bash
+# Step 1: Can you reach the host at all?
+ping -c 3 api.example.com
+
+# Step 2: Is DNS working?
+dig +short api.example.com
+host api.example.com
+
+# Step 3: Can you reach the IP?
+ping -c 3 10.0.0.5
+
+# Step 4: Can you establish TCP connection?
+nc -zv api.example.com 443
+telnet api.example.com 443
+
+# Step 5: Check routing
+ip route get 10.0.0.5
+traceroute 10.0.0.5
+
+# Step 6: Check firewall (on remote and local)
+iptables -L -v -n
+ss -tuln | grep LISTEN
+
+# Step 7: Check if port is listening
+ss -tlnp | grep 443
+netstat -tlnp | grep 443
+
+# Step 8: Test locally on server
+curl -v localhost:8080/health
+```
+
+### Debugging High Latency
+
+```bash
+# 1. Check network latency to gateway
+ping -c 10 10.0.0.1
+
+# 2. Check full path with mtr
+mtr -n api.example.com
+
+# Look for:
+# - High latency at specific hop (router bottleneck)
+# - Packet loss (network congestion)
+# - High jitter (unstable path)
+
+# 3. Check TCP metrics
+ss -ti dst api.example.com:443
+# retrans:0 = no retransmission (good)
+# rcv_space:29200 = auto-tuned receive buffer
+
+# 4. Check interface errors
+ip -s link show eth0
+# Look for drops, errors
+
+# 5. Check CPU softirq saturation
+mpstat 1
+# If softirq > 50% of CPU time, network processing is bottleneck
+```
+
+## CLI Examples
+
+```bash
+# Basic connectivity
+ping -c 4 8.8.8.8
+traceroute -m 15 8.8.8.8
+mtr -n 8.8.8.8
+
+# DNS
+dig @8.8.8.8 example.com A +short
+dig +trace example.com
+nslookup example.com
+
+# Port connectivity
+nc -zv host 80
+nc -zv host 443
+telnet host 22
+
+# Socket analysis
+ss -tuln                    # Listening sockets
+ss -ti state established    # Active with TCP info
+ss -s                       # Summary
+
+# Packet capture
+tcpdump -i eth0 port 80
+tcpdump -i any host 10.0.0.5
+tcpdump -w /tmp/capture.pcap
+tcpdump -r /tmp/capture.pcap 'tcp[tcpflags] & tcp-syn != 0'
+
+# Bandwidth testing
+iperf3 -s                    # Server
+iperf3 -c server -P 4       # Client
+
+# Interface stats
+ip -s link show eth0
+ethtool -S eth0
+cat /proc/net/dev
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `tcpdump` | Packet capture | `tcpdump -i eth0 port 80` |
+| `ss` | Socket stats | `ss -ti state established` |
+| `nc` | Netcat connectivity | `nc -zv host 443` |
+| `ping` | Reachability | `ping -c 4 host` |
+| `traceroute` | Path tracing | `traceroute host` |
+| `mtr` | Combined ping/traceroute | `mtr host` |
+| `dig` | DNS query | `dig @8.8.8.8 host A` |
+
+## Security
+
+### Secure Debugging
+
+```bash
+# Don't capture sensitive data in pcap files
+# Use -w with caution
+# Encrypt pcap files if containing credentials
+
+# For PCI compliance, don't capture card data
+# Use BPF to exclude sensitive ports
+tcpdump -i eth0 'port 80 or port 443 and not (host 10.0.0.5 and port 3306)'
+
+# Rotate pcap files automatically
+# tcpdump -i eth0 -W 10 -C 200 -w /tmp/capture.pcap port 80
+# -W: max files, -C: max file size (MB)
+```
+
+## Troubleshooting
+
+### Common Network Issues
+
+| Symptom | Check | Fix |
+|---------|-------|-----|
+| Can't reach host | ping, traceroute | Check routing, firewall |
+| Connection refused | ss -tuln | Service not running |
+| Connection timeout | tcpdump | Firewall dropping SYN |
+| High latency | mtr, ss -ti | Check for drops, retransmits |
+| DNS failures | dig +trace | Check resolver config |
+| Intermittent drops | tcpdump | Packet loss, MTU issue |
+
+### Debugging Flows
+
+```bash
+# Debug HTTP 502
+# 1. Check backend is up: curl localhost:8080/health
+# 2. Check proxy config: nginx -t
+# 3. Check proxy logs: tail /var/log/nginx/error.log
+# 4. Capture traffic: tcpdump -i any port 8080
+# 5. Check backend response: curl -v http://localhost:8080/
+
+# Debug TLS handshake failure
+# 1. Check certificate: openssl s_client -connect host:443
+# 2. Check protocol: openssl s_client -tls1_2 -connect host:443
+# 3. Check cipher: openssl s_client -cipher 'ECDHE' -connect host:443
+# 4. Check SNI: openssl s_client -servername host -connect host:443
+
+# Debug packet loss
+# 1. ping with large packets: ping -s 1500 host (test MTU)
+# 2. ping with don't fragment: ping -M do -s 1400 host
+# 3. Check for fragmentation: tcpdump host host and 'ip[6:2] & 0x1fff != 0'
+```
+
+## Interview Questions
+
+**Q1: How do you debug a network connectivity issue systematically?**
+
+A: Systematic approach: (1) Define scope—is it one host, multiple, specific service? (2) Check physical layer—cables, link lights, ethtool for errors/duplex. (3) Test L3 connectivity—ping gateway, ping destination. If gateway fails, routing issue. (4) If L3 works, test L4—can you reach the port? `nc -zv host port`. If not, service down or firewall. (5) If L4 works, test L7—does service respond correctly? `curl -v` to check HTTP response. (6) Capture packets at each layer with tcpdump to see what's actually happening. (7) Check recent changes—deployments, firewall rule changes, route changes.
+
+**Q2: What does "connection timeout" vs "connection refused" tell you?**
+
+A: "Connection refused" (ECONNREFUSED) means the destination received your SYN and sent RST—no service listening on that port, or firewall allowed but service not running. "Connection timeout" means no response at all—either the host is unreachable (routing issue), or firewall silently dropping the packet. Timeout suggests network-level blocking; refused suggests service-level blocking. Check with tcpdump: timeout shows no reply packets at all; refused shows RST packet from destination.
+
+**Q3: How do you debug high network latency?**
+
+A: (1) Ping to isolate—ping the gateway first, then destination. If gateway high, local issue. (2) Use mtr to see per-hop latency and identify where latency appears. If intermediate hop high, that router is bottleneck. (3) Check for packet loss with mtr—if some packets lost, network congestion. (4) Check interface for errors/drops with `ip -s link show`. (5) Use `ss -ti` to check TCP retransmissions—if high, packet loss causing retransmission delay. (6) tcpdump to see actual packet timing. (7) Check CPU softirq—if high, kernel can't process packets fast enough. (8) Check MTU—if fragmentation, adds latency.
+
+## Cheat Sheet
+
+### tcpdump Filters
+
+```bash
+# Capture expressions
+host 10.0.0.5              # Specific host
+net 10.0.0.0/24           # Network
+port 80                   # Port
+tcp                        # TCP only
+udp                        # UDP only
+icmp                       # ICMP only
+
+# TCP flags
+'tcp[tcpflags] & tcp-syn != 0'    # SYN packets
+'tcp[tcpflags] & tcp-ack != 0'    # ACK packets
+'tcp[tcpflags] = tcp-syn|tcp-ack' # SYN-ACK
+'tcp[tcpflags] & tcp-fin != 0'    # FIN
+'tcp[tcpflags] & tcp-rst != 0'    # RST
+
+# Protocol-specific
+'ip[9] = 6'               # Protocol 6 = TCP
+'ip[9] = 17'              # Protocol 17 = UDP
+
+# Size
+less 100                   # Less than 100 bytes
+greater 1000               # Greater than 1000 bytes
+```
+
+### ss Quick Reference
+
+```bash
+# States
+ss -tuln                  # Listening sockets
+ss -ti                    # Established with info
+ss -antp                  # All TCP with process
+
+# Filter by state
+ss state time-wait
+ss state fin-wait-2
+
+# Filter by address
+ss dst 10.0.0.5:443
+ss src :80
+```
+
+### Debug Checklist
+
+```
+□ Ping gateway (L3 reachability)
+□ Ping destination (end-to-end)
+□ Check DNS resolution
+□ Check port accessibility (nc -zv)
+□ Check service listening (ss -tuln)
+□ Check firewall rules (iptables -L)
+□ Check routing (ip route get)
+□ Capture packets (tcpdump)
+□ Check interface stats (ip -s link)
+□ Check TCP state (ss -ti)
+```
+
+## Related Topics
+
+- [Observability](./observability) — Network metrics
+- [Firewall](./firewall) — Debugging firewall issues
+- [Packet Flow](./packet-flow) — Understanding kernel processing
+- [TCP](./tcp) — TCP debugging

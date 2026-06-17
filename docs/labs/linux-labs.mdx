@@ -1,0 +1,623 @@
+---
+sidebar_position: 2
+title: Linux Labs
+description: Hands-on Linux administration and scripting labs
+---
+
+# Linux Labs
+
+## Overview
+
+Master Linux administration through hands-on exercises covering system management, process control, networking, and automation scripting. These labs use real commands on real systems.
+
+## Prerequisites
+
+- Basic command line knowledge (ls, cd, cat)
+- Access to a Linux terminal (VM, Cloud Shell, or WSL2)
+- Root/sudo access for system labs
+
+### Required Tools
+
+```bash
+# Verify Linux version
+uname -a
+cat /etc/os-release
+
+# Check available tools
+which systemctl sshd nginx docker
+dpkg -l | grep -E 'vim|git|curl|wget'
+```
+
+---
+
+## Lab 1: User and Group Management
+
+**Objective**: Create users, manage groups, and configure sudo access
+**Estimated Time**: 20 minutes
+**Prerequisites**: Root/sudo access, bash shell
+
+### Step-by-Step
+
+#### 1. Create a New User
+
+```bash
+# Create user with home directory and default shell
+sudo useradd -m -s /bin/bash devops-user
+
+# Set the password
+sudo passwd devops-user
+
+# Verify user was created
+id devops-user
+cat /etc/passwd | grep devops-user
+```
+
+#### 2. Create and Manage Groups
+
+```bash
+# Create groups for different teams
+sudo groupadd developers
+sudo groupadd operations
+sudo groupadd readonly
+
+# Add user to multiple groups
+sudo usermod -aG developers,operations devops-user
+
+# Verify group membership
+id devops-user
+groups devops-user
+```
+
+#### 3. Configure Sudo Access
+
+```bash
+# Create sudoers configuration file (safer than editing /etc/sudoers directly)
+sudo visudo -f /etc/sudoers.d/devops-user
+
+# Add the following content:
+# devops-user ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/docker
+# devops-user ALL=(ALL) ALL
+
+# Set correct permissions
+sudo chmod 0440 /etc/sudoers.d/devops-user
+```
+
+#### 4. Test User Switching
+
+```bash
+# Switch to the new user
+su - devops-user
+
+# Test sudo access (from devops-user shell)
+sudo whoami
+sudo systemctl status sshd
+```
+
+### Validation
+
+```bash
+# Verify all configurations
+echo "=== User Info ===" && id devops-user
+echo "=== Groups ===" && groups devops-user
+echo "=== Sudoers File ===" && sudo cat /etc/sudoers.d/devops-user
+```
+
+Expected output shows user with uid, gid, and supplemental groups configured.
+
+### Cleanup
+
+```bash
+# Remove user from groups
+sudo gpasswd -d devops-user developers
+sudo gpasswd -d devops-user operations
+
+# Delete the sudoers file
+sudo rm /etc/sudoers.d/devops-user
+
+# Delete the user and home directory
+sudo userdel -r devops-user
+
+# Delete groups (if no longer needed)
+sudo groupdel developers
+sudo groupdel operations
+sudo groupdel readonly
+```
+
+---
+
+## Lab 2: Process Management and Monitoring
+
+**Objective**: Monitor processes, manage priority, and control services
+**Estimated Time**: 25 minutes
+**Prerequisites**: bash shell, htop or top installed
+
+### Step-by-Step
+
+#### 1. Process Monitoring
+
+```bash
+# View all processes
+ps aux | head -20
+ps -ef | head -20
+
+# Monitor processes in real-time
+top
+# Press '1' to see per-CPU stats
+# Press 'M' to sort by memory
+# Press 'q' to quit
+
+# Install and use htop (more user-friendly)
+sudo apt-get install -y htop  # Debian/Ubuntu
+# or
+sudo yum install -y htop     # RHEL/CentOS
+
+htop
+```
+
+#### 2. Find Processes by Name or Port
+
+```bash
+# Find process by name
+pgrep -a sshd
+pidof nginx
+
+# Find process using a specific port
+sudo lsof -i :80
+sudo netstat -tlnp | grep :80
+sudo ss -tlnp | grep :80
+
+# Find all processes for a user
+ps -u $USER
+```
+
+#### 3. Process Priority Control
+
+```bash
+# Start a low-priority process
+nice -n 10 sleep 1000 &
+echo $!
+
+# Check priority
+ps -o pid,ni,cmd -p $(pgrep sleep)
+
+# Change priority of running process
+renice -n 5 -p $(pgrep sleep)
+
+# Start process with high priority (requires root)
+sudo nice -n -10 long-running-task.sh
+```
+
+#### 4. Background and Foreground Process Control
+
+```bash
+# Run process in background
+sleep 60 &
+jobs
+
+# Bring to foreground
+fg %1
+
+# Send to background (while running)
+# Press Ctrl+Z to suspend
+bg %1
+
+# Kill specific job
+kill %1
+```
+
+### Validation
+
+```bash
+# Create a test script and verify process control
+cat > process_test.sh << 'EOF'
+#!/bin/bash
+for i in {1..100}; do
+  echo "Iteration $i"
+  sleep 1
+done
+EOF
+chmod +x process_test.sh
+
+# Run with different priorities and verify
+./process_test.sh &
+sleep 5
+ps -o pid,ni,cmd -p $(pgrep -f process_test)
+```
+
+### Cleanup
+
+```bash
+# Kill all test processes
+pkill -f process_test.sh
+rm process_test.sh
+```
+
+---
+
+## Lab 3: Log Management and Analysis
+
+**Objective**: Navigate system logs, search with grep, and configure logrotate
+**Estimated Time**: 25 minutes
+**Prerequisites**: bash shell, sudo access
+
+### Step-by-Step
+
+#### 1. Navigate System Logs
+
+```bash
+# Common log locations
+ls -la /var/log/
+
+# View system logs
+sudo less /var/log/syslog      # Debian/Ubuntu
+sudo less /var/log/messages    # RHEL/CentOS
+
+# View authentication logs
+sudo less /var/log/auth.log    # Debian/Ubuntu
+sudo less /var/secure          # RHEL/CentOS
+
+# View kernel logs
+dmesg
+dmesg | less
+dmesg | grep -i error
+```
+
+#### 2. Search Logs with grep
+
+```bash
+# Search for errors in syslog
+sudo grep -i error /var/log/syslog | tail -20
+
+# Search for authentication failures
+sudo grep -i "failed password" /var/log/auth.log | tail -10
+
+# Use grep with regex for complex patterns
+sudo grep -E "sshd.*(failed|accepted)" /var/log/auth.log | tail -10
+
+# Count occurrences
+sudo grep -c "error" /var/log/syslog
+
+# Show context (lines before/after)
+sudo grep -B2 -A2 "error" /var/log/syslog | head -30
+```
+
+#### 3. Real-time Log Monitoring
+
+```bash
+# Follow logs in real-time
+sudo tail -f /var/log/syslog
+
+# Follow multiple logs simultaneously
+sudo tail -f /var/log/syslog /var/log/auth.log
+
+# Use watch for periodic commands
+watch -n 5 'sudo grep -c "error" /var/log/syslog'
+```
+
+#### 4. Configure Log Rotation
+
+```bash
+# Check current logrotate configuration
+ls -la /etc/logrotate.d/
+
+# View a specific configuration
+cat /etc/logrotate.d/rsyslog
+
+# Create custom log rotation for application logs
+sudo tee /etc/logrotate.d/myapp << 'EOF'
+/var/log/myapp/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        systemctl reload myapp > /dev/null 2>&1 || true
+    endscript
+}
+EOF
+
+# Test the configuration
+sudo logrotate -d /etc/logrotate.d/myapp
+```
+
+### Validation
+
+```bash
+# Create test logs and verify rotation
+sudo mkdir -p /var/log/myapp
+sudo chmod 755 /var/log/myapp
+
+# Create test log file
+logger -p user.info "Test log entry from lab"
+echo "Test application log $(date)" | sudo tee /var/log/myapp/app.log
+
+# Verify log file exists
+ls -la /var/log/myapp/
+
+# Force logrotate to run (dry run first)
+sudo logrotate -f /etc/logrotate.d/myapp --verbose
+```
+
+### Cleanup
+
+```bash
+# Remove test configuration
+sudo rm /etc/logrotate.d/myapp
+sudo rm -rf /var/log/myapp
+```
+
+---
+
+## Lab 4: Disk and Storage Management
+
+**Objective**: Manage partitions, filesystems, and disk quotas
+**Estimated Time**: 30 minutes
+**Prerequisites**: sudo access, additional disk/partition recommended
+
+### Step-by-Step
+
+#### 1. Disk Usage Analysis
+
+```bash
+# Check disk space
+df -h
+
+# Check inodes
+df -i
+
+# Find largest directories
+du -sh /* 2>/dev/null | sort -rh | head -10
+
+# Find largest files in /var/log
+find /var/log -type f -exec du -h {} + 2>/dev/null | sort -rh | head -10
+
+# Interactive disk usage analyzer
+sudo apt-get install -y ncdu  # Debian/Ubuntu
+# or
+sudo yum install -y ncdu      # RHEL/CentOS
+
+ncdu /
+```
+
+#### 2. Create and Format Filesystem
+
+```bash
+# List block devices
+lsblk
+sudo fdisk -l
+
+# Create a new partition (interactive - use 'n', 'p', '1', 'w')
+sudo fdisk /dev/sdb
+
+# Format with ext4
+sudo mkfs.ext4 /dev/sdb1
+
+# Create mount point and mount
+sudo mkdir -p /mnt/data
+sudo mount /dev/sdb1 /mnt/data
+
+# Add to /etc/fstab for automatic mount
+echo '/dev/sdb1 /mnt/data ext4 defaults 0 2' | sudo tee -a /etc/fstab
+
+# Verify mount
+df -h | grep /mnt/data
+mount | grep /mnt/data
+```
+
+#### 3. Configure Disk Quotas
+
+```bash
+# Install quota tools
+sudo apt-get install -y quota  # Debian/Ubuntu
+# or
+sudo yum install -y quota      # RHEL/CentOS
+
+# Enable quota on filesystem
+sudo quotaoff -a
+sudo quotacheck -ugm /mnt/data
+sudo quotaon -a
+
+# Set quota for user
+sudo setquota -u devops-user 100M 150M 1000 1100 /mnt/data
+
+# Set quota for group
+sudo setquota -g developers 500M 750M 5000 5500 /mnt/data
+
+# Check quota status
+sudo quota -u devops-user
+sudo quota -g developers
+sudo repquota -a
+```
+
+### Validation
+
+```bash
+# Test quota by creating files
+su - devops-user
+dd if=/dev/zero of=/mnt/data/testfile bs=1M count=50
+# This should succeed (under 100M limit)
+
+dd if=/dev/zero of=/mnt/data/testfile2 bs=1M count=120
+# This should fail (over 100M limit)
+
+exit
+```
+
+### Cleanup
+
+```bash
+# Remove quota configuration
+sudo quotaoff -a
+sudo rm -rf /mnt/data/*
+sudo umount /mnt/data
+
+# Remove fstab entry
+sudo sed -i '/\/mnt\/data/d' /etc/fstab
+
+# Remove mount point
+sudo rmdir /mnt/data
+```
+
+---
+
+## Lab 5: Systemd Service Management
+
+**Objective**: Create and manage systemd services, journalctl logging
+**Estimated Time**: 30 minutes
+**Prerequisites**: sudo access, bash shell
+
+### Step-by-Step
+
+#### 1. Systemd Fundamentals
+
+```bash
+# List running services
+systemctl list-units --type=service --state=running
+
+# Check service status
+systemctl status nginx
+systemctl status sshd
+
+# Start/stop/restart services
+sudo systemctl start nginx
+sudo systemctl stop nginx
+sudo systemctl restart nginx
+
+# Enable/disable services at boot
+sudo systemctl enable nginx
+sudo systemctl disable nginx
+```
+
+#### 2. Create Custom Service
+
+```bash
+# Create application script
+sudo tee /usr/local/bin/myapp.sh << 'EOF'
+#!/bin/bash
+while true; do
+    echo "MyApp running at $(date)" >> /var/log/myapp.log
+    sleep 10
+done
+EOF
+sudo chmod +x /usr/local/bin/myapp.sh
+
+# Create systemd service file
+sudo tee /etc/systemd/system/myapp.service << 'EOF'
+[Unit]
+Description=My Application
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/tmp
+ExecStart=/usr/local/bin/myapp.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload systemd and start service
+sudo systemctl daemon-reload
+sudo systemctl start myapp
+sudo systemctl enable myapp
+```
+
+#### 3. Journalctl Logging
+
+```bash
+# View service logs
+journalctl -u myapp
+journalctl -u myapp -f  # follow mode
+journalctl -u myapp -n 50  # last 50 lines
+
+# Filter by time
+journalctl -u myapp --since "1 hour ago"
+journalctl -u myapp --since "2024-01-01" --until "2024-01-02"
+
+# View kernel messages
+dmesg | tail -50
+journalctl -k
+
+# View all logs (system-wide)
+journalctl -xe
+```
+
+#### 4. Service Dependencies
+
+```bash
+# View service dependencies
+systemctl list-dependencies myapp
+systemctl list-dependencies nginx
+
+# Check if service failed
+systemctl is-failed myapp
+
+# Reset failed state
+sudo systemctl reset-failed
+```
+
+### Validation
+
+```bash
+# Verify service is running
+systemctl status myapp
+
+# Check logs
+journalctl -u myapp -n 5
+
+# Verify log file exists
+cat /var/log/myapp.log | tail -5
+
+# Test service restart
+sudo systemctl restart myapp
+sleep 2
+systemctl status myapp
+```
+
+### Cleanup
+
+```bash
+# Stop and disable service
+sudo systemctl stop myapp
+sudo systemctl disable myapp
+
+# Remove service file and script
+sudo rm /etc/systemd/system/myapp.service
+sudo rm /usr/local/bin/myapp.sh
+sudo rm /var/log/myapp.log
+
+# Reload systemd
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+```
+
+---
+
+## Interview Prep Connections
+
+Review these common Linux interview topics alongside these labs:
+
+- [Linux Process Management](/docs/linux/process-management)
+- [User and Group Management](/docs/linux/user-management)
+- [System Logging and Monitoring](/docs/linux/logging)
+
+Common interview questions:
+- "How do you troubleshoot a service that won't start?"
+- "Explain the difference between systemd init and sysvinit"
+- "How would you find the largest files on a disk?"
+- "Walk me through creating a new user with sudo access"
+
+## Related Topics
+
+- [Shell Scripting](/docs/linux/bash-scripting)
+- [Networking Fundamentals](/docs/networking/basics)
+- [Container Basics](/docs/containers/docker)

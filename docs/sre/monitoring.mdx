@@ -1,0 +1,897 @@
+---
+sidebar_position: 6
+---
+
+# Monitoring
+
+## Overview
+
+Monitoring is the practice of collecting, processing, and analyzing metrics, logs, and traces to understand system behavior and detect issues. For SRE, monitoring is foundational — you cannot manage what you cannot measure. Without effective monitoring, you cannot set meaningful SLOs, detect reliability degradation, or diagnose incidents.
+
+The goal of monitoring is not to collect as much data as possible, but to collect the right data to answer the questions that matter: Is the service working? Is it performing well? Is it secure? Effective monitoring answers these questions at a glance and alerts when attention is needed.
+
+Modern monitoring approaches emphasize observable systems — services that expose their internal state in a way that makes debugging possible without requiring access to production systems. The three pillars of observability are metrics, logs, and traces, each serving different debugging and analysis needs.
+
+## When To Use
+
+- **Real-time service health** — Understanding current system state
+- **Incident detection** — Automated alerting when issues occur
+- **Performance optimization** — Identifying bottlenecks and inefficiencies
+- **SLO tracking** — Measuring reliability against targets
+- **Capacity planning** — Understanding resource utilization trends
+- **Debugging** — Root cause analysis during incidents
+- **Change validation** — Confirming deployments don't cause regressions
+
+## When NOT To Use
+
+- **Without clear questions** — Monitoring for monitoring's sake wastes resources
+- **Before instrumentation exists** — You need code to expose metrics first
+- **For services with no users** — Monitoring production is more important than staging
+- **As a replacement for testing** — Monitoring finds problems, testing prevents them
+
+## Core Concepts
+
+### The Three Pillars of Observability
+
+**Metrics**: Numerical measurements aggregated over time. Low cardinality, efficient storage, good for dashboards and alerts.
+
+```promql
+# Example: Request rate over time
+rate(http_requests_total[5m])
+
+# Example: Error rate
+rate(http_requests_total{status=~"5.."}[5m]) 
+/ 
+rate(http_requests_total[5m])
+```
+
+**Logs**: Immutable, timestamped records of discrete events. High cardinality, larger storage footprint, good for debugging and audit.
+
+```
+2024-01-15T10:30:45.123Z INFO "GET /api/users/123" status=200 duration=45ms
+2024-01-15T10:30:46.456Z ERROR "POST /api/orders" status=500 duration=1203ms error="database connection timeout"
+```
+
+**Traces**: Records of a single request's path through multiple services. Critical for understanding distributed system behavior.
+
+```
+Trace: abc123
+  Span 1: api-gateway (0ms - 45ms)
+    Span 2: auth-service (5ms - 15ms)
+    Span 3: user-service (18ms - 40ms)
+      Span 4: database (20ms - 35ms)
+```
+
+### Golden Signals
+
+Google's SRE team identified four key signals that indicate user-facing service health:
+
+| Signal | What It Measures | Why It Matters |
+|--------|------------------|----------------|
+| **Latency** | Time to process requests | Slow service = user impact |
+| **Traffic** | Requests per second/throughput | Demand vs capacity |
+| **Errors** | Rate of failed requests | System dysfunction |
+| **Saturation** | Resource utilization | Proximity to capacity limits |
+
+```yaml
+# Golden signal monitoring configuration
+monitoring:
+  latency:
+    sli: histogram_quantile(0.99, request_duration_seconds)
+    warning_threshold: 500ms
+    critical_threshold: 1s
+    
+  traffic:
+    sli: rate(http_requests_total[5m])
+    warning_threshold: 80% of capacity
+    critical_threshold: 95% of capacity
+    
+  errors:
+    sli: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])
+    warning_threshold: 0.1% (0.1 errors per 100 requests)
+    critical_threshold: 1% (1 error per 100 requests)
+    
+  saturation:
+    sli: cpu_usage + memory_usage / 2
+    warning_threshold: 70%
+    critical_threshold: 85%
+```
+
+### USE Method (Utilization, Saturation, Errors)
+
+Brendan Gregg's method for infrastructure monitoring:
+
+```
+For every resource, check:
+- Utilization: % time resource was busy
+- Saturation: length of queue or wait time
+- Errors: count of error events
+```
+
+| Resource | Utilization | Saturation | Errors |
+|----------|-------------|------------|--------|
+| CPU | cpu_usage | run_queue_length | cpu_errors |
+| Memory | mem_used / mem_total | swap_in/out | oom_count |
+| Disk | disk_io_percent | queue_depth | disk_errors |
+| Network | bandwidth / capacity | interface_drops | network_errors |
+
+### RED Method (Rate, Errors, Duration)
+
+Method for microservices monitoring:
+
+```
+For every service, measure:
+- Rate: Requests per second
+- Errors: Failed requests (5xx)
+- Duration: Request latency (percentiles)
+```
+
+```yaml
+# RED method metrics
+metrics:
+  rate:
+    query: sum(rate(http_requests_total[5m]))
+    labels: [service, endpoint, method]
+    
+  errors:
+    query: sum(rate(http_requests_total{status=~"5.."}[5m]))
+    labels: [service, endpoint, status]
+    
+  duration:
+    query: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+    labels: [service, endpoint]
+```
+
+## Real Production Example
+
+### Kubernetes Monitoring Stack
+
+```yaml
+# Prometheus configuration for Kubernetes
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Kubernetes API server metrics
+  - job_name: 'kubernetes-apiservers'
+    kubernetes_sd_configs:
+      - role: endpoints
+    scheme: https
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+  # Kubernetes pod metrics (cAdvisor)
+  - job_name: 'kubernetes-pods'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+  # Node metrics (node_exporter)
+  - job_name: 'kubernetes-nodes'
+    kubernetes_sd_configs:
+      - role: node
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: instance
+        replacement: ${1}
+```
+
+### Service Level Monitoring
+
+```yaml
+# Service monitor for API service
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-service
+  labels:
+    team: backend
+spec:
+  selector:
+    matchLabels:
+      app: api
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scheme: http
+      tlsConfig:
+        insecureSkipVerify: true
+  namespaceSelector:
+    matchNames:
+      - production
+---
+# PrometheusRule for SLI-based alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-sli-alerts
+spec:
+  groups:
+    - name: api-sli
+      rules:
+        - record: sli:request_success:rate5m
+          expr: |
+            sum(rate(http_requests_total{job="api",status!~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="api"}[5m]))
+            
+        - alert: SLIDegraded
+          expr: sli:request_success:rate5m < 0.999
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "API success rate below 99.9%"
+```
+
+### Multi-Tier Application Monitoring
+
+```yaml
+# Complete monitoring configuration
+monitoring:
+  # Layer 1: Load Balancer
+  load_balancer:
+    metrics:
+      - backend_connections
+      - request_rate
+      - error_rate
+      - latency_p99
+    dashboards:
+      - name: "Load Balancer Overview"
+        panels: [throughput, latency, errors, active_connections]
+        
+  # Layer 2: Application Servers
+  application:
+    metrics:
+      - request_rate
+      - error_rate
+      - latency_p50, p95, p99
+      - cpu_usage
+      - memory_usage
+      - goroutine_count
+    dashboards:
+      - name: "API Performance"
+        panels: [request_rate, latency_histogram, error_breakdown]
+        
+  # Layer 3: Database
+  database:
+    metrics:
+      - queries_per_second
+      - query_duration_p99
+      - connections_used
+      - connections_waiting
+      - replication_lag
+      - cache_hit_rate
+    dashboards:
+      - name: "Database Performance"
+        panels: [qps, query_latency, connections, replication]
+        
+  # Layer 4: Cache
+  cache:
+    metrics:
+      - hit_rate
+      - memory_usage
+      - evictions
+      - connections
+    dashboards:
+      - name: "Cache Health"
+        panels: [hit_rate, memory, evictions]
+```
+
+## Metrics / Formulas / Frameworks
+
+### Latency Percentiles
+
+```python
+import numpy as np
+
+def calculate_latency_percentiles(durations_ms):
+    """
+    Calculate latency percentiles from raw duration data.
+    """
+    return {
+        'p50': np.percentile(durations_ms, 50),
+        'p90': np.percentile(durations_ms, 90),
+        'p95': np.percentile(durations_ms, 95),
+        'p99': np.percentile(durations_ms, 99),
+        'p99.9': np.percentile(durations_ms, 99.9),
+        'mean': np.mean(durations_ms),
+        'std': np.std(durations_ms)
+    }
+
+# Example: 1000 requests with varying latency
+# Output: {'p50': 45ms, 'p90': 120ms, 'p95': 180ms, 'p99': 350ms, ...}
+```
+
+### Availability Calculation
+
+```python
+def calculate_availability(successful_requests, total_requests):
+    """
+    Calculate service availability as percentage.
+    """
+    if total_requests == 0:
+        return 100.0
+    return (successful_requests / total_requests) * 100
+
+def calculate_uptime_from_downtime(total_minutes, downtime_minutes):
+    """
+    Calculate uptime percentage from downtime minutes.
+    """
+    return ((total_minutes - downtime_minutes) / total_minutes) * 100
+
+# Example
+total_month = 30 * 24 * 60  # 43,200 minutes
+downtime = 45  # minutes of downtime
+uptime = calculate_uptime_from_downtime(total_month, downtime)
+print(f"Uptime: {uptime:.4f}%")  # 99.896%
+```
+
+### Saturation Scoring
+
+```python
+def calculate_saturation_score(metrics):
+    """
+    Calculate composite saturation score from multiple metrics.
+    Each metric normalized to 0-100 scale.
+    """
+    weights = {
+        'cpu': 0.3,
+        'memory': 0.3,
+        'disk': 0.2,
+        'network': 0.2
+    }
+    
+    score = 0
+    for metric, weight in weights.items():
+        # Normalize to 0-100 (assuming thresholds set properly)
+        normalized = min(100, max(0, metrics.get(metric, 0)))
+        score += normalized * weight
+        
+    return score
+
+# Example
+metrics = {
+    'cpu': 75,      # 75% utilized
+    'memory': 68,   # 68% utilized
+    'disk': 45,     # 45% utilized
+    'network': 30   # 30% utilized
+}
+score = calculate_saturation_score(metrics)
+print(f"Saturation Score: {score:.1f}")  # 61.8
+```
+
+### Capacity Forecasting
+
+```python
+import numpy as np
+
+def forecast_capacity(current_usage, growth_rate, months_ahead):
+    """
+    Simple linear forecast of capacity needs.
+    
+    Args:
+        current_usage: Current utilization percentage
+        growth_rate: Monthly growth rate (e.g., 0.05 for 5%)
+        months_ahead: How many months to forecast
+    """
+    forecasts = []
+    for month in range(1, months_ahead + 1):
+        forecast = current_usage * (1 + growth_rate) ** month
+        forecasts.append({
+            'month': month,
+            'forecasted_usage': forecast,
+            'days_to_capacity': calculate_days_to_full(forecast)
+        })
+    return forecasts
+
+def calculate_days_to_full(current_usage, threshold=85):
+    """
+    Calculate days until capacity reaches threshold.
+    """
+    if current_usage >= threshold:
+        return 0
+    # Assume linear growth (simplified)
+    daily_growth = (threshold - current_usage) / 30
+    return int((threshold - current_usage) / daily_growth)
+
+# Example
+forecast = forecast_capacity(60, 0.05, 6)
+# Month 1: 63%, Month 2: 66%, Month 3: 69%, ...
+```
+
+## Common Tools and Commands
+
+### Prometheus Queries for Monitoring
+
+```promql
+-- Golden signals queries
+
+-- Latency: p99 by endpoint
+histogram_quantile(0.99, 
+  sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+)
+
+-- Traffic: requests per second
+sum(rate(http_requests_total[5m])) by (service)
+
+-- Errors: 5xx rate by status
+sum(rate(http_requests_total{status=~"5.."}[5m])) by (status)
+/
+sum(rate(http_requests_total[5m]))
+
+-- Saturation: CPU utilization
+rate(process_cpu_seconds_total[5m]) * 100
+
+-- Combined dashboard query
+{
+  __name__: "http_requests_total",
+  status: "200",
+  job: "api"
+}
+```
+
+### Grafana Dashboard JSON
+
+```json
+{
+  "title": "Service Monitoring Dashboard",
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(http_requests_total[5m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2
+          },
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(http_requests_total{status=~\"4..|5..\"}[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line"
+          }
+        }
+      }
+    },
+    {
+      "title": "Latency Percentiles",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line"
+          }
+        }
+      }
+    },
+    {
+      "title": "CPU & Memory Saturation",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total[5m]) * 100",
+          "legendFormat": "CPU %"
+        },
+        {
+          "expr": "process_resident_memory_bytes / 1024 / 1024 / 1024",
+          "legendFormat": "Memory GB"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Kubernetes Monitoring Queries
+
+```bash
+# Pod resource utilization
+kubectl top pods -n production --sort-by=memory
+
+# Node resource utilization
+kubectl top nodes
+
+# Pod restart analysis
+kubectl get pods -n production -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].restartCount}{"\n"}{end}'
+
+# Resource requests vs actual
+kubectl describe nodes | grep -A 5 "Allocated resources"
+```
+
+## Monitoring / Alerting Examples
+
+### Comprehensive Monitoring Rules
+
+```yaml
+# prometheus/rules/monitoring-alerts.yaml
+groups:
+  - name: golden-signals
+    rules:
+      # Latency alerts
+      - alert: HighLatencyP99
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          signal: latency
+        annotations:
+          summary: "API p99 latency above 1 second"
+          description: "p99 latency is {{ $value | humanizeDuration }}"
+
+      - alert: CriticalLatency
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le)
+          ) > 3
+        for: 2m
+        labels:
+          severity: critical
+          signal: latency
+        annotations:
+          summary: "API latency critical"
+          description: "p99 latency exceeds 3 seconds"
+
+      # Traffic alerts
+      - alert: TrafficAnomaly
+        expr: |
+          abs(
+            sum(rate(http_requests_total{job="api"}[5m])) 
+            - avg_over_time(sum(rate(http_requests_total{job="api"}[5m]))[1h:5m])
+          ) 
+          > 3 * stddev_over_time(sum(rate(http_requests_total{job="api"}[5m]))[1h:5m])
+        for: 5m
+        labels:
+          severity: warning
+          signal: traffic
+        annotations:
+          summary: "Unusual traffic pattern detected"
+
+      - alert: TrafficDrop
+        expr: |
+          sum(rate(http_requests_total{job="api"}[5m])) 
+          < 0.1 * avg_over_time(sum(rate(http_requests_total{job="api"}[5m]))[7d:5m])
+        for: 5m
+        labels:
+          severity: warning
+          signal: traffic
+        annotations:
+          summary: "Traffic dropped significantly"
+
+      # Error alerts
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="api",status=~"5.."}[5m])) 
+          / 
+          sum(rate(http_requests_total{job="api"}[5m])) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          signal: errors
+        annotations:
+          summary: "API error rate above 1%"
+
+      - alert: Elevated4xxRate
+        expr: |
+          sum(rate(http_requests_total{job="api",status=~"4.."}[5m])) 
+          / 
+          sum(rate(http_requests_total{job="api"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          signal: errors
+        annotations:
+          summary: "4xx error rate elevated"
+
+      # Saturation alerts
+      - alert: HighCPU
+        expr: |
+          rate(process_cpu_seconds_total{job="api"}[5m]) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+          signal: saturation
+        annotations:
+          summary: "API service CPU above 80%"
+
+      - alert: MemoryPressure
+        expr: |
+          process_resident_memory_bytes{job="api"} 
+          / on(job) group_left 
+          container_spec_memory_limit_bytes{container="api"} > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          signal: saturation
+        annotations:
+          summary: "Memory usage above 80% of limit"
+
+      - alert: DiskPressure
+        expr: |
+          (1 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          signal: saturation
+        annotations:
+          summary: "Disk usage above 85%"
+```
+
+## Security
+
+### Security Monitoring
+
+```yaml
+# Security-focused monitoring
+groups:
+  - name: security-monitoring
+    rules:
+      # Failed authentication attempts
+      - alert: HighAuthFailureRate
+        expr: |
+          sum(rate(http_requests_total{job="api",status="401"}[5m]))
+          /
+          sum(rate(http_requests_total{job="api"}[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "High rate of authentication failures"
+
+      # Unusual error patterns
+      - alert: SQLInjectionAttempt
+        expr: |
+          sum(rate(http_requests_total{job="api",uri=~".*('|;|--|union).*"}[5m])) > 10
+        for: 1m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "Possible SQL injection attempt detected"
+
+      # Certificate expiry
+      - alert: TLSCertExpiring
+        expr: |
+          probe_ssl_earliest_cert_expiry - time() < 86400 * 30
+        for: 0m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "TLS certificate expiring in less than 30 days"
+```
+
+## Cost Optimization
+
+### Monitoring Cost Management
+
+```yaml
+cost_optimization:
+  metrics_retention:
+    raw_metrics: "15 days"
+    aggregated_metrics: "90 days"
+    archival: "1 year (sampled)"
+    
+  scrape_interval_optimization:
+    critical_metrics: "10s"
+    standard_metrics: "30s"
+    low_priority: "60s"
+    
+  cardinality_management:
+    # Limit high-cardinality labels
+    high_cardinality_labels:
+      - user_id: false  # Don't include user IDs in metrics
+      - request_id: false
+      - trace_id: false
+    # Instead use correlation via logs/traces
+```
+
+### Query Optimization
+
+```promql
+-- Efficient: Use recording rules
+sli:request_success:rate5m  # Pre-computed
+
+-- Inefficient: Complex query every dashboard load
+sum(rate(http_requests_total{status!~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Monitoring Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| Too many dashboards | Hard to find signal | Focus on 3-5 key dashboards |
+| Alerting on everything | Alert fatigue | Alert only on SLO impacts |
+| No signal hierarchy | Can't triage | Golden signals first |
+| Ignoring seasonality | False alerts | Use multi-week comparison |
+| No aggregation plan | Cardinality explosion | Pre-aggregate in recording rules |
+
+### Monitoring Debugging
+
+**Symptom**: Metrics suddenly stop updating
+
+**Diagnosis**:
+```bash
+# Check Prometheus targets
+curl -s localhost:9090/api/v1/targets | jq '.data.activeTargets'
+
+# Check scrape config
+grep -A 5 "job_name: 'api'" /etc/prometheus/prometheus.yml
+
+# Check service metrics endpoint
+curl -s localhost:8080/metrics | head -20
+```
+
+## Interview Questions
+
+### Q1: What are the golden signals and why do they matter?
+
+**A**: The golden signals are the four key metrics that indicate user-facing service health:
+
+1. **Latency** — How long requests take. Slow responses = user impact.
+2. **Traffic** — How much demand exists. Low traffic might indicate problems; high traffic tests capacity.
+3. **Errors** — How many requests fail. Errors are direct user-visible failures.
+4. **Saturation** — How utilized the system is. Near-100% = risk of failure.
+
+They matter because they focus monitoring on what users actually experience, not internal implementation details. By monitoring these four signals, you can detect most user-impacting issues without maintaining hundreds of individual metrics.
+
+### Q2: What's the difference between metrics, logs, and traces?
+
+**A**:
+
+- **Metrics**: Numerical measurements aggregated over time. Low cardinality, efficient storage, good for dashboards and alerting. Example: request rate, error rate, latency percentiles.
+- **Logs**: Immutable records of events. High cardinality, larger storage. Good for debugging and audit trails. Example: "Request XYZ failed: connection timeout".
+- **Traces**: Records of a single request's path through multiple services. Critical for understanding distributed systems. Example: "Request ABC took 150ms total: 10ms in API, 80ms in DB, 60ms in cache."
+
+All three are needed for complete observability. Metrics tell you something is wrong, logs tell you why, traces tell you where.
+
+### Q3: How do you decide what to monitor?
+
+**A**: I use the RED/USE methods and focus on user-facing signals:
+
+**For services (RED method)**:
+- Rate: How many requests per second?
+- Errors: What's the error rate?
+- Duration: What are the latency percentiles?
+
+**For infrastructure (USE method)**:
+- Utilization: How busy is the resource?
+- Saturation: Is there a queue building up?
+- Errors: Are there errors?
+
+**Key filter**: Would a change in this metric be actionable? If yes, monitor it. If no, don't.
+
+### Q4: How do you handle monitoring at scale?
+
+**A**: At scale, monitoring must be:
+
+1. **Hierarchical**: Aggregate at each level (pod → service → cluster)
+2. **Pre-computed**: Use recording rules for common queries
+3. **Cardinality controlled**: Limit label combinations
+4. **Multi-level**: Monitor at infrastructure, service, and business levels
+5. **Distributed tracing**: For microservice request flows
+
+Key techniques:
+- Recording rules pre-aggregate expensive queries
+- Federation spreads load across Prometheus instances
+- tsdb with proper retention policies
+- Adaptive metrics collection based on importance
+
+## Cheat Sheet
+
+### Golden Signals Quick Reference
+
+```
+Latency:
+  - p50, p95, p99 response time
+  - Histogram of all request durations
+  
+Traffic:
+  - Requests per second
+  - Active connections
+  - Throughput (bytes/sec)
+  
+Errors:
+  - 5xx rate (server errors)
+  - 4xx rate (client errors)
+  - Application-level error rates
+  
+Saturation:
+  - CPU utilization
+  - Memory utilization
+  - Disk utilization
+  - Connection pool utilization
+  - Queue depth
+```
+
+### Alert Severity Quick Reference
+
+| Severity | Response Time | Example |
+|----------|---------------|---------|
+| P1/Critical | 5 minutes | Site down, all requests failing |
+| P2/High | 15 minutes | Major feature broken |
+| P3/Medium | 1 hour | Degraded performance |
+| P4/Low | 4 hours | Minor issue |
+
+### Prometheus Metric Types
+
+```
+Counter:     Increments only (requests_total, errors_total)
+Gauge:       Can go up or down (cpu_usage, memory_used)
+Histogram:   Distribution of values (request_duration)
+Summary:     Quantiles over sliding window (request_latency)
+```
+
+## Related Topics
+
+- [Alerting](./alerting.mdx) — Alerting based on monitoring data
+- [SLO](./slo.mdx) — SLO monitoring and tracking
+- [Error Budget](./error-budget.mdx) — Budget monitoring
+- [Incident Management](./incident-management.mdx) — Responding to monitoring alerts

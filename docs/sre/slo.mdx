@@ -1,0 +1,922 @@
+---
+sidebar_position: 3
+---
+
+# SLO (Service Level Objective)
+
+## Overview
+
+A Service Level Objective (SLO) is the target value for one or more SLIs. It defines what level of service quality you're trying to achieve — the North Star that guides reliability investments. SLOs transform abstract goals ("be reliable") into concrete, measurable targets ("99.9% of requests complete within 200ms").
+
+SLOs are internal targets — they're what your engineering team commits to achieving and measuring against. They're typically stricter than SLAs (which have contractual penalties) and based on what users actually need rather than what you can promise without consequences.
+
+The power of SLOs lies in their decision-making utility. When you have a well-defined SLO and a way to measure error budget consumption, you have a principled framework for answering questions like: "Should we ship this risky feature now or wait?" "Do we need more redundancy?" "Is this alert worth responding to at 3 AM?"
+
+## When To Use
+
+- **Setting reliability targets** — When you need to define what "reliable enough" means for a service
+- **Prioritizing engineering work** — When you need a data-driven way to decide what to work on
+- **Managing error budgets** — When you want to use budget burn rate to trigger actions
+- **Defining SLAs** — SLOs typically inform and are stricter than SLAs
+- **Reporting to stakeholders** — When you need to communicate reliability status clearly
+- **Making deployment decisions** — When you need a framework for risky changes
+
+## When NOT To Use
+
+- **Before you have meaningful SLI data** — Set SLOs after measuring baseline performance, not before
+- **For every internal system** — SLOs are for user-facing services; internal systems may just need monitoring
+- **As a substitute for SLA** — If you have contractual obligations, define SLAs explicitly
+- **If SLO targets keep changing** — Volatile SLOs indicate you don't understand user needs
+
+## Core Concepts
+
+### SLO vs SLI vs SLA
+
+```
+SLI: What you measure (the raw metric)
+     "99.7% of requests returned successfully"
+
+SLO: What you target (the goal)
+     "Target: 99.9% availability"
+
+SLA: What you promise (the contract)
+     "Guaranteed 99.9% or we refund 10% of subscription"
+```
+
+**SLI** is the indicator — the actual measurement.
+**SLO** is the objective — the target you set.
+**SLA** is the agreement — the promise you make (usually with financial consequences).
+
+SLO should be stricter than SLA (you want to beat your target consistently), and SLI should be measured against SLO to track whether you're meeting your target.
+
+### Choosing SLO Targets
+
+**User-centric approach**: What would users perceive as "broken"?
+
+- If response time doubles, do users complain?
+- If 1 in 100 requests fails, is that noticeable?
+- If data is 5 minutes stale, is that acceptable?
+
+**Historical approach**: What has the service historically achieved?
+
+- Measure for 2-4 weeks before setting SLO
+- Set target slightly above median (not peak) performance
+- Adjust as reliability improves
+
+**Competitive approach**: What do similar services offer?
+
+- What availability are competitors advertising?
+- What's the industry standard for this type of service?
+
+**Business impact approach**: What's the cost of downtime vs reliability investment?
+
+```
+If downtime costs $100k/hour and improving from 99% to 99.9% costs $50k/month:
+- 99% = 3.65 days/year downtime = $876k potential loss
+- 99.9% = 8.76 hours/year downtime = $87.6k potential loss
+- ROI: $50k/month to prevent $788k/year = positive
+```
+
+### SLO Windows
+
+SLOs are measured over a time window. Common windows:
+
+| Window | Description | Use Case |
+|--------|-------------|----------|
+| 30 days | Calendar month | Most common, matches billing cycles |
+| 7 days | Rolling week | Faster feedback on improvements |
+| 1 day | Rolling day | Near-real-time SLO health |
+| Rolling 28 days | Continuous | Prevents month-end gaming |
+
+**Note**: A 30-day SLO measured on the 1st of the month only has 1 day of data. Use rolling windows or calculate from a fixed start date.
+
+### Multiple SLOs Per Service
+
+Most services have multiple SLOs addressing different aspects:
+
+```
+Payment Service SLOs:
+├── Availability: 99.95% (credit card processing succeeds)
+├── Latency: 99.9% of requests < 2s
+├── Accuracy: 99.999% of transactions recorded correctly
+└── Freshness: Payment status updated within 30 seconds
+```
+
+Not all SLOs are equally important. Weight them based on user impact and error budget allocation.
+
+## Real Production Example
+
+### Google Cloud SLO Examples
+
+Google Cloud Platform publishes SLOs for their services:
+
+**Cloud Run SLO**:
+- Availability: 99.95% (monthly)
+- Error budget: 21.9 minutes/month
+- Measurement: Container instances successfully handle requests
+
+**BigQuery SLO**:
+- Query success rate: 99.9% for queries < 100 seconds
+- Measured as: Completed queries / Total queries
+- Excludes: Timeout queries, quota errors
+
+### E-Commerce Platform SLOs
+
+```yaml
+# E-commerce platform SLOs
+service: checkout
+team: payments
+created: 2024-01-15
+
+slos:
+  - name: checkout-availability
+    sli_ref: sli.mdx#checkout-availability
+    target: 99.9%
+    window: 30d rolling
+    error_budget_minutes: 43.8
+    
+  - name: checkout-latency
+    sli_ref: sli.mdx#checkout-latency
+    target: 99.0% of requests < 500ms
+    window: 30d rolling
+    error_budget_minutes: 7.3  # 1% of requests can be slow
+    
+  - name: payment-processing
+    sli_ref: sli.mdx#payment-success
+    target: 99.5%
+    window: 30d rolling
+    error_budget_minutes: 36.5
+    
+error_budget_policy:
+  depletion_threshold: 50%  # Trigger action when 50% budget used
+  depletion_action:
+    - name: halt-deployments
+      description: "Halt non-critical production deployments"
+    - name: page-sre
+      description: "Notify SRE team for investigation"
+    
+  exhaustion_threshold: 90%
+  exhaustion_action:
+    - name: emergency-response
+      description: "Activate incident response, all hands on reliability"
+    - name: freeze-deployments
+      description: "Freeze all production deployments except security fixes"
+```
+
+### Kubernetes Platform SLOs
+
+```yaml
+# Kubernetes platform SLOs
+service: platform-api
+namespace: production
+team: platform-sre
+
+slos:
+  - name: api-server-availability
+    description: "Kubernetes API server handles requests successfully"
+    target: 99.95%
+    window: 30d rolling
+    measurement: |
+      sum(rate(apiserver_requests_total{code=~"2.."}[30d]))
+      /
+      sum(rate(apiserver_requests_total[30d]))
+    error_budget:
+      minutes: 21.9
+      percentage: 0.05%
+      
+  - name: pod-scheduling-success
+    description: "Pods schedule within 30 seconds"
+    target: 99.5%
+    window: 30d rolling
+    measurement: |
+      sum(rate(scheduler_succeeded_attempts_total[30d]))
+      /
+      sum(rate(scheduler_attempts_total[30d]))
+    error_budget:
+      minutes: 36.5
+      percentage: 0.5%
+      
+  - name: node-health
+    description: "Nodes remain in Ready condition"
+    target: 99.9%
+    window: 30d rolling
+    measurement: |
+      sum(kube_node_status_condition{condition="Ready",status="true"})
+      /
+      count(kube_node_status_condition{condition="Ready"})
+    error_budget:
+      minutes: 43.8
+      percentage: 0.1%
+```
+
+## Metrics / Formulas / Frameworks
+
+### Error Budget Calculation
+
+```python
+def calculate_error_budget(slo_target, window_days):
+    """
+    Calculate error budget in minutes.
+    
+    Args:
+        slo_target: SLO as percentage (e.g., 99.9 for 99.9%)
+        window_days: Measurement window in days
+    """
+    minutes_in_window = window_days * 24 * 60
+    error_budget_percent = 100 - slo_target
+    error_budget_minutes = error_budget_percent / 100 * minutes_in_window
+    return error_budget_minutes
+
+# Examples
+print(f"99.9% over 30 days: {calculate_error_budget(99.9, 30):.1f} minutes")
+# 43.8 minutes
+
+print(f"99.95% over 30 days: {calculate_error_budget(99.95, 30):.1f} minutes")
+# 21.9 minutes
+
+print(f"99.99% over 30 days: {calculate_error_budget(99.99, 30):.1f} minutes")
+# 4.4 minutes
+```
+
+### SLO Achievement Calculation
+
+```python
+def calculate_slo_achievement(sli_value, slo_target):
+    """
+    Calculate SLO achievement as percentage of target.
+    
+    Achievement > 100% means SLI exceeded SLO target.
+    Achievement < 100% means SLI missed SLO target.
+    
+    Args:
+        sli_value: Actual SLI value (e.g., 99.85)
+        slo_target: SLO target (e.g., 99.9)
+    """
+    return (sli_value / slo_target) * 100
+
+# Example
+actual_sli = 99.92  # 99.92% availability achieved
+target_slo = 99.9   # Target was 99.9%
+achievement = calculate_slo_achievement(actual_sli, target_slo)
+print(f"SLO Achievement: {achievement:.2f}%")  # 100.02%
+```
+
+### Error Budget Burn Rate
+
+```python
+def calculate_burn_rate(slo_target, window_hours, burn_window_hours, sli_measured):
+    """
+    Calculate how fast error budget is being consumed.
+    
+    burn_rate = 1.0 means consuming budget at expected rate
+    burn_rate > 1.0 means consuming faster than expected
+    burn_rate < 1.0 means consuming slower than expected
+    
+    Args:
+        slo_target: Target SLO percentage
+        window_hours: SLO measurement window
+        burn_window_hours: Window for this measurement
+        sli_measured: Measured SLI value
+    """
+    budget_rate = (100 - slo_target) / 100 / window_hours
+    actual_errors = max(0, (100 - sli_measured) / 100 / burn_window_hours)
+    return actual_errors / budget_rate if budget_rate > 0 else 0
+
+# Example: 99.9% SLO, measuring 1-hour window
+# Measured 99.5% in that hour = burning 4x too fast
+burn = calculate_burn_rate(99.9, 30*24, 1, 99.5)
+print(f"Burn rate: {burn:.1f}x")  # 4.0x
+```
+
+### Time to Exhaustion
+
+```python
+def time_to_exhaustion(budget_minutes, burn_rate, window_hours):
+    """
+    Calculate how long until error budget is exhausted.
+    
+    Args:
+        budget_minutes: Remaining error budget in minutes
+        burn_rate: Current burn rate (>1 = depleting, <1 = rebuilding)
+        window_hours: The SLO window
+    """
+    if burn_rate <= 0:
+        return float('inf')  # Budget not depleting
+    
+    # At burn_rate, how many windows to exhaust?
+    window_minutes = window_hours * 60
+    windows_to_exhaust = budget_minutes / (window_minutes * (burn_rate - 1)) if burn_rate > 1 else float('inf')
+    
+    return windows_to_exhaust * window_minutes
+
+# Example: 40 minutes remaining, burn rate 2.0, 30-day window
+exhaustion_hours = time_to_exhaustion(40, 2.0, 30*24) / 60
+print(f"Exhaustion in {exhaustion_hours:.1f} hours")
+# ~1200 hours = 50 days
+```
+
+### Composite SLO Calculations
+
+```python
+def composite_slo_achievement(slos):
+    """
+    Calculate composite SLO achievement across multiple objectives.
+    
+    Each SLO contributes to overall achievement based on weight.
+    """
+    total_weight = sum(weight for _, _, weight in slos)
+    weighted_achievement = sum(
+        achievement * (weight / total_weight)
+        for _, achievement, weight in slos
+    )
+    return weighted_achievement
+
+# Example
+slos = [
+    ("availability", 100.02, 0.5),   # 50% weight, 100.02% achievement
+    ("latency", 98.5, 0.3),          # 30% weight, 98.5% achievement  
+    ("accuracy", 99.99, 0.2),        # 20% weight, 99.99% achievement
+]
+composite = composite_slo_achievement(slos)
+print(f"Composite SLO Achievement: {composite:.2f}%")  # 99.67%
+```
+
+## Common Tools and Commands
+
+### Prometheus SLO Queries
+
+```promql
+-- Current SLO achievement (30-day window)
+(
+  sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total{job="api"}[30d]))
+) * 100
+
+-- Error budget consumed
+100 - (
+  (
+    sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+    /
+    sum(rate(http_requests_total{job="api"}[30d]))
+  ) * 100
+) / (1 - 0.999) * 100
+
+-- Remaining error budget in minutes
+(
+  1 - (
+    sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+    /
+    sum(rate(http_requests_total{job="api"}[30d]))
+  )
+) / (1 - 0.999) * 30 * 24 * 60
+
+-- Burn rate (5-minute window)
+(
+  1 - (
+    sum(rate(http_requests_total{job="api",status!~"5.."}[5m]))
+    /
+    sum(rate(http_requests_total{job="api"}[5m]))
+  )
+) / (1 - 0.999) / (5 / 60 / (30 * 24 * 60))
+```
+
+### Grafana SLO Dashboard
+
+```json
+{
+  "title": "SLO Dashboard",
+  "panels": [
+    {
+      "title": "SLO Achievement",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n  /\n  sum(rate(http_requests_total{job='api'}[30d]))\n) * 100",
+          "legendFormat": "Current"
+        },
+        {
+          "expr": "99.9",
+          "legendFormat": "Target"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "red"},
+              {"value": 99.9, "color": "yellow"},
+              {"value": 99.95, "color": "green"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Error Budget Remaining",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "(\n  1 - (\n    sum(rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n    /\n    sum(rate(http_requests_total{job='api'}[30d]))\n  )\n) / (1 - 0.999) * 100"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "red"},
+              {"value": 25, "color": "yellow"},
+              {"value": 50, "color": "green"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Error Budget Burn Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(\n  1 - (\n    sum(rate(http_requests_total{job='api',status!~\"5..\"}[1h]))\n    /\n    sum(rate(http_requests_total{job='api'}[1h]))\n  )\n) / (1 - 0.999)",
+          "legendFormat": "1h burn rate"
+        },
+        {
+          "expr": "(\n  1 - (\n    sum(rate(http_requests_total{job='api',status!~\"5..\"}[4h]))\n    /\n    sum(rate(http_requests_total{job='api'}[4h]))\n  )\n) / (1 - 0.999)",
+          "legendFormat": "4h burn rate"
+        }
+      ]
+    },
+    {
+      "title": "SLO by Endpoint",
+      "type": "bargauge",
+      "targets": [
+        {
+          "expr": "sum by (endpoint) (rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n/\nsum by (endpoint) (rate(http_requests_total{job='api'}[30d])) * 100",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### SLO Configuration as Code
+
+```yaml
+# slo-config.yaml - SLO definitions as code
+apiVersion: sli.dev/v1
+kind: ServiceLevelObjective
+metadata:
+  name: checkout-slo
+  namespace: production
+spec:
+  service: checkout
+  objectives:
+    - displayName: "Checkout Availability"
+      sliMetric:
+        source: prometheus
+        query: |
+          sum(rate(checkout_requests_total{status!~"5.."}[5m]))
+          /
+          sum(rate(checkout_requests_total[5m]))
+      target: 0.999
+      window: 30d
+      
+    - displayName: "Checkout Latency (p99)"
+      sliMetric:
+        source: prometheus
+        query: |
+          histogram_quantile(0.99,
+            sum(rate(checkout_request_duration_seconds_bucket[5m])) by (le)
+          )
+      target: 0.5  # 500ms
+      window: 30d
+      
+  errorBudget:
+    target: 0.001  # 0.1% total budget
+    burnRateThreshold: 1.5
+    alertWhenDepleted: 0.5  # Alert at 50% depleted
+```
+
+## Monitoring / Alerting Examples
+
+### SLO Burn Rate Alerts
+
+```yaml
+# prometheus/rules/slo-alerts.yaml
+groups:
+  - name: slo-burn-rate-alerts
+    rules:
+      # Fast burn: 50% budget in 1 hour = burn rate of 12x
+      # For 30-day SLO, 1 hour = 1/(30*24) = 1/720 of window
+      # To burn 50% in 1 hour, need 360x burn rate
+      - alert: SLOErrorBudgetFastBurn
+        expr: |
+          (
+            # Errors in last hour
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{job="api"}[1h]))
+            )
+          )
+          /
+          # Allowed error rate
+          (1 - 0.999)
+          /
+          # Window ratio (1h / 30 days)
+          (1 / (30 * 24))
+          > 50
+        for: 0m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "SLO error budget burning fast"
+          description: |
+            {{ $value | printf "%.0f" }}% of budget burned in 1 hour
+            (burn rate: {{ $value | printf "%.1f" }}x)
+
+      # Slow burn: 50% budget in 4 hours = burn rate of 90x
+      - alert: SLOErrorBudgetSlowBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[4h]))
+              /
+              sum(rate(http_requests_total{job="api"}[4h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (4 / (30 * 24))
+          > 50
+        for: 0m
+        labels:
+          severity: warning
+          slo: api-availability
+        annotations:
+          summary: "SLO error budget burning slowly"
+          description: |
+            50% of budget burned in 4 hours
+            (burn rate: {{ $value | printf "%.1f" }}x)
+
+      # Multi-window burn rate alert (more sensitive)
+      - alert: SLOBurnRateMultiWindow
+        expr: |
+          # Fast window (1h) burning faster than 14.4x = 50% in 6h
+          (
+            (1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{job="api"}[1h]))
+            )) / (1 - 0.999)
+          )
+          and
+          # Slow window (6h) also burning fast
+          (
+            (1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{job="api"}[6h]))
+            )) / (1 - 0.999)
+          )
+          > 14.4
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SLO burning fast across multiple windows"
+```
+
+### SLO Achievement Alerts
+
+```yaml
+      # SLO at risk (remaining budget < 10%)
+      - alert: SLOErrorBudgetAtRisk
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+              /
+              sum(rate(http_requests_total{job="api"}[30d]))
+            )
+          )
+          /
+          (1 - 0.999)
+          > 0.9
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLO error budget nearly exhausted"
+          description: |
+            Less than 10% error budget remaining
+            Current achievement: {{ $value | printf "%.2f" }}%
+
+      # SLO breached
+      - alert: SLOBreached
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+            /
+            sum(rate(http_requests_total{job="api"}[30d]))
+          )
+          < 0.999
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SLO target not being met"
+          description: |
+            Current availability {{ $value | printf "%.4f" }}
+            Target: 99.9%
+```
+
+## Security
+
+### SLO Impact on Security
+
+**Security incidents often cause SLO breaches**: A DDoS attack causes latency spikes and potentially errors, burning error budget. A successful breach might cause system unavailability during remediation.
+
+**SLO monitoring can detect security events**:
+```yaml
+# Anomalous traffic patterns
+- alert: UnusualTrafficSpike
+  expr: |
+    rate(http_requests_total{job="api"}[5m]) 
+    > 10 * avg_over_time(rate(http_requests_total{job="api"}[5m])[7d])
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Unusual traffic spike - possible attack or misconfiguration"
+```
+
+### SLO Data Sensitivity
+
+SLO data can reveal:
+- System reliability weaknesses (attack surface)
+- Peak usage patterns (business intelligence)
+- Dependency relationships (reconnaissance value)
+
+Protect SLO dashboards and reports appropriately.
+
+## Cost Optimization
+
+### SLO Cost Tradeoffs
+
+Higher SLOs cost more exponentially:
+
+```
+99.0% → 99.9%:  9× improvement, 3-5× cost increase
+99.9% → 99.99%: 10× improvement, 5-10× cost increase
+```
+
+For most services:
+- 99.9% (43.8 min/month) is sufficient
+- 99.99% (4.4 min/month) for critical services
+- 99.999% (< 30 sec/month) for extremely critical, rarely needed
+
+### Cost-Effective SLO Achievement
+
+```yaml
+# Minimize cost while meeting SLO
+cost_optimization_strategies:
+  - name: "Right-size redundancy"
+    description: "Only multi-AZ if SLO needs it. Single-AZ is cheaper."
+    applicable_when: "SLO < 99.9%"
+    
+  - name: "Graceful degradation"
+    description: "Serve cached/stale data when primary fails"
+    applicable_when: "Freshness SLO allows some staleness"
+    
+  - name: "Autoscaling"
+    description: "Pay for capacity you use rather than peak + buffer"
+    applicable_when: "Variable traffic patterns"
+    
+  - name: "CDN for static content"
+    description: "Offload traffic, improve latency, reduce costs"
+    applicable_when: "Serving static or cacheable content"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common SLO Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| SLO too tight | Constant firefighting, no feature velocity | Set SLO based on user needs, not perfection |
+| SLO too loose | Users suffer without alarm | SLO should be noticeable degradation |
+| No error budget policy | Budget depletion has no consequences | Define actions at 50%, 75%, 90% depletion |
+| Wrong window | Gaming at month end | Use rolling windows, not calendar months |
+| Too many SLOs |分散 focus | Prioritize 3-5 most important SLIs |
+| SLOs not reviewed | Stale targets, meaningless | Quarterly SLO review, adjust based on data |
+
+### SLO Troubleshooting
+
+**Symptom**: SLO consistently missed even though users seem happy
+
+**Diagnosis**:
+```bash
+# 1. Check if SLI definition matches user perception
+# Maybe "success" is defined too strictly
+# A request that returns 200 with degraded functionality should count as failure?
+
+# 2. Check if measurement includes user-relevant paths
+# Maybe you're measuring all requests including health checks, etc.
+
+# 3. Check if window alignment is causing issues
+# If you measure from 1st of month, early data is sparse
+```
+
+**Symptom**: Error budget always high (never depletes)
+
+**Diagnosis**:
+```bash
+# 1. Check if SLO is too loose
+# If you're achieving 99.99% with a 99.9% SLO, maybe tighten it
+
+# 2. Check if your monitoring is missing failures
+# Are you measuring complete traffic?
+# Are there silent failures not captured by your SLI?
+
+# 3. Consider if this service needs a stricter SLO
+# Higher SLO = more reliability investment = better user experience
+```
+
+## Interview Questions
+
+### Q1: How do you decide what SLO to set for a new service?
+
+**A**: I follow a data-driven approach:
+
+1. **Measure baseline** for 2-4 weeks to understand current performance
+2. **Define user-centric success criteria**: What would users perceive as broken?
+3. **Set initial SLO slightly above median** performance (not peak)
+4. **Iterate based on data**: Tighten as reliability improves
+
+For a new API, I might:
+- Start with 99% availability (based on what competitors offer)
+- Measure actual performance
+- If consistently achieving 99.9%, tighten the SLO
+- Never set an SLO tighter than what users would notice as broken
+
+### Q2: What do you do when your SLO's error budget is depleting?
+
+**A**: Error budget depletion triggers specific actions:
+
+1. **Verify data accuracy** — Confirm it's not a measurement issue
+2. **Identify root cause** — What's causing the degradation?
+3. **Mitigate immediately** — Rollback if deployment-related
+4. **Communicate** — Update stakeholders, consider status page
+5. **Error budget policy triggers**:
+   - 50% depleted: Halt non-critical deployments, investigate
+   - 75% depleted: Pause features, focus on reliability
+   - 90% depleted: All-hands on reliability, freeze deployments
+
+The key is having predefined policies so you don't make ad-hoc decisions.
+
+### Q3: How do you handle SLOs for services with multiple user segments?
+
+**A**: Different user segments often need different SLOs:
+
+Example: B2B SaaS with free and enterprise tiers:
+```yaml
+slos:
+  - name: free-tier-availability
+    target: 99.5%
+    affected_users: "Free tier users"
+    
+  - name: enterprise-availability
+    target: 99.9%
+    affected_users: "Enterprise users"
+    
+  - name: api-availability
+    target: 99.9%
+    affected_users: "API consumers"
+```
+
+Track each separately, but report the most stringent to all stakeholders (enterprise expectation sets the bar).
+
+### Q4: What's the relationship between SLO and error budget?
+
+**A**: They are directly related:
+
+```
+Error Budget = 100% - SLO_target
+Error Budget for 99.9% = 0.1%
+
+Error Budget Duration (for 30-day window):
+= 0.1% × 30 days × 24 hours × 60 minutes
+= 43.8 minutes
+```
+
+Error budget provides a concrete "currency" for reliability decisions:
+- When budget is healthy: invest in features
+- When budget depletes: invest in reliability
+- The budget creates a natural regulator
+
+### Q5: How do you report SLO achievement to stakeholders?
+
+**A**: Clear, regular reporting:
+
+**Weekly SLO report**:
+```
+API Service SLO Status (Week of 2024-01-15)
+─────────────────────────────────────────────
+Availability:     99.92% | Target: 99.9%  | ACHIEVED ✓
+Latency (p99):    180ms  | Target: <200ms | ACHIEVED ✓
+Error Budget:     85% remaining
+
+No incidents this week. On track to meet monthly SLO.
+```
+
+**Monthly SLO report**:
+```
+Monthly SLO Achievement: 99.87% (Target: 99.9%)
+
+Error Budget Consumed: 18.7% of monthly budget
+Remaining Budget: 35.9 minutes
+
+Notable Events:
+- 2024-01-10: 12-minute latency spike (dependency issue) - 27% budget consumed
+- Action: Added circuit breaker to dependency calls
+
+Next Month Focus:
+- Implement proactive scaling to prevent traffic spikes
+```
+
+## Cheat Sheet
+
+### SLO Quick Reference
+
+| SLO Target | Monthly Downtime | Weekly Downtime | Daily Downtime |
+|------------|------------------|-----------------|----------------|
+| 99% | 7.3 hours | 1.68 hours | 14.4 minutes |
+| 99.5% | 3.65 hours | 50.4 minutes | 7.2 minutes |
+| 99.9% | 43.8 minutes | 10.1 minutes | 1.44 minutes |
+| 99.95% | 21.9 minutes | 5.04 minutes | 43.2 seconds |
+| 99.99% | 4.4 minutes | 1.01 minutes | 8.6 seconds |
+| 99.999% | 26 seconds | 6 seconds | 0.86 seconds |
+
+### Error Budget by SLO Target (30-day window)
+
+```
+99%    → 7.3 hours (438 minutes)
+99.5%  → 3.65 hours (219 minutes)
+99.9%  → 43.8 minutes
+99.95% → 21.9 minutes
+99.99% → 4.4 minutes
+99.999%→ 26 seconds
+```
+
+### SLO Decision Tree
+
+```
+                    ┌─────────────────────┐
+                    │ User perceives       │
+                    │ service as broken?   │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┴────────────────┐
+              │ Yes                                  │ No
+              ▼                                     ▼
+    ┌─────────────────┐                  ┌─────────────────┐
+    │ Include in SLO  │                  │ Consider        │
+    │ Define target   │                  │ operational     │
+    │ based on impact │                  │ monitoring      │
+    └─────────────────┘                  │ instead         │
+                                         └─────────────────┘
+```
+
+### Key SLO Formulas
+
+```python
+# Error budget in minutes
+error_budget_minutes = (100 - slo_target) / 100 * 30 * 24 * 60
+
+# Error budget burn rate
+burn_rate = actual_errors / permitted_errors
+# where permitted_errors = (100 - slo_target) × time_elapsed / window
+
+# Time to exhaustion
+time_to_exhaustion = remaining_budget / (burn_rate - 1) × baseline_burn_rate
+
+# SLO achievement
+achievement = measured_sli / slo_target × 100
+```
+
+## Related Topics
+
+- [SLI](./sli.mdx) — Measuring service behavior
+- [SLA](./sla.mdx) — Contractual commitments
+- [Error Budget](./error-budget.mdx) — Budget framework for decision-making
+- [Monitoring](./monitoring.mdx) — Observability for SLO tracking
+- [Alerting](./alerting.mdx) — SLO-based alerting
+- [Incident Management](./incident-management.mdx) — Responding to SLO breaches

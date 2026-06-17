@@ -1,0 +1,683 @@
+# TCP (Transmission Control Protocol)
+
+## Overview
+
+TCP is the workhorse of reliable network communication. Every time you `curl` an HTTPS endpoint, SSH into a server, or query a database, TCP is underneath ensuring your bytes arrive in order, without corruption, and without overwhelming the receiver. Understanding TCP internals—sequence numbers, flow control, congestion control, and the TCP state machine—is essential for debugging production issues like mysterious latency spikes, connection stalls, and throughput degradation.
+
+The protocol is deceptively simple in concept (reliable, ordered, connection-oriented byte stream) but complex in implementation. Modern TCP implementations include sophisticated algorithms for congestion control (CUBIC, BBR), connection resilience (fast retransmit, selective acknowledgment), and performance optimization (window scaling, TFO cookies). In production Linux environments, TCP tuning often provides larger gains than application-level optimizations.
+
+This page covers TCP operation at a depth sufficient to understand connection stalls, retransmission patterns, and performance issues. For complete understanding, trace through tcpdump captures while explaining what you see.
+
+## When To Use
+
+- **Debugging connection stalls**: When TCP connections hang without progress, understanding TIME_WAIT, zero window, or connection timeout states
+- **Performance tuning**: Buffer sizes, congestion control algorithms, TCP options (window scaling, SACK)
+- **Load balancer configuration**: Understanding how L4 vs L7 load balancing affects TCP behavior
+- **Network troubleshooting**: Interpreting tcpdump captures, ss output, and TCP retransmission patterns
+- **Application protocol debugging**: HTTP/2, gRPC, and other protocols run over TCP and inherit its behaviors
+
+## When NOT To Use
+
+- **Latency-critical applications**: UDP may be appropriate when millisecond overhead matters
+- **Broadcast/multicast**: TCP is unicast only; use UDP for broadcast scenarios
+- **Simple request-response where overhead matters**: For tiny, frequent messages, TCP connection setup may outweigh benefits (consider connection pooling)
+
+## Core Concepts
+
+### TCP Header Structure
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Source Port          |       Destination Port        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Sequence Number                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Acknowledgment Number                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Offset |  Reserved  | Flags  |             Window             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|           Checksum            |         Urgent Pointer        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Options (Variable)                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+**Source/Destination Port**: 16-bit each. Source port (ephemeral port) chosen by client, destination port identifies service (80, 443, 22).
+
+**Sequence Number**: 32-bit, identifies position in byte stream. ISN (Initial Sequence Number) is randomized to prevent stale segment injection. For a 1460-byte payload with sequence 1000: next expected = 2460.
+
+**Acknowledgment Number**: Next expected sequence number. ACK flag must be set for acknowledgment to be valid.
+
+**Data Offset**: Header length (4 bits), identifies where data begins (TCP header is variable due to options).
+
+**Flags**: URG, ACK, PSH, RST, SYN, FIN (6 bits).
+
+**Window Size**: 16-bit, scaled via window scaling option. Indicates receive buffer size.
+
+**Checksum**: 16-bit one's complement of header + data + pseudo-header (source/dest IP, protocol, length).
+
+**Urgent Pointer**: Points to end of urgent data (rarely used).
+
+### Three-Way Handshake
+
+```
+Client                                    Server
+  │                                         │
+  │ ──── SYN, seq=1000, win=65535 ────────▶ │  Client: SYN_SENT
+  │     MSS=1460, WS=10, SACK, TS           │
+  │                                         │
+  │ ◀──── SYN-ACK, seq=2000, ack=1001 ───── │  Server: SYN_RCVD
+  │     MSS=1460, WS=10, SACK, TS           │  Server chooses ISN
+  │     ack=1001 (next expected from client)│
+  │                                         │
+  │ ──── ACK, seq=1001, ack=2001 ──────────▶ │  Client: ESTABLISHED
+  │     win=xxx                             │
+  │                                         │
+  │ ◀──── First data segment ────────────── │  Server: ESTABLISHED
+```
+
+**Key points**:
+- ISN is randomized to prevent sequence number injection attacks
+- Both sides announce their maximum segment size (MSS) and window scaling
+- Three-way handshake costs 1.5 RTT before any data can be sent
+- SYN cookies allow server to defer state until third handshake segment
+
+### TCP State Machine
+
+```
+CLOSED ──▶ LISTEN
+   │                    │
+   │                    │ SYN (passive open)
+   │                    ▼
+   │              ┌──────────┐
+   │              │  LISTEN  │
+   │              └────┬─────┘
+   │                   │ SYN (active open)
+   │                   ▼
+   │              ┌──────────┐
+   │              │ SYN_SENT │
+   │              └────┬─────┘
+   │                   │ SYN+ACK
+   │                   ▼
+   │              ┌──────────┐
+   │              │ SYN_RCVD │◀───────┐
+   │              └────┬─────┘        │ SYN (retrans)
+   │                   │              │
+   │                   │ ACK          │
+   │                   ▼              │
+   │              ┌──────────┐        │
+   └─────────────▶│ESTABLISHED│───────┘
+                  └────┬─────┘
+                       │ FIN
+                       ▼
+                  ┌──────────┐
+                  │  CLOSE_WAIT  │
+                  └────┬─────┘
+                       │ CLOSE
+                       ▼
+                  ┌──────────┐
+                  │ LAST_ACK │
+                  └────┬─────┘
+                       │ ACK
+                       ▼
+                  ┌──────────┐
+                  │  CLOSED  │
+                  └──────────┘
+```
+
+**Connection termination (4-way close)**:
+```
+Client                                  Server
+  │                                       │
+  │ ──── FIN, seq=5000, ack=3000 ──────▶ │  Client: FIN_WAIT_1
+  │                                       │
+  │ ◀──── ACK, ack=5001 ──────────────── │  Server: CLOSE_WAIT
+  │                                       │  (client can now receive only)
+  │ ◀──── FIN, seq=3000, ack=5001 ────── │  Server: LAST_ACK
+  │                                       │
+  │ ──── ACK, ack=3001 ────────────────▶ │  Client: TIME_WAIT
+  │                                       │  Server: CLOSED
+  │                                       │
+  │ ◀── 2MSL (60 seconds typically) ────▶ │  Client: CLOSED
+```
+
+**TIME_WAIT state** lasts 2× Maximum Segment Lifetime (MSL). Linux default MSL is 60 seconds, so TIME_WAIT is typically 120 seconds. This ensures:
+1. Delayed packets from the connection are handled
+2. Final ACK reaches the peer (if retransmitted, it's discarded as duplicate)
+
+### Flow Control
+
+TCP uses a sliding window for flow control. The receiver advertises available buffer space via the Window field. The sender cannot have more unacknowledged data than the window allows.
+
+```bash
+# View socket buffer sizes
+ss -ti dst 10.0.0.5:443
+# ts sack ecn inflight:0/0 pacing_rate 10.1Mbps
+
+# View socket memory allocation
+cat /proc/net/sockstat
+# TCP: inuse 45 orphan 0 tw 89 mem 2
+# mem: pages used by all TCP sockets
+```
+
+**Window scaling**: The 16-bit Window field only allows 65535 bytes. With window scaling option, it can extend to 1GB (scale factor 14 max).
+
+```bash
+# Default receive buffer sizes
+sysctl net.core.rmem_default
+sysctl net.core.wmem_default
+
+# Maximum receive buffer sizes
+sysctl net.core.rmem_max
+sysctl net.core.wmem_max
+
+# TCP auto-tuning (min, default, max for TCP sockets)
+sysctl net.ipv4.tcp_rmem
+# "4096 87380 6291456" = min 4KB, default 87KB, max 6MB
+```
+
+### Congestion Control
+
+TCP's congestion control prevents overwhelming the network. The `cwnd` (congestion window) limits unacknowledged data.
+
+**Algorithms**:
+- **Slow Start**: Begin with cwnd = 1 MSS. Double cwnd each RTT until loss or ssthresh reached.
+- **Congestion Avoidance**: Increase cwnd linearly after reaching ssthresh.
+- **Fast Retransmit**: On 3 duplicate ACKs, retransmit lost segment without waiting for timeout.
+- **Recovery**: Reduce cwnd and proceed.
+
+**CUBIC** (Linux default): Uses cubic function for faster convergence and better high-bandwidth, high-latency networks.
+
+**BBR** (Bottleneck Bandwidth and Round-trip propagation time): Model-based approach that attempts to operate at optimal point. Better for long-distance, high-BDP (bandwidth-delay product) links.
+
+```bash
+# Check current congestion control algorithm
+sysctl net.ipv4.tcp_congestion_control
+# net.ipv4.tcp_congestion_control = cubic
+
+# List available algorithms
+sysctl net.ipv4.tcp_available_congestion_control
+# net.ipv4.tcp_available_congestion_control = cubic reno bbr
+
+# Switch to BBR (requires kernel module)
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+modprobe tcp_bbr
+
+# Tune BBR parameters
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+```
+
+### TCP Options
+
+| Option | Length | Purpose |
+|--------|--------|---------|
+| MSS | 4 | Maximum Segment Size (typically 1460) |
+| Window Scaling | 3 | Scale factor for window size (up to 14) |
+| SACK Permitted | 2 | Enable Selective Acknowledgment |
+| SACK | Variable | Acknowledge non-contiguous segments |
+| Timestamps | 10 | RTTM and PAWS (protection against wrapped seq) |
+| TFO | Variable | TCP Fast Open (data in SYN) |
+
+```bash
+# View negotiated TCP options for active connection
+ss -ti dst 10.0.0.5:443
+# ts sack ecn inflight:0/0 pacing_rate 10.1Mbps
+
+# With tcpdump, see options:
+# ... options [mss 1460, sackOK, TS val 100 ecr 0, nop, wscale 10]
+```
+
+### Common TCP Issues
+
+**TIME_WAIT exhaustion**: Server closing many connections, running out of ports in TIME_WAIT. Solutions: `tcp_tw_reuse`, `tcp_tw_recycle`, reduce MSL, increase ephemeral port range.
+
+```bash
+# Enable TIME_WAIT recycling
+sysctl -w net.ipv4.tcp_tw_reuse=1
+
+# Check port range
+sysctl net.ipv4.ip_local_port_range
+# 32768 60999 = ~28K available ephemeral ports
+
+# If exhausting ports, widen range
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+```
+
+**Zero window**: Receiver's buffer fills up, advertises window=0. Sender must wait for window update. Watch with `ss -ti` and look for `rcv_space` decreasing.
+
+**Connection stall (SYN retrans)**: Server not responding to SYN. Firewall dropping SYN, server overloaded, or SYN queue full.
+
+```bash
+# Check SYN queue size
+ss -lnt
+# Recv-Q: backlog, Send-Q: incomplete connections
+
+# Increase SYN queue
+sysctl -w net.ipv4.tcp_max_syn_backlog=4096
+sysctl -w net.core.somaxconn=4096
+```
+
+**Retransmission storms**: Network congested or path MTU issue. Check with `ss -ti` for high `retrans` values.
+
+## Real Production Example
+
+### Observing TCP Behavior with tcpdump
+
+```bash
+# Capture TCP handshake and first data exchange
+tcpdump -i eth0 -nn 'port 80' -w /tmp/tcp-demo.pcap &
+
+# Make a request
+curl -s http://10.0.0.5:80/ > /dev/null
+
+# Stop capture and analyze
+kill %1
+tcpdump -r /tmp/tcp-demo.pcap -v
+
+# Output shows:
+# 10:23:41.194372 IP (tos 0x0, ttl 64, id=54321, offset=0, flags[DF], proto TCP (6), length 60)
+#     10.0.0.10.42345 > 10.0.0.5.80: Flags [S], cksum 0xabcd, seq 1000:1060, win 65535,
+#     options [mss 1460, sackOK, TS val 100 ecr 0, nop, wscale 10], length 0
+# 10:23:41.194573 IP (tos 0x0, ttl 64, id=0, offset=0, flags[DF], proto TCP (6), length 60)
+#     10.0.0.5.80 > 10.0.0.10.42345: Flags [S.], cksum 0xdef1, seq 2000:2060, ack 1001,
+#     options [mss 1460, sackOK, TS val 200 ecr 100, nop, wscale 10], length 0
+# 10:23:41.194601 IP (tos 0x0, ttl 64, id=54322, offset=0, flags[DF], proto TCP (6), length 52)
+#     10.0.0.10.42345 > 10.0.0.5.80: Flags [ACK], cksum 0x1234, ack 2061, win 1024,
+#     options [nop, nop, TS val 101 ecr 200], length 0
+```
+
+### TCP Tuning for High-Throughput Workload
+
+```bash
+# /etc/sysctl.d/99-tcp-tuning.conf
+
+# Increase buffer sizes
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+
+# Enable BBR for high-BDP links
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+# Optimize for many connections
+net.ipv4.tcp_max_syn_backlog=4096
+net.core.somaxconn=4096
+net.ipv4.tcp_fin_timeout=15
+
+# TIME_WAIT reuse and recycling
+net.ipv4.tcp_tw_reuse=1
+
+# Increase local port range
+net.ipv4.ip_local_port_range=1024 65535
+
+# TCP keepalive
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+# Disable slow start after idle (for persistent connections)
+net.ipv4.tcp_slow_start_after_idle=0
+
+# Apply
+sysctl --system
+```
+
+## CLI Examples
+
+```bash
+# Socket statistics
+ss -tuln                      # Listening sockets
+ss -ti dst 10.0.0.5:443       # Established with TCP info
+ss -s                         # Summary of socket states
+
+# TCP detailed info for connection
+ss -ti state established '( dst :443 )'
+
+# Show sockets with timers
+ss -ti -e
+
+# Monitor TCP retransmissions
+watch -n 1 'ss -ti | grep -i retrans'
+
+# TCP connection states
+ss -ant state time-wait | wc -l
+
+# Increase buffer for specific socket
+ss -i -M dst 10.0.0.5:443
+# Use SO_SNDBUF/SO_RCVBUF via setsockopt
+
+# tcpdump TCP capture filters
+tcpdump -i eth0 'tcp[tcpflags] & (tcp-syn|tcp-ack) != 0'
+tcpdump -i eth0 'tcp[tcpflags] & tcp-fin != 0'
+tcpdump -i eth0 'tcp[tcpflags] & tcp-rst != 0'
+tcpdump -i eth0 'tcp port 80 and tcp[tcpflags] & tcp-push != 0'
+
+# Capture TCP payload
+tcpdump -i eth0 -A 'tcp port 80 and tcp[((tcp[12:1] & 0xf0) >> 2):2]'
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `ss -tuln` | List TCP/UDP sockets | `ss -tulnp` (with process) |
+| `ss -ti` | TCP socket info | `ss -ti state established` |
+| `ss -s` | Socket summary | Count by state |
+| `netstat -ant` | Active TCP connections | `netstat -antp` (process) |
+| `netstat -s` | Protocol statistics | `netstat -s --tcp` |
+| `tcpdump` | Packet capture | `tcpdump -i any port 80` |
+| `curl -v` | Verbose HTTP | See TCP handshake |
+| `hping3` | Craft TCP packets | `hping3 -S -p 80 host` |
+| `netcat` | TCP/UDP swiss army | `nc -lvp 8080` |
+
+## Monitoring
+
+### Key TCP Metrics
+
+**Connection states**:
+```bash
+# Count connections by state
+ss -ant | awk '{print $1}' | sort | uniq -c | sort -rn
+# 423 ESTAB
+# 89 TIME-WAIT
+# 45 LISTEN
+# 12 SYN-RECV
+# 3 CLOSE-WAIT
+```
+
+**Retransmissions** (critical for performance):
+```bash
+# From /proc/net/netstat
+cat /proc/net/netstat | awk '/Tcp.*/{print $2, $NF}' | column -t
+# Tcp: ActiveOpens PassiveOpens AttemptFails EstabResets
+#      1234      5678        12          3
+
+# Retrans segments
+grep TcpRetransSegs /proc/net/netstat
+```
+
+**Extended socket info**:
+```bash
+# Real-time TCP statistics
+watch -n 1 'ss -s'
+# Total: 145 (established 42, time-wait 89)
+# TCP:   inuse 3 orphan 0 tw 89 alloc 45 mem 2
+#        rcv_space 29200
+
+# rcv_space: auto-tuned receive buffer
+# Higher values = better throughput for bulk transfers
+```
+
+### Prometheus Queries
+
+```promql
+# TCP connection states
+node_netstat_Tcp_CurrEstab{}      # Currently established
+node_netstat_Tcp_InSegs{}         # Segments received
+node_netstat_Tcp_OutSegs{}        # Segments sent
+node_netstat_Tcp_RetransSegs{}    # Retransmitted segments
+node_netstat_Tcp_InErrs{}         # Input errors
+
+# Calculate retransmission rate
+rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m]) * 100
+# Alert if > 1%
+```
+
+## Security
+
+### Hardening TCP Stack
+
+```bash
+# Disable source routing
+sysctl -w net.ipv4.conf.all.accept_source_route=0
+sysctl -w net.ipv6.conf.all.accept_source_route=0
+
+# Disable ICMP redirect acceptance
+sysctl -w net.ipv4.conf.all.accept_redirects=0
+sysctl -w net.ipv6.conf.all.accept_redirects=0
+
+# Enable TCP SYN cookies (prevent SYN flood)
+sysctl -w net.ipv4.tcp_syncookies=1
+
+# Disable ICMP redirect sending
+sysctl -w net.ipv4.conf.all.send_redirects=0
+sysctl -w net.ipv4.conf.default.send_redirects=0
+
+# Increase backlog for SYN queue
+sysctl -w net.ipv4.tcp_max_syn_backlog=4096
+sysctl -w net.core.somaxconn=4096
+
+# Protect against TIME_WAIT assassination
+sysctl -w net.ipv4.tcp_rfc1337=1
+
+# Disable TCP timestamps (if concerned about information disclosure)
+sysctl -w net.ipv4.tcp_timestamps=0
+# Note: This disables PAWS protection and window scaling may be limited
+```
+
+### Connection Limits
+
+```bash
+# Maximum connections
+sysctl -w net.core.somaxconn=4096
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+# Maximum orphaned sockets (not attached to process)
+sysctl -w net.ipv4.tcp_max_orphans=262144
+
+# Maximum TIME_WAIT sockets
+sysctl -w net.ipv4.tcp_max_tw_buckets=262144
+```
+
+## Cost Optimization
+
+TCP has indirect cost implications:
+
+**Connection establishment overhead**: Each new TCP connection costs ~1.5 RTTs before data transfer. For high-volume short connections, connection pooling (keep-alive) significantly reduces overhead.
+
+```bash
+# HTTP keep-alive benefit calculation
+# Without keep-alive: 3-way handshake + request = 1.5 RTTs overhead
+# With keep-alive (100 requests): 1.5 RTTs + 100 requests = ~1.5% overhead
+# Without keep-alive: (3-way handshake + request) * 100 = 150 RTTs overhead
+
+# Example: 10ms RTT, 100 requests/resource per page
+# Without keep-alive: 100 * 1.5 * 10ms = 1500ms wasted
+# With keep-alive: 10ms initial + 100 * 10ms = 1010ms
+```
+
+**Buffer sizing vs memory**: Larger TCP buffers improve throughput but consume kernel memory. Over-provisioning can cause memory pressure.
+
+```bash
+# Memory per TCP socket (roughly)
+# Minimum: ~4KB
+# Default auto-tuned: ~87KB
+# High-throughput (16MB buffers): ~32MB per socket
+
+# At 10,000 connections with 16MB buffers: 320GB required (impossible)
+# Actually: TCP buffer allocation is dynamic, not pre-allocated
+```
+
+**Kernel bypass networking**: For ultra-high throughput (100Gbps+), consider DPDK or kernel bypass (RDMA). This trades TCP compatibility for performance.
+
+## Troubleshooting
+
+### Connection Stall Debugging
+
+```bash
+# 1. Check connection state
+ss -ti dst 10.0.0.5:443
+# Look for: state ESTABLISHED but inflight=0, pacing_rate=0 (stalled)
+
+# 2. Check window advertised
+# If rcv_space is 0 or very small, receiver is overwhelmed
+
+# 3. Check for retransmissions
+ss -ti dst 10.0.0.5:443 | grep retrans
+# high retrans = network or receiver issue
+
+# 4. Capture packets
+tcpdump -i eth0 host 10.0.0.5 and port 443 -w /tmp/stall.pcap
+
+# 5. Analyze in Wireshark
+# Look for: TCP ZeroWindow, TCP Window Full, high RTT variation
+```
+
+### High Retransmission Debugging
+
+```bash
+# 1. Check interface errors
+ip -s link show eth0
+# rx_errors, tx_errors, rx_dropped, tx_dropped
+
+# 2. Check for congestion
+ping -c 100 10.0.0.1 | tail -1
+# packet loss, round-trip min/avg/max
+
+# 3. Check path MTU
+tracepath 10.0.0.5
+# Look for decreasing MTU
+
+# 4. Check NIC offloads (can cause checksum issues)
+ethtool -k eth0
+# tso: on (TCP segmentation offload)
+# gso: on (generic segmentation offload)
+# Checksum offloading enabled?
+
+# 5. Capture to see retransmit pattern
+tcpdump -i eth0 'tcp[tcpflags] & tcp-retrans != 0' -nn
+```
+
+### TIME_WAIT Issues
+
+```bash
+# 1. Check TIME_WAIT count
+ss -ant | grep TIME-WAIT | wc -l
+# If > 10000, might have port exhaustion
+
+# 2. Check ephemeral port usage
+ss -ant sport gt 32768 | wc -l
+
+# 3. Check if ports are stuck
+cat /proc/net/ip_local_port_range
+# 32768	60999 = ~28K ports available
+
+# 4. Solutions if exhausting:
+# a. Enable reuse
+sysctl -w net.ipv4.tcp_tw_reuse=1
+
+# b. Reduce TIME_WAIT duration (risky)
+sysctl -w net.ipv4.tcp_fin_timeout=15
+
+# c. Widen port range
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+```
+
+### SYN Flood Detection
+
+```bash
+# Check SYN queue
+ss -antl | grep -E "Recv-Q|Send-Q"
+# Listen queue: Recv-Q = pending connections, Send-Q = incomplete
+
+# If Recv-Q ~ max queue size, under attack
+ss -antlp | grep -E "Process|backlog"
+
+# Increase SYN queue
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+sysctl -w net.core.somaxconn=8192
+
+# Enable SYN cookies
+sysctl -w net.ipv4.tcp_syncookies=1
+```
+
+## Interview Questions
+
+**Q1: Walk through the TCP state machine, including all states and transitions.**
+
+A: States: CLOSED (initial), LISTEN (server waiting), SYN_SENT (client sent SYN), SYN_RCVD (SYN received), ESTABLISHED (data transfer), FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, CLOSING, LAST_ACK, TIME_WAIT. Transitions: passive open → LISTEN, active open → SYN_SENT, SYN → SYN_RCVD, three-way handshake → ESTABLISHED, close → FIN_WAIT_1, receive FIN → CLOSE_WAIT, ACK of FIN → FIN_WAIT_2, send FIN from FIN_WAIT_2 → CLOSING, ACK of FIN → TIME_WAIT, TIME_WAIT expires → CLOSED. TIME_WAIT is critical: ensures delayed packets are handled and final ACK can be retransmitted if lost.
+
+**Q2: How does TCP's sliding window work, and why does it matter for performance?**
+
+A: The sender maintains a "window" of unacknowledged data it can have in flight. The receiver advertises available buffer space in the Window field. As ACKs arrive, the window slides forward, allowing more data. If window fills, sender must stop. Window scaling extends the 16-bit field to support large BDP (bandwidth-delay product) links. Without window scaling, a 10Gbps link with 100ms RTT needs 125MB window but original TCP only supports 64KB. Modern TCP scales up to 1GB windows, enabling full line-rate throughput on high-BDP networks.
+
+**Q3: What is the difference between fast retransmit and timeout-based retransmission?**
+
+A: Fast retransmit triggers when sender receives 3 duplicate ACKs for the same segment (indicates segment lost but some segments getting through). Sender immediately retransmits the missing segment without waiting for timeout. Timeout-based retransmission is the fallback: after RTO (retransmission timeout) expires with no ACK, sender retransmits. Fast retransmit is faster (typically 3-5 RTT savings) and indicates "mild" congestion (network delivering some packets). Timeout indicates severe congestion. Modern TCP uses adaptive RTO calculation based on RTT variance.
+
+**Q4: What is TIME_WAIT state and why is it 2MSL?**
+
+A: TIME_WAIT occurs on the side that initiates close (sends first FIN). It lasts 2×MSL (Maximum Segment Lifetime), where MSL is the maximum time a segment can live in the network (typically 60 seconds). Two reasons: (1) handle delayed packets from the connection—if new connection uses same ports, old packets might arrive and corrupt data; (2) ensure the final ACK reaches the peer—if ACK is lost, peer will retransmit FIN, and we need to still be able to ACK it. In practice, 2MSL is 60-120 seconds. High-volume servers can run out of ports in TIME_WAIT; solutions include `tcp_tw_reuse`, `tcp_tw_recycle`, reducing MSL, or using more source ports.
+
+**Q5: How would you debug a TCP connection that stalls during data transfer?**
+
+A: (1) Check `ss -ti` for connection state: inflight, rcv_space, pacing_rate. Zero rcv_space = receiver overwhelmed, stalled waiting for receive window update. (2) Check for retransmissions: `ss -ti | grep retrans`. High retrans = network issue or congestion. (3) Check interface for drops/errors: `ip -s link show`. (4) Capture packets: `tcpdump` to see if packets are arriving, if ACKs are delayed, if window updates are sent. (5) Check CPU softirqs: `vmstat 1`, high softirq = CPU bottleneck in network processing. (6) Check buffer tuning: auto-tuned buffers might be too small, `rcv_space` should increase during bulk transfer. (7) If path MTU issue: packets getting dropped silently (no ICMP), use `tracepath` and check MSS clamping.
+
+## Cheat Sheet
+
+### TCP Flags
+
+| Flag | Bit | Purpose |
+|------|-----|---------|
+| URG | 0x20 | Urgent pointer valid |
+| ACK | 0x10 | Acknowledgment number valid |
+| PSH | 0x08 | Push data to application |
+| RST | 0x04 | Reset connection |
+| SYN | 0x02 | Synchronize sequence numbers |
+| FIN | 0x01 | Finish, no more data from sender |
+
+### TCP State Transitions
+
+| State | Meaning |
+|-------|---------|
+| LISTEN | Server waiting for connections |
+| SYN_SENT | Client sent SYN, awaiting SYN-ACK |
+| SYN_RCVD | Server received SYN, sent SYN-ACK |
+| ESTABLISHED | Data transfer active |
+| FIN_WAIT_1 | Initiated close, waiting for ACK |
+| FIN_WAIT_2 | Received ACK, waiting for FIN |
+| CLOSE_WAIT | Received FIN, waiting for app close |
+| CLOSING | Both sides initiated close simultaneously |
+| LAST_ACK | Final ACK before closed |
+| TIME_WAIT | 2MSL wait before releasing |
+
+### Important sysctls
+
+```bash
+net.ipv4.tcp_syncookies=1           # SYN flood protection
+net.ipv4.tcp_tw_reuse=1             # Allow reuse of TIME_WAIT
+net.ipv4.tcp_fin_timeout=15         # Faster FIN timeout
+net.ipv4.tcp_max_syn_backlog=4096   # SYN queue size
+net.core.somaxconn=4096             # Listen queue max
+net.ipv4.tcp_rmem="4096 87380 6291456"  # TCP receive buffer
+net.ipv4.tcp_wmem="4096 65536 6291456"  # TCP send buffer
+net.core.rmem_max=16777216          # Max receive buffer
+net.core.wmem_max=16777216          # Max send buffer
+net.ipv4.tcp_congestion_control=cubic  # Congestion algorithm
+```
+
+### Common TCP Issues and Symptoms
+
+| Symptom | Likely Cause | Check |
+|---------|--------------|-------|
+| Connection timeout | Firewall, SYN queue full | `ss -antl`, firewall logs |
+| Connection refused | Service not listening | `ss -tuln \| grep PORT` |
+| Connection reset | RST received | `tcpdump` for RST flag |
+| Slow transfer | Small window, congestion | `ss -ti`, `ping` for loss |
+| Retransmissions | Network issue, MTU | `ip -s link show`, `tracepath` |
+| TIME_WAIT | Many short connections | `ss -ant \| grep TIME_WAIT` |
+
+## Related Topics
+
+- [OSI Model](./osi-model) — Protocol layering fundamentals
+- [TCP/IP Model](./tcp-ip) — Network layer protocols
+- [UDP](./udp) — Alternative transport protocol
+- [Load Balancing](./load-balancing) — L4 vs L7 load balancing
+- [Firewall](./firewall) — Linux firewall and netfilter
+- [Observability](./observability) — Network metrics
+- [Debugging](./debugging) — Packet capture and analysis

@@ -1,0 +1,489 @@
+---
+sidebar_position: 15
+description: Cron, systemd timers, and scheduled task automation for production Linux environments.
+---
+
+# Cron and Systemd Timers
+
+## Overview
+
+Every production server needs scheduled tasks — database backups, log rotation, certificate renewal, health checks, reporting jobs. In Linux, two mechanisms handle this: the traditional cron system and the modern systemd timer infrastructure. Understanding both, and knowing when to prefer each, is a core DevOps skill.
+
+Cron is the veteran — it has been running Unix systems since the 1970s. It reads crontab files and executes commands at specified intervals. Its simplicity is its strength, but it lacks dependency management, retry logic, and integrated logging.
+
+Systemd timers are the modern answer. They are systemd units (`.timer` + `.service`) that integrate with systemd's dependency system, logging via journald, and resource management via cgroups. For anything beyond the simplest recurring task, systemd timers are superior.
+
+The practical rule: use cron for truly simple recurring tasks that need to run on any Unix system (portability), and systemd timers for anything where reliability, dependencies, or observability matter.
+
+## When To Use
+
+- **Cron**: Simple recurring tasks, cross-platform scripts, environments without systemd (Alpine containers, embedded systems)
+- **Systemd timers**: Complex dependencies, retry on failure, persistent execution (missed runs), integration with systemd ecosystem, resource control
+
+## When NOT To Use
+
+- Event-driven work: use systemd path units or inotify instead
+- Continuous services: use standard systemd services
+- Extremely precise timing: cron has minute-level resolution; use at(1) for one-time delayed execution
+- Long-running tasks with progress: cron is not designed for this — use a proper job queue
+
+## Core Concepts
+
+### Cron
+
+**Crontab format** (5 fields: minute, hour, day-of-month, month, day-of-week):
+
+```
+# +---------------- minute (0-59)
+# |  +------------- hour (0-23)
+# |  |  +---------- day of month (1-31)
+# |  |  |  +------- month (1-12)
+# |  |  |  |  +---- day of week (0-7, 0 and 7 are Sunday)
+# |  |  |  |  |
+  *  *  *  *  *  command
+```
+
+Special strings:
+- `@reboot` — after reboot
+- `@yearly` / `@annually` — 0 0 1 1 *
+- `@monthly` — 0 0 1 * *
+- `@weekly` — 0 0 * * 0
+- `@daily` / `@midnight` — 0 0 * * *
+- `@hourly` — 0 * * * *
+
+**Crontab files:**
+- User crontabs: `/var/spool/cron/crontabs/<username>` (edit via `crontab -e`)
+- System crontabs: `/etc/crontab`, `/etc/cron.d/`, `/etc/cron.daily/`, `/etc/cron.hourly/`, etc.
+- `/etc/cron.allow` and `/etc/cron.deny` control who can use cron
+
+**Cron environment gotchas:**
+- Minimal environment: only `SHELL=/bin/sh`, `LOGNAME=<user>`, `HOME=<homedir>`, `PATH` varies by system
+- Always set `PATH` explicitly in scripts or crontab
+- `MAILTO=""` disables email notification
+
+### Systemd Timers
+
+A timer unit activates a corresponding service unit on a schedule. Timer and service have the same base name (e.g., `backup.timer` triggers `backup.service`).
+
+**Timer types:**
+- `OnCalendar=` — wall-clock time (e.g., `*-*-02 00:00:00` = 2am daily)
+- `OnBootSec=` / `OnStartupSec=` — after boot
+- `OnUnitActiveSec=` — relative to last activation
+- `OnUnitInactiveSec=` — relative to last deactivation
+
+**Key timer options:**
+```ini
+# /etc/systemd/system/backup.timer
+[Unit]
+Description=Daily database backup at 2am
+Requires=backup.service
+
+[Timer]
+OnCalendar=*-*-02,00:00:00          # Every day at 2am
+Persistent=true                      # Run missed jobs after boot
+RandomizedDelaySec=300               # Random delay up to 5min to avoid thundering herd
+AccuracySec=1us                      # High precision
+
+[Install]
+WantedBy=timers.target
+```
+
+`Persistent=true` is critical: if the server was off when a job was supposed to run, it catches up after reboot.
+
+### Anacron
+
+anacron runs jobs that were missed because the system was down. It doesn't assume the system runs continuously. Used for daily/weekly/monthly tasks on laptops or intermittently running machines.
+
+```
+# /etc/anacrontab format
+# period delay identifier command
+1  5  cron.daily   run-parts /etc/cron.daily
+7  10 cron.weekly  run-parts /etc/cron.weekly
+@monthly 15 cron.monthly run-parts /etc/cron.monthly
+```
+
+### Timedatectl and Time Zones
+
+```bash
+timedatectl list-timezones | grep America/New_York
+sudo timedatectl set-timezone America/New_York
+# In crontab, use TZ environment variable:
+# 0 2 * * *  TZ=America/New_York /usr/local/bin/backup.sh
+```
+
+## Real Production Example
+
+Deploying a production backup system with systemd timers for a web application:
+
+```bash
+# === BACKUP SERVICE ===
+
+# /etc/systemd/system/backup.service
+[Unit]
+Description=Database and application backup
+After=postgresql.service mysql.service
+Requires=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=backup
+Group=backup
+# Run as non-root with limited capabilities
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/backups /mnt/backup-nas
+TempDir=/tmp
+Environment=BACKUP_DIR=/backups
+Environment=RETENTION_DAYS=30
+ExecStart=/usr/local/bin/backup.sh
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_DIR="${BACKUP_DIR:-/backups}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.tar.gz"
+
+log() { echo "[$(date -Iseconds)] $*"; }
+
+# PostgreSQL backup
+log "Starting PostgreSQL backup..."
+sudo -u postgres pg_dumpall | gzip > "${BACKUP_DIR}/postgres_${TIMESTAMP}.sql.gz"
+
+# Application data backup
+log "Starting application backup..."
+tar -czf "${BACKUP_FILE}" \
+    --exclude='/opt/myapp/node_modules' \
+    --exclude='/opt/myapp/logs/*.log' \
+    /opt/myapp/data/ 2>/dev/null || true
+
+# Verify backup integrity
+if ! gunzip -t "${BACKUP_FILE}" 2>/dev/null; then
+    log "ERROR: Backup verification failed"
+    exit 1
+fi
+
+# Checksum
+sha256sum "${BACKUP_FILE}" > "${BACKUP_FILE}.sha256"
+
+# Clean old backups
+find "${BACKUP_DIR}" -name "backup_*.tar.gz" -mtime +"${RETENTION_DAYS}" -delete
+find "${BACKUP_DIR}" -name "postgres_*.sql.gz" -mtime +"${RETENTION_DAYS}" -delete
+
+# Report size
+log "Backup complete: $(du -h "${BACKUP_FILE}" | cut -f1)"
+
+# Ship to remote storage
+if [[ -n "${BACKUP_S3_BUCKET:-}" ]]; then
+    log "Uploading to S3..."
+    aws s3 cp "${BACKUP_FILE}" "s3://${BACKUP_S3_BUCKET}/$(date +%Y/%m)/" --storage-class GLACIER
+    aws s3 cp "${BACKUP_DIR}/postgres_${TIMESTAMP}.sql.gz" "s3://${BACKUP_S3_BUCKET}/$(date +%Y/%m)/"
+fi
+
+log "Backup job complete"
+```
+
+```bash
+# === BACKUP TIMER ===
+
+# /etc/systemd/system/backup.timer
+[Unit]
+Description=Daily backup at 2am (with 5min jitter)
+Requires=backup.service
+
+[Timer]
+# Run at 2am every day
+OnCalendar=*-*-02 00:00:00
+# If missed (server was off), run on next boot
+Persistent=true
+# Random delay to avoid thundering herd on shared storage
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+# === ENABLE AND VERIFY ===
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now backup.timer
+
+# Verify
+systemctl list-timers --all | grep backup
+# NEXT                         LEFT     LAST                         PASSED    UNIT        ACTIVATES
+# Mon 2024-01-15 02:00:00 UTC  12h left Sun 2024-01-14 14:22:00 UTC 3h ago    backup.timer backup.service
+
+# Check last run
+journalctl -u backup.service -n 50 --no-pager
+
+# Manual run (for testing)
+sudo systemctl start backup.service
+sudo journalctl -u backup.service -f
+```
+
+**Equivalent cron for comparison (less reliable):**
+```bash
+# /etc/cron.d/backup
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+BACKUP_DIR=/backups
+RETENTION_DAYS=30
+# Run at 2:05am daily to avoid midnight load
+5 2 * * * backup /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1
+```
+
+## CLI Examples
+
+```bash
+# Cron management
+crontab -l              # List current user's crontab
+crontab -e              # Edit crontab (opens $EDITOR)
+crontab -r              # Remove crontab (no confirmation!)
+crontab -l -u <user>    # List specific user's crontab (root only)
+sudo crontab -e -u <user>  # Edit as another user
+
+# System cron directories
+ls /etc/cron.d/
+ls /etc/cron.daily/
+ls /etc/cron.hourly/
+cat /etc/crontab
+
+# Systemd timer management
+systemctl list-timers --all
+systemctl list-timers --all --plain | grep backup
+systemctl status backup.timer
+systemctl status backup.service
+systemctl start backup.timer
+systemctl stop backup.timer
+systemctl enable --now backup.timer
+systemctl disable backup.timer
+
+# Check next run time
+systemctl show backup.timer --property=NextElapseUSecRealtime
+systemctl show backup.timer -p NextElapseUSecRealtime --value
+
+# View timer in human-readable form
+systemctl show backup.timer | grep Trigger
+
+# View last run result
+journalctl -u backup.service -n 5
+systemctl status backup.service
+
+# anacron
+anacron -T              # Test anacron config
+anacron -f              # Force run all anacron jobs
+sudo anacron -u         # Update timestamps (mark as run)
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `crontab -e` | Edit crontab |
+| `crontab -l` | List crontab |
+| `crontab -r` | Remove crontab |
+| `systemctl list-timers` | List active timers |
+| `systemctl start <timer>` | Start timer |
+| `systemctl enable --now <timer>` | Enable and start |
+| `journalctl -u <service>` | View job output |
+| `anacron -T` | Test anacron config |
+| `at` / `atq` | One-time delayed tasks |
+
+## Monitoring
+
+```bash
+# Monitor all timers
+watch "systemctl list-timers --all --plain"
+
+# Prometheus node_exporter Textfile Collector for cron job metrics
+# /etc/systemd/system/backup.service adds metrics:
+cat /var/lib/node_exporter/textfile_collector/cron_metrics.prom
+
+# example: backup_success 1 (or 0)
+# example: backup_duration_seconds 45.2
+# example: backup_size_bytes 1073741824
+
+# Alert if a timer hasn't run in expected window
+# Prometheus alert:
+# - alert: BackupTimerNotRun
+#   expr: (time() - node_cron_last_run_seconds{job="backup"}) > 86400 * 1.5
+#   for: 0m
+#   labels:
+#     severity: critical
+
+# Log ALL scheduled job executions
+# Add to rsyslog template:
+# if $programname == 'CRON' then {
+#   action(type="omfile" file="/var/log/cron.log")
+#   stop
+# }
+```
+
+## Security
+
+**Restrict cron access:**
+```bash
+# /etc/cron.deny (one user per line)
+# Add users here to DENY cron access
+
+# /etc/cron.allow (create to explicitly allow)
+# root (always allowed)
+# backup
+# monitoring
+```
+
+**Cron hardening:**
+```bash
+# Set restricted PATH in crontab
+PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+
+# Never run as root unless necessary
+# Use su/sudo in the script, or run as dedicated user
+
+# Lock down cron environment
+# In /etc/security/limits.conf:
+# @cron     hard    core    0
+# @cron     hard    nofile  1024
+
+# auditd: log all cron execution
+auditctl -w /usr/bin/crontab -p x -k cron_execution
+auditctl -w /etc/cron.d -p rwxa -k cron_config
+```
+
+**Avoid these mistakes in cron:**
+- Running scripts as root when not needed
+- Storing plaintext credentials in cron environment variables
+- Missing `set -euo pipefail` in scripts (errors silently ignored)
+- Not handling timezones correctly
+
+## Troubleshooting
+
+**Cron job not running:**
+```bash
+# 1. Check crontab syntax (especially spaces vs tabs)
+crontab -l | cat -A  # Show all characters
+
+# 2. Check if cron daemon is running
+systemctl status cron   # or crond on RHEL
+
+# 3. Check PATH issues — run with absolute path
+# Before: */5 * * * * myscript.sh
+# After: */5 * * * * /usr/local/bin/myscript.sh
+
+# 4. Check environment
+# Add to crontab:
+# SHELL=/bin/bash
+# PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+# MAILTO=admin@example.com
+
+# 5. Check logs
+grep CRON /var/log/syslog | tail -20
+journalctl -u cron | tail -20
+
+# 6. Check email (cron emails output to local mail)
+mailx
+# or: cat /var/mail/$(whoami)
+
+# 7. Verify command works standalone
+/usr/local/bin/myscript.sh
+```
+
+**Systemd timer missed runs:**
+```bash
+# If Persistent=true but job didn't run after reboot:
+# Check the timestamp file
+ls -la /var/lib/systemd/timers/stamp-*
+
+# View next scheduled run
+systemctl show backup.timer -p NextElapseUSecRealtime
+
+# If timer didn't fire (bug):
+systemctl reset-failed backup.timer
+systemctl start backup.timer
+
+# Check timer unit is actually enabled
+systemctl is-enabled backup.timer
+```
+
+**PATH issues:**
+Cron has a minimal default PATH. Scripts that work interactively fail in cron. Fix:
+```bash
+# Add to crontab:
+PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+# or at the top of the script:
+export PATH="/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+```
+
+## Interview Questions
+
+1. **What's the difference between `OnCalendar=*-*-02 00:00:00` and `OnUnitActiveSec=1d`?**
+
+`OnCalendar` schedules at a specific wall-clock time. `OnUnitActiveSec` schedules a fixed duration after the last successful activation of the unit. If a service takes 2 hours to run, `OnUnitActiveSec=1d` fires 1 day after it completed. `OnCalendar=*-*-02` fires at 2am regardless of when the last run finished. For backup jobs that should run once per day at a specific time, `OnCalendar` is correct. For periodic health checks that should happen X hours after the last check, `OnUnitActiveSec` is better.
+
+2. **How do you ensure a cron job doesn't run if the previous invocation is still running (prevent duplicate execution)?**
+
+Three approaches: (1) Use `flock` to create an exclusive lock file: `flock -n /var/lock/backup.lock -c "/usr/local/bin/backup.sh"`. If the lock is held, the new invocation exits immediately. (2) Use a PID file with a check: `[[ -f /var/run/backup.pid ]] && kill -0 $(cat /var/run/backup.pid) 2>/dev/null && exit`. (3) For systemd timers, the `Type=oneshot` service doesn't support this natively, so flock or a custom lock is needed. (4) For systemd, use `ExclusiveInstance=yes` in the [Unit] section.
+
+3. **What is `RandomizedDelaySec` and why is it important for production?**
+
+It adds a random delay (0 to N seconds) before executing the job. This prevents thundering herd — when many servers have the same scheduled task (e.g., daily backup at midnight), they all hit the shared storage or network simultaneously. RandomizedDelaySec=300 spreads executions over 5 minutes, reducing I/O spikes. This is critical for cloud environments where many VMs share a storage backend.
+
+4. **How would you debug a systemd timer that is supposed to run but isn't?**
+
+Check: (1) `systemctl status <timer>` — shows if active/failed. (2) `systemctl list-timers --all --plain | grep <timer>` — shows next/last run times. (3) `journalctl -u <timer> -u <service>` — combined logs of timer activation and service execution. (4) Verify the timer is enabled: `systemctl is-enabled <timer>`. (5) Check `NextElapseUSecRealtime` in `systemctl show` — if in the past and not triggered, the timer may need reset. (6) Check if the system was in a lower runlevel (e.g., emergency.target) during the scheduled time.
+
+5. **When would you use anacron instead of cron or systemd timers?**
+
+Anacron is for systems that aren't running continuously — laptops, desktops, intermittently powered servers. Unlike cron and systemd timers which expect the system to be on at the scheduled time, anacron tracks when jobs last ran (stored in `/var/spool/anacron/`) and runs missed jobs after a specified delay when the system is next powered on. If a daily cron job misses its 2am slot because the laptop was closed, cron ignores it. Anacron catches it up after the laptop wakes.
+
+## Cheat Sheet
+
+```bash
+# Crontab format
+# min hour dom mon dow  command
+# *  = any
+# */5 = every 5
+# 1,3,5 = at 1, 3, and 5
+# 1-5 = through 5
+
+# Cron special strings
+@reboot    # After boot
+@hourly    # 0 * * * *
+@daily     # 0 0 * * *
+@weekly    # 0 0 * * 0
+@monthly   # 0 0 1 * *
+
+# Common examples
+0 * * * *        # Every hour
+*/5 * * * *      # Every 5 minutes
+0 2 * * *        # Every day at 2am
+0 2 * * 0        # Every Sunday at 2am
+0 0 1 * *        # First of every month
+*/15 * * * *     # Every 15 minutes
+
+# Systemd timer
+systemctl list-timers --all
+systemctl enable --now backup.timer
+journalctl -u backup.service
+
+# Prevent duplicate cron runs
+flock -n /var/lock/job.lock -c "command"
+```
+
+## Related Topics
+
+- [Systemd](./systemd) — Service management, dependencies
+- [Shell](./shell) — Redirection for cron output
+- [Bash](./bash) — Scripting scheduled tasks
+- [Security](./security) — Cron access control
+- [Performance](./performance) — Avoiding I/O thundering herd

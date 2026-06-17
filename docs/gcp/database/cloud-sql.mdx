@@ -1,0 +1,791 @@
+# Cloud SQL
+
+## Overview
+
+Google Cloud SQL is a fully managed relational database service supporting MySQL, PostgreSQL, and SQL Server. It provides automated backups, replication, patching, and maintenance while abstracting database administration overhead. Cloud SQL handles over 100,000 databases for GCP customers and offers up to 64 TB of storage with high availability configurations.
+
+## When To Use
+
+- Traditional web applications requiring SQL
+- E-commerce platforms with transactional needs
+- CMS and content management systems
+- Mobile application backends
+- Analytics dashboards with relational data
+- Small to medium datasets (< 64 TB)
+- Lift-and-shift from on-premises SQL workloads
+
+## When NOT To Use
+
+- Massive scale (> 100 TB, multi-petabyte)
+- Globally distributed writes (use Spanner)
+- Complex NoSQL queries (use Firestore or Bigtable)
+- In-memory caching (use Memorystore)
+- Time-series data at scale (use BigQuery or TimescaleDB)
+- Extreme write throughput (use Cloud Bigtable)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Cloud SQL                              │
+├─────────────────────────────────────────────────────────────┤
+│  Supported Engines:                                         │
+│  ├── MySQL 8.0, 5.7 (Community Edition)                    │
+│  ├── PostgreSQL 15, 14, 13, 12, 11                         │
+│  └── SQL Server 2022, 2019, 2017 (Enterprise, Standard)     │
+├─────────────────────────────────────────────────────────────┤
+│  Instance Types:                                            │
+│  ├── db-f1-micro      (1 vCPU, 0.6 GB RAM)                 │
+│  ├── db-g1-small      (1 vCPU, 3.75 GB RAM)                │
+│  ├── db-n1-standard   (1-96 vCPUs, 3.75-384 GB RAM)        │
+│  ├── db-n2-standard   (2-128 vCPUs, 8-512 GB RAM)          │
+│  ├── db-m1            (28-96 vCPUs, 256-1408 GB RAM)       │
+│  └── db-m2            (28-128 vCPUs, 256-2088 GB RAM)      │
+├─────────────────────────────────────────────────────────────┤
+│  High Availability:                                         │
+│  ├── Regional: Primary + Standby (automatic failover)       │
+│  ├── Read replicas: Async replication                       │
+│  └── Cross-region: Disaster recovery                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Instance
+The core database server. Types: Primary (read-write), Read Replica (read-only), Failover Replica (HA standby).
+
+### Database
+Logical container within an instance holding tables, views, and other objects.
+
+### Connection
+Client connection to the database. Cloud SQL Proxy provides secure connectivity.
+
+### Backup
+Point-in-time recovery using automated or on-demand backups stored in Cloud Storage.
+
+### Private IP
+VPC-native connectivity without public internet exposure.
+
+### Authorized Network
+IP ranges allowed to connect directly to the instance.
+
+### Flags
+Database-specific configuration parameters (e.g., `max_connections`, `log_min_duration_statement`).
+
+### HA Configuration
+Regional configuration with automatic failover to standby in different zone.
+
+## Real Production Example
+
+**E-commerce Platform with Cloud SQL PostgreSQL**
+
+```hcl
+# Terraform configuration for production e-commerce database
+
+# Enable required APIs
+resource "google_project_service" "sqladmin" {
+  service = "sqladmin.googleapis.com"
+}
+
+# Create VPC for private connectivity
+resource "google_compute_network" "sql_vpc" {
+  name = "sql-vpc-${var.environment}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "sql_subnet" {
+  name          = "sql-subnet-${var.environment}"
+  network       = google_compute_network.sql_vpc.id
+  ip_cidr_range = "10.0.1.0/24"
+  region        = var.region
+  
+  private_ip_google_access = true
+}
+
+# Create Private Service Access for Cloud SQL
+resource "google_compute_global_address" "sql_private_ip" {
+  name          = "sql-private-ip-${var.environment}"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.sql_vpc.id
+}
+
+resource "google_service_networking_connection" "sql_vpc_connection" {
+  network       = google_compute_network.sql_vpc.id
+  service       = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.sql_private_ip.name]
+}
+
+# Create Cloud SQL instance with HA
+resource "google_sql_database_instance" "ecommerce_db" {
+  name             = "ecommerce-db-${var.environment}"
+  database_version = "POSTGRES_15"
+  region           = var.region
+  
+  deletion_protection  = true
+  enable_binary_logging = true
+  insights_config {
+    query_insights_enabled  = true
+    query_string_length     = 1024
+    record_application_tags = true
+    record_client_address   = false
+  }
+  
+  settings {
+    tier              = "db-n2-standard-4"
+    availability_type = "REGIONAL"  # HA enabled
+    disk_type         = "PD_SSD"
+    disk_size         = 500
+    disk_autoresize   = true
+    storage_auto_increase_limit = 1000
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.sql_vpc.id
+      require_ssl     = true
+      
+      authorized_networks {
+        name  = "app-tier"
+        value = "10.0.2.0/24"
+      }
+    }
+    
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+      backup_retention_settings {
+        retained_backups = 7
+        retention_unit   = "COUNT"
+      }
+    }
+    
+    maintenance_window {
+      day          = 7  # Sunday
+      hour         = 4  # 4 AM
+      update_track = "stable"
+    }
+    
+    database_flags {
+      name  = "max_connections"
+      value = "500"
+    }
+    
+    database_flags {
+      name  = "log_min_duration_statement"
+      value = "1000"
+    }
+    
+    database_flags {
+      name  = "pgaudit.log"
+      value = "read,write"
+    }
+    
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+    }
+    
+    ip_configuration {
+      dynamic "authorized_networks" {
+        for_each = var.authorized_ips
+        content {
+          name  = authorized_networks.value.name
+          value = authorized_networks.value.cidr
+        }
+      }
+    }
+  }
+  
+  labels = {
+    environment = var.environment
+    team        = "platform"
+    component   = "database"
+  }
+}
+
+# Create databases
+resource "google_sql_database" "ecommerce" {
+  name     = "ecommerce"
+  instance = google_sql_database_instance.ecommerce_db.name
+}
+
+resource "google_sql_database" "analytics" {
+  name     = "analytics"
+  instance = google_sql_database_instance.ecommerce_db.name
+}
+
+# Create read replica in same region
+resource "google_sql_database_instance" "read_replica" {
+  name            = "ecommerce-db-read-replica-${var.environment}"
+  database_version = "POSTGRES_15"
+  region          = var.region
+  
+  master_instance_name = google_sql_database_instance.ecommerce_db.name
+  
+  deletion_protection = false
+  
+  replica_configuration {
+    failover_target = false
+  }
+  
+  settings {
+    tier              = "db-n2-standard-4"
+    availability_type = "ZONAL"  # Replica is zonal
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.sql_vpc.id
+      require_ssl     = true
+    }
+    
+    database_flags {
+      name  = "max_connections"
+      value = "500"
+    }
+  }
+}
+
+# Cross-region read replica for DR
+resource "google_sql_database_instance" "dr_replica" {
+  name             = "ecommerce-db-dr-${var.environment}"
+  database_version = "POSTGRES_15"
+  region           = var.dr_region  # Different region
+  
+  master_instance_name = google_sql_database_instance.ecommerce_db.name
+  
+  deletion_protection = false
+  
+  settings {
+    tier              = "db-n2-standard-2"  # Smaller for DR
+    availability_type = "ZONAL"
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.dr_vpc.id
+      require_ssl     = true
+    }
+  }
+}
+
+# User management via Secret Manager (production best practice)
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "ecommerce-db-password"
+  
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "db_password" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = var.db_password
+}
+
+# IAM database authentication
+resource "google_sql_database_instance" "ecommerce_db" {
+  # ... previous config ...
+  
+  settings {
+    # ... previous settings ...
+    
+    iam_authentication = true
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create PostgreSQL instance
+gcloud sql instances create my-instance \
+  --database-version=POSTGRES_15 \
+  --tier=db-n2-standard-2 \
+  --region=us-central1 \
+  --storage-type=SSD \
+  --storage-size=100GB \
+  --storage-auto-increase \
+  --availability-type=REGIONAL \
+  --backup-start-time=03:00 \
+  --enable-bin-log \
+  --network=VPC_NAME \
+  --no-assign-ip
+
+# Create MySQL instance
+gcloud sql instances create my-mysql \
+  --database-version=MYSQL_8_0 \
+  --tier=db-n2-standard-4 \
+  --region=us-central1 \
+  --storage-type=SSD \
+  --storage-size=500GB
+
+# Create SQL Server instance
+gcloud sql instances create my-sqlserver \
+  --database-version=SQLSERVER_2022_STANDARD \
+  --tier=db-n2-standard-4 \
+  --region=us-central1 \
+  --storage-size=500GB
+
+# Create read replica
+gcloud sql instances create my-replica \
+  --master-instance-name=my-instance \
+  --region=us-central1 \
+  --tier=db-n2-standard-2
+
+# Create cross-region replica
+gcloud sql instances create my-dr-replica \
+  --master-instance-name=my-instance \
+  --region=us-east1 \
+  --tier=db-n2-standard-2
+
+# Import data from Cloud Storage
+gcloud sql import sql my-instance \
+  gs://my-bucket/dumps/database.sql \
+  --database=ecommerce
+
+# Export to Cloud Storage
+gcloud sql export sql my-instance \
+  gs://my-bucket/exports/backup-$(date +%Y%m%d).sql \
+  --database=ecommerce
+
+# Connect via Cloud SQL Auth Proxy
+cloud-sql-proxy my-instance:us-central1:my-project:us-central1:my-instance &
+mysql -h 127.0.0.1 -u user -p
+
+# Create database
+gcloud sql databases create ecommerce --instance=my-instance
+
+# Create user
+gcloud sql users create appuser \
+  --instance=my-instance \
+  --password=SECURE_PASSWORD
+
+# Enable IAM authentication
+gcloud sql instances describe my-instance --format="yaml(settings.iamAuth)"
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Primary instance
+resource "google_sql_database_instance" "primary" {
+  name             = "primary-db"
+  database_version = "POSTGRES_15"
+  region           = "us-central1"
+  
+  deletion_protection = true
+  
+  settings {
+    tier              = "db-n2-standard-4"
+    availability_type = "REGIONAL"
+    disk_type         = "PD_SSD"
+    disk_size         = 100
+    disk_autoresize   = true
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+      require_ssl     = true
+    }
+    
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = true
+    }
+    
+    maintenance_window {
+      day  = 0
+      hour = 4
+    }
+    
+    database_flags = [
+      { name = "max_connections", value = "500" },
+      { name = "log_min_duration_statement", value = "1000" },
+    ]
+    
+    insights_config {
+      query_insights_enabled = true
+    }
+  }
+}
+
+# Read replica
+resource "google_sql_database_instance" "read_replica" {
+  name                 = "read-replica"
+  database_version     = "POSTGRES_15"
+  region               = "us-central1"
+  master_instance_name = google_sql_database_instance.primary.name
+  
+  deletion_protection = false
+  
+  replica_configuration {
+    failover_target = false
+  }
+  
+  settings {
+    tier              = "db-n2-standard-4"
+    availability_type = "ZONAL"
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.id
+    }
+  }
+}
+
+# Database resource
+resource "google_sql_database" "app_db" {
+  name     = "app_db"
+  instance = google_sql_database_instance.primary.name
+}
+
+# User resource
+resource "google_sql_user" "app_user" {
+  name     = "app_user"
+  instance = google_sql_database_instance.primary.name
+  password = var.db_password
+}
+```
+
+## Common Commands
+
+```bash
+# Instance operations
+gcloud sql instances create INSTANCE [flags]
+gcloud sql instances list
+gcloud sql instances describe INSTANCE
+gcloud sql instances update INSTANCE [flags]
+gcloud sql instances delete INSTANCE
+
+# Database operations
+gcloud sql databases create DATABASE --instance=INSTANCE
+gcloud sql databases list --instance=INSTANCE
+gcloud sql databases delete DATABASE --instance=INSTANCE
+
+# User operations
+gcloud sql users create USER --instance=INSTANCE --password=PASS
+gcloud sql users list --instance=INSTANCE
+gcloud sql users delete USER --instance=INSTANCE
+
+# Import/Export
+gcloud sql export sql INSTANCE gs://BUCKET/FILE --database=DB
+gcloud sql import sql INSTANCE gs://BUCKET/FILE --database=DB
+
+# Connect
+gcloud sql connect INSTANCE --user=USER
+
+# Backup operations
+gcloud sql backups list --instance=INSTANCE
+gcloud sql backups create --instance=INSTANCE
+gcloud sql instances restore INSTANCE --backup-id=ID
+
+# Failover
+gcloud sql instances failover INSTANCE
+
+# Get IP
+gcloud sql instances describe INSTANCE --format="yaml(ipAddresses)"
+```
+
+## Monitoring
+
+### Key Metrics
+- **CPU utilization**: Instance CPU usage
+- **Memory usage**: RAM utilization
+- **Disk utilization**: Storage used vs allocated
+- **Connections**: Active database connections
+- **Queries/second**: Query throughput
+- **Transaction latency**: P99 latency for transactions
+- **Replication lag**: For read replicas
+- **Replication byte lag**: For cross-region replicas
+
+### Cloud Monitoring Integration
+
+```bash
+# Built-in metrics in Cloud Monitoring
+gcloud sql instances list --format="table(name,databaseVersion,tier,region,state)"
+
+# Create alert for high CPU
+gcloud monitoring policies create \
+  --display-name="High CPU Alert" \
+  --condition-display-name="CPU > 90%" \
+  --condition-filter='resource.type="cloudsql_database" AND metric.type="cloudsql.googleapis.com/database/cpu/utilization"' \
+  --condition-threshold-value=0.9 \
+  --notification-channels=CHANNEL_ID
+
+# Query specific metrics
+gcloud monitoring metrics read \
+  "cloudsql.googleapis.com/database/postgresql/num_backends" \
+  --filter='resource.instance_name="my-instance"'
+
+# Enable Query Insights
+gcloud sql instances patch my-instance \
+  --query-insights-enabled \
+  --query-string-length=1024
+```
+
+### Performance Tuning Queries
+
+```sql
+-- Check slow queries
+SELECT * FROM pg_stat_statements 
+ORDER BY mean_exec_time DESC LIMIT 10;
+
+-- Check connection usage
+SELECT count(*), state 
+FROM pg_stat_activity 
+GROUP BY state;
+
+-- Check replication lag
+SELECT slot_name, pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) 
+FROM pg_replication_slots;
+
+-- Check disk usage per table
+SELECT schemaname, tablename, pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename))
+FROM pg_tables ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC LIMIT 10;
+```
+
+## Security
+
+### Encryption
+- **At rest**: Google-managed, Cloud KMS (CMEK), or Customer-managed
+- **In transit**: TLS 1.2+ enforced by default
+- **IAM Authentication**: Service account-based auth
+
+```bash
+# Create instance with CMEK
+gcloud sql instances create my-instance \
+  --disk-encryption-key=KMS_KEY_NAME
+
+# Enable IAM authentication
+gcloud sql instances patch my-instance --iam-authentication
+
+# Create IAM user
+gcloud sql users create user@example.com \
+  --instance=my-instance \
+  --type=CLOUD_IAM_USER
+```
+
+### Network Security
+```bash
+# Private IP only
+gcloud sql instances create my-instance \
+  --network=VPC_NAME \
+  --no-assign-ip
+
+# Authorized networks (if needed)
+gcloud sql instances patch my-instance \
+  --authorized-networks=192.168.1.0/24
+```
+
+### IAM Best Practices
+```bash
+# Use service accounts with minimal permissions
+# Cloud SQL Client role
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@my-project.iam.gserviceaccount.com \
+  --role=roles/cloudsql.client
+
+# Cloud SQL Instance User role
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@my-project.iam.gserviceaccount.com \
+  --role=roles/cloudsql.instanceUser
+```
+
+## Cost Optimization
+
+### Instance Sizing
+| Workload | Tier Recommendation |
+|----------|---------------------|
+| Dev/Test | db-f1-micro, db-g1-small |
+| Small Production | db-n2-standard-2 |
+| Medium Production | db-n2-standard-8 |
+| Large Production | db-n2-standard-16+ |
+
+### Storage Optimization
+```bash
+# Enable storage auto-increase with limit
+gcloud sql instances patch my-instance \
+  --storage-auto-increase \
+  --storage-size=200
+
+# Monitor storage usage
+gcloud sql instances describe my-instance \
+  --format="yaml(settings.storageSizeGb)"
+```
+
+### Read Replica Strategy
+```bash
+# Use read replicas for read-heavy workloads
+# Offload reads from primary
+# Smaller tier for replicas if appropriate
+```
+
+### Backup Costs
+- Automated backups included (7-day retention)
+- Additional backups: ~$0.08/GB/month
+- Use `--backup-start-time` to schedule during off-peak
+
+## Troubleshooting
+
+### Connection Issues
+```bash
+# Check instance status
+gcloud sql instances describe my-instance --format="yaml(state)"
+
+# Test connectivity via proxy
+cloud-sql-proxy --instances=PROJECT:REGION:INSTANCE=tcp:5432 &
+psql -h 127.0.0.1 -p 5432 -U user -d database
+
+# Check authorized networks
+gcloud sql instances describe my-instance --format="yaml(ipAddresses)"
+
+# Check SSL requirements
+gcloud sql instances describe my-instance --format="yaml(settings.ipConfiguration.requireSsl)"
+```
+
+### High CPU/Memory
+```bash
+# Check running queries
+gcloud sql connect my-instance --user=postgres
+SELECT pid, now() - query_start AS duration, query FROM pg_stat_activity WHERE state != 'idle';
+
+# Kill long-running query
+SELECT pg_terminate_backend(pid);
+
+# Check slow query log
+SELECT * FROM pg_stat_statements ORDER BY total_time DESC LIMIT 10;
+```
+
+### Replication Lag
+```bash
+# Check replica lag
+gcloud sql instances describe read-replica --format="yaml(settings.replicationStatus)"
+
+# On replica, check lag
+SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;
+
+# Monitor via Cloud Monitoring
+gcloud monitoring metrics read "cloudsql.googleapis.com/database/replication/replication_lag"
+```
+
+### Disk Full
+```bash
+# Check disk usage
+gcloud sql instances describe my-instance --format="yaml(settings.storageSizeGb)"
+
+# Increase storage (online)
+gcloud sql instances patch my-instance --storage-size=500
+
+# Clean up temp files in database
+# VACUUM ANALYZE;
+```
+
+### Backup/Restore Issues
+```bash
+# List available backups
+gcloud sql backups list --instance=my-instance
+
+# Check backup status
+gcloud sql backups describe BACKUP_ID --instance=my-instance
+
+# Restore to point in time
+gcloud sql instances restore my-instance \
+  --backup-timestamp=2024-01-15T10:00:00Z \
+  --restore-instance=restored-instance
+```
+
+## Interview Questions
+
+**Q: What is the difference between REGIONAL and ZONAL availability types?**
+A: REGIONAL creates a standby replica in a different zone within the same region, providing high availability with automatic failover (~60 second RTO). ZONAL is single-zone only, lower cost but no HA. Regional adds ~50% to instance cost.
+
+**Q: How does Cloud SQL handle point-in-time recovery?**
+A: Cloud SQL maintains continuous Write-Ahead Log (WAL) archiving to Cloud Storage. When PITR is enabled, you can restore to any point within the backup retention period (1-35 days) by replaying WAL entries.
+
+**Q: What are the connection limits for Cloud SQL?**
+A: PostgreSQL default max_connections varies by tier (db-f1-micro: 25, db-g1-small: 50, larger: 100-8000). Use connection pooling (PgBouncer, Cloud SQL Auth Proxy) for high-concurrency workloads.
+
+**Q: When should you use Cloud SQL vs Cloud Spanner?**
+A: Choose Cloud SQL for: regional data, moderate scale (< 2 TB), cost-sensitive workloads, MySQL/PostgreSQL compatibility. Choose Spanner for: global distribution, > 2 TB, massive scale, strong consistency across regions.
+
+**Q: How do you secure Cloud SQL connections?**
+A: Use Private IP with VPC, enforce SSL (`require_ssl=true`), enable IAM authentication, use Cloud SQL Auth Proxy, configure authorized networks if needed, and implement principle of least privilege in IAM.
+
+**Q: What is Cloud SQL Auth Proxy and why use it?**
+A: Auth Proxy provides secure connection to Cloud SQL using Cloud SQL API, eliminating the need for allowlisting IP addresses. It handles IAM authentication and mTLS encryption automatically, working even from outside GCP.
+
+**Q: How do you migrate from on-premises to Cloud SQL?**
+A: Use Database Migration Service (DMS) for continuous migration with minimal downtime. For PostgreSQL, also use `pg_dump`/`pg_restore` for one-time migration or logical replication for ongoing sync.
+
+## Cheat Sheet
+
+```bash
+# Create instance
+gcloud sql instances create NAME --database-version=VER --tier=TIER --region=REGION
+
+# Enable HA
+gcloud sql instances create NAME --availability-type=REGIONAL
+
+# Connect via proxy
+cloud-sql-proxy projects/PROJECT/instances/INSTANCE &
+psql -h 127.0.0.1 -p 5432
+
+# Create with private IP
+gcloud sql instances create NAME --network=VPC --no-assign-ip
+
+# Import/Export
+gcloud sql export sql INSTANCE gs://BUCKET/FILE --database=DB
+gcloud sql import sql INSTANCE gs://BUCKET/FILE --database=DB
+
+# Failover
+gcloud sql instances failover INSTANCE
+
+# Enable PITR
+gcloud sql instances patch INSTANCE --enable-bin-log
+```
+
+## Labs
+
+### Lab 1: HA PostgreSQL Deployment
+Deploy production-grade PostgreSQL with high availability.
+1. Create regional instance with automated backups
+2. Configure private IP connectivity
+3. Enable point-in-time recovery
+4. Create read replica for read scaling
+5. Test failover and verify RTO
+
+### Lab 2: Secure Database Access
+Implement secure database access patterns.
+1. Enable IAM authentication
+2. Deploy Cloud SQL Auth Proxy in application
+3. Configure VPC with private service connect
+4. Set up audit logging
+5. Implement connection pooling
+
+### Lab 3: Database Migration
+Migrate on-premises PostgreSQL to Cloud SQL.
+1. Use Database Migration Service
+2. Configure continuous replication
+3. Validate data integrity
+4. Perform cutover with minimal downtime
+5. Verify application connectivity
+
+## Related Services
+
+- **Cloud SQL Auth Proxy**: Secure connection without IP allowlisting
+- **Database Migration Service**: Migration tool for MySQL/PostgreSQL
+- **Memorystore**: In-memory Redis for caching
+- **Cloud Spanner**: Globally distributed relational database
+- **BigQuery**: Data warehouse for analytics
+- **Cloud SQL for SQL Server**: Windows SQL Server workloads

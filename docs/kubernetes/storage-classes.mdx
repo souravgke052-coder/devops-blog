@@ -1,0 +1,538 @@
+---
+title: "Kubernetes Storage Classes"
+description: "Complete guide to Kubernetes Storage Classes - dynamic volume provisioning and storage types"
+sidebar_position: 9
+---
+
+# Kubernetes Storage Classes
+
+## Overview
+
+A **StorageClass** provides a way for administrators to describe the "classes" of storage they offer. Different classes might map to different quality-of-service levels, backup policies, or arbitrary policies determined by the cluster administrators. StorageClasses enable dynamic volume provisioning, allowing PersistentVolumeClaims to automatically provision volumes when needed.
+
+## When To Use
+
+- **Dynamic volume provisioning** - automatically create storage when PVC is created
+- **Different storage tiers** - SSD vs HDD, standard vs premium
+- **Cloud storage** - GCE PD, AWS EBS, Azure Disk
+- **Network storage** - NFS, Ceph, GlusterFS
+- **Custom storage requirements** - specific performance or availability needs
+
+## When NOT to Use
+
+- **Static provisioning** - when you have pre-created PVs
+- **Simple testing** - hostPath or emptyDir may suffice
+- **Cross-cloud portability** - use abstract storage classes
+- **When storage class isn't supported** - some environments don't support dynamic provisioning
+
+## Core Concepts
+
+### StorageClass Components
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        StorageClass Architecture                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PersistentVolumeClaim (user)                                                │
+│  │                                                                          │
+│  │  spec:                                                                   │
+│  │    storageClassName: standard-rwo                                        │
+│  │    resources:                                                             │
+│  │      requests:                                                            │
+│  │        storage: 50Gi                                                      │
+│  ▼                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ StorageClass: standard-rwo                                             │   │
+│  │   provisioner: pd.csi.storage.gke.io                                   │   │
+│  │   parameters:                                                          │   │
+│  │     type: pd-standard                                                  │   │
+│  │     replication: regional-pd                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                 Dynamic Provisioner                                   │   │
+│  │   Creates PersistentVolume                                            │   │
+│  │   based on StorageClass                                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                 Cloud Storage (GCE PD)                                │   │
+│  │   Disk: 50Gi, Regional PD, Standard                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Reclaim Policy
+
+| Policy | Behavior |
+|--------|----------|
+| Delete | Delete the volume when PVC is deleted |
+| Retain | Keep the volume, manual cleanup required |
+| Recycle | Delete contents and make available again (deprecated) |
+
+## Architecture / How It Works
+
+### Provisioning Flow
+
+```
+User creates PVC
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  PVC specifies StorageClass: "standard-rwo"                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  StorageClass provisioner (e.g., gce-pd)                                     │
+│  - Reads parameters from StorageClass                                        │
+│  - Calls cloud API to create disk                                            │
+│  - Creates PersistentVolume                                                  │
+│  - Binds PVC to PV                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Pod uses PVC → Volume attached to node → Container mounts volume            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### GKE StorageClasses
+
+```yaml
+# Standard storage (default)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard-rwo
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-standard
+  replication-type: regional-pd
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+---
+
+# Premium SSD
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: premium-rwo
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+---
+
+# Local SSD (fast, ephemeral)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-ssd
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: local-ssd
+volumeBindingMode: Immediate
+allowVolumeExpansion: false
+reclaimPolicy: Delete
+---
+
+# NFS/filestore
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-standard
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  tier: standard
+  network: default
+mountOptions:
+- vers=4.1
+- noresvport
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+```
+
+### NFS StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-storage
+provisioner: nfs.storage.k8s.io
+parameters:
+  server: nfs-server.example.com
+  path: /exports
+mountOptions:
+- vers=4.1
+- hard
+- timeo=600
+- retrans=2
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+```
+
+### Custom StorageClass (Ceph RBD)
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-storage
+provisioner: rbd.csi.ceph.com
+parameters:
+  clusterID: ceph-cluster
+  pool: rbd
+  imageFormat: "2"
+  imageFeatures: layering
+  csi.storage.k8s.io/provisioner-secret-name: ceph-csi-config
+  csi.storage.k8s.io/provisioner-secret-namespace: ceph-system
+  csi.storage.k8s.io/controller-expand-secret-name: ceph-csi-config
+  csi.storage.k8s.io/controller-expand-secret-namespace: ceph-system
+  csi.storage.k8s.io/node-stage-secret-name: ceph-csi-config
+  csi.storage.k8s.io/node-stage-secret-namespace: ceph-system
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+```
+
+## YAML Examples
+
+### Basic StorageClass
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+provisioner: kubernetes.io/gce-pd
+parameters:
+  type: pd-standard
+  replication-type: regional-pd
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+```
+
+### StorageClass with Volume Expansion
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: expandable-storage
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-standard
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true  # Enable online expansion
+reclaimPolicy: Delete
+```
+
+### Immediate vs WaitForFirstConsumer
+
+```yaml
+# WaitForFirstConsumer (delays binding until pod is scheduled)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: delayed-binding
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: WaitForFirstConsumer
+# Volume will be in pending until a pod using the PVC is scheduled
+
+---
+# Immediate (binds as soon as PVC is created)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: immediate-binding
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: Immediate
+# Volume is created immediately
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# List storage classes
+kubectl get storageclass
+kubectl get sc
+
+# Describe storage class
+kubectl describe storageclass standard-rwo
+
+# Get default storage class
+kubectl get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class=="true")].metadata.name}'
+
+# Set default storage class
+kubectl patch storageclass standard -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+# Delete storage class
+kubectl delete storageclass old-storage-class
+```
+
+### PVC Operations
+
+```bash
+# Create PVC with specific storage class
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  storageClassName: standard-rwo
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+EOF
+
+# Check PVC creation (will provision volume)
+kubectl get pvc my-pvc -w
+
+# Expand PVC
+kubectl patch pvc my-pvc -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+```
+
+### Provisioner Operations
+
+```bash
+# Check CSI driver status (GKE)
+kubectl get csidriver
+
+# List all CSI drivers
+kubectl get csidriver -o wide
+
+# Check provisioner pods
+kubectl get pods -A -l app.kubernetes.io/name=csi-provisioner
+```
+
+## Common Commands
+
+```bash
+# Check available provisioners
+kubectl get csidriver
+
+# List PVs by storage class
+kubectl get pv -o jsonpath='{range .items[*]}{.spec.storageClassName}{"\t"}{.metadata.name}{"\n"}{end}' | sort | uniq
+
+# Find PVCs using specific storage class
+kubectl get pvc -o json | jq '.items[] | select(.spec.storageClassName=="standard-rwo") | .metadata.name'
+
+# Check storage class parameters
+kubectl get storageclass standard-rwo -o jsonpath='{.parameters}'
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| storageclass_usage_bytes | Storage used per class |
+| pv_capacity_bytes | Total capacity per PV |
+| kubelet_volume_stats_used_bytes | Volume usage |
+
+### Prometheus Queries
+
+```promql
+# Storage usage by class
+sum(kubelet_volume_stats_used_bytes) by (storageclass)
+
+# Available capacity by class
+sum(kubelet_volume_stats_available_bytes) by (storageclass)
+
+# PVC count by class
+count(persistentvolumeclaim) by (storageclass)
+```
+
+## Security
+
+### RBAC for Storage Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: storage-admin
+  namespace: production
+rules:
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims", "persistentvolumes"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+```
+
+## Cost Optimization
+
+### Storage Tier Selection Guide
+
+| Tier | Use Case | Performance | Cost |
+|------|----------|-------------|------|
+| standard | General purpose | Moderate | $ |
+| standard-rwo | Single zone block | Moderate | $$ |
+| premium-rwo | High I/O | High | $$$ |
+| local-ssd | Cache, temp data | Very High | $$ |
+| ultra | Database, analytics | Maximum | $$$$ |
+
+### Right-Sizing PVCs
+
+```bash
+# Find oversized PVCs
+kubectl get pvc -A -o json | jq '.items[] | select(.status.capacity != null) | {name: .metadata.name, requested: .spec.resources.requests.storage, used: .status.capacity}'
+
+# Monitor unused PVCs
+kubectl get pvc -A --field-selector status.phase=Bound | grep -v default
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| PVC stuck pending | No provisioner, wrong zone | Check StorageClass, use WaitForFirstConsumer |
+| Volume expansion failed | Expansion not enabled | Enable allowVolumeExpansion |
+| Volume not mounting | Zone mismatch | Use regional PD, check topology |
+| Provisioner not found | CSI driver not installed | Install CSI driver |
+
+### Diagnostic Commands
+
+```bash
+# Check storage class
+kubectl get sc
+kubectl describe sc standard-rwo
+
+# Check PVC status
+kubectl get pvc -A
+kubectl describe pvc my-pvc
+
+# Check provisioner logs
+kubectl logs -n kube-system -l app=csi-provisioner --tail=100
+
+# Check PVC events
+kubectl get events --field-selector involvedObject.name=my-pvc
+
+# Check PV binding
+kubectl get pv | grep my-pvc
+
+# Check CSI driver
+kubectl get csidriver
+kubectl describe csidriver pd.csi.storage.gke.io
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a StorageClass in Kubernetes?**
+A: A StorageClass is a resource that defines the types of storage available in a cluster. It specifies the provisioner to use, parameters for that provisioner (like disk type), and policies for volume binding and reclaiming.
+
+**Q: What is dynamic volume provisioning?**
+A: Dynamic volume provisioning automatically creates storage volumes when PersistentVolumeClaims are created. The StorageClass defines how volumes should be created without manual intervention.
+
+**Q: What is the difference between WaitForFirstConsumer and Immediate volume binding?**
+A: WaitForFirstConsumer delays volume binding until a pod using the PVC is scheduled, allowing the scheduler to consider topology constraints. Immediate binds the volume as soon as the PVC is created.
+
+### Intermediate Questions
+
+**Q: How does volume expansion work?**
+A: When allowVolumeExpansion: true is set on a StorageClass, users can patch PVCs to request more storage. The provisioner then expands the underlying volume. For CSI drivers, this is typically online expansion.
+
+**Q: What is reclaim policy and what options are available?**
+A: Reclaim policy determines what happens to the volume when its PVC is deleted. Options are Delete (automatically delete the volume) and Retain (keep the volume for manual cleanup).
+
+### Advanced Questions
+
+**Q: How would you migrate data between storage classes?**
+A: Data migration between storage classes typically requires: 1) Deploy a migration job, 2) Create new PVC with target StorageClass, 3) Copy data, 4) Update Pod references to new PVC, 5) Delete old PVC. Some storage systems support volume cloning or replication.
+
+## Cheat Sheet
+
+### StorageClass YAML Template
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: my-storage-class
+  # Annotate as default
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: pd.csi.storage.gke.io  # or other provisioner
+parameters:
+  type: pd-standard  # provisioner-specific
+  replication-type: regional-pd
+volumeBindingMode: WaitForFirstConsumer  # Immediate or WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete  # Delete or Retain
+mountOptions:  # optional
+- vers=4.1
+```
+
+### Common Provisioners
+
+| Provisioner | Cloud/Storage | Notes |
+|-------------|---------------|-------|
+| pd.csi.storage.gke.io | GCE PD | GKE native |
+| ebs.csi.aws.com | AWS EBS | AWS EKS |
+| disk.csi.azure.com | Azure Disk | AKS |
+| nfs.storage.k8s.io | NFS | Generic NFS |
+| cephfs.csi.ceph.com | CephFS | Ceph |
+| rbd.csi.ceph.com | RBD (Ceph) | Ceph block |
+
+### Essential Commands
+
+```bash
+# List storage classes
+kubectl get sc
+
+# Get default class
+kubectl get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class=="true")].metadata.name}'
+
+# Create PVC with storage class
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+spec:
+  storageClassName: standard-rwo
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+EOF
+
+# Expand PVC
+kubectl patch pvc my-pvc -p '{"spec":{"resources":{"requests":{"storage":"100Gi"}}}}'
+```
+
+## Related Topics
+
+- [Volumes](./volumes) - Volume types and mounting
+- [StatefulSets](./statefulsets) - Stateful application storage
+- [GKE](./gke) - GKE-specific storage options

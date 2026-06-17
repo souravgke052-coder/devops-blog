@@ -1,0 +1,892 @@
+---
+sidebar_position: 4
+---
+
+# SLA (Service Level Agreement)
+
+## Overview
+
+A Service Level Agreement (SLA) is a formal commitment between a service provider and a customer, defining the level of service expected. Unlike SLOs (which are internal targets) and SLIs (which are measurements), SLAs carry contractual obligations and often financial consequences for non-compliance.
+
+SLAs typically have legal weight. They're found in contracts, terms of service, and service descriptions. Breaching an SLA can trigger service credits, refunds, penalties, or even contract termination. This makes SLAs more conservative than SLOs — you promise less than you aim for.
+
+The relationship is hierarchical: **SLI ≤ SLO ≤ SLA**. Your SLI (actual measurement) should consistently exceed your SLO (internal target), which should exceed the SLA (customer commitment). If your SLA is 99.9%, your SLO should be 99.95% and your actual performance should be 99.98%.
+
+## When To Use
+
+- **B2B or enterprise services** — When you have contractual relationships with customers
+- **Regulated industries** — Healthcare, finance, and other regulated sectors often require documented SLAs
+- **Multi-tenant platforms** — SaaS products with free/paid tiers define SLAs per tier
+- **Partnership agreements** — When other businesses depend on your service
+- **Customer-facing commitments** — Any time you're promising specific reliability to users
+
+## When NOT To Use
+
+- **Internal services** — Use SLOs for internal systems, not SLAs
+- **Development/staging** — SLA definitions are for production
+- **Without legal review** — SLA contracts should be reviewed by legal
+- **When you can't measure** — Don't promise what you can't track
+
+## Core Concepts
+
+### SLA Structure
+
+A complete SLA document typically includes:
+
+1. **Service scope** — What services are covered
+2. **Availability target** — The specific uptime/downtime commitment
+3. **Measurement methodology** — How availability is calculated
+4. **Exclusions** — What doesn't count against SLA (planned maintenance, force majeure)
+5. **Credits/remedies** — What happens when SLA is breached
+6. **Escalation process** — How to report and resolve SLA breaches
+7. **Review period** — How often SLA terms are revisited
+
+### SLA Tiers
+
+Many services offer tiered SLAs based on customer pricing:
+
+```yaml
+# Example SLA tiers for a SaaS platform
+sla_tiers:
+  free:
+    availability: 99.0%
+    support: Community forums
+    credits: None
+    uptime_calculation: "Monthly uptime percentage"
+    
+  pro:
+    availability: 99.9%
+    support: Email, 8-hour response
+    credits: "10% monthly credit for each 1% below target"
+    uptime_calculation: "Monthly uptime percentage"
+    
+  enterprise:
+    availability: 99.95%
+    support: Dedicated CSM, 1-hour response
+    credits: "25% monthly credit for each 0.1% below target"
+    uptime_calculation: "Monthly uptime percentage"
+    additional:
+      - Dedicated infrastructure
+      - Custom SLAs negotiable
+      - Penalty clauses for extended outages
+```
+
+### SLA vs SLO Differences
+
+| Aspect | SLA | SLO |
+|--------|-----|-----|
+| **Audience** | External customers | Internal engineering |
+| **Enforcement** | Contractual/legal | Operational policies |
+| **Consequences** | Financial penalties, credits | Internal prioritization |
+| **Flexibility** | Hard to change | Easy to adjust |
+| **Precision** | Conservative (lower) | Aggressive (higher) |
+| **Coverage** | User-facing services | All critical services |
+
+### Measurement Windows
+
+SLAs are typically measured monthly and reported:
+
+```yaml
+# SLA measurement example
+measurement:
+  window: Calendar month (UTC)
+  calculation: |
+    Uptime Percentage = 
+      (Total Minutes in Month - Downtime Minutes) / Total Minutes in Month × 100%
+  
+  downtime_includes:
+    - Unplanned outages
+    - Degraded performance below threshold
+    - Service errors
+    
+  exclusions:
+    - Scheduled maintenance (with 48h notice)
+    - Force majeure events
+    - Customer-caused issues
+    - Third-party service failures outside our control
+```
+
+## Real Production Example
+
+### Major Cloud Provider SLAs
+
+**AWS EC2 SLA**:
+```
+Service Commitment: 99.99% monthly availability
+(Regional Multi-AZ instances)
+
+Service Credits:
+- < 99.99% but >= 99.0%: 10% credit
+- < 99.0% but >= 95.0%: 30% credit  
+- < 95.0%: 100% credit
+
+Calculation: Monthly Uptime Percentage = 
+  (Available Minutes - Downtime Minutes) / Available Minutes × 100%
+```
+
+**Google Cloud SLA**:
+```
+Cloud Run: 99.95% monthly availability
+BigQuery: 99.9% monthly availability  
+Cloud Storage: 99.999999999% monthly durability
+
+Credit calculation for Cloud Run:
+- < 99.95% but >= 99.0%: 10% credit
+- < 99.0% but >= 95.0%: 25% credit
+- < 95.0%: 50% credit
+```
+
+**Azure SLA**:
+```
+Virtual Machines (Single Instance): 99.9%
+Virtual Machines (Availability Set): 99.95%
+App Service: 99.95%
+
+Credit tiers vary by service and severity of breach.
+```
+
+### SaaS Platform SLA
+
+```yaml
+# Example: E-commerce platform SLA
+document_version: "2.1"
+effective_date: "2024-01-01"
+
+services_covered:
+  - Storefront API
+  - Payment Processing
+  - Order Management
+  - Customer Authentication
+
+availability_targets:
+  storefront_api:
+    monthly_uptime: 99.9%
+    measurement: "Successful API responses / Total requests"
+    latency_sla: "p99 < 200ms"
+    
+  payment_processing:
+    monthly_uptime: 99.95%
+    measurement: "Authorized payments / Total payment attempts"
+    latency_sla: "p99 < 500ms"
+    
+  customer_auth:
+    monthly_uptime: 99.9%
+    measurement: "Successful authentications / Total attempts"
+    latency_sla: "p99 < 100ms"
+
+exclusions:
+  - Scheduled maintenance (up to 4 hours/month, 7-day notice)
+  - DDoS attacks and cyber attacks
+  - Customer application code
+  - Third-party integrations (payment gateways, identity providers)
+  - Force majeure events
+
+service_credits:
+  tier_1_breach:  # 0.1% - 0.5% downtime
+    credit: "10% of monthly fee"
+    trigger: "Any single outage > 1 minute"
+    
+  tier_2_breach:  # 0.5% - 1.0% downtime
+    credit: "25% of monthly fee"
+    trigger: "Any single outage > 30 minutes"
+    
+  tier_3_breach:  # > 1.0% downtime
+    credit: "50% of monthly fee"
+    trigger: "Monthly uptime < 99.0%"
+
+reporting:
+  frequency: Monthly
+  delivery: "Automated report via dashboard"
+  content:
+    - Uptime percentage
+    - Incidents summary
+    - Credit calculations (if applicable)
+```
+
+### Enterprise SLA Contract
+
+```yaml
+# Example: Enterprise SLA with penalty clauses
+contract_id: "ENT-2024-0847"
+customer: "Large Enterprise Corp"
+term: "3 years"
+
+service_level_commitments:
+  primary_service:
+    availability: 99.95%
+    latency_p99: 150ms
+    throughput: "Sustained 10,000 TPS"
+    
+  disaster_recovery:
+    rpo: 1 hour  # Recovery Point Objective
+    rto: 4 hours  # Recovery Time Objective
+    
+support_commitments:
+  response_times:
+    critical_issue: 15 minutes
+    high_priority: 1 hour
+    medium_priority: 4 hours
+    low_priority: 1 business day
+    
+  support_hours: 24/7/365
+  dedicated_tam: true
+  escalation_contacts:
+    - name: "VP Engineering"
+      phone: "+1-555-0100"
+      response_time: 30 minutes
+
+financial_terms:
+  annual_contract_value: "$500,000"
+  
+  sla_penalties:
+    availability_shortfall:
+      # Per 0.1% below 99.95%
+      penalty_per_incident: "$5,000"
+      max_annual_penalty: "$100,000"
+      
+    latency_shortfall:
+      # If p99 exceeds 150ms for > 5 minutes
+      penalty_per_incident: "$2,000"
+      
+  service_credits:
+    # Alternative to penalties (customer's choice)
+    credits_apply: true
+    credit_calculation: |
+      Credit = (Monthly Fee) × (Target% - Actual%) / Target%
+      Maximum monthly credit: 50% of monthly fee
+
+exclusions:
+  - Planned maintenance (8 hours/month with 7-day notice)
+  - Customer-caused incidents
+  - Force majeure
+  - Third-party cloud provider failures
+  - DDoS mitigation during attack
+
+reporting_and_review:
+  monthly_report: true
+  quarterly_business_review: true
+  annual_sla_review: true
+  
+  metrics_shared:
+    - Availability
+    - Latency percentiles (p50, p95, p99)
+    - Error rates
+    - Capacity utilization
+    - Incident statistics
+```
+
+## Metrics / Formulas / Frameworks
+
+### SLA Calculation
+
+```python
+def calculate_sla_achievement(total_minutes, downtime_minutes, exclusions=0):
+    """
+    Calculate SLA achievement percentage.
+    
+    Args:
+        total_minutes: Total minutes in measurement period
+        downtime_minutes: Minutes of unplanned downtime
+        exclusions: Minutes excluded from calculation
+    """
+    billable_minutes = total_minutes - exclusions
+    available_minutes = billable_minutes - downtime_minutes
+    return (available_minutes / billable_minutes) * 100
+
+# Example: 30-day month, 45 minutes downtime
+total = 30 * 24 * 60  # 43,200 minutes
+downtime = 45  # minutes
+achievement = calculate_sla_achievement(total, downtime)
+print(f"SLA Achievement: {achievement:.4f}%")
+# 99.896%
+# Below 99.9% SLA threshold
+```
+
+### Service Credit Calculation
+
+```python
+def calculate_service_credit(monthly_fee, actual_sla, target_sla):
+    """
+    Calculate service credit based on SLA shortfall.
+    
+    Returns credit amount or 0 if SLA was met.
+    """
+    if actual_sla >= target_sla:
+        return 0  # No credit needed
+    
+    shortfall = target_sla - actual_sla
+    
+    # Credit tiers (example)
+    if shortfall < 0.1:  # < 0.1% below
+        credit_percent = 10
+    elif shortfall < 0.5:  # < 0.5% below
+        credit_percent = 25
+    else:  # >= 0.5% below
+        credit_percent = 50
+    
+    credit_amount = monthly_fee * (credit_percent / 100)
+    return credit_amount
+
+# Example
+monthly_fee = 5000  # $5,000/month
+actual_sla = 99.85  # Actual achievement
+target_sla = 99.9   # SLA target
+credit = calculate_service_credit(monthly_fee, actual_sla, target_sla)
+print(f"Service Credit: ${credit:.2f}")
+# Service Credit: $250.00 (5% of $5,000)
+```
+
+### Multi-Component SLA
+
+```python
+def composite_sla(services):
+    """
+    Calculate composite SLA for multiple services.
+    System is available only if ALL services are available.
+    """
+    composite = 1.0
+    for sla in services:
+        composite *= sla / 100
+    return composite * 100
+
+# Example: API + Database + Cache
+services = [99.95, 99.99, 99.9]  # Each at their respective SLAs
+composite = composite_sla(services)
+print(f"Composite SLA: {composite:.4f}%")
+# 99.84%
+```
+
+### RTO/RPO Calculation
+
+```python
+def calculate_downtime_risk(target_sla, target_rto_hours, incidents_per_year):
+    """
+    Calculate expected downtime and business risk.
+    """
+    # Annual downtime based on SLA
+    annual_downtime_minutes = (100 - target_sla) / 100 * 365 * 24 * 60
+    annual_downtime_hours = annual_downtime_minutes / 60
+    
+    # Risk exposure (potential data loss)
+    potential_data_loss_hours = incidents_per_year * target_rto_hours
+    
+    return {
+        "annual_downtime_hours": annual_downtime_hours,
+        "annual_downtime_minutes": annual_downtime_minutes,
+        "incidents_per_year": incidents_per_year,
+        "potential_data_loss_hours": potential_data_loss_hours
+    }
+
+# Example
+risk = calculate_downtime_risk(99.9, 4, 3)  # 99.9% SLA, 4hr RTO, 3 incidents/year
+print(risk)
+# {
+#     'annual_downtime_hours': 8.76,
+#     'annual_downtime_minutes': 525.6,
+#     'incidents_per_year': 3,
+#     'potential_data_loss_hours': 12
+# }
+```
+
+## Common Tools and Commands
+
+### SLA Monitoring with Prometheus
+
+```promql
+-- Monthly SLA achievement
+(
+  sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total{job="api"}[30d]))
+) * 100
+
+-- Check if SLA threshold met
+(
+  sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total{job="api"}[30d]))
+) >= 0.999
+
+-- Downtime minutes in month (for 99.9% SLA)
+(1 - (
+  sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total{job="api"}[30d]))
+)) * 30 * 24 * 60
+
+-- Projected SLA achievement for month (partial month)
+(
+  sum(rate(http_requests_total{job="api",status!~"5.."}[15d]))
+  /
+  sum(rate(http_requests_total{job="api"}[15d]))
+) * 100
+```
+
+### SLA Reporting Dashboard
+
+```json
+{
+  "title": "SLA Dashboard",
+  "panels": [
+    {
+      "title": "Monthly SLA Achievement",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n  /\n  sum(rate(http_requests_total{job='api'}[30d]))\n) * 100",
+          "legendFormat": "Current"
+        },
+        {
+          "expr": "99.9",
+          "legendFormat": "SLA Target"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "red"},
+              {"value": 99.9, "color": "yellow"},
+              {"value": 99.95, "color": "green"}
+            ]
+          },
+          "decimals": 4
+        }
+      }
+    },
+    {
+      "title": "Projected vs Target SLA",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[1d]))\n  /\n  sum(rate(http_requests_total{job='api'}[1d]))\n) * 100",
+          "legendFormat": "Projected Monthly"
+        },
+        {
+          "expr": "99.9",
+          "legendFormat": "SLA Target"
+        }
+      ]
+    },
+    {
+      "title": "Downtime Minutes (vs 43.8 min allowance)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(1 - (\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n  /\n  sum(rate(http_requests_total{job='api'}[30d]))\n)) * 30 * 24 * 60",
+          "legendFormat": "Downtime Minutes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 1,
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "green"},
+              {"value": 30, "color": "yellow"},
+              {"value": 43.8, "color": "red"}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+## Monitoring / Alerting Examples
+
+### SLA Breach Prevention Alerts
+
+```yaml
+# SLA monitoring alerts - trigger before breach
+groups:
+  - name: sla-monitoring
+    rules:
+      # Alert when projected to miss SLA (50% of downtime budget used)
+      - alert: SLAProjectionWarning
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[7d]))
+              /
+              sum(rate(http_requests_total{job="api"}[7d]))
+            )
+          )
+          /
+          (1 - 0.999)
+          * (7 / 30)  # Proportional to time elapsed
+          > 0.5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Projected to miss SLA this month"
+          description: |
+            Using >50% of SLA downtime budget with 50% of month remaining.
+            Current trajectory may result in SLA breach.
+
+      # Alert when SLA is at immediate risk
+      - alert: SLAImmediateRisk
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[24h]))
+              /
+              sum(rate(http_requests_total{job="api"}[24h]))
+            )
+          )
+          >
+          (1 - 0.999) * 0.75  # Using 75% of daily allowance in 1 day
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SLA at immediate risk - consuming too much downtime"
+          description: "Using more than 75% of daily downtime budget in last 24 hours"
+```
+
+### SLA Breach Detection
+
+```yaml
+      # SLA breach alert
+      - alert: SLABreached
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+            /
+            sum(rate(http_requests_total{job="api"}[30d]))
+          )
+          < 0.999
+        for: 5m
+        labels:
+          severity: critical
+          sla_breach: "true"
+        annotations:
+          summary: "SLA BREACHED"
+          description: |
+            Monthly SLA of 99.9% has been breached.
+            Current achievement: {{ $value | printf "%.4f" }}%
+            This will trigger service credits.
+            
+      # Track projected credit amount
+      - alert: SLAProjectedCredit
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+              /
+              sum(rate(http_requests_total{job="api"}[30d]))
+            )
+          )
+          /
+          (1 - 0.999)
+          > 1.0  # Error budget exhausted
+        for: 0m
+        labels:
+          severity: warning
+          credit_eligible: "true"
+        annotations:
+          summary: "Service credits will be issued"
+          description: |
+            Error budget exhausted - service credits will be issued per SLA.
+            Please update customer communication.
+```
+
+## Security
+
+### SLA and Security Incidents
+
+Security incidents often trigger SLA breaches:
+
+```yaml
+# Detect security-related SLA impact
+- alert: SecurityIncidentSLAImpact
+  expr: |
+    # If error rate spikes coincide with security alerts
+    sum(rate(http_requests_total{job="api",status=~"5.."}[5m])) 
+    / 
+    sum(rate(http_requests_total{job="api"}[5m])) > 0.05
+    and
+    sum(rate(http_requests_total{job="api"}[5m])) < 0.5 * avg_over_time(sum(rate(http_requests_total{job="api"}[5m]))[1h:5m])
+  for: 2m
+  labels:
+    severity: critical
+    potential_security: "true"
+  annotations:
+    summary: "Potential security incident causing SLA impact"
+    description: "Significant error rate spike with traffic drop - possible attack"
+```
+
+### SLA Exclusions for Security Events
+
+SLA contracts typically exclude:
+- DDoS attacks (force majeure)
+- Customer credential compromise
+- Third-party security failures
+
+Define these exclusions clearly in your SLA documentation.
+
+## Cost Optimization
+
+### SLA Cost Tradeoffs
+
+Higher SLA targets cost exponentially more:
+
+```python
+# Estimated cost multiplier for different SLA levels
+# (relative to 99.9% baseline)
+sla_costs = {
+    99.0: 1.0,    # Baseline
+    99.5: 1.5,    # 50% more
+    99.9: 2.5,    # 150% more (10x improvement from 99%)
+    99.95: 4.0,   # 300% more
+    99.99: 8.0,   # 700% more
+    99.999: 20.0, # 1900% more
+}
+```
+
+### Cost-Effective SLA Management
+
+```yaml
+# Strategies to meet SLA without overprovisioning
+cost_strategies:
+  - name: "Graceful degradation"
+    description: "Serve cached/stale content during outages"
+    sla_impact: "Maintain partial availability"
+    
+  - name: "Geographic distribution"
+    description: "Multi-region deployment for resilience"
+    sla_impact: "Regional failures don't breach SLA"
+    
+  - name: "Auto-scaling"
+    description: "Handle traffic spikes without degradation"
+    sla_impact: "Maintain performance under load"
+    
+  - name: "Circuit breakers"
+    description: "Isolate failing dependencies"
+    sla_impact: "Prevent cascade failures"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common SLA Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| SLA tighter than SLO | Constant breaches, credit liability | SLO should be stricter than SLA |
+| Not tracking exclusions | Over-counting downtime | Define and monitor exclusions |
+| No measurement methodology | Disputes with customers | Document calculation clearly |
+| SLA credits too generous | Revenue loss | Model credit exposure before agreeing |
+| Not reviewing SLA regularly | Stale targets | Annual SLA review with data |
+
+### SLA Troubleshooting
+
+**Symptom**: Consistent SLA misses despite good SLO performance
+
+**Diagnosis**:
+```bash
+# 1. Check if SLO and SLA thresholds match
+# SLO: 99.95%, SLA: 99.9% - should be fine
+# But check calculation methodology differences
+
+# 2. Check measurement window differences
+# Maybe SLA measures calendar month while SLO uses rolling window
+
+# 3. Check if exclusions aren't being applied
+# Maintenance windows should reduce downtime count
+```
+
+## Interview Questions
+
+### Q1: What's the difference between SLA, SLO, and SLI?
+
+**A**: Think of them as a hierarchy:
+
+- **SLI (Service Level Indicator)**: What you measure. The raw metric. "Our API returns 99.7% successful responses"
+- **SLO (Service Level Objective)**: What you target. The internal goal. "We aim for 99.9% availability"  
+- **SLA (Service Level Agreement)**: What you promise. The contractual commitment. "We guarantee 99.9% or issue credits"
+
+The key distinction: SLAs have legal/financial consequences. You should always exceed your SLA internally (via SLOs), so you never accidentally breach the customer-facing commitment.
+
+### Q2: How do you handle SLA breaches?
+
+**A**: Breach handling has both technical and customer relations aspects:
+
+**Technical**:
+1. Acknowledge and diagnose root cause
+2. Implement fix or workaround
+3. Verify fix resolves issue
+4. Update monitoring to prevent recurrence
+
+**Customer Relations**:
+1. Notify customer per SLA terms (often within 24 hours)
+2. Provide incident timeline and impact
+3. Issue service credits per SLA formula
+4. Share postmortem if appropriate
+
+**Prevention**:
+- Proactive SLA monitoring (project before month end)
+- SLO stricter than SLA with error budget alerts
+- Regular SLA performance reviews
+
+### Q3: How do you design SLA tiers?
+
+**A**: Tiers balance customer value with operational cost:
+
+```yaml
+tier_design:
+  free_tier:
+    availability: 99.0%  # Lower commitment
+    support: Self-service
+    price: $0
+    
+  standard_tier:
+    availability: 99.5%  # Balanced
+    support: Email response
+    price: $99/month
+    
+  premium_tier:
+    availability: 99.9%  # Full commitment
+    support: 24/7 phone
+    price: $499/month
+    
+  enterprise_tier:
+    availability: 99.95% # Custom
+    support: Dedicated TAM
+    price: Negotiable
+```
+
+Key principle: Each tier should pay for its cost. Premium features (dedicated infra, custom SLAs) cost more but should be priced accordingly.
+
+### Q4: How do you calculate SLA credits?
+
+**A**: Credit calculation depends on your SLA terms:
+
+```python
+def calculate_sla_credit(monthly_revenue, actual_uptime, target_uptime):
+    """
+    Common credit calculation approach.
+    """
+    if actual_uptime >= target_uptime:
+        return 0  # No breach, no credit
+    
+    # Calculate shortfall
+    shortfall = target_uptime - actual_uptime  # e.g., 0.05% (99.95% - 99.9%)
+    
+    # Tiered credit structure
+    if shortfall <= 0.05:
+        credit_percent = 10  # 10% of monthly fee
+    elif shortfall <= 0.1:
+        credit_percent = 25
+    elif shortfall <= 0.25:
+        credit_percent = 50
+    else:
+        credit_percent = 100  # Full refund if severe breach
+        
+    return monthly_revenue * (credit_percent / 100)
+
+# Example
+credit = calculate_sla_credit(10000, 99.85, 99.9)
+print(f"Credit due: ${credit}")  # $250 (2.5% shortfall × 10% rate)
+```
+
+### Q5: How do you handle SLA during deployments?
+
+**A**: Deployments are a common cause of SLA risk:
+
+```yaml
+deployment_strategy:
+  blue_green:
+    description: "Maintain two environments, switch traffic"
+    sla_impact: "Zero downtime deployment"
+    requirements:
+      - Load balancer with instant switchover
+      - Data sync between environments
+      
+  rolling:
+    description: "Gradually update instances"
+    sla_impact: "Maintains partial availability"
+    max_unavailable: 10%  # Never exceed 10% down
+      
+  canary:
+    description: "Test with small % first"
+    sla_impact: "Limited blast radius"
+    rollout: "1% → 10% → 100% over hours"
+    
+  maintenance_window:
+    description: "Scheduled downtime with notice"
+    sla_impact: "Excluded from SLA if properly noticed"
+    requirements:
+      - 7+ days advance notice
+      - Within excluded hours (e.g., 2am-6am)
+      - Limited to 4 hours/month
+```
+
+Always apply SLA exclusions for planned maintenance, but ensure proper notice is given per contract terms.
+
+## Cheat Sheet
+
+### SLA Quick Reference
+
+| SLA Target | Monthly Downtime | Monthly Credits Trigger |
+|------------|------------------|------------------------|
+| 99.0% | 7.3 hours | ~1% shortfall |
+| 99.5% | 3.65 hours | ~0.5% shortfall |
+| 99.9% | 43.8 minutes | ~0.1% shortfall |
+| 99.95% | 21.9 minutes | ~0.05% shortfall |
+| 99.99% | 4.4 minutes | ~0.01% shortfall |
+
+### SLA vs SLO Sizing
+
+```
+If SLA is 99.9%:
+  → SLO should be 99.95% (margin above)
+  → Actual performance should be 99.98%+
+  
+This ensures you never accidentally breach SLA.
+```
+
+### Credit Calculation Template
+
+```python
+def calculate_credits(monthly_fee, actual_sla, target_sla):
+    if actual_sla >= target_sla:
+        return 0
+    
+    shortfall = target_sla - actual_sla
+    
+    # Generic tiered structure
+    if shortfall < 0.05:   # < 0.05%
+        return monthly_fee * 0.10  # 10% credit
+    elif shortfall < 0.1:  # < 0.1%
+        return monthly_fee * 0.25  # 25% credit
+    elif shortfall < 0.5:  # < 0.5%
+        return monthly_fee * 0.50  # 50% credit
+    else:
+        return monthly_fee  # 100% credit
+```
+
+### SLA Exclusions Checklist
+
+```
+Typical SLA exclusions:
+[ ] Planned maintenance (with proper notice)
+[ ] Scheduled updates (with customer agreement)
+[ ] Force majeure events
+[ ] Third-party provider failures
+[ ] DDoS/cyber attacks
+[ ] Customer-caused incidents
+[ ] Testing/development environments
+```
+
+## Related Topics
+
+- [SLI](./sli.mdx) — How to measure service behavior
+- [SLO](./slo.mdx) — Internal reliability targets
+- [Error Budget](./error-budget.mdx) — Budget framework for SLO/SLA alignment
+- [Monitoring](./monitoring.mdx) — SLA monitoring and reporting
+- [Alerting](./alerting.mdx) — SLA breach prevention
+- [Incident Management](./incident-management.mdx) — Handling SLA-impacting incidents

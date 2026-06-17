@@ -1,0 +1,842 @@
+# Cloud Load Balancing
+
+## Overview
+
+Cloud Load Balancing in GCP provides globally distributed, software-defined load balancing that distributes traffic across instances, containers, or VMs across multiple regions. Unlike traditional hardware load balancers, GCP's load balancers are fully managed, highly available, and scale automatically without user intervention.
+
+GCP offers several types of load balancers optimized for different use cases: HTTP(S) Load Balancers for web applications, TCP/UDP Load Balancers for non-HTTP traffic, and internal load balancers for private traffic within a VPC. The external HTTP(S) load balancer is particularly powerful—it operates at Google's global edge network, providing Premium Tier network routing, SSL termination, and integration with Cloud Armor for security.
+
+Load balancers in GCP consist of multiple components that work together: a forwarding rule that receives traffic, a target proxy that processes the request, a backend service or backend group that distributes traffic to actual backends, and health checks that ensure traffic only goes to healthy instances. Understanding how these components interact is essential for proper load balancer configuration.
+
+## When To Use
+
+- **High availability**: Distribute traffic across multiple instances in multiple zones
+- **Global applications**: Route users to the nearest healthy instance
+- **HTTPS traffic**: Terminate SSL/TLS at the edge with managed certificates
+- **Microservices**: Load balance traffic to containerized workloads
+- **Zero-downtime deployments**: Health checks ensure only healthy instances receive traffic
+- **DDoS protection**: Integrate with Cloud Armor for application-layer protection
+- **Private load balancing**: Internal traffic within VPC (no external IPs)
+
+## When NOT To Use
+
+- **Single instance**: Load balancing adds unnecessary complexity
+- **UDP-based gaming**: Use TCP/UDP load balancer with caution for real-time apps
+- **Legacy protocols without health check support**: Custom health checks may be needed
+- **Cross-cloud load balancing**: Use global load balancers like Cloudflare
+- **Real-time financial trading**: Latency sensitivity may require different architecture
+
+## Architecture
+
+**HTTP(S) Load Balancer Architecture:**
+```
+Internet Traffic
+    ↓
+Global Forwarding Rule (HTTPS:443)
+    ↓
+HTTPS Proxy (SSL Termination)
+    ↓
+URL Map (path-based routing)
+    ↓
+Backend Service (instance group)
+    ↓
+Health Check
+    ↓
+Instance Group (multi-zone)
+    ↓
+VM Instances
+```
+
+**Load Balancer Types:**
+
+| Type | Scope | Use Case |
+|------|-------|----------|
+| Global External HTTP(S) | Global | Web apps, APIs |
+| Global External HTTPS | Global | HTTPS with SSL termination |
+| Global TCP Proxy | Global | Non-HTTP SSL termination |
+| Global SSL Proxy | Global | SSL termination for any protocol |
+| Regional External HTTP(S) | Regional | Regional web apps |
+| Regional Network (TCP/UDP) | Regional | TCP/UDP non-HTTP |
+| Internal HTTP(S) | Regional | Private internal services |
+| Internal TCP/UDP | Regional | Private non-HTTP |
+
+**Components:**
+1. **Forwarding Rule**: Receives traffic, defines IP, port, protocol
+2. **Target Proxy**: Processes requests (HTTP/S, SSL, TCP)
+3. **URL Map**: Routes requests to backends based on rules
+4. **Backend Service/Group**: Distributes traffic to backends
+5. **Health Check**: Monitors backend health
+6. **SSL Certificate**: Managed or self-managed certificates
+
+## Core Concepts
+
+### Creating an External HTTP(S) Load Balancer
+
+```bash
+# 1. Create instance template with nginx
+gcloud compute instance-templates create web-template \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --tags=allow-health-checks \
+    --metadata=startup-script='#!/bin/bash
+      apt-get update && apt-get install -y nginx
+      echo "Hello from $(hostname)" > /var/www/html/index.html'
+
+# 2. Create managed instance group
+gcloud compute instance-groups managed create web-mig \
+    --template=web-template \
+    --size=2 \
+    --region=us-central1
+
+# 3. Configure autoscaling
+gcloud compute instance-groups managed set-autoscaling web-mig \
+    --region=us-central1 \
+    --min-num-replicas=2 \
+    --max-num-replicas=10 \
+    --target-cpu-utilization=0.6
+
+# 4. Create health check
+gcloud compute health-checks create http http-health-check \
+    --port=80 \
+    --request-path=/ \
+    --check-interval=10 \
+    --timeout=5 \
+    --healthy-threshold=2 \
+    --unhealthy-threshold=3
+
+# 5. Create backend service
+gcloud compute backend-services create web-backend \
+    --protocol=HTTP \
+    --port-name=http \
+    --health-checks=http-health-check \
+    --global
+
+gcloud compute backend-services add-backend web-backend \
+    --instance-group=web-mig \
+    --instance-group-region=us-central1 \
+    --global
+
+# 6. Create URL map
+gcloud compute url-maps create web-map \
+    --default-service=web-backend
+
+# 7. Create managed SSL certificate
+gcloud compute ssl-certificates create web-cert \
+    --domains=example.com,www.example.com \
+    --global
+
+# 8. Create HTTPS target proxy
+gcloud compute target-https-proxies create https-proxy \
+    --url-map=web-map \
+    --ssl-certificates=web-cert \
+    --global
+
+# 9. Create global forwarding rule (HTTPS)
+gcloud compute forwarding-rules create https-rule \
+    --global \
+    --target-https-proxy=https-proxy \
+    --ports=443 \
+    --address=web-static-ip \
+    --description="HTTPS load balancer"
+
+# 10. Create HTTP redirect to HTTPS
+gcloud compute target-http-proxies create http-proxy \
+    --url-map=web-map \
+    --global
+
+gcloud compute forwarding-rules create http-rule \
+    --global \
+    --target-http-proxy=http-proxy \
+    --ports=80 \
+    --description="HTTP to HTTPS redirect"
+```
+
+### Creating an Internal HTTP(S) Load Balancer
+
+```bash
+# 1. Create proxy-only subnet
+gcloud compute networks subnets create proxy-subnet \
+    --network=my-vpc \
+    --region=us-central1 \
+    --range=10.0.30.0/24 \
+    --purpose=REGIONAL_MANAGED_PROXY
+
+# 2. Create instance template
+gcloud compute instance-templates create app-template \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --subnet=app-subnet \
+    --no-address
+
+# 3. Create managed instance group
+gcloud compute instance-groups managed create app-mig \
+    --template=app-template \
+    --size=2 \
+    --region=us-central1
+
+# 4. Create health check
+gcloud compute health-checks create http app-health-check \
+    --port=80 \
+    --request-path=/health
+
+# 5. Create backend service
+gcloud compute backend-services create app-backend \
+    --protocol=HTTP \
+    --port-name=http \
+    --health-checks=app-health-check \
+    --region=us-central1 \
+    --load-balancing-scheme=INTERNAL
+
+gcloud compute backend-services add-backend app-backend \
+    --instance-group=app-mig \
+    --instance-group-region=us-central1 \
+    --region=us-central1
+
+# 6. Create URL map
+gcloud compute url-maps create app-map \
+    --default-service=app-backend \
+    --region=us-central1
+
+# 7. Create target proxy
+gcloud compute target-https-proxies create app-https-proxy \
+    --url-map=app-map \
+    --region=us-central1
+
+# 8. Create forwarding rule
+gcloud compute forwarding-rules create app-https-rule \
+    --region=us-central1 \
+    --load-balancing-scheme=INTERNAL \
+    --ports=443 \
+    --target-https-proxy=app-https-proxy \
+    --subnet=proxy-subnet \
+    --description="Internal HTTPS load balancer"
+```
+
+### Network Load Balancer (TCP/UDP)
+
+```bash
+# 1. Create unmanaged instance group
+gcloud compute instance-groups managed create tcp-mig \
+    --template=tcp-template \
+    --region=us-central1
+
+# 2. Create health check
+gcloud compute health-checks create tcp tcp-health-check \
+    --port=443
+
+# 3. Create backend service
+gcloud compute backend-services create tcp-backend \
+    --protocol=TCP \
+    --health-checks=tcp-health-check \
+    --region=us-central1
+
+gcloud compute backend-services add-backend tcp-backend \
+    --instance-group=tcp-mig \
+    --instance-group-region=us-central1 \
+    --region=us-central1
+
+# 4. Create target pool
+gcloud compute target-pools create tcp-pool \
+    --health-checks=tcp-health-check \
+    --region=us-central1
+
+gcloud compute target-pools add-instances tcp-pool \
+    --instances=instance-1,instance-2 \
+    --region=us-central1
+
+# 5. Create forwarding rule
+gcloud compute forwarding-rules create tcp-rule \
+    --region=us-central1 \
+    --ports=443 \
+    --target-pool=tcp-pool
+```
+
+### SSL Certificate Management
+
+```bash
+# Create managed certificate
+gcloud compute ssl-certificates create my-cert \
+    --domains=example.com,www.example.com \
+    --global
+
+# Create managed certificate with wildcard
+gcloud compute ssl-certificates create wildcard-cert \
+    --domains=*.example.com \
+    --global
+
+# List certificates
+gcloud compute ssl-certificates list --global
+
+# Describe certificate
+gcloud compute ssl-certificates describe my-cert --global
+
+# Delete certificate
+gcloud compute ssl-certificates delete my-cert --global
+```
+
+### Health Checks
+
+```bash
+# HTTP health check
+gcloud compute health-checks create http http-hc \
+    --port=80 \
+    --request-path=/healthz
+
+# HTTPS health check
+gcloud compute health-checks create https https-hc \
+    --port=443 \
+    --request-path=/healthz
+
+# TCP health check
+gcloud compute health-checks create tcp tcp-hc \
+    --port=3306
+
+# HTTP/2 health check
+gcloud compute health-checks create http2 http2-hc \
+    --port=443
+
+# SSL health check
+gcloud compute health-checks create ssl ssl-hc \
+    --port=443
+
+# List health checks
+gcloud compute health-checks list
+
+# Describe health check
+gcloud compute health-checks describe http-hc
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Backend services per project | 100 (global), 100 (regional) |
+| Health checks per project | 500 |
+| Forwarding rules per project | 255 |
+| SSL certificates per project | 100 |
+| Target proxies per project | 100 |
+| URL maps per project | 100 |
+
+### Key Gotchas
+
+- **Global load balancers require Premium Tier** network—Standard Tier is regional only
+- **Managed SSL certificates take 60-90 minutes** to provision—plan ahead
+- **Health checks come from Google IP ranges** (130.211.0.0/22, 35.191.0.0/16)—ensure firewall allows these
+- **Backend services require at least one healthy instance** or return 500 errors
+- **Load balancer forwarding rules consume static IP quota** if using static external IPs
+- **Internal load balancers use RFC 1918 addresses** only
+- **URL maps can route based on path and host**—use for A/B testing or blue/green deployments
+
+## Real Production Example
+
+Complete production HTTPS load balancer setup:
+
+```bash
+#!/bin/bash
+set -e
+
+# Variables
+PROJECT="my-prod-project"
+REGION="us-central1"
+VPC="prod-vpc"
+SUBNET="web-subnet"
+IG_NAME="web-mig"
+TMPL_NAME="web-template"
+BACKEND_NAME="web-backend"
+HC_NAME="http-health-check"
+URL_MAP_NAME="web-url-map"
+HTTPS_PROXY="https-proxy"
+HTTP_PROXY="http-proxy"
+FW_RULE_HTTPS="allow-https-lb"
+FW_RULE_HC="allow-health-checks"
+CERT_NAME="prod-cert"
+
+# Enable required APIs
+gcloud services enable compute.googleapis.com
+
+# 1. Reserve static IP
+gcloud compute addresses create web-lb-ip \
+    --global \
+    --ip-version=IPV4
+
+WEB_LB_IP=$(gcloud compute addresses describe web-lb-ip \
+    --global --format="value(address)")
+echo "Reserved IP: $WEB_LB_IP"
+
+# 2. Create firewall rules for health checks
+gcloud compute firewall-rules create $FW_RULE_HC \
+    --network=$VPC \
+    --allow=tcp:80,tcp:443,tcp:8080 \
+    --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+    --target-tags=web-server \
+    --description="Allow Google health checks"
+
+# 3. Create instance template
+gcloud compute instance-templates create $TMPL_NAME \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud \
+    --network=$VPC \
+    --subnet=$SUBNET \
+    --tags=web-server \
+    --metadata=startup-script='#!/bin/bash
+        apt-get update -y
+        apt-get install -y nginx
+        systemctl start nginx
+        systemctl enable nginx'
+
+# 4. Create managed instance group
+gcloud compute instance-groups managed create $IG_NAME \
+    --template=$TMPL_NAME \
+    --size=2 \
+    --region=$REGION
+
+# Configure autoscaling
+gcloud compute instance-groups managed set-autoscaling $IG_NAME \
+    --region=$REGION \
+    --min-num-replicas=2 \
+    --max-num-replicas=10 \
+    --target-cpu-utilization=0.7 \
+    --cool-down-period=90
+
+# 5. Create health check
+gcloud compute health-checks create http $HC_NAME \
+    --port=80 \
+    --request-path=/ \
+    --check-interval=10 \
+    --timeout=5 \
+    --healthy-threshold=2 \
+    --unhealthy-threshold=3
+
+# 6. Create backend service
+gcloud compute backend-services create $BACKEND_NAME \
+    --protocol=HTTP \
+    --port-name=http \
+    --health-checks=$HC_NAME \
+    --enable-cdn \
+    --global
+
+gcloud compute backend-services add-backend $BACKEND_NAME \
+    --instance-group=$IG_NAME \
+    --instance-group-region=$REGION \
+    --balancing-mode=UTILIZATION \
+    --max-utilization=0.8 \
+    --global
+
+# 7. Create URL map
+gcloud compute url-maps create $URL_MAP_NAME \
+    --default-service=$BACKEND_NAME \
+    --global
+
+# Add path rule for /api
+gcloud compute url-maps add-path-matcher $URL_MAP_NAME \
+    --path-matcher-name=api-paths \
+    --default-service=$BACKEND_NAME \
+    --path-rules="/api/*=api-backend" 2>/dev/null || true
+
+# 8. Create SSL certificate
+gcloud compute ssl-certificates create $CERT_NAME \
+    --domains=example.com,www.example.com \
+    --global
+
+# 9. Create HTTPS target proxy
+gcloud compute target-https-proxies create $HTTPS_PROXY \
+    --url-map=$URL_MAP_NAME \
+    --ssl-certificates=$CERT_NAME \
+    --global
+
+# Enable QUIC
+gcloud compute target-https-proxies update $HTTPS_PROXY \
+    --global \
+    --enable-quic
+
+# 10. Create HTTPS forwarding rule
+gcloud compute forwarding-rules create https-rule \
+    --global \
+    --target-https-proxy=$HTTPS_PROXY \
+    --ports=443 \
+    --address=web-lb-ip \
+    --description="HTTPS load balancer"
+
+# 11. Create HTTP to HTTPS redirect
+gcloud compute target-http-proxies create $HTTP_PROXY \
+    --url-map=$URL_MAP_NAME \
+    --global \
+    --redirect-http-to-https
+
+gcloud compute forwarding-rules create http-rule \
+    --global \
+    --target-http-proxy=$HTTP_PROXY \
+    --ports=80 \
+    --description="HTTP to HTTPS redirect"
+
+echo "Load balancer created successfully!"
+echo "HTTPS: https://$WEB_LB_IP"
+```
+
+```hcl
+# Terraform: Production Load Balancer
+variable "project" {
+  default = "my-prod-project"
+}
+
+variable "region" {
+  default = "us-central1"
+}
+
+# Reserve static IP
+resource "google_compute_global_address" "lb_ip" {
+  name         = "web-lb-ip"
+  ip_version   = "IPV4"
+  project      = var.project
+}
+
+# Firewall for health checks
+resource "google_compute_firewall" "allow_health_checks" {
+  name    = "allow-health-checks"
+  network = "prod-vpc"
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443", "8080"]
+  }
+
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = ["web-server"]
+}
+
+# Instance template
+resource "google_compute_instance_template" "web" {
+  name           = "web-template"
+  machine_type   = "e2-medium"
+  can_ip_forward = false
+
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+  }
+
+  network_interface {
+    network = "prod-vpc"
+    subnetwork = "web-subnet"
+    subnetwork_region = var.region
+    tags = ["web-server"]
+  }
+
+  metadata = {
+    startup-script = <<-EOF
+      #!/bin/bash
+      apt-get update -y
+      apt-get install -y nginx
+      systemctl start nginx
+    EOF
+  }
+}
+
+# Managed Instance Group
+resource "google_compute_region_instance_group_manager" "web_mig" {
+  name           = "web-mig"
+  base_instance_name = "web"
+  region         = var.region
+  version {
+    instance_template = google_compute_instance_template.web.id
+    name = "web"
+  }
+  target_size    = 2
+}
+
+# Health check
+resource "google_compute_health_check" "http" {
+  name               = "http-health-check"
+  check_interval_sec = 10
+  timeout_sec        = 5
+  healthy_threshold  = 2
+  unhealthy_threshold = 3
+
+  http_health_check {
+    port               = 80
+    request_path       = "/"
+  }
+}
+
+# Backend service
+resource "google_compute_backend_service" "web_backend" {
+  name          = "web-backend"
+  protocol      = "HTTP"
+  port_name     = "http"
+  health_checks = google_compute_health_check.http.id
+  enable_cdn    = true
+
+  backend {
+    group           = google_compute_region_instance_group_manager.web_mig.instance_group
+    balancing_mode  = "UTILIZATION"
+    max_utilization = 0.8
+  }
+}
+
+# SSL Certificate
+resource "google_compute_managed_ssl_certificate" "web" {
+  name = "web-cert"
+
+  managed {
+    domains = ["example.com", "www.example.com"]
+  }
+}
+
+# URL Map
+resource "google_compute_url_map" "web" {
+  name            = "web-url-map"
+  default_service = google_compute_backend_service.web_backend.id
+}
+
+# Target HTTPS Proxy
+resource "google_compute_target_https_proxy" "web" {
+  name             = "https-proxy"
+  url_map          = google_compute_url_map.web.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.web.id]
+}
+
+# Global forwarding rule (HTTPS)
+resource "google_compute_global_forwarding_rule" "https" {
+  name       = "https-rule"
+  target     = google_compute_target_https_proxy.web.id
+  port_range = "443"
+  ip_address = google_compute_global_address.lb_ip.id
+}
+```
+
+## CLI Examples
+
+```bash
+# Backend services
+gcloud compute backend-services list --global
+gcloud compute backend-services describe backend --global
+gcloud compute backend-services add-backend backend --instance-group=mig --instance-group-region=REG --global
+
+# Health checks
+gcloud compute health-checks list
+gcloud compute health-checks create http NAME --port=80 --request-path=/health
+
+# SSL certificates
+gcloud compute ssl-certificates list --global
+gcloud compute ssl-certificates create NAME --domains=example.com --global
+
+# Forwarding rules
+gcloud compute forwarding-rules list --global
+gcloud compute forwarding-rules describe rule --global
+
+# URL maps
+gcloud compute url-maps list --global
+gcloud compute url-maps describe map --global
+
+# Target proxies
+gcloud compute target-https-proxies list --global
+```
+
+## Terraform Example
+
+```hcl
+# Complete load balancer with all components
+resource "google_compute_global_address" "lb" {
+  name = "lb-ip"
+}
+
+resource "google_compute_health_check" "https" {
+  name = "https-health-check"
+
+  https_health_check {
+    port = 443
+  }
+}
+
+resource "google_compute_backend_service" "backend" {
+  name = "my-backend"
+  protocol = "HTTPS"
+  health_checks = [google_compute_health_check.https.id]
+
+  backend {
+    group = google_compute_region_instance_group_manager.mig.instance_group
+  }
+}
+
+resource "google_compute_managed_ssl_certificate" "cert" {
+  name = "my-cert"
+
+  managed {
+    domains = ["example.com"]
+  }
+}
+
+resource "google_compute_url_map" "map" {
+  name = "my-url-map"
+  default_service = google_compute_backend_service.backend.id
+}
+
+resource "google_compute_target_https_proxy" "proxy" {
+  name = "my-proxy"
+  url_map = google_compute_url_map.map.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.cert.id]
+}
+
+resource "google_compute_global_forwarding_rule" "https" {
+  name = "my-https-rule"
+  target = google_compute_target_https_proxy.proxy.id
+  port_range = "443"
+  ip_address = google_compute_global_address.lb.id
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List backends | `gcloud compute backend-services list --global` |
+| Describe backend | `gcloud compute backend-services describe NAME --global` |
+| List health checks | `gcloud compute health-checks list` |
+| Create health check | `gcloud compute health-checks create http NAME --port=80 --request-path=/` |
+| List SSL certs | `gcloud compute ssl-certificates list --global` |
+| Create forwarding rule | `gcloud compute forwarding-rules create NAME --global --target-proxy=PROXY --ports=443` |
+
+## Monitoring
+
+**Key Load Balancer Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| Request count | Total requests handled |
+| Backend latency | Time from LB to backend |
+| Backend request count | Requests per backend |
+| Backend error rate | 5xx errors / total requests |
+| Healthy instances | Current healthy instance count |
+| RTT | Round-trip time to backends |
+
+```bash
+# View load balancer metrics
+gcloud monitoring metrics list | grep loadbalancing
+
+# Check backend service health
+gcloud compute backend-services get-health backend --global
+
+# View logs
+gcloud logging read 'resource.type="http_load_balancer"'
+```
+
+## Security
+
+**Load Balancer Security:**
+- SSL/TLS termination with managed certificates
+- QuIC protocol support for better performance
+- Cloud Armor integration for DDoS and WAF
+- HTTP Strict Transport Security (HSTS) support
+- Certificate revocation checking
+
+**Best Practices:**
+```bash
+# Use strong TLS policies
+gcloud compute ssl-policies create strong-policy \
+    --profile=RESTRICTED \
+    --min-tls-version=TLS_1_2
+
+# Apply SSL policy to target proxy
+gcloud compute target-https-proxies update my-proxy \
+    --ssl-policy=strong-policy
+```
+
+## Cost Optimization
+
+**Load Balancer Costs:**
+| Component | Cost |
+|-----------|------|
+| Forwarding rules (global) | ~$0.025/hour |
+| Forwarding rules (regional) | ~$0.01/hour |
+| Data processed | ~$0.008/GB |
+| SSL certificates (managed) | Free |
+
+**Optimization:**
+- Use regional LBs for regional traffic
+- Enable CDN caching to reduce backend load
+- Use connection draining for graceful instance removal
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Health checks failing**
+   ```bash
+   # Check firewall rules allow health check IPs
+   gcloud compute firewall-rules list --filter="name~health"
+   
+   # Verify backend is running
+   gcloud compute backend-services get-health backend --global
+   
+   # Test health check endpoint
+   curl -v http://BACKEND_IP/health
+   ```
+
+2. **SSL certificate not working**
+   ```bash
+   # Check certificate status
+   gcloud compute ssl-certificates describe cert --global
+   
+   # Certificate provisioning takes 60-90 minutes
+   # Check for DNS verification if using managed cert
+   ```
+
+3. **502 Bad Gateway errors**
+   ```bash
+   # No healthy backends
+   gcloud compute backend-services get-health backend --global
+   
+   # Increase backend timeout
+   gcloud compute backend-services update backend --global --timeout=30s
+   ```
+
+## Interview Questions
+
+1. **What's the difference between global and regional load balancers in GCP?**
+
+2. **Explain the components of an HTTP(S) Load Balancer and how they work together.**
+
+3. **How do health checks work and what are the common health check configurations?**
+
+4. **When would you use an internal load balancer vs an external load balancer?**
+
+5. **How does managed SSL certificate provisioning work in GCP?**
+
+## Cheat Sheet
+
+```
+# Load Balancer Components
+gcloud compute backend-services          # Backends
+gcloud compute health-checks             # Health monitoring
+gcloud compute url-maps                  # Request routing
+gcloud compute target-https-proxies      # SSL termination
+gcloud compute forwarding-rules          # Traffic intake
+gcloud compute ssl-certificates          # SSL/TLS certs
+
+# Key Flags
+--global              # Global load balancer
+--region=REGION       # Regional load balancer
+--enable-cdn          # Enable Cloud CDN
+--health-checks=HC    # Attach health check
+--ssl-certificates=   # Attach SSL certificate
+```
+
+## Labs
+
+1. **HTTP Load Balancer**: Create external HTTP LB with managed instance group
+2. **HTTPS with SSL**: Add SSL certificate and configure HTTPS
+3. **Internal Load Balancer**: Create internal LB for private services
+4. **Path-based Routing**: Configure URL map for multiple services
+5. **Health Checks**: Configure and test health checks
+
+## Related Services
+
+- [VPC](./vpc)
+- [Firewall Rules](./firewall)
+- [Cloud Armor](https://cloud.google.com/armor)
+- [Cloud CDN](./cloud-cdn)
+- [GKE](../compute/gke)

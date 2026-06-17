@@ -1,0 +1,458 @@
+---
+sidebar_position: 6
+description: Linux user management, groups, sudo configuration, PAM, and authentication integration for production systems.
+---
+
+# Users and Groups
+
+## Overview
+
+User and group management is foundational to Linux security. Every process runs as a user, every file is owned by a user and group. Misunderstanding this leads to permission errors, security vulnerabilities, and failed deployments. DevOps engineers must master useradd, sudoers configuration, PAM modules, and integration with centralized authentication systems like LDAP/Active Directory.
+
+The /etc/passwd file stores user information (UID, GID, home shell). /etc/shadow stores encrypted passwords (only root readable). /etc/group stores group memberships. These files are critical infrastructure — corruption breaks login and sudo. Production systems increasingly delegate authentication to central directories (LDAP, Active Directory, SAML, OIDC) via PAM and SSSD.
+
+## When To Use
+
+- Creating service accounts for applications
+- Configuring sudo access for operators
+- Debugging permission denied errors
+- Setting up LDAP/Active Directory integration
+- Managing sudo privileges in compliance with least privilege
+
+## When NOT To Use
+
+- When containers should handle isolation (Kubernetes SecurityContext)
+- When a centralized identity provider handles authentication
+
+## Core Concepts
+
+### User Database Files
+
+```bash
+# /etc/passwd format: name:password:uid:gid:gecos:home:shell
+# password field is 'x' — actual password is in /etc/shadow
+cat /etc/passwd
+root:x:0:0:root:/root:/bin/bash
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+
+# /etc/shadow format: name:encrypted_password:last_change:min:max:warn:inactive:expire
+# ! means account locked, * means no password
+sudo cat /etc/shadow
+root:$6$saltsalt$hash:19124:0:99999:7:::
+www-data:!:19124:0:99999:7:::
+
+# /etc/group format: name:password:gid:members
+cat /etc/group
+sudo:x:27:user1,user2
+www-data:x:33:
+```
+
+### Creating and Managing Users
+
+```bash
+# Create user with defaults
+sudo useradd deploy
+
+# Create user with specific options
+sudo useradd \
+    -c "Deployment Service Account" \
+    -d /opt/deploy \
+    -s /bin/bash \
+    -m \
+    -u 1500 \
+    -g deploy-group \
+    -G sudo,docker \
+    deploy
+
+# Modify user
+sudo usermod -aG docker deploy        # Add to group
+sudo usermod -s /sbin/nologin deploy  # Disable login
+sudo usermod -L deploy                # Lock account
+sudo usermod -U deploy                # Unlock account
+
+# Set password
+sudo passwd deploy
+
+# Delete user (keep home)
+sudo userdel deploy
+
+# Delete user and home directory
+sudo userdel -r deploy
+
+# View user info
+id deploy
+whoami
+groups
+finger deploy
+
+# Set default permissions for new users
+useradd -D                          # Show defaults
+useradd -D -s /bin/zsh             # Change default shell
+```
+
+### Creating and Managing Groups
+
+```bash
+# Create group
+sudo groupadd developers
+sudo groupadd -g 1500 ops-team
+
+# Add users to group
+sudo usermod -aG developers user1
+sudo gpasswd -a user1 developers
+
+# Remove user from group
+sudo gpasswd -d user1 developers
+sudo gpasswd -d user1 developers
+
+# List group members
+getent group developers
+
+# Delete group
+sudo groupdel developers
+```
+
+### Sudo Configuration
+
+```bash
+# NEVER edit /etc/sudoers directly — use visudo
+sudo visudo
+
+# Basic sudoers syntax
+# user  host=(runas) commands
+deploy  ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx
+
+# Example sudoers file
+cat /etc/sudoers.d/deploy-users
+# Deployment team can restart services
+%deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl restart gunicorn
+
+# Operators can sudo as any user except root
+%operators ALL=(ALL) !/usr/bin/passwd root, !/bin/su root
+
+# Specific user with password expiry
+deploy-user ALL=(deploy-service) PASSWD: /bin/bash, /usr/bin/ls
+
+# Aliases in sudoers
+User_Alias DEPLOY_OPS = user1, user2, user3
+Cmnd_Alias NGINX_CMDS = /usr/bin/systemctl * nginx, /usr/bin/nginx -t
+DEPLOY_OPS ALL=(ALL) NOPASSWD: NGINX_CMDS
+
+# Environment preserved
+Defaults env_keep += "DJANGO_SETTINGS_MODULE"
+Defaults env_keep += "PATH"
+
+# Disable sudo password for specific user
+deploy ALL=(ALL) NOPASSWD: ALL
+
+# Defaults (security hardening)
+Defaults    timestamp_timeout=15      # Cache password for 15 min
+Defaults    requiretty                 # Require TTY
+Defaults    use_pty                    # UsePTY for sudo commands
+```
+
+### PAM (Pluggable Authentication Modules)
+
+```bash
+# PAM configuration files
+ls /etc/pam.d/
+cat /etc/pam.d/sshd
+
+# Common PAM modules
+# pam_unix.so - traditional /etc/passwd auth
+# pam_systemd.so - session management via systemd
+# pam_limits.so - resource limits (ulimit)
+# pam_pwquality.so - password quality
+# pam_faillock.so - account lockout
+
+# Password quality requirements
+cat /etc/security/pwquality.conf
+minlen = 14
+dcredit = -1    # At least 1 digit
+ucredit = -1    # At least 1 uppercase
+lcredit = -1    # At least 1 lowercase
+maxrepeat = 2   # Max repeated characters
+
+# Resource limits
+cat /etc/security/limits.conf
+* soft nofile 65536
+* hard nofile 65536
+www-data soft nproc 4096
+www-data hard nproc 8192
+```
+
+## Real Production Example
+
+Setting up LDAP authentication for a production environment:
+
+```bash
+#!/bin/bash
+# setup-ldap-auth.sh
+
+set -euo pipefail
+
+# Install LDAP client
+apt-get update
+apt-get install -y \
+    libnss-ldapd \
+    libpam-ldapd \
+    nslcd \
+    ldap-utils
+
+# Configure nslcd (LDAP connection)
+cat > /etc/nslcd.conf <<'EOF'
+uid nslcd
+gid nslcd
+uri ldap://ldap.internal.example.com
+base dc=example,dc=com
+binddn cn=service,ou=service-accounts,dc=example,dc=com
+bindpw SECRET_BIND_PASSWORD
+ssl start tls
+tls_checkcat yes
+tls_cacertfile /etc/ssl/certs/ca-certificates.crt
+
+# User search filter
+filter passwd (objectClass=posixAccount)
+map passwd uid sAMAccountName
+map passwd uidNumber msSFU30UidNumber
+map passwd gidNumber msSFU30GidNumber
+map passwd homeDirectory msSFU30HomeDirectory
+map passwd loginShell msSFU30LoginShell
+
+# Group search
+filter group (objectClass=posixGroup)
+map group gidNumber msSFU30GidNumber
+EOF
+
+chmod 600 /etc/nslcd.conf
+
+# Configure NSS to use LDAP
+cat > /etc/nsswitch.conf <<'EOF'
+passwd:         files ldap
+group:          files ldap
+shadow:         files ldap
+hosts:          files dns
+networks:       files
+protocols:      db files
+services:       db files
+ethers:         db files
+rpc:            db files
+netgroup:       nis
+EOF
+
+# PAM configuration for LDAP
+# /etc/pam.d/common-account - add:
+# account [success=1 new_authtok_reqd=done default=ignore] pam_ldap.so
+
+# Create local admin backup account
+useradd -m -s /bin/bash -G sudo localadmin
+passwd localadmin
+
+# Test LDAP lookup
+getent passwd deploy-user
+id deploy-user
+
+# Restart services
+systemctl restart nslcd
+systemctl enable nslcd
+```
+
+## CLI Examples
+
+```bash
+# User management
+sudo useradd -m newuser
+sudo passwd newuser
+sudo usermod -aG groupname newuser
+sudo userdel -r newuser
+
+# Group management
+sudo groupadd groupname
+sudo gpasswd -a username groupname
+sudo groupdel groupname
+
+# Sudo
+sudo -i                           # Interactive root shell
+sudo -u username command          # Run as user
+sudo -l                           # List sudo privileges
+sudo visudo                       # Edit sudoers safely
+
+# PAM
+pam-auth-update                   # Configure PAM
+pam_unix.so
+
+# LDAP/LDAPS
+ldapsearch -x -h ldap.example.com -b "dc=example,dc=com" "(uid=*)"
+getent passwd username
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `useradd` | Create user | `useradd -m deploy` |
+| `usermod` | Modify user | `usermod -aG docker deploy` |
+| `userdel` | Delete user | `userdel -r deploy` |
+| `passwd` | Set password | `passwd username` |
+| `groupadd` | Create group | `groupadd developers` |
+| `gpasswd` | Group admin | `gpasswd -a user group` |
+| `id` | User identity | `id username` |
+| `whoami` | Current user | `whoami` |
+| `visudo` | Edit sudoers | `visudo` |
+| `getent` | Query databases | `getent group sudo` |
+
+## Monitoring
+
+```bash
+# Failed login attempts
+sudo lastb
+journalctl -u sshd | grep "Failed password"
+
+# Current sessions
+who
+w
+last
+lastlog
+
+# Sudo command usage
+sudo grep sudo /var/log/auth.log
+
+# Account lockouts
+sudo pam_tally2 --user username
+sudo faillock --user username --list
+
+# Password expiry
+sudo chage -l username
+sudo passwd -S username
+```
+
+## Security
+
+**Critical practices:**
+
+- Use `visudo` always, never edit /etc/sudoers directly
+- Prefer group-based sudo (allow sudo group, not individual users)
+- NOPASSWD is acceptable for service accounts running automation
+- Require password for privileged commands, not TTY
+- Set `timestamp_timeout=15` or less (default 15 minutes)
+- Lock service account passwords (`usermod -L`)
+- Use `/sbin/nologin` or `/usr/bin/nologin` for service accounts
+- Regular audit of sudo access:
+
+```bash
+# Audit sudo access
+grep -E "^(User|Group)" /etc/sudoers.d/* 2>/dev/null
+# Find users with sudo
+getent group sudo
+# Review sudo logs
+sudo grep "COMMAND" /var/log/auth.log | tail
+```
+
+**PAM hardening:**
+
+```bash
+# /etc/pam.d/common-auth additions
+auth required pam_faillock.so preauth silent audit deny=5 unlock_time=900
+auth [default=die] pam_faillock.so authfail audit deny=5 unlock_time=900
+```
+
+## Troubleshooting
+
+**"User is not in the sudoers file":**
+
+```bash
+# Solution: add user to sudo group
+usermod -aG sudo username
+# Or edit sudoers (from root)
+echo "username ALL=(ALL) ALL" >> /etc/sudoers.d/username
+```
+
+**LDAP user cannot login:**
+
+```bash
+# Debug nslcd
+nslcd -d   # Debug mode, foreground
+
+# Test LDAP connection
+ldapsearch -x -h ldap.internal -b "dc=example,dc=com" -D "cn=admin,dc=example,dc=com" -W
+
+# Check nsswitch.conf
+getent passwd username
+# If empty, LDAP isn't resolving
+
+# Check nslcd logs
+journalctl -u nslcd -n 50
+```
+
+**Account locked after failed attempts:**
+
+```bash
+# Check lock status
+sudo pam_tally2 --user username
+
+# Unlock
+sudo pam_tally2 --user username --reset
+
+# Or with faillock
+sudo faillock --user username --reset
+```
+
+## Interview Questions
+
+1. **What's the difference between /etc/passwd and /etc/shadow? Why split them?**
+
+/etc/passwd is world-readable (needed for lookup utilities) but contains user info including what used to be the password field. Modern systems put 'x' there as a placeholder. /etc/shadow is only readable by root and contains the encrypted password plus password aging metadata. Splitting them allows non-root processes to get user information without exposure to password cracking attacks.
+
+2. **How does LDAP authentication work on Linux?**
+
+The nslcd daemon connects to the LDAP server (using binddn credentials) and caches results. When a user logs in or `getent` is called, nslcd queries LDAP and maps attributes (sAMAccountName to uid, msSFU30HomeDirectory to homeDirectory). NSS (Name Service Switch) is configured to check both local files and LDAP. PAM handles the actual authentication via pam_ldap.so, which binds to LDAP as the user.
+
+3. **What is the difference between `usermod -aG` and adding a user to a group in /etc/group directly?**
+
+`usermod -aG` appends the user to the supplementary group list, preserving existing memberships. Editing /etc/group manually or using `gpasswd -a` is equivalent. However, `usermod -G` (without -a) replaces the group list entirely, which can remove groups. Always use -a when appending.
+
+4. **How would you audit who has sudo access across multiple servers?**
+
+Collect `/etc/sudoers` and `/etc/sudoers.d/*` from all servers, plus group memberships for sudo/sudoers/admin groups. Parse for user specifications (`username ALL=`) and group specifications (`%groupname ALL=`). Cross-reference with LDAP/AD if used. Tools like ansible, puppet, or commercial sudo management solutions can automate this. Also check sudo logs for actual usage.
+
+5. **What happens when you lock a user account with `usermod -L`?**
+
+The account isn't deleted or disabled for existing sessions, but the password field in /etc/shadow gets an `!` prefix prepended, making the stored hash invalid. Any existing SSH key or PAM-based session remains active. For complete lockout, also set `usermod -s /sbin/nologin` and kill existing sessions with `pkill -KILL -u username`.
+
+## Cheat Sheet
+
+```
+# User operations
+useradd -m -s /bin/bash username
+usermod -aG group username     # Add to group
+usermod -L username            # Lock account
+usermod -s /sbin/nologin svc   # No login shell
+userdel -r username            # Delete + home
+
+# Group operations
+groupadd groupname
+gpasswd -a user group
+gpasswd -d user group
+
+# Sudo
+visudo                           # Edit sudoers
+sudo -l                          # List privileges
+
+# Info
+id username
+whoami
+groups
+getent group groupname
+finger username
+
+# Password management
+passwd username
+chage -l username               # Password aging info
+```
+
+## Related Topics
+
+- [Permissions](./permissions) — File ownership, ACLs, special bits
+- [Security](./security) — Account hardening, PAM security
+- [Processes](./processes) — Process ownership and user context
+- [Shell](./shell) — Login shells and environment

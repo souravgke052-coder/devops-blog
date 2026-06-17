@@ -1,0 +1,495 @@
+---
+sidebar_position: 9
+description: Linux process management, signals, ps, top, htop, process priority, and daemon management.
+---
+
+# Process Management
+
+## Overview
+
+Every running program on Linux is a process. Understanding process lifecycle — creation, states, signals, and termination — is fundamental to system administration and debugging. Processes have PIDs, parent PIDs, ownership, file descriptors, and consume CPU/memory. The kernel schedules processes, manages their execution, and provides inter-process communication mechanisms.
+
+Processes exist in different states: running (R), sleeping (S), disk sleep (D), stopped (T), tracing stop (t), zombie (Z), or dead (X). Zombie processes are terminated but waiting for the parent to read their exit status. Dead processes are truly gone. The init process (PID 1, now systemd) adopts orphaned processes.
+
+Signals are the primary mechanism for process control. SIGTERM (15) requests graceful termination, SIGKILL (9) forces termination, SIGHUP (1) often triggers configuration reload. Understanding signal handling is critical for graceful service restarts.
+
+## When To Use
+
+- Debugging high CPU/memory usage
+- Gracefully restarting services
+- Finding processes by name, port, or file
+- Setting process priority
+- Debugging hung or zombie processes
+
+## When NOT To Use
+
+- When containers/Kubernetes handle process management
+- When systemd manages the application lifecycle
+
+## Core Concepts
+
+### Process States
+
+```
+R - Running or runnable (on run queue)
+S - Interruptible sleep (waiting for event)
+D - Uninterruptible sleep (I/O, cannot be interrupted)
+T - Stopped (by job control signal)
+t - Tracing stop (debugger)
+Z - Zombie (terminated but not reaped)
+X - Dead (should never be seen)
+```
+
+### ps Command
+
+```bash
+# Basic process list
+ps aux                 # All processes, user-oriented format
+ps -ef                 # Full-format listing
+ps -eLf                # Threads (LWP = light-weight process)
+
+# Format options
+ps -o pid,ppid,user,comm,%cpu,%mem,etime
+
+# Sort by CPU/memory
+ps aux --sort=-%cpu
+ps aux --sort=-%mem
+
+# Find specific process
+ps aux | grep nginx
+ps -C nginx            # By command name
+
+# Process tree
+pstree
+pstree -p              # With PIDs
+ps -ef --forest        # ASCII tree
+```
+
+### top and htop
+
+```bash
+# top basics
+top                    # Interactive
+top -d 1               # Update every second
+top -p <PID>           # Monitor specific process
+top -u deploy          # Only user processes
+top -b -n 1            # Batch mode (scripting)
+
+# top interactive commands
+# h/j/k - highlight/sort columns
+# f - add/remove columns
+# 1 - toggle CPU per-core
+# c - show command line
+# k - kill process
+# r - renice
+# q - quit
+
+# htop (better top)
+htop
+htop -d 10             # Delay
+htop -u deploy         # Filter by user
+htop -p PID1,PID2      # Monitor specific PIDs
+
+# htop interactive
+# F2 - setup (columns, colors)
+# F3 - search
+# F4 - filter
+# F5 - tree view
+# F6 - sort
+# space - nice
+# u - show user processes
+```
+
+### Process Signals
+
+| Signal | Number | Default | Purpose |
+|--------|--------|---------|---------|
+| SIGTERM | 15 | Terminate | Graceful termination request |
+| SIGKILL | 9 | Terminate | Force kill (cannot be caught) |
+| SIGHUP | 1 | Terminate | Hangup — often reload config |
+| SIGINT | 2 | Terminate | Interrupt (Ctrl+C) |
+| SIGUSR1 | 10 | Ignore | User-defined (often reload) |
+| SIGUSR2 | 12 | Ignore | User-defined |
+| SIGSTOP | 19 | Stop | Pause (cannot be caught) |
+| SIGCONT | 18 | Continue | Resume stopped process |
+
+```bash
+# Send signal to process
+kill <PID>             # SIGTERM (15)
+kill -9 <PID>          # SIGKILL (9)
+kill -HUP <PID>        # SIGHUP (1)
+kill -USR1 <PID>       # SIGUSR1
+
+# Send to process by name
+pkill nginx            # SIGTERM
+pkill -9 nginx         # SIGKILL
+pkill -HUP nginx       # SIGHUP
+
+# Kill all by name
+killall nginx
+killall -9 nginx
+
+# List signals
+kill -l
+```
+
+### Process Priority
+
+**Nice values:** -20 (highest priority) to +19 (lowest), default 0.
+
+```bash
+# Nice (start with priority)
+nice -n -10 /path/to/command      # Higher priority
+nice -n 10 /path/to/command       # Lower priority
+
+# Renice (change running process)
+renice -n -10 -p <PID>
+renice -n 10 -u deploy            # All processes for user
+
+# ionice (I/O priority)
+ionice -c 2 -n 6 -p <PID>         # Best-effort, priority 6
+ionice -c 1 -p <PID>              # Real-time (needs root)
+ionice -c 3 -p <PID>              # Idle (only when disk idle)
+
+# cclass: 1=real-time, 2=best-effort, 3=idle
+# classdata: 0-7 for real-time/best-effort
+```
+
+### Zombie Processes
+
+```bash
+# Find zombie processes
+ps aux | grep -w Z
+top # Z column
+
+# Find zombie with parent
+ps -ef | grep -w Z
+
+# Check parent (PPID)
+# If PPID is 1 (init/systemd), the parent died
+# If PPID is another process, that parent isn't reaping
+
+# Force parent to reap (if parent is broken)
+# Kill the parent, then init reaps children
+kill -CHLD <parent_pid>
+
+# If parent won't die:
+kill -9 <parent_pid>
+```
+
+### Daemon Processes
+
+```bash
+# Classic daemon pattern (SysV)
+# 1. Fork
+# 2. setsid() - new session
+# 3. Fork again (optional)
+# 4. Change working directory
+# 5. Close stdio
+# 6. Redirect stdout/stderr to log
+
+# Modern: systemd handles daemonization
+# Just exec the process in foreground
+```
+
+## Real Production Example
+
+Monitoring and managing a production application:
+
+```bash
+#!/bin/bash
+# monitor-app.sh
+
+set -euo pipefail
+
+APP_NAME="myapp"
+APP_USER="myapp"
+APP_PID_FILE="/run/${APP_NAME}.pid"
+ALERT_CPU=80
+ALERT_MEM=80
+
+get_cpu_usage() {
+    ps -p $(cat $APP_PID_FILE 2>/dev/null) -o %cpu= 2>/dev/null || echo 0
+}
+
+get_mem_usage() {
+    ps -p $(cat $APP_PID_FILE 2>/dev/null) -o %mem= 2>/dev/null || echo 0
+}
+
+check_process() {
+    if [[ ! -f $APP_PID_FILE ]]; then
+        echo "PID file missing"
+        return 1
+    fi
+
+    local pid=$(cat $APP_PID_FILE)
+    if ! kill -0 $pid 2>/dev/null; then
+        echo "Process $pid not running"
+        return 1
+    fi
+
+    echo "Process $pid is running"
+    ps -p $pid -o pid,ppid,user,%cpu,%mem,etime,cmd
+}
+
+graceful_restart() {
+    echo "Graceful restart..."
+    kill -HUP $(cat $APP_PID_FILE)
+    sleep 5
+    check_process
+}
+
+force_restart() {
+    echo "Force restart..."
+    kill -TERM $(cat $APP_PID_FILE)
+    sleep 2
+    kill -KILL $(cat $APP_PID_FILE) 2>/dev/null || true
+    sleep 1
+    systemctl restart myapp
+}
+
+# Find processes by port
+find_by_port() {
+    local port=$1
+    lsof -i :$port -t
+}
+
+# Find processes by file
+find_by_file() {
+    local file=$1
+    lsof $file
+}
+
+# Show file descriptors for process
+show_fds() {
+    local pid=$1
+    ls -la /proc/$pid/fd/
+    echo "---"
+    ls -la /proc/$pid/fd/ | wc -l
+}
+
+# Show process environment
+show_env() {
+    local pid=$1
+    cat /proc/$pid/environ | tr '\0' '\n'
+}
+```
+
+## CLI Examples
+
+```bash
+# Basic process viewing
+ps aux
+ps -ef
+ps -C nginx
+
+# Threads
+ps -eLf | grep nginx
+ps -T -p <PID>
+
+# Tree view
+pstree -p
+pstree -ap <user>
+
+# Find processes
+pgrep nginx
+pidof nginx
+pkill nginx
+
+# Signal handling
+kill -l                    # List signals
+kill -SIGTERM 1234
+killall -SIGUSR1 nginx
+
+# Priority
+nice -n 10 command
+renice -n 10 -p 1234
+ionice -c 2 -n 6 -p 1234
+
+# Interactive monitoring
+top
+htop
+atop
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `ps aux` | All processes | `ps aux \| grep nginx` |
+| `ps -ef` | Full format | Parent-child relationships |
+| `pstree` | Process tree | Visual hierarchy |
+| `top` | Interactive monitor | Real-time CPU/mem |
+| `htop` | Better top | Color, easier navigation |
+| `kill` | Send signal | `kill -9 1234` |
+| `pkill` | Kill by name | `pkill nginx` |
+| `killall` | Kill by name | `killall nginx` |
+| `renice` | Change priority | `renice -n 10 -p 1234` |
+| `lsof` | Open files | `lsof -i :8080` |
+
+## Monitoring
+
+```bash
+# Real-time monitoring
+top
+htop
+atop                    # Advanced, persisted stats
+
+# Per-process I/O
+iotop -p <PID>
+pidstat -d 1 -p <PID>
+
+# System-wide I/O
+iostat -x 1
+
+# File descriptors
+lsof -p <PID>
+cat /proc/<PID>/limits
+
+# Context switches
+pidstat -w 1 -p <PID>
+
+# Thread count
+ps -eLf | grep <PID> | wc -l
+```
+
+## Security
+
+**Process isolation:**
+
+```bash
+# Run as specific user
+su - deploy -c "/path/to/command"
+sudo -u deploy /path/to/command
+
+# namespaces (unshare)
+unshare --pid --fork --mount-proc /bin/bash
+
+# cgroups limiting
+cgcreate -g memory:/limited
+echo 500M > /sys/fs/cgroup/memory/limited/memory.limit_in_bytes
+cgexec -g memory:/limited /path/to/command
+```
+
+**Process auditing:**
+
+```bash
+# Audit syscalls (requires auditd)
+auditctl -w /usr/bin/nginx -p x
+
+# strace (debugging)
+strace -p <PID>                    # Attach
+strace -f -e trace=open,read,write -p <PID>
+strace -c -p <PID>                 # Count syscalls
+```
+
+## Troubleshooting
+
+**Process in uninterruptible sleep (D):**
+
+```bash
+# Usually I/O waiting
+# Check with:
+iostat -x 1
+# or:
+dmesg | tail
+
+# If NFS: check NFS mount status
+mount | grep nfs
+# May need to force unmount
+umount -f /mnt/nfs
+
+# If disk failure: may need to reboot
+```
+
+**Zombie processes:**
+
+```bash
+# Find zombie
+ps aux | grep -w Z
+# Check parent
+ps -ef | grep -w Z
+
+# If parent is hung: kill parent
+kill -9 <parent_pid>
+
+# If parent won't die: escalate
+# Zombie isn't holding resources (just PID table entry)
+# May need to reboot if truly stuck
+```
+
+**High CPU but unknown cause:**
+
+```bash
+# Top CPU consumers
+ps aux --sort=-%cpu | head -20
+
+# Per-core usage
+top then press 1
+
+# strace top processes
+strace -c -p <high_pid>
+
+# Check for fork bombs
+ps -eLf | awk '{print $2}' | sort | uniq -c | sort -rn | head
+```
+
+## Interview Questions
+
+1. **What's the difference between SIGTERM and SIGKILL?**
+
+SIGTERM (15) is the polite termination request — processes can catch it, clean up (close files, flush buffers, stop gracefully), and exit. SIGKILL (9) cannot be caught or ignored — the kernel terminates the process immediately. Always try SIGTERM first; use SIGKILL only when the process doesn't respond.
+
+2. **What is a zombie process and how do you fix it?**
+
+A zombie is a terminated process that hasn't been reaped — the parent hasn't called wait() to read the exit status. The process table entry remains so the parent can later retrieve it. Fix by terminating the parent process (init/systemd will then reap). If parent won't die, you may need to reboot. Zombies don't consume CPU/memory beyond the PID table entry.
+
+3. **What is the difference between kill -9 and kill -SIGKILL?**
+
+None — they're identical. Signal 9 is SIGKILL. You can use either form. Similarly, kill -15 and kill -SIGTERM are the same.
+
+4. **How do you find which process is using a specific port?**
+
+`lsof -i :<port>` or `ss -tlnp | grep :<port>` or `netstat -tlnp | grep :<port>`. These show PID and process name. The -p flag requires root for full details.
+
+5. **What's the difference between ps aux and ps -ef?**
+
+`ps aux` shows all processes with a user-oriented format (BSD style) — includes %CPU, %MEM, VSZ, RSS, TTY, STAT columns. `ps -ef` shows standard (System V) format — includes UID, PID, PPID, C, STIME, TTY, TIME, CMD. The underlying data is the same; format differs. `ps aux` sorts by CPU% by default; `ps -ef` shows full parent-child relationship clearly.
+
+## Cheat Sheet
+
+```
+# Process viewing
+ps aux                  # All processes
+ps -ef                  # Full format
+ps -C <cmd>             # By command name
+pstree -p               # Tree view
+
+# Signal handling
+kill -15 <pid>          # SIGTERM (graceful)
+kill -9 <pid>           # SIGKILL (force)
+kill -HUP <pid>         # SIGHUP (reload)
+pkill <name>            # By name
+
+# Monitoring
+top                     # Real-time
+htop                    # Better top
+pidstat 1 -p <pid>      # Per-process stats
+
+# Priority
+nice -n 10 <cmd>        # Lower priority
+renice -n 10 -p <pid>   # Change running
+
+# Info
+lsof -p <pid>           # Open files
+cat /proc/<pid>/status  # Full status
+/proc/<pid>/environ     # Environment
+/proc/<pid>/maps        # Memory maps
+```
+
+## Related Topics
+
+- [Systemd](./systemd) — Service management
+- [Memory](./memory) — Process memory management
+- [CPU](./cpu) — Process scheduling
+- [Filesystem](./filesystem) — /proc filesystem

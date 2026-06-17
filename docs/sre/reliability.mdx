@@ -1,0 +1,839 @@
+---
+sidebar_position: 10
+---
+
+# Reliability
+
+## Overview
+
+Reliability is the measure of a system's ability to function correctly and consistently over time. In SRE, reliability is not about building perfect systems — that's impossible and expensive. Instead, reliability is about making explicit tradeoffs between the cost of improving reliability and the cost of failures, then systematically improving reliability where it matters most.
+
+Reliability is a product feature. Users choose services based on reliability. Businesses succeed or fail based on reliability. But reliability must be balanced against features and velocity — an infinitely reliable system that ships nothing has no value. SRE's error budget framework provides a principled way to balance these competing priorities.
+
+The goal is not 100% reliability — that's impossible and not cost-effective. The goal is "reliable enough" — defined by user expectations, business requirements, and competitive benchmarks. Once you know what "reliable enough" is (your SLO), you can systematically improve toward that target.
+
+## When To Use
+
+- **Designing new systems** — Build reliability in from the start
+- **Improving existing systems** — Systematic reliability improvement programs
+- **Setting SLOs** — Understanding what reliability level is needed
+- **Capacity planning** — Knowing how much redundancy is needed
+- **Incident review** — Understanding reliability impact of failures
+- **Architecture decisions** — Evaluating reliability tradeoffs
+
+## When NOT to Use
+
+- **Perfect systems** — Impossible and not cost-effective
+- **Before understanding user needs** — Reliability targets should match expectations
+- **Without measurement** — You can't improve what you don't measure
+- **At all costs** — Some reliability investments aren't worth the cost
+
+## Core Concepts
+
+### Availability vs Reliability
+
+**Availability**: The fraction of time a system is operational. "99.9% uptime"
+
+**Reliability**: How likely a system is to function correctly over time. Related but distinct:
+
+```
+A system can have high availability but low reliability:
+- Uptime: 99.9% (only 8.76 hours downtime/year)
+- But: When it works, it has bugs, data corruption, or errors
+
+A system can have high reliability but lower availability:
+- Never produces wrong results
+- But: May have scheduled maintenance windows
+```
+
+Reliability is about correctness, availability is about uptime. Both matter.
+
+### Key Reliability Metrics
+
+```yaml
+metrics:
+  availability:
+    description: "Fraction of time system is operational"
+    formula: "MTBF / (MTBF + MTTR)"
+    
+  mtbf:
+    description: "Mean Time Between Failures"
+    formula: "Total operational time / Number of failures"
+    
+  mttr:
+    description: "Mean Time To Repair"
+    formula: "Total repair time / Number of repairs"
+    
+  failure_rate:
+    description: "Frequency of failures"
+    formula: "1 / MTBF"
+    
+  reliability_score:
+    description: "Probability system works over time period"
+    formula: "e^(-failure_rate × time)"
+```
+
+### Redundancy Levels
+
+| Level | Description | Use Case | Cost Multiplier |
+|-------|-------------|----------|-----------------|
+| N | Single instance | Dev/test | 1x |
+| N+1 | One extra instance | Low criticality | 1.1-1.5x |
+| N+2 | Two extra instances | Medium criticality | 1.2-2x |
+| Active-Active | All instances serve traffic | High availability | 2x |
+| Active-Passive | Standby ready to take over | Critical systems | 2-3x |
+| Multi-Region | Geographic redundancy | Disaster recovery | 3-5x |
+
+## Real Production Example
+
+### Availability Calculations
+
+```python
+def calculate_availability(mtbf_hours, mttr_hours):
+    """
+    Calculate availability percentage.
+    
+    Args:
+        mtbf_hours: Mean time between failures in hours
+        mttr_hours: Mean time to repair in hours
+    """
+    total_cycle = mtbf_hours + mttr_hours
+    return (mtbf_hours / total_cycle) * 100 if total_cycle > 0 else 0
+
+# Example: System fails every 720 hours (30 days), takes 1 hour to repair
+mtbf = 720  # 30 days between failures
+mttr = 1    # 1 hour to repair
+availability = calculate_availability(mtbf, mttr)
+print(f"Availability: {availability:.4f}%")  # 99.86%
+
+# Example: System fails every 720 hours, takes 30 minutes to repair
+mttr = 0.5  # 30 minutes
+availability = calculate_availability(mtbf, mttr)
+print(f"Availability: {availability:.4f}%")  # 99.93%
+```
+
+### Composite System Availability
+
+```python
+def composite_availability_serial(components):
+    """
+    Calculate availability for components in series.
+    System fails if ANY component fails.
+    
+    Availability = A1 × A2 × A3 × ... × An
+    
+    Example: 99.9% API × 99.9% DB × 99.9% Cache = 99.7%
+    """
+    result = 1.0
+    for avail in components:
+        result *= avail / 100
+    return result * 100
+
+def composite_availability_parallel(components):
+    """
+    Calculate availability for components in parallel.
+    System fails only if ALL components fail.
+    
+    Availability = 1 - (1-A1) × (1-A2) × ... × (1-An)
+    
+    Example: Two 99% available systems in parallel = 99.99%
+    """
+    result = 1.0
+    for avail in components:
+        result *= (100 - avail) / 100
+    return (1 - result) * 100
+
+# Example: API (99.9%), Database (99.99%), Cache (99.9%)
+components = [99.9, 99.99, 99.9]
+serial_avail = composite_availability_serial(components)
+print(f"Overall availability (serial): {serial_avail:.4f}%")  
+# 99.79%
+
+# Example: Two API instances, each 99.9%, running in parallel
+# If one fails, the other handles traffic
+api_instances = [99.9, 99.9]
+parallel_avail = composite_availability_parallel(api_instances)
+print(f"API availability (2x parallel): {parallel_avail:.4f}%")
+# 99.99%
+```
+
+### Designing for Reliability
+
+```yaml
+# Example: Highly available payment processing architecture
+
+architecture:
+  design: "Active-Active Multi-Region"
+  
+  components:
+    dns:
+      service: "Route 53 Latency Routing"
+      failover: "Automatic health check based"
+      rtt: "< 1 second"
+      
+    cdn:
+      service: "CloudFront"
+      cache_ttl: "Edge caching reduces origin load"
+      availability: 99.99%
+      
+    load_balancer:
+      service: "ALB + NLB"
+      health_checks: "Every 30 seconds"
+      failover: "Automatic"
+      availability: 99.99%
+      
+    application:
+      design: "Auto-scaling groups across 3 AZs"
+      min_instances: 3
+      max_instances: 50
+      health_check: "ELB health check + application health endpoint"
+      self_healing: true
+      
+    database:
+      design: "RDS Multi-AZ with read replicas"
+      primary: "1 in AZ-1"
+      standby: "1 in AZ-2 (sync replication)"
+      read_replicas: "2 in AZ-3"
+      failover_time: "< 60 seconds"
+      availability: 99.95%
+      
+    cache:
+      design: "ElastiCache Redis Cluster"
+      nodes: "3 shards, 2 replicas each"
+      automatic_failover: true
+      availability: 99.99%
+      
+    queue:
+      design: "SQS with DLQ"
+      redundancy: "Multi-AZ messages"
+      availability: 99.9%
+
+  overall_availability_calculation:
+    # Using worst-case approximation
+    dns: 99.99
+    cdn: 99.99
+    load_balancer: 99.99
+    application: 99.99
+    database: 99.95
+    cache: 99.99
+    queue: 99.90
+    
+    # System requires all components working
+    estimated_overall: "~99.9% with current design"
+```
+
+## Metrics / Formulas / Frameworks
+
+### Availability Math
+
+```python
+import math
+
+def downtime_from_availability(target_pct, period_days):
+    """
+    Calculate allowed downtime for target availability.
+    """
+    allowed_downtime_pct = 100 - target_pct
+    total_minutes = period_days * 24 * 60
+    return total_minutes * (allowed_downtime_pct / 100)
+
+def reliability_probability(failure_rate_per_hour, time_hours):
+    """
+    Calculate probability system works for given time.
+    
+    Based on exponential distribution.
+    """
+    return math.exp(-failure_rate_per_hour * time_hours)
+
+def mtbf_from_failure_rate(failure_rate_per_hour):
+    """Convert failure rate to MTBF."""
+    return 1 / failure_rate_per_hour if failure_rate_per_hour > 0 else float('inf')
+
+def failure_rate_from_mtbf(mtbf_hours):
+    """Convert MTBF to failure rate."""
+    return 1 / mtbf_hours if mtbf_hours > 0 else 0
+
+# Examples
+print(f"Downtime at 99.9% over 30 days: {downtime_from_availability(99.9, 30):.1f} minutes")
+# 43.8 minutes
+
+print(f"Downtime at 99.99% over 30 days: {downtime_from_availability(99.99, 30):.1f} minutes")
+# 4.4 minutes
+
+# Reliability after 24 hours (1 failure per 720 hours = 1 per month)
+failure_rate = 1 / 720  # per hour
+reliability = reliability_probability(failure_rate, 24)
+print(f"Reliability over 24h: {reliability:.4f} ({reliability*100:.2f}%)")
+# 96.72%
+```
+
+### Capacity vs Reliability
+
+```python
+def capacity_reliability_tradeoff(current_capacity, peak_demand, availability_target):
+    """
+    Analyze tradeoffs between capacity and reliability.
+    """
+    headroom = (current_capacity - peak_demand) / peak_demand
+    is_adequate = current_capacity >= peak_demand * 1.2  # 20% headroom
+    
+    cost_of_reliability = estimate_reliability_cost(current_capacity, availability_target)
+    
+    return {
+        'headroom_pct': headroom * 100,
+        'is_adequate': is_adequate,
+        'recommendation': 'scale_up' if not is_adequate else 'adequate'
+    }
+```
+
+## Common Tools and Commands
+
+### Reliability Testing
+
+```bash
+# === Load Testing (k6) ===
+# k6-basic.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '5m', target: 100 },   // Ramp up
+    { duration: '10m', target: 100 },  // Steady state
+    { duration: '5m', target: 0 },     // Ramp down
+  ],
+  thresholds: {
+    http_req_duration: ['p99<500'],  // p99 latency < 500ms
+    http_req_failed: ['rate<0.01'],   // Error rate < 1%
+  },
+};
+
+export default function() {
+  const res = http.get('https://api.example.com/health');
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'duration < 200ms': (r) => r.timings.duration < 200,
+  });
+  sleep(1);
+}
+
+# Run load test
+k6 run k6-basic.js
+
+# === Chaos Engineering (Litmus) ===
+# Install Litmus
+helm install litmus litmuschaos/litmus --namespace litmus
+
+# Run pod-kill experiment
+kubectl apply -f - <<EOF
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: api-chaos
+  namespace: production
+spec:
+  appinfo:
+    appns: production
+    applabel: app=api
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-kill
+EOF
+
+# === Health Check ===
+curl -s -o /dev/null -w "%{http_code}" https://api.example.com/healthz
+# Should return 200
+```
+
+### Reliability Monitoring
+
+```promql
+-- Service availability (30-day window)
+sum(rate(http_requests_total{job="api",status!~"5.."}[30d]))
+/
+sum(rate(http_requests_total{job="api"}[30d]))
+
+-- SLO achievement over time
+# For 99.9% SLO
+1 - (
+  sum(rate(http_requests_total{job="api",status=~"5.."}[7d]))
+  /
+  sum(rate(http_requests_total{job="api"}[7d]))
+)
+
+-- Failure rate (failures per hour)
+sum(rate(http_requests_total{job="api",status=~"5.."}[1h]))
+
+-- MTTR proxy (average time in error state)
+# Approximation: total error time / number of error incidents
+sum(increase(http_requests_total{job="api",status=~"5.."}[24h])) 
+/
+sum(increase(http_requests_total{job="api",status=~"5.."}[1h]) > 0)
+```
+
+## Monitoring / Alerting Examples
+
+### Reliability Alert Rules
+
+```yaml
+# prometheus/rules/reliability-alerts.yaml
+groups:
+  - name: reliability
+    rules:
+      # SLO at risk
+      - alert: SLODailyBudgetBurned
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[24h]))
+              /
+              sum(rate(http_requests_total{job="api"}[24h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          > 100  # Burned full daily budget in 24 hours
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLO daily budget consumed"
+          description: "Full daily error budget burned in last 24 hours. Investigate."
+
+      # Reliability degradation trend
+      - alert: ReliabilityDegradationTrend
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status!~"5.."}[7d]))
+            /
+            sum(rate(http_requests_total{job="api"}[7d]))
+          )
+          <
+          (
+            sum(rate(http_requests_total{job="api",status!~"5.."}[7d] offset 7d))
+            /
+            sum(rate(http_requests_total{job="api"}[7d] offset 7d))
+          )
+          - 0.005  # More than 0.5% degradation week-over-week
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reliability degraded week-over-week"
+          description: "This week's reliability is {{ $value | humanizePercentage }} vs last week"
+
+      # Component failures tracking
+      - alert: ComponentFailureRateHigh
+        expr: |
+          sum(rate(component_failures_total[1h])) 
+          / 
+          sum(rate(component_operations_total[1h])) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Component failure rate above 1%"
+          description: "Component error rate: {{ $value | humanizePercentage }}"
+```
+
+### Availability Dashboard
+
+```json
+{
+  "title": "Reliability Dashboard",
+  "panels": [
+    {
+      "title": "30-Day Availability",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[30d]))\n  /\n  sum(rate(http_requests_total{job='api'}[30d]))\n) * 100",
+          "legendFormat": "Availability"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "red"},
+              {"value": 99.9, "color": "yellow"},
+              {"value": 99.95, "color": "green"}
+            ]
+          },
+          "decimals": 4
+        }
+      }
+    },
+    {
+      "title": "Weekly Availability Trend",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[7d]))\n  /\n  sum(rate(http_requests_total{job='api'}[7d]))\n) * 100",
+          "legendFormat": "This week"
+        },
+        {
+          "expr": "(\n  sum(rate(http_requests_total{job='api',status!~\"5..\"}[7d] offset 7d))\n  /\n  sum(rate(http_requests_total{job='api'}[7d] offset 7d))\n) * 100",
+          "legendFormat": "Last week"
+        }
+      ]
+    },
+    {
+      "title": "MTBF / MTTR Trend",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "mtbf_hours{service='api'}",
+          "legendFormat": "MTBF (hours)"
+        },
+        {
+          "expr": "mttr_minutes{service='api'}",
+          "legendFormat": "MTTR (minutes)"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Security
+
+### Reliability vs Security Tradeoffs
+
+```yaml
+security_reliability_tradeoffs:
+  encryption:
+    reliability_impact: "Slight latency increase from crypto operations"
+    recommendation: "Use hardware acceleration, optimize crypto libraries"
+    
+  authentication:
+    reliability_impact: "Failure can block all users"
+    recommendation: "Have fallback authentication, cache auth tokens"
+    
+  rate_limiting:
+    reliability_impact: "May block legitimate users during traffic spikes"
+    recommendation: "Graceful degradation, per-user limits not per-IP"
+    
+  backups:
+    reliability_impact: "None - improves data reliability"
+    recommendation: "Regular automated backups with tested restore"
+```
+
+### Data Integrity
+
+```yaml
+data_integrity_reliability:
+  checksum_verification:
+    description: "Verify data integrity at rest and in transit"
+    implementation: "SHA-256 checksums for backups, TLS for transit"
+    
+  consistency_checks:
+    description: "Periodic verification of data consistency"
+    implementation: "Scheduled jobs comparing expected vs actual record counts"
+    
+  durability_testing:
+    description: "Regular testing of backup restoration"
+    implementation: "Monthly restore tests with integrity verification"
+```
+
+## Cost Optimization
+
+### Reliability Investment Analysis
+
+```python
+def reliability_investment_analysis(current_reliability, target_reliability, 
+                                     cost_per_incident, incidents_per_year):
+    """
+    Analyze whether reliability investment is worth it.
+    """
+    # Calculate cost of current unreliability
+    current_cost = cost_per_incident * incidents_per_year
+    
+    # Estimate improvement from investment
+    # Doubling reliability roughly halves incident rate (rough approximation)
+    improvement_factor = target_reliability / current_reliability
+    improved_incidents = incidents_per_year / improvement_factor
+    
+    # Cost of improvement
+    # These would be actual estimates
+    investment_cost = estimate_investment_cost(current_reliability, target_reliability)
+    improved_cost = cost_per_incident * improved_incidents
+    
+    roi = (current_cost - improved_cost - investment_cost) / investment_cost * 100
+    
+    return {
+        'current_annual_cost': current_cost,
+        'improved_annual_cost': improved_cost,
+        'investment_cost': investment_cost,
+        'roi_percentage': roi,
+        'payback_months': investment_cost / ((current_cost - improved_cost) / 12)
+    }
+
+def reliability_cost_curve():
+    """
+    Show that reliability costs increase exponentially.
+    """
+    reliability_levels = [99, 99.5, 99.9, 99.95, 99.99, 99.999]
+    relative_costs = [1, 1.5, 2.5, 4, 8, 20]
+    
+    return list(zip(reliability_levels, relative_costs))
+# Output: [(99, 1), (99.5, 1.5), (99.9, 2.5), (99.95, 4), (99.99, 8), (99.999, 20)]
+```
+
+### Cost-Effective Reliability
+
+```yaml
+high_impact_low_cost_reliability:
+  - name: "Automated health checks"
+    cost: "Low (existing in most frameworks)"
+    impact: "High (faster detection)"
+    
+  - name: "Graceful degradation"
+    cost: "Medium (code changes needed)"
+    impact: "High (reduces user impact)"
+    
+  - name: "Better monitoring"
+    cost: "Low (observability tooling)"
+    impact: "High (faster MTTD)"
+    
+  - name: "Rollback automation"
+    cost: "Medium (CI/CD changes)"
+    impact: "High (faster MTTR)"
+    
+  - name: "Load shedding"
+    cost: "Medium (rate limiting implementation)"
+    impact: "High (prevents cascade failures)"
+
+low_impact_high_cost_reliability:
+  - name: "100% redundancy everywhere"
+    cost: "Very high"
+    impact: "Low (overkill for non-critical paths)"
+    
+  - name: "Zero-downtime deployments"
+    cost: "High"
+    impact: "Low for services with natural restart tolerance"
+    
+  - name: "Active-Active for single-region services"
+    cost: "High (complexity + cost)"
+    impact: "Medium (only helps with full AZ failure)"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Reliability Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| Over-engineering | Wasted resources | Match reliability to actual needs |
+| Under-monitoring | Slow detection | Monitor at all critical points |
+| No error budget | Unmanaged reliability | Set SLOs, track budget |
+| Ignoring failure modes | Cascading failures | Document and test failure scenarios |
+| No rollback plan | Extended outages | Automate rollback, test regularly |
+
+### Reliability Anti-Patterns
+
+```yaml
+anti_patterns:
+  - name: "Perfectionism"
+    description: "Building 99.999% reliability everywhere"
+    problem: "Massive cost, minimal benefit"
+    better: "Match reliability investment to user impact"
+    
+  - name: "Hope-based reliability"
+    description: "Assuming failures won't happen"
+    problem: "No preparation for failures that do happen"
+    better: "Design for failure, test failure scenarios"
+    
+  - name: "Magic redundancy"
+    description: "Adding redundancy without understanding failure modes"
+    problem: "Redundant components may share failure modes"
+    better: "Understand common-cause failures"
+    
+  - name: "Optimization for five nines"
+    description: "Targeting 99.999% without understanding cost"
+    problem: "20x cost for marginal improvement"
+    better: "Calculate if five nines justified"
+```
+
+## Interview Questions
+
+### Q1: How do you decide what reliability level to target?
+
+**A**: I base reliability targets on multiple factors:
+
+1. **User expectations**: What do users expect for this type of service?
+   - Banking: 99.99%+ (users will leave if unreliable)
+   - Social media: 99.9% (users tolerate brief issues)
+   - Batch processing: 99% (runs in background, retries OK)
+
+2. **Business impact**: What does downtime cost?
+   - Calculate cost per hour of downtime
+   - Compare to cost of improving reliability
+   - ROI analysis
+
+3. **Competitive benchmarks**: What do similar services offer?
+   - Don't significantly underperform competitors
+   - Don't over-engineer beyond market standards
+
+4. **Technical feasibility**: What can we actually achieve?
+   - Consider current architecture
+   - Factor in dependency reliability
+   - Plan improvement roadmap
+
+The result is typically a range: "Between 99.9% and 99.99%" — then I set SLOs at the achievable end and improve from there.
+
+### Q2: How do you design for reliability?
+
+**A**: Reliability design principles:
+
+1. **Design for failure**: Assume components WILL fail
+   - Implement circuit breakers
+   - Use bulkheads to isolate failures
+   - Design graceful degradation
+
+2. **Eliminate single points of failure**:
+   - Redundancy at each layer
+   - Understand shared failure modes
+   - Test failover behavior
+
+3. **Automate recovery**:
+   - Self-healing infrastructure
+   - Automated rollback
+   - Auto-scaling
+
+4. **Monitor deeply**:
+   - Golden signals at minimum
+   - Component-level health
+   - Predictive metrics (trending issues)
+
+5. **Reduce complexity**:
+   - Simpler systems fail in simpler ways
+   - Minimize dependencies
+   - Prefer proven patterns
+
+### Q3: What's the difference between horizontal and vertical scaling?
+
+**A**:
+
+| Aspect | Vertical (Scale Up) | Horizontal (Scale Out) |
+|--------|--------------------|-----------------------|
+| **How** | Add more CPU/RAM to existing machine | Add more machines |
+| **Limitation** | Hardware limits | Application must support distributed |
+| **Reliability** | Single point of failure | Built-in redundancy if done right |
+| **Cost** | Discrete jumps (buy bigger machine) | Linear (pay per instance) |
+| **Operational complexity** | Lower | Higher (distributed system challenges) |
+| **Best for** | Databases, stateful services | Stateless web services, APIs |
+
+Modern cloud-native architectures typically prefer horizontal scaling for reliability (easy to add/remove capacity, inherent redundancy), but some workloads (databases) still benefit from vertical scaling.
+
+### Q4: How do you balance reliability with feature velocity?
+
+**A**: The error budget framework provides a principled answer:
+
+- **Budget healthy**: Ship features aggressively
+- **Budget depleting**: Pause features, invest in reliability
+- **Budget exhausted**: All-hands on reliability, no new features
+
+Key practices:
+1. **Set SLOs and track error budget** — Visible, objective measure
+2. **Automate reliability work** — Prevents it from competing with features
+3. **Build reliability into deployment** — Rollback, canary, feature flags
+4. **Prioritize high-impact reliability work** — Not everything matters equally
+5. **Measure toil** — Automated away repetitive work doesn't compete with features
+
+### Q5: What is chaos engineering and when should you use it?
+
+**A**: Chaos engineering is the practice of deliberately injecting failures into systems to test their resilience. Netflix pioneered this with Chaos Monkey.
+
+**When to use**:
+- Building confidence in complex distributed systems
+- Validating that redundancy actually works
+- Finding hidden failure modes before users do
+- Testing disaster recovery procedures
+
+**How to do it safely**:
+1. Start with non-production experiments
+2. Define steady-state hypothesis (what should work)
+3. Inject small, controlled failures
+4. Observe and learn
+5. Gradually increase scope
+
+**Tools**: Litmus (Kubernetes), Chaos Monkey (Netflix), Gremlin (commercial)
+
+**Don't do**:
+- Run chaos in production without mature monitoring
+- Target critical systems without stakeholder buy-in
+- Inject failures that will definitely cause incidents
+
+## Cheat Sheet
+
+### Availability vs Downtime
+
+| Availability | Daily Downtime | Weekly Downtime | Monthly Downtime | Yearly Downtime |
+|--------------|----------------|-----------------|------------------|-----------------|
+| 99% | 14.4 min | 1.68 hr | 7.3 hr | 3.65 day |
+| 99.5% | 7.2 min | 50.4 min | 3.65 hr | 1.83 day |
+| 99.9% | 1.44 min | 10.1 min | 43.8 min | 8.76 hr |
+| 99.95% | 43.2 sec | 5.04 min | 21.9 min | 4.38 hr |
+| 99.99% | 8.64 sec | 1.01 min | 4.38 min | 52.6 min |
+| 99.999% | 0.86 sec | 6 sec | 26.3 sec | 5.26 min |
+
+### Reliability Formulas
+
+```python
+# Availability
+availability = MTBF / (MTBF + MTTR)
+
+# MTBF
+MTBF = Total Operational Time / Number of Failures
+
+# MTTR
+MTTR = Total Repair Time / Number of Repairs
+
+# Reliability (probability of success over time)
+R(t) = e^(-λt)  where λ = failure rate = 1/MTBF
+
+# Series system availability (both must work)
+A_series = A1 × A2 × A3 × ...
+
+# Parallel system availability (either can work)
+A_parallel = 1 - (1-A1) × (1-A2) × ...
+```
+
+### Redundancy Availability
+
+```
+N systems at 99% each:
+  Series: 99% (any failure fails the system)
+  Parallel (any): 99.99% (all must fail to fail)
+
+N=2 systems at 99.9% each:
+  Parallel: 99.9999% (0.0001% * 0.0001% = both fail)
+
+N=3 systems at 99% each:
+  2-of-3 voting: 99.99%+
+```
+
+### High Availability Checklist
+
+```
+[ ] No single points of failure
+[ ] Redundancy at each layer
+[ ] Health checks and failover
+[ ] Automated recovery/rollback
+[ ] Graceful degradation
+[ ] Circuit breakers
+[ ] Load shedding
+[ ] Monitoring at all layers
+[ ] Tested failover procedures
+[ ] Runbooks for failure scenarios
+```
+
+## Related Topics
+
+- [SLO](./slo.mdx) — Setting reliability targets
+- [Error Budget](./error-budget.mdx) — Managing reliability investments
+- [Capacity Planning](./capacity-planning.mdx) — Planning for growth
+- [Incident Management](./incident-management.mdx) — Responding to failures
+- [Monitoring](./monitoring.mdx) — Detecting reliability issues

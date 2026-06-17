@@ -1,0 +1,858 @@
+---
+title: "Kubernetes StatefulSets"
+description: "Complete guide to Kubernetes StatefulSets - managing stateful applications with stable identity and persistent storage"
+sidebar_position: 12
+---
+
+# Kubernetes StatefulSets
+
+## Overview
+
+A **StatefulSet** is a Kubernetes workload API object designed for managing stateful applications. Unlike Deployments, StatefulSets maintain a stable, unique network identity and persistent storage for each Pod. They are ideal for applications that require stable hostnames, ordered deployment/scaling, and persistent data across pod rescheduling.
+
+## When to Use
+
+- **Databases** (MySQL, PostgreSQL, MongoDB) requiring stable storage
+- **Message queues** (Kafka, RabbitMQ) requiring stable identities
+- **Distributed systems** requiring ordered startup/shutdown
+- **Clustered applications** requiring stable network identifiers
+- **Applications requiring persistent storage** that survives restarts
+- **Leader election** patterns requiring stable identities
+
+## When NOT to Use
+
+- **Stateless applications** - use Deployments instead
+- **Applications without persistent state** - unnecessary complexity
+- **Simple key-value stores** that can use shared storage
+- **Applications that don't need ordered operations**
+
+## Core Concepts
+
+### StatefulSet vs Deployment
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     StatefulSet vs Deployment                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Deployment (Stateless)                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Pods: myapp-abc123, myapp-def456, myapp-ghi789                     │   │
+│  │  • Random hash suffixes                                              │   │
+│  │  • Interchangeable (no stable identity)                              │   │
+│  │  • Parallel scaling/deployment                                       │   │
+│  │  • Single PVC (shared) or Ephemeral storage                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  StatefulSet (Stateful)                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Pods: mysql-0, mysql-1, mysql-2                                    │   │
+│  │  • Ordinal suffixes (stable identity)                                │   │
+│  │  • Ordered scaling/deployment                                        │   │
+│  │  • Ordered graceful termination                                      │   │
+│  │  • Individual PVCs per pod                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### StatefulSet Features
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         StatefulSet Features                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Stable Network Identity                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  {name}-{ordinal}.{service-name}.{namespace}.svc.cluster.local     │   │
+│  │  mysql-0.mysql.production.svc.cluster.local                         │   │
+│  │  mysql-1.mysql.production.svc.cluster.local                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Stable Persistent Storage                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  PVC: data-mysql-0  →  PV: mysql-pv-0                               │   │
+│  │  PVC: data-mysql-1  →  PV: mysql-pv-1                               │   │
+│  │  PVC: data-mysql-2  →  PV: mysql-pv-2                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Ordered Deployment/Scaling                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Deploy: mysql-0 → mysql-1 → mysql-2 (one at a time)               │   │
+│  │  Scale:  mysql-0 → mysql-1 → mysql-2 (add one, wait)               │   │
+│  │  Delete: mysql-2 → mysql-1 → mysql-0 (reverse ordinal order)       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### StatefulSet Controller Logic
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      StatefulSet Controller                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Create/Update:                                                           │
+│     - Create PersistentVolumeClaims from template                           │
+│     - Wait for PVCs to be bound                                              │
+│     - Create Pods with ordinal names                                         │
+│                                                                              │
+│  2. Scale Up:                                                                │
+│     - Create PVC for new pod                                                 │
+│     - Wait for PVC to bind                                                   │
+│     - Create pod with next ordinal                                           │
+│                                                                              │
+│  3. Scale Down:                                                              │
+│     - Mark pod as terminating (decrement ordinal)                           │
+│     - Wait for pod to terminate                                              │
+│     - PVC deletion depends on reclaimPolicy                                 │
+│                                                                              │
+│  4. Rolling Update:                                                          │
+│     - Update pods in reverse ordinal order                                   │
+│     - Wait for pod to be Ready before next                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production MySQL StatefulSet
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: production
+  labels:
+    app: mysql
+    tier: database
+spec:
+  serviceName: mysql
+  replicas: 3
+  podManagementPolicy: OrderedReady  # or Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  
+  selector:
+    matchLabels:
+      app: mysql
+  
+  template:
+    metadata:
+      labels:
+        app: mysql
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      # Service account for RBAC
+      serviceAccountName: mysql-sa
+      
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+      
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Init containers
+      initContainers:
+      # Bootstrap script
+      - name: init-mysql
+        image: mysql:8.0
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex
+          # Generate server-id based on ordinal
+          [[ -d /var/lib/mysql/mysql ]] && exit 0
+          
+          # Initialize data directory
+          mysql_install_db --user=mysql --datadir=/var/lib/mysql
+          
+          # Write server-id
+          echo "server-id=${HOSTNAME##*-}" > /mnt/config-map-etc/mysql/server-id.cnf
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        - name: config
+          mountPath: /mnt/config-map-etc
+      
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        ports:
+        - name: mysql
+          containerPort: 3306
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secrets
+              key: root-password
+        - name: MYSQL_DATABASE
+          value: "appdb"
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secrets
+              key: username
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secrets
+              key: password
+        
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+            ephemeral-storage: 10Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+            ephemeral-storage: 50Gi
+        
+        livenessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - "-h"
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - "-h"
+            - localhost
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+        
+        startupProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - "-h"
+            - localhost
+          failureThreshold: 30
+          periodSeconds: 10
+        
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - bash
+              - "-c"
+              - |
+                if [ -f /var/lib/mysql/mysql/master.info ]; then
+                  mysqladmin shutdown
+                fi
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - SYS_NICE
+        
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: config
+          mountPath: /etc/mysql/conf.d
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: run
+          mountPath: /var/run/mysqld
+          subPath: mysqld
+        
+        # Volume claim templates reference
+        # Data volume is managed separately via volumeClaimTemplates
+      
+      volumes:
+      - name: config
+        configMap:
+          name: mysql-config
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+      - name: run
+        emptyDir:
+          medium: Memory
+  
+  # Volume claim templates - creates separate PVCs for each pod
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app: mysql
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: premium-rwo
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Headless Service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: production
+  labels:
+    app: mysql
+spec:
+  # Headless service - no cluster IP, DNS returns pod IPs directly
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: mysql
+  - name: metrics
+    port: 9090
+    targetPort: metrics
+
+---
+# Client service for load-balanced access
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-read
+  namespace: production
+  labels:
+    app: mysql
+spec:
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+  # Only route to ready pods
+  publishNotReadyAddresses: false
+
+---
+# Secrets for MySQL
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secrets
+  namespace: production
+type: Opaque
+stringData:
+  root-password: "secure-root-password"
+  username: "appuser"
+  password: "secure-app-password"
+
+---
+# ConfigMap for MySQL configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: production
+data:
+  # Master configuration
+  master.cnf: |
+    [mysqld]
+    log-bin=mysql-bin
+    relay-log=mysql-relay-bin
+    binlog-format=ROW
+    gtid-mode=ON
+    enforce-gtid-consistency=ON
+    auto-increment-increment=3
+    auto-increment-offset=1
+  
+  # Slave configuration  
+  slave.cnf: |
+    [mysqld]
+    log-slave-updates=ON
+    relay-log=mysql-relay-bin
+    read-only=ON
+    super-read-only=ON
+    gtid-mode=ON
+    enforce-gtid-consistency=ON
+    auto-increment-increment=3
+```
+
+### Kafka StatefulSet
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: production
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  podManagementPolicy: Parallel  # Kafka can start in parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+      - name: kafka
+        image: confluentinc/cp-kafka:7.5.0
+        ports:
+        - containerPort: 9092
+          name: kafka
+        - containerPort: 9093
+          name: internal
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        command:
+        - bash
+        - "-c"
+        - |
+          export KAFKA_BROKER_ID=${POD_NAME##*-}
+          exec /etc/confluent/docker/run
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/kafka/data
+        - name: config
+          mountPath: /etc/kafka/secrets
+      volumes:
+      - name: config
+        secret:
+          secretName: kafka-secrets
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: premium-rwo
+      resources:
+        requests:
+          storage: 500Gi
+```
+
+## YAML Examples
+
+### Basic StatefulSet
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: my-statefulset
+spec:
+  serviceName: my-service  # Headless service name
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+      - name: app
+        image: nginx
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+```
+
+### StatefulSet with PersistentVolumeClaim Expansion
+
+```yaml
+volumeClaimTemplates:
+- metadata:
+    name: data
+  spec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: standard-rwo
+    resources:
+      requests:
+        storage: 100Gi  # Can be expanded later
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create StatefulSet
+kubectl apply -f statefulset.yaml
+
+# List StatefulSets
+kubectl get statefulsets
+kubectl get sts
+
+# Scale StatefulSet
+kubectl scale statefulset mysql --replicas=3
+
+# Get StatefulSet details
+kubectl get statefulset mysql -o yaml
+
+# Describe StatefulSet
+kubectl describe statefulset mysql
+
+# Delete StatefulSet (PVCs may remain)
+kubectl delete statefulset mysql
+```
+
+### StatefulSet Operations
+
+```bash
+# Get pods with ordinal index
+kubectl get pods -l app=mysql -o wide
+
+# Check PVCs for StatefulSet
+kubectl get pvc -l app=mysql
+
+# Check pod status
+kubectl get pod mysql-0 -o wide
+
+# Watch StatefulSet rollout
+kubectl rollout status statefulset/mysql
+
+# Delete StatefulSet with cascade (including PVCs)
+kubectl delete statefulset mysql --cascade=orphan
+kubectl delete pvc -l app=mysql
+
+# Force delete pod (StatefulSet will recreate)
+kubectl delete pod mysql-0 --force --grace-period=0
+```
+
+### Debugging
+
+```bash
+# Check pod order
+kubectl get pods -l app=mysql --sort-by='.metadata.name'
+
+# Check PVC binding status
+kubectl get pvc -l app=mysql
+
+# Check events for StatefulSet
+kubectl get events --field-selector involvedObject.name=mysql
+
+# Check individual pod
+kubectl describe pod mysql-0
+
+# Check pod logs
+kubectl logs mysql-0 --tail=100
+```
+
+## Common Commands
+
+```bash
+# Generate StatefulSet YAML
+kubectl create statefulset my-ss --image=nginx --dry-run=client -o yaml
+
+# Update StatefulSet image
+kubectl set image statefulset/mysql mysql=mysql:8.1
+
+# Rolling update
+kubectl rollout status statefulset/mysql
+
+# Rollback
+kubectl rollout undo statefulset/mysql
+
+# Get StatefulSet status
+kubectl get statefulset mysql -o jsonpath='{.status}'
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| statefulset_replicas | Desired replica count |
+| statefulset_status_replicas_ready | Ready replicas |
+| statefulset_status_replicas_updated | Updated replicas |
+| statefulset_status_replicas_healthy | Healthy replicas |
+| kube_persistentvolumeclaim_status_phase | PVC phase (Bound/Pending/Failed) |
+
+### Prometheus Queries
+
+```promql
+# StatefulSets not fully ready
+statefulset_status_replicas_ready < statefulset_replicas
+
+# Pod count by StatefulSet
+count(kube_pod_info) by (statefulset)
+
+# PVC usage
+kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes
+```
+
+## Security
+
+### RBAC for StatefulSet
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: statefulset-manager
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets/status"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list"]
+```
+
+### PodDisruptionBudget for StatefulSet
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mysql-pdb
+  namespace: production
+spec:
+  # Ensure at least 2 pods are available
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mysql
+```
+
+## Cost Optimization
+
+### Storage Selection
+
+| Use Case | Storage Class | Cost Optimization |
+|----------|---------------|-------------------|
+| High I/O databases | premium-rwo | Use regional PD for HA |
+| Development/testing | standard-rwo | Smaller volumes |
+| Caching/ephemeral | local-ssd | Fast, but no persistence |
+| Backup/snapshots | standard | Periodic snapshots |
+
+### Right-Sizing
+
+```bash
+# Check storage usage
+kubectl exec mysql-0 -n production -- df -h /var/lib/mysql
+
+# Monitor PVC sizes
+kubectl get pvc -l app=mysql -n production
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pod stuck in Pending | PVC not bound | Check StorageClass, provisioner |
+| Pod stuck in Terminating | Finalizers stuck | Check volume mounts, force delete |
+| Volume expansion failed | Not enabled | Enable allowVolumeExpansion |
+| Pod not starting | Init container failed | Check init container logs |
+| Data inconsistency | Concurrent writes | Use proper leader election |
+
+### Diagnostic Commands
+
+```bash
+# Check StatefulSet status
+kubectl get statefulset mysql -n production
+kubectl describe statefulset mysql -n production
+
+# Check all pods
+kubectl get pods -l app=mysql -n production
+
+# Check PVCs
+kubectl get pvc -l app=mysql -n production
+kubectl describe pvc data-mysql-0 -n production
+
+# Check pod events
+kubectl describe pod mysql-0 -n production
+
+# Check init container logs
+kubectl logs mysql-0 -n production -c init-mysql --previous
+
+# Force recreation
+kubectl delete pod mysql-0 -n production --grace-period=0
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a StatefulSet and when would you use it?**
+A: A StatefulSet is a Kubernetes workload for stateful applications that require stable network identity, ordered deployment/scaling, and persistent storage. Use it for databases, message queues, and clustered applications requiring stable hostnames.
+
+**Q: What is the difference between StatefulSet and Deployment?**
+A: Deployments create pods with random suffixes and are interchangeable. StatefulSets create pods with ordinal suffixes and stable identities. StatefulSets maintain individual PVCs per pod, while Deployments typically share a PVC or use ephemeral storage.
+
+**Q: What is a headless Service?**
+A: A headless Service (clusterIP: None) doesn't load balance but provides DNS entries that resolve to individual pod IPs. For StatefulSets, this enables direct pod-to-pod communication using stable hostnames.
+
+### Intermediate Questions
+
+**Q: How does StatefulSet handle scaling?**
+A: When scaling up, StatefulSet creates PVC then pod with next ordinal. When scaling down, it terminates pods in reverse ordinal order and can optionally delete PVCs based on reclaimPolicy.
+
+**Q: What is podManagementPolicy?**
+A: OrderedReady (default) creates/terminates pods sequentially, waiting for each to be Ready/Terminated. Parallel creates/terminates all pods simultaneously without waiting.
+
+### Advanced Questions
+
+**Q: How would you implement a MySQL primary-replica setup with StatefulSets?**
+A: Use a StatefulSet with 1 primary and N replicas. The primary uses specific configuration. Use an init container to configure replication. Use a headless Service for pod discovery and a ClusterIP Service for client access.
+
+## Cheat Sheet
+
+### StatefulSet YAML Template
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: my-statefulset
+spec:
+  serviceName: "my-headless-service"  # Must match headless Service
+  replicas: 3
+  podManagementPolicy: OrderedReady  # or Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+      - name: app
+        image: nginx
+  volumeClaimTemplates:
+  - metadata:
+      name: data  # Creates: data-my-statefulset-N
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard-rwo
+      resources:
+        requests:
+          storage: 10Gi
+```
+
+### Essential Commands
+
+```bash
+# Create
+kubectl apply -f statefulset.yaml
+
+# Scale
+kubectl scale statefulset my-ss --replicas=5
+
+# Get pods
+kubectl get pods -l app=myapp
+
+# Get PVCs
+kubectl get pvc -l app=myapp
+
+# Check rollout
+kubectl rollout status statefulset/my-ss
+
+# Delete
+kubectl delete statefulset my-ss --cascade=orphan  # Keep PVCs
+```
+
+### StatefulSet vs Deployment
+
+| Feature | StatefulSet | Deployment |
+|---------|-------------|------------|
+| Pod naming | Ordinal suffix | Random hash |
+| Stable identity | Yes | No |
+| Ordered operations | Yes | No (all at once) |
+| Individual PVCs | Yes | Typically shared |
+| Headless Service | Required | Optional |
+
+## Related Topics
+
+- [Deployments](./deployments) - Stateless applications
+- [Services](./services) - Headless and regular services
+- [Volumes](./volumes) - Persistent storage
+- [StorageClasses](./storage-classes) - Storage provisioning

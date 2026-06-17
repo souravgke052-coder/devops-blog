@@ -1,0 +1,445 @@
+---
+sidebar_position: 10
+description: Linux memory management, swap, OOM killer, huge pages, cgroups, and memory troubleshooting.
+---
+
+# Memory Management
+
+## Overview
+
+Linux memory management is complex but critical for production systems. The kernel dynamically allocates memory between file cache, process memory, and free buffers. Understanding MemAvailable vs MemFree, swap usage, and the OOM killer is essential for debugging memory pressure issues. Memory cgroups provide container-level isolation.
+
+Linux uses virtual memory — every process gets its own address space. Physical RAM is managed by the kernel through page reclaim, cache eviction, and swap. When physical RAM is exhausted, the kernel evicts pages to swap or invokes the OOM killer to free memory by terminating processes.
+
+## When To Use
+
+- Debugging out-of-memory issues
+- Configuring swap appropriately
+- Setting memory limits for containers or services
+- Understanding why "free memory" is low when system is healthy
+- Tuning memory for specific workloads (databases, Java)
+
+## When NOT To Use
+
+- When the application handles its own memory (embedded systems)
+- When running in memory-constrained containers with explicit limits
+
+## Core Concepts
+
+### Memory Terminology
+
+```
+MemTotal:     Total physical RAM
+MemFree:      Completely unused RAM
+MemAvailable: RAM available for processes (estimate)
+             = MemFree + reclaimable (cache/buffers)
+Buffers:      Raw disk blocks (metadata)
+Cached:       File contents (page cache)
+SwapCached:   Swapped pages now in RAM
+SwapTotal:    Total swap space
+SwapFree:     Unused swap
+```
+
+### /proc/meminfo
+
+```bash
+# Key metrics
+cat /proc/meminfo
+MemTotal:        32768000 kB     # ~32GB
+MemFree:          2048000 kB     # 2GB free
+MemAvailable:    24000000 kB     # 24GB available for apps
+Buffers:           512000 kB
+Cached:          18000000 kB     # Page cache
+SwapCached:        128000 kB
+SwapTotal:       8000000 kB      # 8GB swap
+SwapFree:        7900000 kB
+Shmem:             256000 kB     # Shared memory (tmpfs)
+SReclaimable:    12000000 kB     # Reclaimable slab
+```
+
+### free Command
+
+```bash
+# Basic
+free -h
+
+# Detailed with categories
+free -w
+
+# Per-swap area
+free -h -s 5                # Update every 5 seconds
+
+# Output:
+#               total        used        free      shared     buffers/cache   available
+# Mem:          32Gi        16Gi        2Gi       256Mi       14Gi           24Gi
+# Swap:         8Gi        100Mi       7.9Gi
+```
+
+### Virtual Memory and Swap
+
+```bash
+# Check swap usage
+swapon -s
+cat /proc/swaps
+
+# Enable/disable swap
+sudo swapon /swapfile
+sudo swapoff /swapfile
+
+# Create swap file
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# Add to fstab
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Swappiness (0-100, default 60)
+# Lower values = less swapping (better for databases)
+cat /proc/sys/vm/swappiness
+sudo sysctl -w vm.swappiness=10
+echo "vm.swappiness=10" | sudo tee -a /etc/sysctl.conf
+```
+
+### Page Cache and Buffer Cache
+
+```bash
+# Drop page cache (rarely needed)
+sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+# Values:
+# 1 = drop page cache
+# 2 = drop dentries and inodes
+# 3 = drop everything
+
+# Check cache pressure
+cat /proc/sys/vm/vfs_cache_pressure
+# 100 = reclaim cache aggressively
+# 50 = balanced (default)
+# 0 = never reclaim (can cause OOM)
+
+sudo sysctl -w vm.vfs_cache_pressure=50
+```
+
+### OOM Killer
+
+```bash
+# Check if OOM killer has fired
+dmesg | grep -i "out of memory"
+dmesg | grep -i "killed process"
+
+# Example:
+# [1234567.890123] Out of memory: Killed process 12345 (mysqld) total-vm:8234500kB, anon-rss:8123400kB, file-rss:0kB
+
+# OOM score for a process (0 to 1000, higher = more likely to die)
+cat /proc/<PID>/oom_score
+
+# Adjust OOM preference (lower = less likely to kill)
+echo -500 | sudo tee /proc/<PID>/oom_score_adj
+echo -1000 | sudo tee /proc/<PID>/oom_score_adj  # Protect completely
+
+# Prevent OOM killer for root processes
+echo -1000 > /proc/1/oom_score_adj  # systemd/init
+```
+
+### Huge Pages
+
+```bash
+# Check huge pages
+cat /proc/meminfo | grep -i huge
+# AnonHugePages:     1024 kB
+# HugePages_Total:       0
+# HugePages_Free:        0
+# Hugepagesize:       2048 kB
+
+# Allocate huge pages (for databases)
+# Edit /etc/sysctl.conf:
+vm.nr_hugepages = 128    # 128 * 2MB = 256MB
+
+# Or:
+sudo sysctl -w vm.nr_hugepages=128
+
+# Check allocation
+grep -i huge /proc/meminfo
+```
+
+### Memory Cgroups
+
+```bash
+# Memory cgroup limits (systemd)
+# In unit file:
+MemoryMax=4G
+MemoryHigh=3G
+MemoryLow=2G
+
+# Or runtime:
+sudo systemctl set-property nginx MemoryMax=2G
+
+# cgroup v2 limits
+# /sys/fs/cgroup/systemd/.../memory.max
+# /sys/fs/cgroup/systemd/.../memory.current
+
+# Check container memory (from inside container)
+cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+```
+
+## Real Production Example
+
+Optimizing a MySQL database server for memory:
+
+```bash
+#!/bin/bash
+# tune-mysql-memory.sh
+
+set -euo pipefail
+
+# Reserve more memory for MySQL by tuning OS
+cat >> /etc/sysctl.conf <<'EOF'
+# Memory tuning for MySQL
+vm.swappiness=10              # Minimal swapping (MySQL handles its own buffer)
+vm.vfs_cache_pressure=50      # Moderate cache reclaim
+vm.dirty_ratio=15             # Start writing at 15% of RAM
+vm.dirty_background_ratio=5   # Background write at 5%
+vm.overcommit_memory=1        # Always allow overcommit (MySQL uses sparse files)
+vm.overcommit_ratio=50        # 50% of RAM can be overcommit
+EOF
+
+sysctl -p
+
+# Create MySQL tuning config
+cat > /etc/mysql/conf.d/99-production.cnf <<'EOF'
+[mysqld]
+# InnoDB buffer pool - set to ~70-80% of RAM for dedicated DB server
+innodb_buffer_pool_size=24G
+
+# Keep buffer pool warm
+innodb_buffer_pool_instances=8
+
+# Log buffer (usually fine at default)
+innodb_log_buffer_size=128M
+
+# Temp tables in memory
+tmp_table_size=256M
+max_heap_table_size=256M
+
+# Query cache (disabled in MySQL 5.7+)
+# query_cache_type=0
+
+# Connection memory
+max_connections=500
+key_buffer_size=256M
+sort_buffer_size=4M
+read_buffer_size=2M
+join_buffer_size=2M
+
+# Thread memory
+thread_stack=256K
+thread_cache_size=32
+
+# OOM protection - MySQL should handle its own memory
+# Use cgroup limits if needed
+EOF
+
+# Restart MySQL to apply
+systemctl restart mysql
+```
+
+## CLI Examples
+
+```bash
+# Memory overview
+free -h
+cat /proc/meminfo
+
+# Detailed per-process
+ps aux --sort=-%mem | head
+pmap -x <pid>                # Memory map
+
+# Real-time monitoring
+vmstat 1
+vmstat 1 5                   # 5 samples
+
+# Per-process memory over time
+pidstat -r 1 -p <pid>
+
+# smem (more detailed)
+smem
+smem --userfilter deploy
+smem --processfilter nginx
+
+# memtest (boot test)
+# memtest86+ (run from GRUB)
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `free -h` | Memory summary | Shows total/used/free/available |
+| `cat /proc/meminfo` | Detailed memory stats | Kernel memory info |
+| `vmstat` | Virtual memory stats | `vmstat 1` |
+| `ps aux --sort=-%mem` | Sort by memory | Top memory consumers |
+| `pmap` | Process memory map | `pmap -x <pid>` |
+| `smem` | Memory report | Per-process with unique set size |
+| `lsof` | Open files (memory) | Check mmap'd files |
+
+## Monitoring
+
+```bash
+# Basic monitoring
+free -h
+cat /proc/meminfo
+
+# Per-process
+pidstat -r 1 -p <pid>        # RSS over time
+smem -p                      # Sort by percent
+
+# OOM events
+dmesg | grep -i oom
+journalctl -k | grep -i oom
+
+# Cgroup memory (containers)
+cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+
+# Transparent huge pages
+cat /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+## Security
+
+**Memory hardening:**
+
+```bash
+# Disable if not needed (reduces attack surface)
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+
+# /etc/default/grub:
+GRUB_CMDLINE_LINUX="transparent_hugepage=never"
+
+# ASLR (Address Space Layout Randomization)
+# Usually enabled by default
+cat /proc/sys/kernel/randomize_va_space
+# 0 = disabled, 1 = stack random, 2 = all random
+
+# Lock memory (prevent swapping sensitive data)
+mlockall() in application
+# or via PAM/limits.conf:
+echo "* soft memlock unlimited" >> /etc/security/limits.conf
+echo "* hard memlock unlimited" >> /etc/security/limits.conf
+```
+
+## Troubleshooting
+
+**System is OOM:**
+
+```bash
+# Check dmesg
+dmesg | grep -i "out of memory"
+
+# Find the culprit
+journalctl -k | grep -i killed
+
+# Increase memory or reduce pressure
+# Temporary: add swap
+# Long-term: increase RAM or reduce memory usage
+
+# Check what was running
+ps aux --sort=-%mem | head
+```
+
+**High memory usage, system slow:**
+
+```bash
+# Check what's using memory
+free -h
+ps aux --sort=-%mem | head
+
+# If mostly cache, system is healthy
+# If mostly used by processes, check for leaks
+
+# Memory leak detection
+valgrind --leak-check=full <command>
+# Or:
+pmap -x <pid> | grep -v "\[ anon \]" | tail
+
+# Check for process memory bloat
+cat /proc/<pid>/status | grep -E "(VmSize|VmRSS|VmData)"
+```
+
+**MySQL/Java using too much memory:**
+
+```bash
+# Check cgroup limits
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+
+# If limits are higher than physical RAM + swap
+# Set MemoryMax in systemd unit
+systemctl set-property mysql MemoryMax=28G
+
+# Java heap should be ~70% of container memory
+# -Xmx4g -XX:+UseContainerSupport
+```
+
+## Interview Questions
+
+1. **What's the difference between MemFree and MemAvailable?**
+
+MemFree is completely unused RAM. MemAvailable estimates how much memory is available for new processes without causing swapping — it's MemFree plus reclaimable page cache and buffers. MemAvailable ≤ MemFree + reclaimable memory. Before kernel 3.14, you had to estimate available memory manually; MemAvailable was added to make this easier.
+
+2. **When does Linux start swapping?**
+
+Linux uses the swappiness tunable (default 60) to decide when to evict pages to swap. Higher values = more aggressive swapping (even when RAM isn't full). Lower values = less swapping (better for workloads that should keep data in RAM). Setting swappiness=0 can still cause swapping under extreme memory pressure.
+
+3. **What is the OOM killer and how does it decide which process to kill?**
+
+When physical memory and swap are exhausted, the OOM killer selects a process to terminate based on an oom_score calculated from: memory usage, CPU time, runtime, and oom_score_adj (which you can adjust from -1000 to +1000). Lower oom_score_adj = less likely to kill. The kernel aims to kill the "most guilty" process — the one consuming the most memory relative to its importance.
+
+4. **What's the difference between RSS and VSZ in ps output?**
+
+RSS (Resident Set Size) is physical RAM actually used by the process (includes shared libraries). VSZ (Virtual Set Size) is the total virtual memory allocated (includes swapped out, allocated but not used, shared libraries). RSS is what matters for actual RAM usage; VSZ can be misleadingly large for processes with large address spaces.
+
+5. **When should you disable transparent huge pages?**
+
+Transparent huge pages (THP) can cause memory fragmentation and latency spikes as the kernel compacts memory. Databases and latency-sensitive applications often disable THP (`echo never > /sys/kernel/mm/transparent_hugepage/enabled`). For most other workloads, THP is beneficial and should be left enabled.
+
+## Cheat Sheet
+
+```
+# Memory monitoring
+free -h                       # Human-readable summary
+cat /proc/meminfo             # Detailed /proc info
+vmstat 1                      # Virtual memory stats
+
+# Swap
+swapon -s                     # Show swap areas
+swapon /swapfile              # Enable swap
+swapoff /swapfile             # Disable swap
+
+# Tuning
+/proc/sys/vm/swappiness       # 0-100
+/proc/sys/vm/vfs_cache_pressure
+/proc/sys/vm/dirty_ratio
+/proc/sys/vm/overcommit_memory
+
+# OOM
+dmesg | grep -i oom           # Check OOM events
+/proc/<pid>/oom_score         # Kill likelihood
+/proc/<pid>/oom_score_adj     # Adjust (-1000 to 1000)
+
+# Process memory
+ps aux --sort=-%mem           # Sort by memory
+pmap -x <pid>                 # Memory map
+smem                          # Detailed per-process
+```
+
+## Related Topics
+
+- [CPU](./cpu) — Process scheduling
+- [Storage](./storage) — Swap on disk
+- [Performance](./performance) — Memory tuning
+- [Processes](./processes) — Process memory usage

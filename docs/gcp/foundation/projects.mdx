@@ -1,0 +1,648 @@
+# Projects
+
+## Overview
+
+A GCP Project is the fundamental organizational unit for creating, enabling, and using all GCP services. Each project is a discrete billing and permissions boundary—it has its own quota, its own API enablement state, and its own IAM policies. Every resource you create belongs to exactly one project, and all API usage, quota consumption, and billing charges are tracked at the project level.
+
+Projects provide logical isolation between different applications, environments, or teams. A typical enterprise has dozens or hundreds of projects organized into folders under the organization node. Projects can be created, modified, deleted, and recovered (within 30 days) through the Resource Manager API.
+
+Understanding project architecture is crucial because it determines how you structure access control, billing, and resource management. Poor project structure leads to security vulnerabilities, billing confusion, and operational complexity. Well-designed projects enable teams to move fast while maintaining proper governance.
+
+## When To Use
+
+- **Separating environments**: Use separate projects for production, staging, development
+- **Isolating applications**: Each application or microservice gets its own project
+- **Team isolation**: Different teams or business units get separate projects
+- **Security boundaries**: High-security workloads in isolated projects
+- **Billing separation**: Track costs by project for chargeback/showback
+- **API isolation**: Services with different API requirements or quotas
+- **Shared VPC architectures**: Host projects and service projects for network isolation
+
+## When NOT To Use
+
+- **Single monolithic applications**: One project may suffice for simple apps
+- **Personal experimentation**: Use personal projects or a sandbox project
+- **Tightly coupled services that need shared state**: Use namespace or labels instead
+- **Quick prototypes**: Use a shared development project with labels for prototyping
+
+## Architecture
+
+**Project Components:**
+
+```
+Project (my-app-prod)
+├── Project ID: unique globally, immutable (my-app-prod)
+├── Project Number: auto-assigned (123456789012)
+├── Name: display name (My App Production)
+├── Labels: key-value pairs for organization ({env: prod, team: platform})
+├── Billing Account: linked billing account
+├── API Enablement: per-API enabled/disabled state
+├── IAM Policies: who can access what
+├── Quotas: per-region, per-resource limits
+└── Resources: VMs, storage, databases, etc.
+```
+
+**Project Lifecycle:**
+
+1. **ACTIVE**: Normal operation, resources can be created
+2. **DELETE_REQUESTED**: Soft delete, recoverable for 30 days
+3. **DELETE_IN_PROGRESS**: Being deleted, non-recoverable
+4. **LAPSED**: Billing issues, read-only state
+
+**Project Folder Hierarchy:**
+```
+Organization
+└── Folder: Production
+    ├── Project: my-app-prod
+    ├── Project: api-gateway-prod
+    └── Project: database-prod
+└── Folder: Staging
+    ├── Project: my-app-staging
+    └── ...
+```
+
+## Core Concepts
+
+### Project ID vs Project Number vs Project Name
+
+- **Project ID**: Globally unique, immutable, used in APIs and URLs (e.g., `my-app-prod-12345`)
+- **Project Number**: Auto-assigned, used internally (e.g., `123456789012`)
+- **Project Name**: Display name, can be changed (e.g., `My App Production`)
+
+```bash
+# Create project with specific ID
+gcloud projects create my-app-prod --name="My App Production"
+
+# List projects
+gcloud projects list
+
+# Describe specific project
+gcloud projects describe my-app-prod
+
+# Update project name
+gcloud projects update my-app-prod --name="My App Production v2"
+```
+
+### Labels
+
+Labels are key-value pairs for organizing and filtering projects:
+```bash
+# Add labels
+gcloud projects update my-app-prod --update-labels=environment=production,team=platform
+
+# Remove label
+gcloud projects update my-app-prod --remove-labels=legacy
+
+# List with labels
+gcloud projects list --filter="labels.environment=production"
+```
+
+### Billing
+
+Link billing account to project:
+```bash
+# Link billing
+gcloud billing projects link my-app-prod --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# Get current billing
+gcloud billing projects describe my-app-prod
+
+# Disable billing (requires owner role)
+gcloud billing projects unlink my-app-prod
+```
+
+### API Enablement
+
+Services must be enabled before use:
+```bash
+# Enable API
+gcloud services enable compute.googleapis.com --project=my-app-prod
+
+# Disable API
+gcloud services disable compute.googleapis.com --project=my-app-prod
+
+# List enabled APIs
+gcloud services list --enabled --project=my-app-prod
+```
+
+### Quotas
+
+Each project has quotas limiting resource usage:
+```bash
+# View project quotas
+gcloud compute project-info describe --project=my-app-prod
+
+# View regional quotas
+gcloud compute regions describe us-central1 --project=my-app-prod
+
+# Request quota increase
+# Via Console: IAM & Admin > Quotas > Select quota > Request Increase
+# Via API: support ticket
+```
+
+**Common Quotas:**
+| Resource | Default Limit |
+|----------|---------------|
+| CPUs per region | 8,000 |
+| Persistent disks (total TB) | 64 TB |
+| Static external IPs | 7 per region |
+| Firewall rules | 100 per project |
+| Routes | 200 per VPC |
+| Forwarding rules | 100 per region |
+| Cloud SQL instances | 10 per region |
+
+### Key Gotchas
+
+- **Project IDs are globally unique and immutable**—choose carefully at creation
+- **Project IDs can only contain lowercase letters, numbers, hyphens**—no underscores
+- **Deleting a project takes 30 days**—resources continue billing during this period
+- **You cannot reuse a deleted project ID** for 30 days
+- **Cross-project access requires explicit IAM grants**—no automatic inheritance
+- **API enablement is per-project**—enable APIs in each project separately
+- **Billing must be linked for most resources**—unlinked projects can't create billable resources
+- **Project number is used in some API references**—note both ID and number
+
+## Real Production Example
+
+Production project setup:
+
+```bash
+# 1. Create project
+gcloud projects create my-production-app \
+    --name="Production Application" \
+    --enable-cloud-apis
+
+# 2. Link billing
+gcloud billing projects link my-production-app \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# 3. Move to folder
+gcloud projects move my-production-app --folder=folders/PROD_FOLDER_ID
+
+# 4. Set labels
+gcloud projects update my-production-app \
+    --update-labels=environment=production,team=platform,application=my-app
+
+# 5. Enable required APIs
+gcloud services enable \
+    compute.googleapis.com \
+    container.googleapis.com \
+    sqladmin.googleapis.com \
+    storage.googleapis.com \
+    cloudkms.googleapis.com \
+    secretmanager.googleapis.com \
+    --project=my-production-app
+
+# 6. Create service accounts
+gcloud iam service-accounts create app-backend \
+    --display-name="App Backend" \
+    --project=my-production-app
+
+gcloud iam service-accounts create data-processor \
+    --display-name="Data Processor" \
+    --project=my-production-app
+
+# 7. Grant service account permissions
+gcloud projects add-iam-policy-binding my-production-app \
+    --member="serviceAccount:app-backend@my-production-app.iam.gserviceaccount.com" \
+    --role="roles/cloudsql.client"
+
+gcloud projects add-iam-policy-binding my-production-app \
+    --member="serviceAccount:app-backend@my-production-app.iam.gserviceaccount.com" \
+    --role="roles/storage.objectViewer"
+
+gcloud projects add-iam-policy-binding my-production-app \
+    --member="serviceAccount:data-processor@my-production-app.iam.gserviceaccount.com" \
+    --role="roles/bigquery.dataEditor"
+
+# 8. Create VPC (if not using shared VPC)
+gcloud compute networks create prod-vpc \
+    --subnet-mode=custom \
+    --bgp-routing-mode=regional \
+    --project=my-production-app
+```
+
+```hcl
+# Terraform: Production project setup
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "project_id" {
+  description = "The project ID"
+  type        = string
+}
+
+variable "billing_account" {
+  description = "Billing account ID"
+  type        = string
+}
+
+variable "folder_id" {
+  description = "Parent folder ID"
+  type        = string
+}
+
+# Create project
+resource "google_project" "production_app" {
+  project_id = var.project_id
+  name       = "Production Application"
+  folder_id  = var.folder_id
+  billing_account = var.billing_account
+
+  labels = {
+    environment = "production"
+    team        = "platform"
+    application = "my-app"
+  }
+}
+
+# Enable APIs
+resource "google_project_service" "apis" {
+  for_each = toset([
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "sqladmin.googleapis.com",
+    "storage.googleapis.com",
+    "cloudkms.googleapis.com",
+    "secretmanager.googleapis.com",
+  ])
+
+  project = google_project.production_app.id
+  service = each.key
+
+  disable_dependent_services = true
+}
+
+# Service account
+resource "google_service_account" "app_backend" {
+  project    = google_project.production_app.id
+  account_id = "app-backend"
+  display_name = "App Backend Service Account"
+}
+
+# IAM bindings
+resource "google_project_iam_member" "app_backend_cloudsql" {
+  project = google_project.production_app.id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.app_backend.email}"
+}
+
+resource "google_project_iam_member" "app_backend_storage" {
+  project = google_project.production_app.id
+  role    = "roles/storage.objectViewer"
+  member  = "serviceAccount:${google_service_account.app_backend.email}"
+}
+
+# VPC Network
+resource "google_compute_network" "prod_vpc" {
+  project                 = google_project.production_app.id
+  name                    = "prod-vpc"
+  auto_create_subnetworks = false
+}
+```
+
+## CLI Examples
+
+```bash
+# List projects
+gcloud projects list
+
+# Describe project
+gcloud projects describe my-project
+
+# Create project
+gcloud projects create my-new-project \
+    --name="My New Project" \
+    --folder=folders/FOLDER_ID
+
+# Update project
+gcloud projects update my-project \
+    --name="Updated Name" \
+    --update-labels=key=value
+
+# Set active project
+gcloud config set project my-project
+
+# Get project number
+gcloud projects describe my-project --format="value(projectNumber)"
+
+# Move project to folder
+gcloud projects move my-project --folder=folders/FOLDER_ID
+
+# Delete project (soft delete, recoverable)
+gcloud projects delete my-project
+
+# Restore deleted project
+gcloud projects undelete my-project
+
+# Get project IAM policy
+gcloud projects get-iam-policy my-project
+
+# Set project IAM policy
+gcloud projects set-iam-policy my-project policy.json
+```
+
+## Terraform Example
+
+```hcl
+# Project factory module for creating multiple projects
+variable "projects" {
+  description = "List of project configurations"
+  type = list(object({
+    id          = string
+    name        = string
+    folder_id   = string
+    labels      = map(string)
+    billing_account = string
+    api_services  = list(string)
+  }))
+}
+
+resource "google_project" "projects" {
+  for_each = { for p in var.projects : p.id => p }
+
+  project_id      = each.value.id
+  name            = each.value.name
+  folder_id       = each.value.folder_id
+  billing_account = each.value.billing_account
+  labels          = each.value.labels
+}
+
+resource "google_project_service" "project_apis" {
+  for_each = {
+    for p in var.projects : p.id => p
+  }
+
+  project    = google_project.projects[each.key].id
+  service    = each.value.api_services[0]
+  disable_dependent_services = true
+
+  depends_on = [google_project.projects]
+}
+
+resource "google_project_iam_member" "project_viewer" {
+  for_each = {
+    for p in var.projects : p.id => p
+  }
+
+  project = google_project.projects[each.key].id
+  role    = "roles/viewer"
+  member  = "group:all-users@company.com"
+}
+
+# Project with Shared VPC
+resource "google_compute_shared_vpc_host_project" "host" {
+  project = google_project.host.id
+}
+
+resource "google_compute_shared_vpc_service_project" "service" {
+  host_project    = google_compute_shared_vpc_host_project.host.project
+  service_project = google_project.service.id
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List projects | `gcloud projects list` |
+| Describe project | `gcloud projects describe PROJECT` |
+| Create project | `gcloud projects create ID --name=NAME` |
+| Update project | `gcloud projects update PROJECT [FLAGS]` |
+| Delete project | `gcloud projects delete PROJECT` |
+| Undelete project | `gcloud projects undelete PROJECT` |
+| Move to folder | `gcloud projects move PROJECT --folder=FOLDER` |
+| Set active project | `gcloud config set project PROJECT` |
+| Get project number | `gcloud projects describe PROJECT --format="value(projectNumber)"` |
+| Link billing | `gcloud billing projects link PROJECT --billing-account=ACCOUNT` |
+
+## Monitoring
+
+**Key Metrics to Track:**
+
+1. **API Quota Usage**: Cloud Monitoring > Resources > Quotas
+2. **Resource Utilization**: Per-resource metrics (CPU, memory, disk)
+3. **Billing**: Budget alerts, cost breakdown by project
+4. **API Error Rates**: Cloud Logging filters for error logs
+
+```bash
+# List quotas with usage
+gcloud monitoring metrics list --filter="metric.type:starts_with('compute.googleapis.com')"
+
+# Create budget alert
+gcloud billing budgets create \
+    --billing-account=XXXXXX \
+    --display-name="Project Budget" \
+    --amount=50000USD \
+    --threshold-rules=percent=0.8,percent=1.0 \
+    --filter-projects=my-project
+
+# Query project-specific logs
+gcloud logging read 'resource.type="project" AND resource.labels.project_id="my-project"' \
+    --project=my-project
+```
+
+**Project-Level Alerts:**
+- Quota usage > 80%
+- Unusual API activity
+- Failed deployments
+- Billing threshold breaches
+
+## Security
+
+**Project Security Best Practices:**
+
+1. **Use folders for grouping, not project-per-team** if you have many teams
+2. **Enable organization policies** to enforce security across projects
+3. **Use service accounts** for workloads, not user credentials
+4. **Enable VPC Service Controls** for data exfiltration protection
+5. **Disable serial port access** on all VM projects
+6. **Use CMEK** for sensitive data
+
+```bash
+# Enable OS Login organization-wide
+gcloud org-policies set-policy require-os-login.yaml
+
+# Disable VM external IPs in specific projects
+gcloud org-policies set-policy no-external-ip.yaml --project=my-secure-project
+
+# Enable VPC Service Controls perimeter
+gcloud access-context-manager perimeters create secure-perimeter \
+    --title="Secure Perimeter" \
+    --perimeter-type=TYPE \
+    --projects=my-project-1,my-project-2
+```
+
+**IAM for Projects:**
+```bash
+# Grant project viewer to all employees
+gcloud projects add-iam-policy-binding my-project \
+    --member="group:all-employees@company.com" \
+    --role="roles/viewer"
+
+# Grant specific roles to teams
+gcloud projects add-iam-policy-binding my-project \
+    --member="group:devops@company.com" \
+    --role="roles/container.developer"
+
+# Grant project owner for admin tasks only
+gcloud projects add-iam-policy-binding my-project \
+    --member="user:admin@company.com" \
+    --role="roles/owner"
+```
+
+## Cost Optimization
+
+**Project-Level Cost Strategies:**
+
+1. **Separate production and dev projects** for granular cost tracking
+2. **Use labels for chargeback** to allocate costs to teams/applications
+3. **Set per-project budgets** to catch runaway costs early
+
+```bash
+# Create budget for specific project
+gcloud billing budgets create \
+    --billing-account=XXXXXX \
+    --display-name="Dev Project Budget" \
+    --amount=1000USD \
+    --threshold-rules=percent=0.5,percent=0.8,percent=1.0 \
+    --filter-projects=my-dev-project
+
+# List projects with their costs
+gcloud billing accounts list --filter="account_id=XXXXXX"
+
+# Export billing to BigQuery for analysis
+gcloud billing export bigquery create \
+    --billing-account=XXXXXX \
+    --dataset-name=billing_data
+```
+
+**Cost Reduction Tips:**
+- Delete unused projects to avoid lingering resources
+- Schedule non-production projects to pause during off-hours
+- Use preemptible VMs for batch workloads
+- Right-size Compute Engine instances using recommendations
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Project won't create**
+   ```bash
+   # Check quota
+   gcloud organizations describe 123456789012
+   
+   # Check permissions (need resourcemanager.projectCreator)
+   gcloud projects get-iam-policy my-org
+   
+   # Check if ID is taken
+   gcloud projects list --filter="projectId=my-project"
+   ```
+
+2. **Resources can't communicate across projects**
+   ```bash
+   # Verify IAM permissions on both projects
+   gcloud projects get-iam-policy project-a
+   gcloud projects get-iam-policy project-b
+   
+   # For Shared VPC, verify host project configuration
+   gcloud compute shared-vpc get-host-project project-a
+   
+   # Check firewall rules
+   gcloud compute firewall-rules list --project=project-a
+   ```
+
+3. **Can't enable API**
+   ```bash
+   # Check if API exists
+   gcloud services list --available | grep api-name
+   
+   # Check billing is linked
+   gcloud billing projects describe my-project
+   
+   # Check permissions (needs Project Owner or Editor)
+   ```
+
+4. **Billing charges after deletion**
+   ```bash
+   # Project is in DELETE_REQUESTED state for 30 days
+   # Verify actual deletion
+   gcloud projects describe my-project  # Should show DELETE_IN_PROGRESS
+   
+   # List all projects including pending deletion
+   gcloud projects list --filter="lifecycleState=DELETE_REQUESTED"
+   ```
+
+5. **Quota exceeded**
+   ```bash
+   # View current quotas
+   gcloud compute project-info describe --project=my-project
+   
+   # Request increase via support ticket
+   # Console: IAM & Admin > Quotas > Select quota > Request Increase
+   ```
+
+## Interview Questions
+
+1. **How would you design a project structure for a company with 5 teams, 3 environments each, and 50 microservices?**
+
+2. **What's the difference between a project ID, project number, and project name? Why does this matter?**
+
+3. **Explain the project lifecycle states and what happens when you delete a project.**
+
+4. **How do you handle cross-project communication for microservices? What are the security implications?**
+
+5. **What's the maximum number of projects in a GCP organization by default, and how would you request an increase?**
+
+## Cheat Sheet
+
+```
+# Project Management
+gcloud projects list                          # List all projects
+gcloud projects describe PROJECT              # Describe project
+gcloud projects create ID --name=NAME         # Create project
+gcloud projects update PROJECT [FLAGS]        # Update project
+gcloud projects delete PROJECT                # Delete (30-day recover)
+gcloud projects undelete PROJECT              # Restore deleted
+gcloud projects move PROJECT --folder=FOLDER  # Move to folder
+
+# Configuration
+gcloud config set project PROJECT             # Set active project
+gcloud config list                            # List config
+
+# Billing
+gcloud billing projects link PROJECT --billing-account=ACCOUNT
+gcloud billing projects describe PROJECT
+
+# APIs
+gcloud services list --enabled --project=PROJECT
+gcloud services enable SERVICE --project=PROJECT
+gcloud services disable SERVICE --project=PROJECT
+
+# Quotas
+gcloud compute project-info describe --project=PROJECT
+gcloud compute regions describe REGION --project=PROJECT
+```
+
+## Labs
+
+1. **Project Creation**: Create a new project, link billing, enable APIs, configure basic IAM
+2. **Project Organization**: Create folder structure and move projects between folders
+3. **Cross-Project Access**: Set up service accounts for cross-project API access
+4. **Project Cleanup**: Create projects, use them, then delete and verify cleanup
+5. **Billing Setup**: Configure budgets, export billing data to BigQuery, analyze costs
+
+## Related Services
+
+- [Organization Node](./organization)
+- [Folders](./folders)
+- [Resource Hierarchy](./resource-hierarchy)
+- [IAM](./iam)
+- [Billing](./billing)
+- [VPC Networking](../network/vpc)

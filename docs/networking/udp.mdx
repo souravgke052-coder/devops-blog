@@ -1,0 +1,579 @@
+# UDP (User Datagram Protocol)
+
+## Overview
+
+UDP is the "send and pray" protocol—connectionless, unreliable, and unordered. Yet it powers some of the most latency-sensitive and bandwidth-critical applications: DNS queries, video streaming, VoIP, online gaming, and QUIC (the transport behind HTTP/3). Understanding when UDP outperforms TCP, and more importantly, when it doesn't, is critical for modern network architecture.
+
+UDP's simplicity is its strength. Without TCP's handshake, congestion control, and reliability mechanisms, UDP has minimal overhead: just 8 bytes of header vs TCP's minimum 20 bytes, and zero RTT before data transfer. This makes UDP ideal for real-time applications where late data is worse than lost data. However, without reliability, applications must implement their own recovery, ordering, and flow control—or accept lossy behavior.
+
+In production, you'll encounter UDP in DNS (which runs over both), media streaming, syscall events, Kubernetes service discovery (headless services), and increasingly, in QUIC-based protocols that add reliability on top of UDP. The key is understanding trade-offs: UDP is not "faster" than TCP in all cases—TCP's congestion avoidance actually prevents the packet loss that UDP applications suffer—but for applications that need lowest possible latency and can tolerate some loss, UDP is the right choice.
+
+## When To Use
+
+- **Real-time applications**: VoIP, video conferencing, live streaming—where receiving stale data is worse than not receiving it
+- **Low-latency request-response**: DNS queries, NTP, SNMP—where a single packet request-response doesn't need reliability overhead
+- **Multicast/broadcast**: TCP is unicast only; UDP supports multicast (RTP, RTSP, mDNS discovery)
+- **High-throughput, lossy-tolerant applications**: Video streaming, online gaming, telemetry collection
+- **As a foundation for custom protocols**: QUIC builds reliability/encryption on top of UDP
+- **When connection overhead is prohibitive**: For small, frequent transactions where TCP handshake overhead dominates
+
+## When NOT To Use
+
+- **Reliable data transfer**: Files, database queries, API calls—anywhere missing data is unacceptable
+- **Ordered delivery required**: Unless your application implements reordering
+- **Connection-oriented semantics**: TCP's state machine provides connection lifecycle management
+- **Flow control**: Applications must implement their own if needed
+- **Applications behind restrictive firewalls**: Some firewalls block UDP entirely
+
+## Core Concepts
+
+### UDP Header Structure
+
+UDP's header is minimal—just source port, destination port, length, and checksum:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Source Port          |       Destination Port        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|             Length            |           Checksum            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **Source Port** (16 bits): Ephemeral port on sender. Optional—can be 0 if not expecting response.
+- **Destination Port** (16 bits): Identifies receiving application.
+- **Length** (16 bits): Header + data length in bytes. Minimum is 8 (header only).
+- **Checksum** (16 bits): Optional in IPv4 (0 = no checksum), required in IPv6.
+
+UDP header is 8 bytes minimum. No sequence numbers, no acknowledgment, no flow control, no congestion control.
+
+### UDP vs TCP Comparison
+
+| Feature | UDP | TCP |
+|---------|-----|-----|
+| Connection | None | 3-way handshake |
+| Reliability | None | ACK, retransmit |
+| Ordering | None | Sequence numbers |
+| Flow control | None | Sliding window |
+| Congestion control | None | CUBIC, BBR, etc. |
+| Header overhead | 8 bytes | 20+ bytes |
+| State | Stateless | Stateful |
+| Multicast | Yes | No |
+| Latency | Lower | Higher |
+| Throughput (ideal) | Higher | Lower (due to overhead) |
+
+### UDP Checksum Calculation
+
+UDP checksum covers a pseudo-header (source IP, destination IP, protocol number, UDP length) plus the UDP header and data. This provides end-to-end integrity verification.
+
+```bash
+# Verify UDP checksum in tcpdump (IPv4)
+# The checksum field shows 0x0000 if checksum is disabled
+# With checksum: shows actual checksum value
+
+# In IPv4, checksum is optional (set to 0 to skip)
+# In IPv6, checksum is mandatory
+
+# Capture and verify checksums
+tcpdump -i eth0 -nn -v 'port 53'
+# UDP, length 45
+#     Source Port: 54321
+#     Destination Port: 53
+#     Length: 45
+#     Checksum: 0x4d5a [correct]
+```
+
+### UDP Fragmentation
+
+Unlike TCP (which handles MTU by sending MSS-sized segments), UDP can send datagrams larger than MTU. If a UDP datagram exceeds the path MTU, the IP layer fragments it:
+
+```bash
+# UDP fragmentation example
+# Application sends 4000-byte datagram with MTU=1500
+# IP fragments into 3 packets:
+#   Fragment 1: offset 0, more fragments, 1500 bytes (IP header + 1480 data)
+#   Fragment 2: offset 1480, more fragments, 1500 bytes
+#   Fragment 3: offset 2960, last fragment, 1088 bytes (4000 - 2960 + 48 header)
+
+# MTU matters more for UDP than TCP:
+# - Lost fragment = entire datagram lost (no partial delivery)
+# - Reassembly timeout (typically 60 seconds)
+# - All fragments must arrive in order
+
+# Test fragmentation
+ping -M do -s 3000 8.8.8.8  # Will fragment or fail depending on MTU
+```
+
+### DNS over UDP
+
+DNS is the canonical example of UDP in production. DNS queries are typically sent over UDP port 53, with responses up to 512 bytes (original limit). Larger responses use TCP.
+
+```bash
+# DNS query example
+dig @8.8.8.8 example.com A +short
+# 93.184.216.34
+
+# Capture DNS query
+tcpdump -i any -nn port 53
+# 10.0.0.5.54321 > 8.8.8.8.53: 12345+ A? example.com.
+# 8.8.8.8.53 > 10.0.0.5.54321: 12345 1/0/0 A 93.184.216.34
+
+# TCP fallback for large responses
+dig @8.8.8.8 large-zone.example.com AXFR +tcp
+
+# DNS over UDP peculiarities:
+# - Single request, single response (no connection)
+# - Truncation (TC bit) when response > 512 bytes
+# - Client retries over TCP on truncation
+```
+
+### QUIC: Reliability on UDP
+
+QUIC (Quick UDP Internet Connections) is a transport protocol built on UDP. HTTP/3 uses QUIC as its transport, combining UDP's low-latency foundation with reliability, ordering, and encryption.
+
+**QUIC advantages over TCP**:
+- 0-RTT connection establishment (data in first flight)
+- No head-of-line blocking (streams are independent)
+- Connection migration (IP/port change doesn't break connection)
+- Built-in TLS 1.3 (no separate TLS handshake)
+
+```bash
+# QUIC in tcpdump
+tcpdump -i eth0 -nn 'port 443' and 'udp[8:4] & 0x0f0f0000 = 0x0a1a0000'
+# QUIC packets have special header encoding
+# This filter identifies QUIC version negotiation or common header patterns
+
+# Capture HTTP/3 traffic
+tcpdump -i eth0 -nn port 443 -v | grep -i quic
+# QUIC, length 1200, dcid: 7f3a4b5c6d8e9f0a
+# UDP, length 1250
+```
+
+## Real Production Example
+
+### UDP Socket Programming
+
+```c
+// Server: Simple UDP echo server
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+#define PORT 8080
+#define BUF_SIZE 1024
+
+int main() {
+    int sockfd;
+    char buffer[BUF_SIZE];
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    
+    // Create UDP socket
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    
+    // Bind to port
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
+    bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    
+    while (1) {
+        // Receive
+        int n = recvfrom(sockfd, buffer, BUF_SIZE, 0,
+                        (struct sockaddr*)&client_addr, &addr_len);
+        
+        // Process (echo)
+        sendto(sockfd, buffer, n, 0,
+               (struct sockaddr*)&client_addr, addr_len);
+    }
+    
+    close(sockfd);
+    return 0;
+}
+```
+
+### Kubernetes DNS (CoreDNS) UDP Configuration
+
+CoreDNS uses UDP for DNS resolution with fallback to TCP:
+
+```yaml
+# Corefile for CoreDNS
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        forward . 8.8.8.8 8.8.4.4 {
+            max_concurrent 1000
+        }
+        log
+        errors
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+```
+
+### UDP Health Checks
+
+Load balancers sending UDP health checks must handle the unreliable nature:
+
+```bash
+# HAProxy UDP health check (for DNS, NTP, etc.)
+backend dns-servers
+    mode udp
+    option udp-check
+    # Send DNS query
+    http-check expect string -R "0.0.0.0"
+    # Or with custom send/expect
+    udp-check send "HOST example.com\r\n"
+    udp-check expect string "OK"
+
+# AWS NLB UDP health checks
+# UDP health checks are "unhealthy" if no response to 3 consecutive probes
+# Interval: 10 seconds, Threshold: 3 = 30 second detection
+```
+
+## CLI Examples
+
+```bash
+# View UDP sockets
+ss -uln              # Listening UDP sockets
+ss -un               # Established UDP sockets
+ss -uap              # With process names
+
+# UDP statistics
+ss -su               # Summary
+netstat -anu         # All UDP connections
+
+# Network statistics for UDP
+cat /proc/net/udp
+# sl  local_address rem_address   st tx_queue rx_queue
+# 0: 00000000:0050 00000000:0000 01 00000000:00000000
+#    0:port 0             0:port  state   tx:rx queue
+
+# UDP specific stats from /proc/net/snmp
+cat /proc/net/snmp | grep -i udp
+# Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors
+# Udp: 1234567    1234     0       2345678     0            0
+
+# DNS query with dig
+dig @8.8.8.8 example.com A +short
+dig @1.1.1.1 example.com AAAA +short
+
+# DNS zone transfer
+dig @ns1.example.com example.com AXFR +tcp
+
+# NTP query
+ntpdate -q pool.ntp.org
+# server 203.0.113.1, stratum 3, offset 0.023456, delay 0.02789
+
+# VoIP RTP capture (UDP port range)
+tcpdump -i eth0 -nn 'udp[0:2] & 0xff00 == 0x8000'
+# RTP header: first 2 bits = 10 (binary) = 2
+# If first 2 bits = 10 and payload type = real-time audio
+
+# UDP flooding (for testing)
+hping3 --udp --rand-source --keep -p 53 8.8.8.8
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `dig` | DNS queries | `dig @8.8.8.8 example.com` |
+| `nslookup` | DNS lookup | `nslookup example.com` |
+| `host` | DNS lookup | `host -a example.com` |
+| `ntpdate` | NTP sync | `ntpdate -q pool.ntp.org` |
+| `ntpdc` | NTP control | `ntpdc -c peers` |
+| `ss -u` | UDP sockets | `ss -ulnp` |
+| `netstat -u` | UDP connections | `netstat -anu` |
+| `tcpdump` | Packet capture | `tcpdump -i any port 53` |
+| `hping3` | Craft UDP | `hping3 --udp -p 53 host` |
+| `nc` | UDP chat | `nc -u -l 8080` |
+
+## Monitoring
+
+### UDP Metrics
+
+```bash
+# /proc/net/udp statistics
+cat /proc/net/udp
+# Columns: sl (slot), local_address, rem_address, st (state), tx_queue, rx_queue
+
+# InDatagrams: packets received
+# OutDatagrams: packets sent
+# InErrors: receive errors (bad length, no buffer)
+# RcvbufErrors: socket buffer full
+# SndbufErrors: send buffer full
+
+# Detailed per-socket info
+cat /proc/net/udp6
+```
+
+### Key Metrics to Watch
+
+```bash
+# UDP receive errors (buffer exhaustion)
+grep -E "RcvbufErrors|SndbufErrors" /proc/net/snmp | awk '{print $2, $NF}'
+# Higher = socket buffer too small or application not reading
+
+# UDP socket memory pressure
+cat /proc/net/sockstat | grep -i udp
+# UDP: inuse 15 mem 3
+# mem: pages allocated to UDP sockets
+
+# Check socket receive buffer usage
+ss -uln
+# Recv-Q shows pending datagrams (application not reading)
+```
+
+### Prometheus Metrics
+
+```promql
+# UDP sockets
+node_netstat_Udp_InDatagrams{}      # Received datagrams
+node_netstat_Udp_OutDatagrams{}     # Sent datagrams
+node_netstat_Udp_InErrors{}         # Receive errors
+node_netstat_Udp_RcvbufErrors{}     # Buffer full on receive
+node_netstat_Udp_SndbufErrors{}     # Buffer full on send
+
+# Calculate drop rate
+rate(node_netstat_Udp_RcvbufErrors[5m]) / rate(node_netstat_Udp_InDatagrams[5m]) * 100
+# Alert if > 0.1%
+```
+
+## Security
+
+### UDP-Based Attacks
+
+**UDP flood**: Attacker sends high-volume UDP packets to random ports. Victim must process each packet (CPU usage) and send ICMP "port unreachable" (outbound bandwidth). Mitigation: rate limiting, ACLs, anycast.
+
+**DNS amplification**: Attacker sends small DNS query with forged source IP (victim). DNS server sends large response to victim. 10x-100x amplification factor. Mitigation: restrict recursion, BCP 38 (ingress filtering).
+
+**SNMP reflection**: Similar to DNS amplification using SNMP.
+
+```bash
+# Rate limit UDP with iptables
+iptables -A INPUT -p udp --dport 53 -m hashlimit \
+  --hashlimit-above 50/second --hashlimit-burst 100 \
+  --hashlimit-htable-size 65536 \
+  --hashlimit-mode srcip \
+  --hashlimit-name udp_dns_limit \
+  -j DROP
+
+# DNS amplification mitigation
+# On authoritative DNS servers, restrict zone transfers
+allow-transfer { 10.0.0.0/8; };
+# Use Response Rate Limiting (RRL)
+rate-limit {
+    responses-per-second 10;
+    window 5;
+};
+```
+
+### Security Considerations
+
+```bash
+# UDP is stateless—harder to filter with simple stateful firewall
+# iptables tracks UDP "connections" via conntrack
+# UDP conntrack timeout is short (30 seconds default)
+
+# Force stricter conntrack for UDP
+sysctl -w net.netfilter.nf_conntrack_udp_timeout=60
+sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=180
+
+# Many services using UDP should use DTLS (TLS over UDP)
+# OpenVPN, WireGuard, QUIC all use encryption
+
+# Check for open UDP ports (less common than TCP)
+ss -ulnp
+# UDP listeners are less frequent—verify each is expected
+```
+
+### QUIC/TLS over UDP Security
+
+```bash
+# QUIC encrypts all payload (unlike TCP where TLS is application layer)
+# This provides:
+# - Confidentiality (no plaintext)
+# - Integrity (tamper detection)
+# - Authentication (certificate validation)
+
+# Unlike TLS over TCP, QUIC:
+# - Cannot be intercepted by MITM proxies
+# - Cannot have TLS inspected
+# - Requires application-level support
+
+# For applications needing inspection (security appliances):
+# - Terminate QUIC at load balancer (decrypt, re-encrypt)
+# - Or use TLS over TCP instead
+```
+
+## Cost Optimization
+
+UDP has minimal overhead compared to TCP:
+
+**Header efficiency**: 8 bytes vs TCP's 20+ bytes. For small packets, this matters.
+
+```bash
+# Calculate header overhead percentage
+# TCP with 1 byte payload: (20 / 21) * 100 = 4.8% overhead
+# UDP with 1 byte payload: (8 / 9) * 100 = 11% overhead
+
+# TCP with 1460 byte payload: (20 / 1480) * 100 = 1.4% overhead
+# UDP with 1460 byte payload: (8 / 1468) * 100 = 0.5% overhead
+
+# For bulk transfer, UDP overhead is negligible
+# For small packets, UDP saves 12 bytes per packet
+```
+
+**Connection overhead**: TCP connection setup costs 1.5 RTTs before data transfer. UDP has no connection overhead.
+
+```bash
+# For DNS:
+# UDP: 1 RTT (query + response)
+# TCP: 3 RTTs (SYN + request + response) before data
+# TCP overhead makes it impractical for simple DNS lookups
+
+# For streaming:
+# TCP: connection setup + TLS handshake = 2-3 RTTs before playback
+# QUIC: 0-1 RTT (with 0-RTT resumption)
+# For video, this directly impacts startup latency
+```
+
+**Cloud costs**: UDP and TCP data transfer have the same egress pricing. No difference there. However, using UDP-based protocols like QUIC reduces connection overhead, indirectly reducing CPU and memory for connection state.
+
+## Troubleshooting
+
+### UDP Port Issues
+
+```bash
+# Check if UDP port is listening
+ss -ulnp | grep :53
+# Proto: UDP, LocalAddress: *:53, State: UNCONN (listening)
+
+# Test UDP port with netcat
+nc -u -l 8080      # Server
+nc -u localhost 8080  # Client (type and see)
+
+# Test with echo
+echo "test" | nc -u -w 2 8.8.8.8 53
+# If no response, no indication of failure (UDP!)
+
+# Check if packets arriving
+tcpdump -i any -nn 'port 8080'
+```
+
+### Common UDP Issues
+
+| Symptom | Likely Cause | Check | Fix |
+|---------|--------------|-------|-----|
+| No response | Port blocked, server down | `tcpdump` | Check firewall, service |
+| Partial response | MTU/fragmentation | `tracepath` | Reduce packet size |
+| High latency | Network path | `ping` | Route changes |
+| Application timeout | Packet lost | Logs | Add retry logic |
+| Buffer overflow | Application slow | `ss -u` Recv-Q | Optimize app, increase buffer |
+
+### DNS-Specific Issues
+
+```bash
+# DNS query fails but ping works
+dig +trace example.com
+# Check each step: root servers → TLD → authoritative
+
+# DNS response truncated
+dig @8.8.8.8 large-zone.example.com
+# Shows "truncated" → retry with +tcp flag
+
+# DNS caching issues
+dig +noedns example.com  # Bypass EDNS
+dig @1.1.1.1 +subnet=10.0.0.0/8  # ECS (EDNS Client Subnet)
+
+# Check DNSSEC validation
+dig +dnssec example.com @1.1.1.1
+# Look for RRSIG records in response
+```
+
+## Interview Questions
+
+**Q1: When would you choose UDP over TCP for an application?**
+
+A: Choose UDP when: (1) Real-time is more important than reliable—VoIP, video conferencing, gaming, where receiving stale data is worse than not receiving it; (2) Application implements its own reliability/ordering—QUIC builds on UDP with reliability, (3) Connection overhead is prohibitive—small, frequent request/response where TCP handshake overhead is significant; (4) Multicast/broadcast is needed—TCP is strictly unicast; (5) Raw throughput matters—TCP's congestion control may limit throughput on high-speed, low-latency networks. Don't choose UDP just because it's "faster"—TCP's congestion avoidance prevents the packet loss that UDP applications suffer from.
+
+**Q2: How does UDP handle fragmentation, and why is this problematic?**
+
+A: When a UDP datagram exceeds the path MTU, the IP layer fragments it. For example, a 4000-byte datagram on a 1500-byte MTU network fragments into 3 IP packets. Problems: (1) All fragments must arrive—the IP layer delivers the datagram only when all fragments arrive. Loss of any fragment = entire datagram lost. TCP would deliver partial data; UDP delivers nothing. (2) Reassembly timeout—if all fragments don't arrive within ~60 seconds, the datagram is discarded. (3) Additional overhead—each fragment has its own IP header (20 bytes), reducing efficiency. (4) Amplification in attacks—fragmentation requests increase attack amplification factor. Best practice: keep UDP datagrams under 1280 bytes (minimum MTU for IPv6) or use Path MTU Discovery.
+
+**Q3: What is QUIC and why does it matter for HTTP/3?**
+
+A: QUIC is a transport protocol built on UDP. HTTP/3 uses QUIC as its transport, combining UDP's low-latency connection establishment with reliability and encryption. Key advantages: (1) 0-RTT resumption—clients can send data immediately without waiting for handshake, significantly reducing latency for returning users; (2) No head-of-line blocking—in HTTP/2, loss of one HTTP stream blocks all streams on the same TCP connection. In HTTP/3, each QUIC stream is independent; losing a packet only blocks that stream; (3) Connection migration—a QUIC connection survives IP/port changes (e.g., switching from WiFi to cellular) because connection is identified by connection ID, not 4-tuple; (4) Built-in TLS 1.3—encryption is part of the protocol, not layered on top. QUIC requires kernel support (Linux 5.0+ for BBR, userspace implementations like quiche, mvfst exist).
+
+**Q4: How does a UDP socket's receive buffer fill, and what happens?**
+
+A: When an application doesn't read from a UDP socket quickly enough, the kernel's receive buffer fills. The kernel has two options: drop the new datagram, or (if socket buffer isn't full yet but kernel memory is pressured) drop older datagrams. `ss -uln` shows Recv-Q (datagrams pending for application). If Recv-Q grows continuously, application isn't keeping up. Eventually, `RcvbufErrors` in /proc/net/snmp increments. The application can: (1) read faster; (2) increase socket buffer size with `setsockopt(SO_RCVBUF)`; (3) implement application-level flow control. Note: setsockopt sets the "maximum" buffer; actual allocation may be smaller (kernel auto-tuning). The kernel may also impose system-wide limits.
+
+**Q5: How do stateful firewalls handle UDP, since UDP is connectionless?**
+
+A: Stateful firewalls use connection tracking (conntrack) to track UDP "connections." When a UDP packet is seen in one direction, the kernel creates a conntrack entry and allows return traffic for a timeout period. The timeout is typically short (30-60 seconds) because UDP has no explicit connection close. If no return traffic arrives within the timeout, the entry expires. For DNS, the timeout might be very short because DNS is request-response. For protocols like QUIC, which maintain long-lived "connections," the timeout must be longer. If stateful firewall timeout is shorter than application session duration, return packets get dropped. This causes "half-open" UDP issues where one direction works but responses are blocked.
+
+## Cheat Sheet
+
+### UDP Header Fields
+
+| Field | Size | Description |
+|-------|------|-------------|
+| Source Port | 16 bits | Ephemeral port (optional, 0 if not needed) |
+| Destination Port | 16 bits | Service port |
+| Length | 16 bits | Header + data length |
+| Checksum | 16 bits | Optional in IPv4, required in IPv6 |
+
+### UDP Socket States
+
+UDP sockets have only one state: `UNCONN` (unconnected listening, or bound but not connected). Unlike TCP, there's no connection state machine. Connected UDP sockets (`connect()`) track the peer address, which causes `ECONNREFUSED` on ICMP port unreachable.
+
+### Common UDP Ports
+
+| Port | Service | Notes |
+|------|---------|-------|
+| 53 | DNS | Both UDP and TCP |
+| 67/68 | DHCP | Server/client |
+| 123 | NTP | Network time |
+| 161/162 | SNMP | Traps use 162 |
+| 514 | Syslog | Also TCP |
+| 1194 | OpenVPN | UDP mode |
+| 51820 | WireGuard | Always UDP |
+| 3478 | STUN/TURN | VoIP NAT traversal |
+| 5000-6000 | RTP/RTCP | Media streaming |
+
+### UDP vs TCP Decision Matrix
+
+| Requirement | Choose UDP | Choose TCP |
+|-------------|------------|------------|
+| Real-time streaming | ✓ | |
+| Low latency | ✓ | |
+| Simple request/response | ✓ | |
+| Reliability required | | ✓ |
+| Ordered delivery | | ✓ |
+| Flow control | | ✓ |
+| Large payloads | | ✓ |
+| Multicast | ✓ | |
+| Throughput over reliability | ✓ | |
+| Behind restrictive firewall | | ✓ |
+
+## Related Topics
+
+- [DNS](./dns) — DNS protocol (UDP/TCP)
+- [HTTP/HTTPS](./http) — HTTP/3 uses QUIC (UDP)
+- [VPN](./vpn) — WireGuard uses UDP
+- [TLS](./tls) — TLS over QUIC
+- [Load Balancing](./load-balancing) — UDP health checks
+- [Debugging](./debugging) — Packet capture for UDP

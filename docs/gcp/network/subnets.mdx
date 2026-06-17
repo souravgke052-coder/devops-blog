@@ -1,0 +1,653 @@
+# Subnets
+
+## Overview
+
+Subnets are regional resources in GCP that subdivide a VPC network into smaller network segments. Each subnet defines an IP address range (CIDR block) from which instance IP addresses are assigned. Subnets enable network segmentation, zone-level redundancy within a region, and fine-grained control over network access.
+
+Subnets in GCP are regional but span multiple zones within that region—any zone in the region can host instances using IPs from a subnet. This design provides high availability since instances in the same subnet can be distributed across zones automatically by Managed Instance Groups.
+
+Key subnet features include Private Google Access (allowing instances without external IPs to access Google APIs), VPC Flow Logs for network traffic monitoring, and secondary ranges for alias IP allocations used by GKE and other container services. Understanding subnet design is essential for building scalable, secure network architectures.
+
+## When To Use
+
+- **Multi-tier architectures**: Separate subnets for web, application, and database tiers
+- **Network isolation**: Isolate sensitive workloads in dedicated subnets
+- **GKE clusters**: Secondary ranges for pods and services
+- **Zone redundancy**: Distribute instances across zones within a regional subnet
+- **Private Google Access**: Enable internal-only instances to reach Google APIs
+- **VPC Flow Logs**: Monitor network traffic per subnet
+
+## When NOT To Use
+
+- **Single-zone applications**: Might not need subnet complexity
+- **Simple single-tier apps**: Default subnet may suffice
+- **Very small-scale testing**: Quick experiments don't need subnet planning
+
+## Architecture
+
+**Subnet Architecture:**
+```
+VPC Network (prod-vpc)
+├── Subnet: web-subnet (us-central1)
+│   ├── IP Range: 10.0.1.0/24
+│   ├── Secondary: gke-pods (10.1.0.0/16)
+│   ├── Secondary: gke-services (10.2.0.0/20)
+│   ├── Regions: us-central1-a, us-central1-b, us-central1-c
+│   ├── Private Google Access: enabled
+│   └── VPC Flow Logs: enabled
+├── Subnet: app-subnet (us-central1)
+│   └── IP Range: 10.0.2.0/24
+└── Subnet: data-subnet (us-central1)
+    └── IP Range: 10.0.3.0/24
+```
+
+**IP Address Allocation:**
+
+| CIDR Size | Usable IPs | Typical Use |
+|-----------|------------|-------------|
+| /24 | 256 (251 usable) | Small subnets, DMZ |
+| /20 | 4,096 (4,091 usable) | Standard subnet |
+| /16 | 65,536 (65,531 usable) | Large subnets |
+
+**Secondary Ranges:**
+- GKE pods: Minimum /16 required for pod networking
+- GKE services: Minimum /24 recommended
+
+## Core Concepts
+
+### Creating Subnets
+
+```bash
+# Basic subnet creation
+gcloud compute networks subnets create web-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.1.0/24
+
+# Subnet with Private Google Access
+gcloud compute networks subnets create app-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.2.0/24 \
+    --enable-private-ip-google-access
+
+# Subnet with secondary ranges for GKE
+gcloud compute networks subnets create gke-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.10.0/24 \
+    --enable-private-ip-google-access \
+    --secondary-ranges=gke-pods=10.1.0.0/16,gke-services=10.2.0.0/20
+
+# Subnet with custom purpose (PRIVATE, INTERNAL_HTTPS_ONLY_PROXY, etc.)
+gcloud compute networks subnets create proxy-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.20.0/24 \
+    --purpose=INTERNAL_HTTPS_ONLY_PROXY
+```
+
+### Viewing Subnet Details
+
+```bash
+# Describe subnet
+gcloud compute networks subnets describe web-subnet \
+    --region=us-central1
+
+# List all subnets
+gcloud compute networks subnets list
+
+# List subnets in specific VPC
+gcloud compute networks subnets list --network=prod-vpc
+
+# Show IP ranges
+gcloud compute networks subnets describe web-subnet \
+    --region=us-central1 \
+    --format="yaml(ipCidrRange,secondaryIpRanges)"
+```
+
+### Updating Subnets
+
+```bash
+# Enable Private Google Access
+gcloud compute networks subnets update web-subnet \
+    --region=us-central1 \
+    --enable-private-ip-google-access
+
+# Disable Private Google Access
+gcloud compute networks subnets update web-subnet \
+    --region=us-central1 \
+    --no-enable-private-ip-google-access
+
+# Enable VPC Flow Logs
+gcloud compute networks subnets update web-subnet \
+    --region=us-central1 \
+    --enable-flow-logs \
+    --logging-flow-sampling=0.5 \
+    --logging-metadata=include-all
+
+# Add secondary range
+gcloud compute networks subnets update gke-subnet \
+    --region=us-central1 \
+    --add-secondary-ranges=new-range=10.3.0.0/16
+
+# Remove secondary range
+gcloud compute networks subnets update gke-subnet \
+    --region=us-central1 \
+    --remove-secondary-ranges=new-range
+```
+
+### Private Google Access
+
+When enabled, instances without external IPs can access Google APIs:
+```bash
+# Enable
+gcloud compute networks subnets update my-subnet \
+    --region=us-central1 \
+    --enable-private-ip-google-access
+
+# Check status
+gcloud compute networks subnets describe my-subnet \
+    --region=us-central1 | grep privateIpGoogleAccess
+```
+
+**What works with Private Google Access:**
+- Cloud Storage (storage.googleapis.com)
+- BigQuery (bigquery.googleapis.com)
+- Cloud SQL (sqladmin.googleapis.com)
+- Container Registry (gcr.io)
+- Most Google APIs
+
+**What doesn't work:**
+- YouTube, other Google services outside Google Cloud
+- Third-party APIs hosted on Google Cloud with external IPs
+
+### VPC Flow Logs
+
+```bash
+# Enable with defaults
+gcloud compute networks subnets update my-subnet \
+    --region=us-central1 \
+    --enable-flow-logs
+
+# Enable with custom settings
+gcloud compute networks subnets update my-subnet \
+    --region=us-central1 \
+    --enable-flow-logs \
+    --logging-flow-sampling=0.5 \
+    --logging-metadata=include-all \
+    --logging-interval=INTERVAL_10_MIN
+
+# Disable
+gcloud compute networks subnets update my-subnet \
+    --region=us-central1 \
+    --no-enable-flow-logs
+
+# Check configuration
+gcloud compute networks subnets describe my-subnet \
+    --region=us-central1 --format="yaml(enableFlowLogs,logConfig)"
+```
+
+**Flow Log Sampling Options:**
+- `0.0` = Disabled
+- `0.5` = 50% of traffic logged (good for dev/staging)
+- `1.0` = 100% of traffic logged (production, higher cost)
+
+**Metadata Options:**
+- `EXCLUDE_ALL_METADATA` = No instance metadata in logs
+- `INCLUDE_ALL_METADATA` = Full metadata (recommended)
+- `CUSTOM_METADATA` = Specific metadata fields only
+
+### Subnet Purposes
+
+Special subnet types for load balancer proxies:
+```bash
+# Regional Managed Proxy subnet (for Internal HTTP(S) Load Balancer)
+gcloud compute networks subnets create proxy-subnet \
+    --network=my-vpc \
+    --region=us-central1 \
+    --range=10.0.30.0/24 \
+    --purpose=REGIONAL_MANAGED_PROXY
+
+# Internal HTTPS Only Proxy
+gcloud compute networks subnets create https-proxy-subnet \
+    --network=my-vpc \
+    --region=us-central1 \
+    --range=10.0.31.0/24 \
+    --purpose=INTERNAL_HTTPS_ONLY_PROXY
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Subnets per VPC | 15 |
+| Secondary ranges per subnet | 10 (including primary) |
+| Primary CIDR minimum | /29 |
+| Primary CIDR maximum | /16 |
+| GKE pod secondary minimum | /16 |
+| GKE service secondary minimum | /24 |
+
+### Key Gotchas
+
+- **Subnets are regional**—spans all zones in region, not a single zone
+- **Primary CIDR cannot be resized** after creation—choose carefully
+- **Secondary ranges can be added** but not removed from used GKE clusters
+- **Private Google Access requires instances to use Google's DNS (8.8.8.8)** or VPC-internal DNS
+- **Flow logs generate Cloud Logging costs**—use sampling for non-production
+- **Subnet purpose (proxy) reserves IP addresses** for load balancer proxies
+- **Deleting subnet requires deleting all resources**—instances, routes, etc.
+
+## Real Production Example
+
+Production subnet setup with GKE:
+
+```bash
+# 1. Create VPC
+gcloud compute networks create prod-vpc --subnet-mode=custom
+
+# 2. Create web tier subnet
+gcloud compute networks subnets create web-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.1.0/24 \
+    --enable-private-ip-google-access
+
+# 3. Create app tier subnet
+gcloud compute networks subnets create app-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.2.0/24 \
+    --enable-private-ip-google-access
+
+# 4. Create data tier subnet (no Private Google Access - isolated)
+gcloud compute networks subnets create data-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.3.0/24
+
+# 5. Create GKE subnet with secondary ranges
+gcloud compute networks subnets create gke-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.10.0/24 \
+    --enable-private-ip-google-access \
+    --secondary-ranges=gke-pods=10.1.0.0/16,gke-services=10.2.0.0/20
+
+# 6. Create proxy subnet for Internal HTTPS Load Balancer
+gcloud compute networks subnets create proxy-subnet \
+    --network=prod-vpc \
+    --region=us-central1 \
+    --range=10.0.30.0/24 \
+    --purpose=REGIONAL_MANAGED_PROXY
+
+# 7. Enable VPC Flow Logs on web subnet
+gcloud compute networks subnets update web-subnet \
+    --region=us-central1 \
+    --enable-flow-logs \
+    --logging-flow-sampling=1.0 \
+    --logging-metadata=include-all \
+    --logging-interval=INTERVAL_5_MIN
+
+# 8. Create instances in different subnets
+gcloud compute instances create web-server-1 \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --subnet=web-subnet \
+    --no-address
+
+gcloud compute instances create app-server-1 \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --subnet=app-subnet
+
+gcloud compute instances create db-server \
+    --zone=us-central1-a \
+    --machine-type=e2-standard-2 \
+    --subnet=data-subnet \
+    --no-address
+```
+
+```hcl
+# Terraform: Production subnets
+resource "google_compute_network" "prod_vpc" {
+  name                    = "prod-vpc"
+  auto_create_subnetworks = false
+}
+
+# Web subnet
+resource "google_compute_subnetwork" "web" {
+  name                     = "web-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.1.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+
+  log_config {
+    aggregation_interval = "INTERVAL_5_MIN"
+    flow_sampling        = 1.0
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+}
+
+# App subnet
+resource "google_compute_subnetwork" "app" {
+  name                     = "app-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.2.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+# Data subnet (isolated)
+resource "google_compute_subnetwork" "data" {
+  name                     = "data-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.3.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = false  # No external access
+}
+
+# GKE subnet with secondary ranges
+resource "google_compute_subnetwork" "gke" {
+  name                     = "gke-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.10.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+
+  secondary_ip_range = [
+    {
+      range_name    = "gke-pods"
+      ip_cidr_range = "10.1.0.0/16"
+    },
+    {
+      range_name    = "gke-services"
+      ip_cidr_range = "10.2.0.0/20"
+    }
+  ]
+}
+
+# Proxy subnet for Internal HTTPS LB
+resource "google_compute_subnetwork" "proxy" {
+  name                       = "proxy-subnet"
+  network                    = google_compute_network.prod_vpc.id
+  ip_cidr_range              = "10.0.30.0/24"
+  region                     = "us-central1"
+  private_ip_google_access   = false
+  purpose                    = "REGIONAL_MANAGED_PROXY"
+}
+```
+
+## CLI Examples
+
+```bash
+# Create subnet
+gcloud compute networks subnets create NAME \
+    --network=NETWORK \
+    --region=REGION \
+    --range=RANGE
+
+# List subnets
+gcloud compute networks subnets list
+
+# List subnets in VPC
+gcloud compute networks subnets list --network=NETWORK
+
+# Describe subnet
+gcloud compute networks subnets describe NAME --region=REGION
+
+# Update subnet (enable Private Google Access)
+gcloud compute networks subnets update NAME \
+    --region=REGION \
+    --enable-private-ip-google-access
+
+# Enable flow logs
+gcloud compute networks subnets update NAME \
+    --region=REGION \
+    --enable-flow-logs \
+    --logging-flow-sampling=0.5
+
+# Add secondary range
+gcloud compute networks subnets update NAME \
+    --region=REGION \
+    --add-secondary-ranges=RANGE_NAME=RANGE
+
+# Delete subnet
+gcloud compute networks subnets delete NAME --region=REGION
+```
+
+## Terraform Example
+
+```hcl
+# Complete subnet configuration
+resource "google_compute_network" "vpc" {
+  name                    = "my-vpc"
+  auto_create_subnetworks = false
+}
+
+# Standard subnet with all options
+resource "google_compute_subnetwork" "my_subnet" {
+  name                       = "my-subnet"
+  network                    = google_compute_network.vpc.id
+  ip_cidr_range              = "10.0.1.0/24"
+  region                      = "us-central1"
+  private_ip_google_access   = true
+  enable_flow_logs           = true
+
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = 0.5
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
+
+  secondary_ip_range = [
+    {
+      range_name    = "pod-range"
+      ip_cidr_range = "10.1.0.0/16"
+    },
+    {
+      range_name    = "svc-range"
+      ip_cidr_range = "10.2.0.0/20"
+    }
+  ]
+}
+
+# Subnet with purpose
+resource "google_compute_subnetwork" "proxy" {
+  name                       = "proxy-subnet"
+  network                    = google_compute_network.vpc.id
+  ip_cidr_range              = "10.0.2.0/24"
+  region                      = "us-central1"
+  purpose                    = "REGIONAL_MANAGED_PROXY"
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create subnet | `gcloud compute networks subnets create NAME --network=NET --region=REG --range=RANGE` |
+| List subnets | `gcloud compute networks subnets list` |
+| Describe subnet | `gcloud compute networks subnets describe NAME --region=REG` |
+| Update subnet | `gcloud compute networks subnets update NAME --region=REG [FLAGS]` |
+| Delete subnet | `gcloud compute networks subnets delete NAME --region=REG` |
+| Enable PGI | `gcloud compute networks subnets update NAME --region=REG --enable-private-ip-google-access` |
+| Enable flow logs | `gcloud compute networks subnets update NAME --region=REG --enable-flow-logs` |
+
+## Monitoring
+
+**Subnet Monitoring:**
+
+1. **VPC Flow Logs Analysis**
+   ```bash
+   # Query flow logs for a subnet
+   gcloud logging read '
+     resource.type="gce_subnetwork"
+     resource.labels.subnetwork_name="web-subnet"
+     resource.labels.region="us-central1"
+   ' --limit=100
+
+   # Find top talkers
+   bq query --use_legacy_sql=false '
+     SELECT
+       src_ip,
+       dest_ip,
+       SUM(bytes_sent) as total_bytes
+     FROM `flow_logs.flow_events`
+     WHERE subnetwork_name = "web-subnet"
+     GROUP BY src_ip, dest_ip
+     ORDER BY total_bytes DESC
+   '
+   ```
+
+2. **Network Metrics**
+   - Cloud Monitoring > Network > Subnet
+   - Bytes in/out, packets in/out
+   - Errors and drops
+
+3. **Alerts**
+   ```bash
+   # Alert on unusual traffic spike
+   gcloud alpha monitoring policies create \
+       --display-name="Subnet Traffic Spike" \
+       --condition-display-name="Traffic > 1GB/min"
+   ```
+
+## Security
+
+**Subnet Security Best Practices:**
+
+1. **Use Private Google Access** for internal-only instances
+2. **Enable VPC Flow Logs** for audit trail
+3. **Restrict external IPs** via organization policy
+4. **Use firewall rules** to control traffic between subnets
+5. **Use dedicated subnets** for special purposes (GKE, proxy)
+
+```bash
+# Organization policy: restrict external IPs
+cat > no-external-ip.yaml << 'EOF'
+name: organizations/ORG_ID/policies/compute.vmExternalIp
+spec:
+  rules:
+  - condition:
+      expression: "resource.location != 'regions/us-central1'"
+    deny:
+      values: ["ENABLED"]
+  - enforce: false
+EOF
+gcloud org-policies set-policy no-external-ip.yaml
+```
+
+## Cost Optimization
+
+**Subnet Cost Considerations:**
+
+| Component | Cost |
+|-----------|------|
+| VPC Flow Logs | Per GB logged (~$0.50/GB) |
+| Egress between subnets | Standard egress rates |
+| Secondary ranges | No direct cost, but IPs reserved |
+
+**Optimization Tips:**
+- Use flow log sampling (0.5) for non-production
+- Size secondary ranges appropriately for GKE
+- Delete unused subnets
+- Use Private Google Access to avoid NAT gateway costs
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Can't reach Google APIs from instance without external IP**
+   ```bash
+   # Check Private Google Access is enabled
+   gcloud compute networks subnets describe my-subnet \
+       --region=us-central1 | grep privateIpGoogleAccess
+   
+   # Check DNS resolution
+   nslookup storage.googleapis.com
+   # Should resolve to internal Google IP
+   ```
+
+2. **GKE pod IP range exhausted**
+   ```bash
+   # Check current pod range usage
+   kubectl get nodes -o wide
+   
+   # Check if secondary range is full
+   # Solution: Add another secondary range or recreate cluster
+   
+   gcloud container clusters describe my-cluster \
+       --region=us-central1 \
+       --format="yaml(networkConfig)"
+   ```
+
+3. **Subnet delete fails**
+   ```bash
+   # Check for remaining resources
+   gcloud compute instances list --filter="networkInterfaces.subnetwork:my-subnet"
+   gcloud compute routes list --filter="network:my-vpc AND nextHopNetwork:my-subnet"
+   
+   # Delete or move resources first
+   ```
+
+4. **Flow logs not appearing**
+   ```bash
+   # Check flow logs are enabled
+   gcloud compute networks subnets describe my-subnet \
+       --region=us-central1 --format="yaml(logConfig)"
+   
+   # Check Cloud Logging quota
+   # Check log sink destination
+   ```
+
+## Interview Questions
+
+1. **What's the difference between a subnet and a VPC? How do they relate?**
+
+2. **Explain Private Google Access. How does it work and what are its limitations?**
+
+3. **When would you use secondary IP ranges on a subnet? Provide a specific example.**
+
+4. **What are subnet purposes (like REGIONAL_MANAGED_PROXY)? When are they required?**
+
+5. **How do you monitor network traffic at the subnet level in GCP?**
+
+## Cheat Sheet
+
+```
+# Subnet Commands
+gcloud compute networks subnets create NAME --network=NET --region=REG --range=RANGE
+gcloud compute networks subnets list
+gcloud compute networks subnets describe NAME --region=REG
+gcloud compute networks subnets update NAME --region=REG [FLAGS]
+gcloud compute networks subnets delete NAME --region=REG
+
+# Key Flags
+--enable-private-ip-google-access    # Allow internal instances to reach Google APIs
+--enable-flow-logs                   # Enable VPC Flow Logs
+--secondary-ranges=RANGE_NAME=RANGE  # Add secondary CIDR
+--purpose=TYPE                       # Special subnet type
+
+# Flow Log Options
+--logging-flow-sampling=0.5          # Sample rate (0.0-1.0)
+--logging-metadata=include-all       # Include VM metadata
+--logging-interval=INTERVAL_10_MIN   # Aggregation interval
+```
+
+## Labs
+
+1. **Subnet Creation**: Create a VPC with multiple subnets for different tiers
+2. **Private Google Access**: Verify instances without external IPs can access Google APIs
+3. **VPC Flow Logs**: Enable flow logs, query logs to understand traffic patterns
+4. **GKE Subnets**: Create subnet with secondary ranges for GKE cluster
+5. **Multi-Region Subnets**: Create subnets in multiple regions, test cross-region connectivity
+
+## Related Services
+
+- [VPC](./vpc)
+- [Firewall Rules](./firewall)
+- [Routes](./routes)
+- [GKE](../compute/gke)
+- [Cloud NAT](./cloud-nat)

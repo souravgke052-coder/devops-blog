@@ -1,0 +1,900 @@
+---
+title: "Container Registry"
+description: "Container registries - Artifact Registry, Harbor, image management, and distribution"
+sidebar_position: 7
+---
+
+# Container Registry
+
+## Overview
+
+A container registry is a storage and distribution system for container images. It hosts image repositories, manages versioning through tags, and provides APIs for pushing and pulling images. Registries are the backbone of the container supply chain, enabling reliable image storage and distribution.
+
+**Registry Types:**
+- **Public registries**: Docker Hub, GitHub Container Registry, Quay.io
+- **Private registries**: Self-hosted Harbor, GitLab Container Registry
+- **Cloud registries**: Google Artifact Registry, AWS ECR, Azure Container Registry
+
+**Key Concepts:**
+- **Registry**: Server hosting multiple repositories
+- **Repository**: Collection of related images (e.g., `myregistry.io/myapp`)
+- **Tag**: Version identifier (e.g., `v1.2.3`, `latest`)
+- **Manifest**: Metadata describing image layers and configuration
+- **Blob**: Individual layer files stored in registry
+
+## When To Use
+
+- **Storing private images** not suitable for public registries
+- **Compliance requirements** for data residency and audit
+- **Air-gapped environments** requiring self-hosted solutions
+- **Performance optimization** with regional registries
+- **Enterprise authentication** with SSO/LDAP integration
+- **Image scanning integration** within the registry
+- **Fine-grained access control** beyond public registry permissions
+
+## When NOT To Use
+
+- **Simple projects** where Docker Hub suffices
+- **Personal/hobby projects** where convenience outweighs control
+- **Proof of concepts** before infrastructure commitment
+
+## Core Concepts
+
+### Registry Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Container Registry                           │
+│                                                                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+│  │   myapp     │  │   nginx     │  │   postgres  │                 │
+│  │  ┌───────┐  │  │  ┌───────┐  │  │  ┌───────┐  │                 │
+│  │  │  v1   │  │  │  │  v1   │  │  │  │  v1   │  │                 │
+│  │  │  v2   │  │  │  │  v2   │  │  │  │  v2   │  │                 │
+│  │  │ latest│  │  │  │ latest│  │  │  │ latest│  │                 │
+│  │  └───────┘  │  │  └───────┘  │  │  └───────┘  │                 │
+│  └─────────────┘  └─────────────┘  └─────────────┘                 │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    Storage Backend                            │  │
+│  │                    (S3, GCS, Azure Blob, filesystem)          │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Image Manifest
+
+```json
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+  "config": {
+    "mediaType": "application/vnd.docker.container.image.v1+json",
+    "size": 7023,
+    "digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d83b1f2179f6b1907"
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+      "size": 2815541,
+      "digest": "sha256:abc123..."
+    },
+    {
+      "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+      "size": 105376,
+      "digest": "sha256:def456..."
+    }
+  ]
+}
+```
+
+### Multi-Architecture Images
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Multi-Architecture Image                          │
+│                                                                      │
+│  myregistry.io/myapp:latest (Multi-arch manifest)                   │
+│  │                                                                  │
+│  ├── linux/amd64 ──────► sha256:abc123...                          │
+│  ├── linux/arm64 ──────► sha256:def456...                          │
+│  └── linux/arm/v7 ─────► sha256:ghi789...                          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Google Artifact Registry Setup
+
+```bash
+# 1. Create Artifact Registry repository
+gcloud artifacts repositories create my-repo \
+  --repository-format=docker \
+  --location=us-central1 \
+  --description="Production container images"
+
+# 2. Configure Docker authentication
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+# 3. Tag and push images
+docker tag myapp:latest us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1.0.0
+docker push us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1.0.0
+
+# 4. Set up vulnerability scanning
+gcloud artifacts repositories update my-repo \
+  --location=us-central1 \
+  --enable-dynamic-import \
+  --docker-repo=docker
+
+# 5. Configure cleanup policies
+gcloud artifacts repositories update my-repo \
+  --location=us-central1 \
+  --docker-repo=docker \
+  --cleanup-policy=delete-days-older-than=90 \
+  --cleanup-policy-dry-run=false
+```
+
+### Harbor Registry Deployment
+
+```yaml
+# docker-compose.yml for Harbor
+
+version: '3.9'
+
+services:
+  # ============================================
+  # Harbor Core Services
+  # ============================================
+  proxy:
+    image: goharbor/nginx-photon:v2.8.0
+    container_name: nginx
+    depends_on:
+      - core
+      - jobservice
+      - trivy-adapter
+    networks:
+      - harbor
+    ports:
+      - "80:8080"
+      - "443:8443"
+    restart: always
+
+  core:
+    image: goharbor/core:v2.8.0
+    container_name: harbor-core
+    env_file:
+      - ./config/core/env
+    depends_on:
+      - redis
+      - db
+    networks:
+      - harbor
+    volumes:
+      - /data/ca-downloads:/etc/core/ca/certs
+      - /data/certificates:/etc/core/ssl
+      - /data/config:/etc/core/app
+      - /data/secretkey:/etc/core/secret
+      - /data/secretkey/dbcrypt:rw
+      - /data/redis:rw
+      - /data/trivy-adapter/trivy:/home/scanner/.cache/trivy:rw
+    restart: always
+
+  jobservice:
+    image: goharbor/jobservice:v2.8.0
+    container_name: harbor-jobservice
+    env_file:
+      - ./config/jobservice/env
+    depends_on:
+      - core
+    networks:
+      - harbor
+    volumes:
+      - /data/job_logs:/var/log/jobservice:rw
+      - /data/secretkey:/etc/core/secret:rw
+      - /data/secretkey/dbcrypt:rw
+    restart: always
+
+  # ============================================
+  # Database
+  # ============================================
+  db:
+    image: goharbor/harbor-db:v2.8.0
+    container_name: harbor-db
+    environment:
+      - POSTGRESQL_PASSWORD=changeme
+      - POSTGRESQL_DATABASE=registry
+      - POSTGRESQL_USERNAME=postgres
+    networks:
+      - harbor
+    volumes:
+      - /data/database:/var/lib/postgresql/data:rw
+    restart: always
+
+  # ============================================
+  # Redis
+  # ============================================
+  redis:
+    image: goharbor/redis-photon:v2.8.0
+    container_name: redis
+    networks:
+      - harbor
+    volumes:
+      - /data/redis:/data:rw
+    restart: always
+
+  # ============================================
+  # Trivy Adapter (Vulnerability Scanning)
+  # ============================================
+  trivy-adapter:
+    image: goharbor/trivy-adapter-photon:v2.8.0
+    container_name: trivy-adapter
+    env_file:
+      - ./config/trivy-adapter/env
+    networks:
+      - harbor
+    volumes:
+      - /data/trivy-adapter/trivy:/home/scanner/.cache/trivy:rw
+    restart: always
+
+  # ============================================
+  # Registry
+  # ============================================
+  registry:
+    image: goharbor/registry-photon:v2.8.0
+    container_name: registry
+    environment:
+      - REGISTRY_HTTP_TLS_CERTIFICATE=/etc/registry/cert.crt
+      - REGISTRY_HTTP_TLS_KEY=/etc/registry/cert.key
+    depends_on:
+      - core
+    networks:
+      - harbor
+    volumes:
+      - /data/registry:/var/lib/registry:rw
+      - /data/certificates:/etc/registry/cert:rw
+    restart: always
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  harbor:
+    driver: bridge
+```
+
+### Harbor Configuration (harbor.yml)
+
+```yaml
+# hostname: registry.example.com
+hostname: registry.example.com
+
+http:
+  port: 80
+
+https:
+  port: 443
+  certificate: /data/certificates/tls.crt
+  private_key: /data/certificates/tls.key
+
+# Database
+database:
+  password: changeme_secure_password
+  max_idle_conns: 50
+  max_open_conns: 100
+
+# Redis
+redis:
+  password:
+
+# Harbor admin password
+harbor_admin_password: changeme_secure_admin_password
+
+# Harbor Data Volume
+volume: /data
+
+# Clair (Vulnerability Scanner)
+clair:
+  enabled: true
+  update_interval: 6h
+  vendors: ["alpine", "redhat", "debian", "ubuntu"]
+
+# Trivy (Alternative Scanner)
+trivy:
+  enabled: true
+  update_interval: 6h
+  ignore_unfixed: false
+  severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+
+# Job Log
+jobservice:
+  max_job_workers: 10
+
+# Log
+log:
+  level: info
+  location: /var/log/harbor
+
+# Proxy (for Harbor behind reverse proxy)
+# proxy:
+#   http_proxy:
+#   https_proxy:
+#   no_proxy: localhost,127.0.0.1
+
+# Notification
+notification:
+  webhook_job_max_retry: 3
+
+# Storage
+storage:
+  # cloud storage configuration
+  # filesystem:
+  #   rootdirectory: /storage
+```
+
+## CLI Examples
+
+### Docker Hub Operations
+
+```bash
+# Login to Docker Hub
+docker login
+
+# Pull image
+docker pull nginx:alpine
+
+# Tag for Docker Hub
+docker tag myapp:latest myusername/myapp:v1.0.0
+
+# Push to Docker Hub
+docker push myusername/myapp:v1.0.0
+
+# List repositories (requires API)
+curl -s -u username:token https://hub.docker.com/v2/repositories/username/ | jq
+```
+
+### Google Artifact Registry (GAR)
+
+```bash
+# Configure Docker authentication
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+# Pull image
+docker pull us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1.0.0
+
+# Tag and push
+docker tag myapp:v1 us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1.0.0
+docker push us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1.0.0
+
+# List repositories
+gcloud artifacts repositories list --location=us-central1
+
+# Delete old versions
+gcloud artifacts docker images delete \
+  us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1.0.0 \
+  --delete-tags
+
+# Show repository IAM policy
+gcloud artifacts repositories get-iam-policy my-repo \
+  --location=us-central1
+```
+
+### Amazon ECR
+
+```bash
+# Create ECR repository
+aws ecr create-repository \
+  --repository-name myapp \
+  --image-scanning-configuration scanOnPush=true \
+  --encryption-configuration encryptionType=AES256
+
+# Get login password
+aws ecr get-login-password | docker login --username AWS --password-stdin \
+  123456789.dkr.ecr.us-east-1.amazonaws.com
+
+# Tag and push
+docker tag myapp:latest 123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:v1
+docker push 123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:v1
+
+# List images
+aws ecr list-images --repository-name myapp
+
+# Describe image scan findings
+aws ecr describe-image-scan-findings \
+  --repository-name myapp \
+  --image-id imageTag=v1
+
+# Lifecycle policy
+aws ecr put-lifecycle-policy \
+  --repository-name myapp \
+  --lifecycle-policy-text '{
+    "rules": [{
+      "rulePriority": 1,
+      "description": "Expire untagged images after 14 days",
+      "selection": {
+        "tagStatus": "untagged",
+        "countType": "sinceImagePushed",
+        "countUnit": "days",
+        "countNumber": 14
+      },
+      "action": {"type": "expire"}
+    }]
+  }'
+```
+
+### Azure Container Registry
+
+```bash
+# Login to ACR
+az acr login --name myregistry
+
+# Pull image
+docker pull myregistry.azurecr.io/myapp:v1
+
+# Tag and push
+docker tag myapp:v1 myregistry.azurecr.io/myapp:v1
+docker push myregistry.azurecr.io/myapp:v1
+
+# List repositories
+az acr repository list -n myregistry -o table
+
+# Show tags
+az acr repository show-tags -n myregistry --repository myapp
+
+# Delete image
+az acr repository delete -n myregistry --image myapp:v1
+
+# Build and push in ACR
+az acr build \
+  --registry myregistry \
+  --image myapp:v1 \
+  --file Dockerfile .
+```
+
+### Harbor CLI
+
+```bash
+# Login to Harbor
+docker login registry.example.com
+
+# Pull image
+docker pull registry.example.com/myproject/myapp:v1
+
+# Tag and push
+docker tag myapp:v1 registry.example.com/myproject/myapp:v1
+docker push registry.example.com/myproject/myapp:v1
+
+# List repositories via API
+curl -s -u admin:password \
+  "https://registry.example.com/api/v2.0/projects?page=1&page_size=10"
+
+# Trigger garbage collection
+curl -X POST -s -u admin:password \
+  "https://registry.example.com/api/v2.0/system/gc/schedule" \
+  -H "Content-Type: application/json" \
+  -d '{"schedule":"0 0 * * * *"}'
+```
+
+## Dockerfile / Compose Examples
+
+### Image Promotion Pipeline
+
+```yaml
+# docker-compose.yml for image promotion
+
+version: "3.9"
+
+services:
+  # Build stage
+  build:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: ${REGISTRY}/myapp:build-${GIT_SHA}
+    profiles:
+      - ci
+
+  # Scan and sign
+  security-scan:
+    image: aquasec/trivy:latest
+    profiles:
+      - ci
+    environment:
+      - REGISTRY=${REGISTRY}
+      - IMAGE_TAG=${GIT_SHA}
+    command: image --severity HIGH,CRITICAL ${REGISTRY}/myapp:build-${GIT_SHA}
+
+  # Promote to staging
+  promote-staging:
+    image: google/cloud-sdk:latest
+    profiles:
+      - ci
+    environment:
+      - REGISTRY=${REGISTRY}
+      - GIT_SHA=${GIT_SHA}
+    command: >
+      gcloud artifacts docker tags set
+      ${REGISTRY}/myapp:build-${GIT_SHA}
+      ${REGISTRY}/myapp:staging-${GIT_SHA}
+
+  # Deploy to staging
+  deploy-staging:
+    image: bitnami/kubectl:latest
+    profiles:
+      - ci
+    environment:
+      - KUBECONFIG=/.kube/config
+    volumes:
+      - kubeconfig:/.kube:ro
+    command: kubectl set image deployment/myapp myapp=${REGISTRY}/myapp:staging-${GIT_SHA}
+
+  # Integration tests would go here
+  test-staging:
+    image: newman:latest
+    profiles:
+      - ci
+    environment:
+      - API_URL=https://staging.example.com
+    command: run postman-collection.json
+
+  # Promote to production
+  promote-production:
+    image: google/cloud-sdk:latest
+    profiles:
+      - ci
+    environment:
+      - REGISTRY=${REGISTRY}
+      - GIT_SHA=${GIT_SHA}
+    command: >
+      gcloud artifacts docker tags set
+      ${REGISTRY}/myapp:staging-${GIT_SHA}
+      ${REGISTRY}/myapp:prod-${GIT_SHA}
+      ${REGISTRY}/myapp:latest
+```
+
+### Kubernetes ImagePullSecrets Setup
+
+```yaml
+# Create pull secret for private registry
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gar-pull-secret
+  namespace: myapp
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: |
+    {
+      "auths": {
+        "us-central1-docker.pkg.dev": {
+          "auth": "base64(service-account-email:token)"
+        }
+      }
+    }
+
+---
+# Use in Pod spec
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  imagePullSecrets:
+    - name: gar-pull-secret
+  containers:
+    - name: myapp
+      image: us-central1-docker.pkg.dev/my-project/my-repo/myapp:v1
+```
+
+## Common Commands
+
+### Registry Operations
+
+| Command | Description |
+|---------|-------------|
+| `docker login` | Authenticate to registry |
+| `docker pull` | Download image |
+| `docker push` | Upload image |
+| `docker tag` | Create image tag |
+| `docker logout` | Log out from registry |
+| `docker search` | Search Docker Hub |
+| `gcloud artifacts` | GAR operations (GCP) |
+| `aws ecr` | ECR operations (AWS) |
+| `az acr` | ACR operations (Azure) |
+
+### Image Management
+
+```bash
+# List all images in repository
+docker images
+
+# Remove unused images
+docker image prune
+docker image prune -a
+
+# Inspect image manifest
+docker manifest inspect myapp:latest
+
+# Show image layers
+docker history myapp:latest
+
+# Delete image from local
+docker rmi myapp:v1
+```
+
+## Monitoring
+
+### Registry Metrics
+
+```bash
+# Harbor metrics (Prometheus)
+curl http://harbor:8080/metrics
+
+# Docker Hub rate limits
+curl -I https://registry.hub.docker.com/v2/
+# X-RateLimit-Remaining header shows remaining requests
+
+# ECR describe image metrics
+aws ecr describe-images --repository-name myapp
+```
+
+### Audit Logging
+
+```bash
+# Harbor audit logs
+docker exec harbor-jobservice cat /var/log/jobservice/jobs.log
+
+# GCP Cloud Audit Logs for GAR
+gcloud logging read 'resource.type="gcr.io"' --limit 10
+
+# AWS CloudTrail for ECR
+aws cloudtrail lookup-events --lookup-attributes AttributeKey=EventName,AttributeValue=PushImage
+```
+
+## Security
+
+### Authentication Methods
+
+| Method | Use Case |
+|--------|----------|
+| **Password/Token** | Simple authentication |
+| **Service Account** | CI/CD, automated systems |
+| **OIDC/SSO** | Enterprise with identity provider |
+| **Robot Accounts** | Machine-to-machine (Harbor) |
+| **Workload Identity** | Kubernetes (GCP) |
+| **IAM Roles** | AWS ECR |
+
+### Access Control Best Practices
+
+```yaml
+# Harbor project access levels
+# 1. Public: Anyone can pull
+# 2. Private: Only project members
+# 3. Harbor DB (default)
+
+# Harbor robot accounts (for CI/CD)
+# Create via Harbor UI or API:
+POST /api/v2.0/projects/myproject/robots
+{
+  "name": "ci-deploy",
+  "permissions": [
+    {
+      "access": [
+        {"resource": "repository", "action": "push"},
+        {"resource": "repository", "action": "pull"}
+      ],
+      "project": "myproject"
+    }
+  ]
+}
+```
+
+### Network Security
+
+```bash
+# Use TLS for registry communication
+# In /etc/docker/daemon.json
+{
+  "registry-mirrors": [],
+  "insecure-registries": []  # NEVER use for production
+}
+
+# Configure DNS for registry
+# Ensure DNS resolution works within cluster
+
+# Use network policies (Kubernetes)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-registry-access
+spec:
+  podSelector:
+    matchLabels:
+      app: myapp
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: registry
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+## Cost Optimization
+
+### Storage Tiers
+
+| Tier | Use Case | Cost |
+|------|----------|------|
+| Hot | Frequently accessed | Higher |
+| Cold | Infrequent access | Lower |
+| Archive | Rarely accessed | Lowest |
+
+### Cleanup Policies
+
+```bash
+# Harbor cleanup via GC
+# Set via Harbor UI or API
+# Retain tags matching pattern, delete older
+
+# ECR lifecycle policy
+aws ecr put-lifecycle-policy \
+  --repository-name myapp \
+  --lifecycle-policy-text '{
+    "rules": [{
+      "rulePriority": 1,
+      "description": "Keep last 10 versions",
+      "selection": {
+        "tagStatus": "tagged",
+        "tagPrefixList": ["v"],
+        "countType": "imageCountMoreThan",
+        "countNumber": 10
+      },
+      "action": {"type": "expire"}
+    }]
+  }'
+
+# GAR cleanup policy
+gcloud artifacts repositories update my-repo \
+  --location=us \
+  --docker-repo=docker \
+  --cleanup-policy=delete-days-older-than=90 \
+  --keep-tag-recent-versions=10
+```
+
+### Multi-Region Replication
+
+```yaml
+# Harbor replication rule
+# Configure in Harbor UI or via API
+# Replicate images to secondary registries
+# Supports:
+#   - Push-based (on push to source)
+#   - Pull-based (on pull from target)
+#   - Scheduled replication
+
+# ECR cross-region replication
+# Enable in repository settings
+# Configure IAM for replication role
+```
+
+## Troubleshooting
+
+### Common Registry Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Image pull fails | Authentication | Run `docker login` |
+| 403 Forbidden | Permission denied | Check IAM/robot account |
+| 404 Not Found | Image tag doesn't exist | Verify tag name |
+| Rate limit exceeded | Too many pulls | Use authenticated pulls |
+| Certificate errors | TLS issue | Check registry TLS cert |
+| Manifest unknown | Multi-arch issue | Check platform support |
+
+### Debugging Commands
+
+```bash
+# Test registry connectivity
+curl -I https://myregistry.com/v2/
+
+# Check Docker daemon logs
+journalctl -u docker -f
+
+# Verify authentication
+docker login myregistry.com
+cat ~/.docker/config.json
+
+# Inspect image manifest
+docker manifest inspect myregistry.com/myapp:v1
+
+# Check for cached credentials
+cat ~/.docker/config.json | jq '.auths'
+
+# Clear Docker cache
+docker system prune -a
+```
+
+## Interview Questions
+
+### Q1: What is the difference between a registry and a repository?
+**A:** A registry is the server hosting multiple repositories (e.g., Docker Hub, GCR). A repository is a named collection of related images within a registry (e.g., `myregistry.io/myapp`). An image is identified by `registry/repository:tag` or `registry/repository@sha256:digest`.
+
+### Q2: How does Docker authenticate to a registry?
+**A:** Docker uses the Docker config file (`~/.docker/config.json`) storing credentials or tokens. On login, credentials are stored base64-encoded. For GCP, `gcloud auth configure-docker` stores OAuth2 tokens. For AWS ECR, `aws ecr get-login-password` provides short-lived tokens.
+
+### Q3: What is a multi-architecture image?
+**A:** A multi-arch image uses a manifest list to reference architecture-specific images. When pulling, the Docker client automatically selects the correct image for the host's architecture (amd64, arm64, etc.). Build with `docker buildx build --platform linux/amd64,linux/arm64`.
+
+### Q4: How do you secure a container registry?
+**A:** Secure by enabling TLS, using strong authentication (SSO, robot accounts), implementing RBAC/IAM, enabling vulnerability scanning, signing images (Cosign), using network policies to restrict access, implementing audit logging, and setting up retention/cleanup policies.
+
+### Q5: What are robot accounts and why use them?
+**A:** Robot accounts are service accounts for CI/CD systems, not tied to individual users. They enable automation without sharing human credentials, can be rotated, and can have scoped permissions. In Harbor, they're called "Robot Accounts."
+
+### Q6: What is image promotion?
+**A:** Image promotion moves images through lifecycle stages (build → staging → production). It typically involves tagging or copying images between registries with security gates (scanning, testing) at each stage. Enables traceability and controlled rollouts.
+
+### Q7: How do you handle registry rate limits?
+**A:** Authenticated requests have higher limits than anonymous. Use service accounts with registry authentication. Implement caching with registry mirrors. For Docker Hub, upgrade to Teams or Business tier. Consider multi-registry distribution.
+
+### Q8: What is a Helm chart repository vs container registry?
+**A:** A container registry stores OCI images. A Helm chart repository stores Helm charts, which package Kubernetes manifests. Helm 3 supports OCI-based chart storage in container registries using the OCI distribution spec.
+
+## Cheat Sheet
+
+### Registry Commands
+
+```bash
+# Login
+docker login registry.example.com
+
+# Pull/Push
+docker pull myregistry.io/myapp:v1
+docker push myregistry.io/myapp:v1
+
+# Tag
+docker tag myapp:v1 myregistry.io/myapp:v1
+
+# List repositories
+docker images | grep myapp
+
+# Delete local
+docker rmi myapp:v1
+```
+
+### Cloud Registry Commands
+
+```bash
+# GCP Artifact Registry
+gcloud artifacts repositories create my-repo --repository-format=docker --location=us
+gcloud auth configure-docker us-docker.pkg.dev
+docker push us-docker.pkg.dev/project/my-repo/myapp:v1
+
+# AWS ECR
+aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REGISTRY
+docker push $ECR_REGISTRY/myapp:v1
+
+# Azure ACR
+az acr login --name myregistry
+docker push myregistry.azurecr.io/myapp:v1
+```
+
+### Security Checklist
+
+- [ ] Enable TLS (HTTPS)
+- [ ] Use authentication
+- [ ] Configure IAM/RBAC
+- [ ] Enable vulnerability scanning
+- [ ] Sign images (Cosign)
+- [ ] Set retention policies
+- [ ] Enable audit logging
+- [ ] Use network policies
+
+## Related Topics
+
+- [Container Overview](./overview.mdx) - Container fundamentals
+- [Docker](./docker.mdx) - Docker CLI reference
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Container Runtime](./container-runtime.mdx) - Runtime internals
+- [Image Security](./image-security.mdx) - Vulnerability scanning
+- [Troubleshooting](./troubleshooting.mdx) - Debugging containers

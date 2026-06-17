@@ -1,0 +1,902 @@
+---
+id: deploy
+title: Deployment Strategies
+description: Rolling, blue-green, canary deployments with approval gates and multi-environment pipelines
+sidebar_position: 7
+---
+
+# Deployment Strategies
+
+## Overview
+
+Deployment strategies define how new versions of software are released to production. The choice of strategy affects downtime, risk, rollback speed, and traffic management. This guide covers the major deployment patterns, when to use each, and how to implement them in production CI/CD pipelines.
+
+## When To Use
+
+- Any production deployment
+- Multiple environments (dev, staging, prod)
+- High-availability requirements
+- Compliance requiring staged rollouts
+- Teams practicing continuous delivery/deployment
+
+## When NOT To Use
+
+- Static content with no runtime
+- Proof-of-concept deployments
+- Emergency patches requiring immediate full rollout
+
+## Core Concepts
+
+### Deployment Strategy Comparison
+
+| Strategy | Downtime | Risk | Rollback Speed | Traffic Impact | Complexity |
+|----------|----------|------|----------------|----------------|------------|
+| **Recreate** | Yes | High | Fast | All at once | Low |
+| **Rolling** | None | Medium | Medium | Gradual | Medium |
+| **Blue-Green** | None | Low | Instant | All at once | Medium |
+| **Canary** | None | Lowest | Fast | Percentage | High |
+| **Feature Flags** | None | Lowest | Instant | Per-user | Medium |
+
+### Key Terminology
+
+| Term | Description |
+|------|-------------|
+| **Deployment** | Replacing old version with new |
+| **Rollout** | Gradual deployment process |
+| **Rollback** | Reverting to previous version |
+| **Traffic Split** | Percentage of users on new version |
+| **Smoke Test** | Quick validation after deployment |
+
+## Real Production Example
+
+### Complete Multi-Environment Deployment Pipeline
+
+```yaml
+name: Production Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+        default: staging
+      skip_smoke_test:
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # Allow queued deployments to complete
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # PRE-DEPLOYMENT VALIDATION
+  # ============================================
+  pre-deploy:
+    name: Pre-deployment Validation
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      environment: ${{ steps.env.outputs.environment }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" != "" ]]; then
+            ENV=${{ github.event.inputs.environment }}
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENV=staging
+          else
+            ENV=dev
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+      
+      - name: Docker meta
+        id: meta
+        run: |
+          TAG="sha-${{ github.sha }}"
+          if [[ "${{ github.event_name }}" == "tag" ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          fi
+          echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG" >> $GITHUB_OUTPUT
+      
+      - name: Verify image exists
+        run: |
+          docker manifest inspect ${{ steps.meta.outputs.tags }} || exit 1
+
+  # ============================================
+  # DEPLOY TO STAGING
+  # ============================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: pre-deploy
+    if: needs.pre-deploy.outputs.environment == 'staging'
+    
+    environment:
+      name: staging
+      url: https://staging.myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.STAGING_SA }}
+      
+      - name: Deploy to GKE
+        run: |
+          gcloud container clusters get-credentials ${{ vars.STAGING_CLUSTER }} --region us-central1
+          
+          # Rolling update with maxSurge for faster deployment
+          kubectl rollout status deployment/api --namespace=staging --timeout=5m
+          
+          # Update deployment
+          kubectl set image deployment/api api=${{ needs.pre-deploy.outputs.image_tag }} --namespace=staging
+          
+          # Wait for rollout
+          kubectl rollout status deployment/api --namespace=staging --timeout=10m
+      
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/api --namespace=staging
+          kubectl get deployment api --namespace=staging -o jsonpath='{.spec.replicas}'
+          kubectl get pods --namespace=staging -l app=api --field-selector=status.phase=Running | wc -l
+
+  # ============================================
+  # SMOKE TESTS
+  # ============================================
+  smoke-tests:
+    name: Post-deployment Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: ${{ !github.event.inputs.skip_smoke_test }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run smoke tests
+        run: |
+          echo "Testing staging deployment..."
+          
+          # Health check
+          curl -f https://staging.myapp.com/health || exit 1
+          
+          # API test
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://staging.myapp.com/api/users)
+          if [[ "$RESPONSE" != "200" ]] && [[ "$RESPONSE" != "401" ]]; then
+            echo "Unexpected API response: $RESPONSE"
+            exit 1
+          fi
+          
+          # Database connectivity
+          kubectl exec -n staging deployment/api -- curl -s localhost:8080/health/db || exit 1
+          
+          echo "All smoke tests passed"
+
+  # ============================================
+  # APPROVAL GATE FOR PRODUCTION
+  # ============================================
+  approval-production:
+    name: Production Approval
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    if: needs.pre-deploy.outputs.environment == 'production'
+    
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    steps:
+      - name: Approval Required
+        run: |
+          echo "Production deployment requires manual approval"
+          echo "Image: ${{ needs.pre-deploy.outputs.image_tag }}"
+          echo "Visit ${{ github.server_url }}/${{ github.repository }}/environments/production to approve"
+
+  # ============================================
+  # PRODUCTION DEPLOYMENT
+  # ============================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [smoke-tests, approval-production]
+    if: needs.pre-deploy.outputs.environment == 'production'
+    
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - deployment: api-blue
+            slot: blue
+          - deployment: api-green
+            slot: green
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+      
+      - name: Deploy to Production (${{ matrix.slot }})
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          # Deploy to the inactive slot (blue or green)
+          kubectl set image deployment/${{ matrix.deployment }} api=${{ needs.pre-deploy.outputs.image_tag }} --namespace=production
+          kubectl rollout status deployment/${{ matrix.deployment }} --namespace=production --timeout=15m
+      
+      - name: Run deployment verification
+        run: |
+          # Verify the deployed version
+          kubectl rollout status deployment/${{ matrix.deployment }} --namespace=production
+          
+          # Run smoke tests against new deployment
+          kubectl exec -n production deployment/${{ matrix.deployment }} -- curl -s localhost:8080/health || exit 1
+
+  # ============================================
+  # TRAFFIC SWITCH (BLUE-GREEN)
+  # ============================================
+  switch-traffic:
+    name: Switch Traffic
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: needs.pre-deploy.outputs.environment == 'production'
+    
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Switch traffic to new deployment
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          
+          # Get current active slot
+          CURRENT=$(kubectl get service api -n production -o jsonpath='{.spec.selector.deployment}')
+          
+          # Switch to inactive slot
+          if [[ "$CURRENT" == "api-blue" ]]; then
+            NEW="api-green"
+          else
+            NEW="api-blue"
+          fi
+          
+          echo "Switching traffic from $CURRENT to $NEW"
+          
+          kubectl patch service api -n production \
+            --type='json' \
+            -p="[{\"op\":\"replace\",\"path\":\"/spec/selector/deployment\",\"value\":\"$NEW\"}]"
+          
+          # Verify traffic switch
+          sleep 10
+          kubectl get pods -n production -l deployment=$NEW --field-selector=status.phase=Running
+      
+      - name: Final smoke test
+        run: |
+          sleep 30  # Wait for DNS propagation
+          curl -f https://myapp.com/health || exit 1
+          curl -f https://myapp.com/api/users || exit 1
+      
+      - name: Cleanup old deployment
+        if: always()
+        run: |
+          # Scale down the old deployment (don't delete for easy rollback)
+          kubectl scale deployment api-${{ needs.deploy-production.outputs.old_slot || 'blue' }} \
+            --namespace=production --replicas=0 || true
+
+  # ============================================
+  # DEPLOYMENT NOTIFICATION
+  # ============================================
+  notify:
+    name: Notify Deployment
+    runs-on: ubuntu-latest
+    needs: [switch-traffic]
+    if: always()
+    
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ needs.switch-traffic.result == 'success' && ':white_check_mark:' || ':x:' }} Deployment ${{ needs.pre-deploy.outputs.environment }}",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Deployment ${{ needs.pre-deploy.outputs.environment }}*\nStatus: ${{ needs.switch-traffic.result }}\nImage: `${{ needs.pre-deploy.outputs.image_tag }}`\nCommit: `${{ github.sha }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### Google Cloud Deploy Configuration
+
+```yaml
+# clouddeploy.yaml
+apiVersion: deploy.cloud.google.com/v1
+kind: Config
+
+metadata:
+  namespace: myproject
+
+targets:
+  - name: dev
+    deployParameters:
+      defaultMinPodAvailability: 1
+      env:
+      - name: ENVIRONMENT
+        value: dev
+  
+  - name: staging
+    deployParameters:
+      defaultMinPodAvailability: 2
+      env:
+      - name: ENVIRONMENT
+        value: staging
+  
+  - name: production
+    deployParameters:
+      defaultMinPodAvailability: 3
+      env:
+      - name: ENVIRONMENT
+        value: production
+      sequentialPromotion: true
+
+deliveryPipeline:
+  name: api-pipeline
+  serialPipeline:
+    stages:
+      - targetId: dev
+        profiles: [dev]
+      - targetId: staging
+        profiles: [staging]
+        deployParameters:
+          enforceMonitoring: true
+      - targetId: production
+        profiles: [production]
+        deployParameters:
+          requireApprovals: true
+          monitoringJobName: verify-job
+```
+
+### Kubernetes Deployment Configurations
+
+#### Rolling Update Configuration
+
+```yaml
+# rolling-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: production
+spec:
+  replicas: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%        # Can exceed desired by 25%
+      maxUnavailable: 0    # All pods must be available
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.0.0
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          successThreshold: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+```
+
+#### Blue-Green Configuration
+
+```yaml
+# blue-green-deployment.yaml
+---
+# Blue deployment (active)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-blue
+  namespace: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app: api
+        slot: blue
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.0.0
+        ports:
+        - containerPort: 8080
+---
+# Green deployment (inactive)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-green
+  namespace: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api
+      slot: green
+  template:
+    metadata:
+      labels:
+        app: api
+        slot: green
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.0.0
+        ports:
+        - containerPort: 8080
+---
+# Service pointing to active slot
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+    slot: blue  # Change to 'green' for switch
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+## Configuration / Pipeline Examples
+
+### ArgoCD Application
+
+```yaml
+# argocd-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-production
+  namespace: argocd
+spec:
+  project: production
+  source:
+    repoURL: https://github.com/myorg/k8s-manifests
+    targetRevision: HEAD
+    path: production/api
+    kustomize:
+      images:
+      - gcr.io/myproject/api:v1.2.3
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### Rollout with Argo Rollouts
+
+```yaml
+# rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: api
+  namespace: production
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      steps:
+      - setWeight: 5
+      - pause: {duration: 5m}
+      - analysis:
+          templates:
+          - templateName: success-rate
+          args:
+          - name: service-name
+            value: api-canary
+      - setWeight: 20
+      - pause: {duration: 10m}
+      - setWeight: 50
+      - pause: {duration: 10m}
+      - setWeight: 100
+      canaryService: api-canary
+      stableService: api-stable
+      trafficRouting:
+        nginx:
+          stableIngress: api-ingress
+          additionalIngressAnnotations:
+            canary-by-header: X-Canary
+      maxSurge: "25%"
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api:v1.2.3
+        ports:
+        - containerPort: 8080
+```
+
+## Common Commands / Steps
+
+### Kubernetes Deployment Commands
+
+```bash
+# Rolling update
+kubectl set image deployment/api api=gcr.io/myproject/api:v1.2.3
+kubectl rollout status deployment/api --timeout=5m
+
+# View rollout history
+kubectl rollout history deployment/api
+kubectl rollout history deployment/api --revision=3
+
+# Rollback
+kubectl rollout undo deployment/api
+kubectl rollout undo deployment/api --to-revision=3
+
+# Blue-green switch
+kubectl patch service api -n production \
+  -p '{"spec":{"selector":{"slot":"green"}}}'
+
+# Scale deployment
+kubectl scale deployment/api --replicas=5
+
+# Check pod status
+kubectl get pods -l app=api -n production
+kubectl describe pod -l app=api -n production
+
+# View logs during deployment
+kubectl logs -l app=api -n production --tail=100 -f
+```
+
+### ArgoCD Commands
+
+```bash
+# Sync application
+argocd app sync api-production
+
+# Watch sync
+argocd app sync api-production --watch
+
+# Rollback
+argocd app rollback api-production
+
+# Set image
+argocd app set api-production --kustomize-image gcr.io/myproject/api=v1.2.3
+
+# Refresh
+argocd app refresh api-production
+```
+
+### Argo Rollouts Commands
+
+```bash
+# Pause rollout
+kubectl argo rollouts pause api
+
+# Resume rollout
+kubectl argo rollouts abort api
+kubectl argo rollouts promote api
+
+# Full promotion (skip analysis)
+kubectl argo rollouts promote api --full
+
+# Abort rollout
+kubectl argo rollouts abort api
+
+# Watch rollout
+kubectl argo rollouts get api --watch
+
+# Analyze
+kubectl argo rollouts get api -w
+```
+
+## Monitoring
+
+### Deployment Metrics
+
+| Metric | Target | Alert |
+|--------|--------|-------|
+| Deployment duration | < 15 min | > 30 min |
+| Rollback frequency | < 5% | > 10% |
+| Post-deploy error rate | < 1% | > 5% |
+| MTTR | < 5 min | > 15 min |
+
+### Deployment Dashboards
+
+```promql
+# Deployment success rate
+sum(rate(deployment_success_total[5m])) / sum(rate(deployment_total[5m])) * 100
+
+# Average deployment duration
+histogram_quantile(0.95, rate(deployment_duration_seconds_bucket[5m]))
+
+# Post-deployment error spike
+rate(http_requests_total{status=~"5.."}[5m]) > 0.01
+```
+
+### Health Check Configuration
+
+```yaml
+# Kubernetes health probes
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  failureThreshold: 30
+  periodSeconds: 10
+```
+
+## Security
+
+### Secure Deployment Practices
+
+```yaml
+# Security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  capabilities:
+    drop:
+    - ALL
+
+# Pod security standards
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+```
+
+### RBAC for Deployments
+
+```yaml
+# Kubernetes RBAC for deployment
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-manager
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "patch"]
+```
+
+## Cost Optimization
+
+### Deployment Cost Strategies
+
+| Strategy | Benefit | Implementation |
+|----------|---------|----------------|
+| Parallel deployments | Faster | Blue-green vs sequential |
+| Right-sized replicas | Lower resource use | Tune maxSurge/maxUnavailable |
+| Spot instances | 60% savings | Use spot for rollout pods |
+| Pre-staged images | Faster rollout | Warm image cache |
+
+### Resource Optimization
+
+```yaml
+# Optimize for cost
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # Minimize extra resources
+      maxUnavailable: 0    # Maintain availability
+  template:
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pods not starting | Image pull error | Check credentials, image exists |
+| Rollout stuck | Readiness probe failing | Check probe config, logs |
+| Traffic not switching | Service selector mismatch | Verify labels match |
+| CrashLoopBackOff | Application error | Check logs, env vars |
+| OOMKilled | Memory limit too low | Increase limits |
+
+### Debug Commands
+
+```bash
+# Check deployment status
+kubectl get deployment api -n production -o wide
+kubectl describe deployment api -n production
+
+# Check rollout
+kubectl rollout status deployment/api -n production
+kubectl rollout history deployment/api -n production
+
+# Check pods
+kubectl get pods -n production -l app=api
+kubectl logs deployment/api -n production --previous
+
+# Check events
+kubectl get events -n production --sort-by='.lastTimestamp'
+
+# Port forward for debugging
+kubectl port-forward -n production deployment/api 8080:8080
+```
+
+### Rollback Procedures
+
+```bash
+# Immediate rollback
+kubectl rollout undo deployment/api -n production
+
+# Rollback to specific version
+kubectl rollout undo deployment/api -n production --to-revision=3
+
+# Verify rollback
+kubectl rollout status deployment/api -n production
+```
+
+## Interview Questions
+
+### Q1: Compare rolling, blue-green, and canary deployments.
+
+**Answer:** Rolling updates gradually replace pods (configurable rate), keeping old and new running simultaneously. Blue-green maintains two identical environments, switching all traffic at once for instant switchover. Canary releases route a small percentage of traffic to new version for real-world testing. Rolling is simpler but both versions serve production traffic. Blue-green offers instant rollback but requires double the resources. Canary minimizes blast radius but requires traffic routing capability.
+
+### Q2: How do you ensure zero-downtime deployment?
+
+**Answer:** 1) Use RollingUpdate with maxUnavailable:0, 2) Configure proper readiness probes to prevent traffic to unready pods, 3) Use preStop hooks for graceful shutdown, 4) Ensure database migrations are backward-compatible, 5) Consider blue-green for schema changes requiring exclusive access, 6) Test rollback procedures before production deployment.
+
+### Q3: What is the difference between a deployment and a release?
+
+**Answer:** A deployment is the technical act of replacing/changing software on infrastructure. A release is the business act of making a feature available to users. A deployment can happen without a release (dark launch), and a release can be done without deployment (feature flag toggle). Modern CD separates these concerns for more control.
+
+### Q4: How would you handle database migrations in a deployment pipeline?
+
+**Answer:** 1) Design migrations to be backward-compatible, 2) Use expand-contract pattern for schema changes, 3) Run migrations before deployment in a separate job, 4) Use feature flags for risky changes, 5) For destructive changes, use blue-green with migration job before traffic switch, 6) Have rollback plan for both app and database. Never let deployment success depend on migration completion in the same step.
+
+### Q5: Explain the purpose of approval gates in CI/CD.
+
+**Answer:** Approval gates enforce human oversight for high-risk operations like production deployments. They provide: 1) Compliance evidence (SOC2, HIPAA), 2) Business review before release, 3) Change management integration, 4) Emergency brake for发现问题. Implementation: environment protection rules in GitHub, manual judgment step in ArgoCD, or external approval system integration.
+
+## Cheat Sheet
+
+```bash
+# Kubernetes
+kubectl set image deploy/api api=gcr.io/project/api:v1.2.3 -n production
+kubectl rollout status deploy/api -n production
+kubectl rollout history deploy/api -n production
+kubectl rollout undo deploy/api -n production
+kubectl scale deploy/api --replicas=5 -n production
+
+# Blue-green switch
+kubectl patch service api -n prod -p '{"spec":{"selector":{"slot":"green"}}}'
+
+# ArgoCD
+argocd app sync api-prod
+argocd app rollback api-prod
+
+# Argo Rollouts
+kubectl argo rollouts get api --watch
+kubectl argo rollouts pause api
+kubectl argo rollouts promote api
+kubectl argo rollouts abort api
+```
+
+## Related Topics
+
+- [Blue-Green Deployments](./blue-green.mdx)
+- [Canary Deployments](./canary.mdx)
+- [Rollback Procedures](./rollback.mdx)
+- [GitHub Actions](./github.mdx)
+- [GitOps & Automation](./automation.mdx)

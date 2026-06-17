@@ -1,0 +1,907 @@
+---
+sidebar_position: 9
+title: "Architecture Interview Questions"
+description: "Advanced system design interview questions covering distributed systems, microservices, databases, and scalability patterns"
+---
+
+# Architecture Interview Questions
+
+## Overview
+
+System design interviews test your ability to think through complex, ambiguous problems at scale. Unlike implementation questions where there's usually a clear answer, architecture questions have multiple valid solutions — the goal is to evaluate your reasoning, trade-off analysis, and communication.
+
+These questions cover distributed systems fundamentals, database design, caching, messaging patterns, and real-world architectural decisions.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Explain the CAP theorem and PACELC. What are practical implications for system design?**
+
+A: **CAP theorem**:
+
+```
+         P
+        / \
+       /   \
+      /     \
+    C ────── A
+     Two of three
+```
+
+**CAP states**: A distributed system can provide at most two of three guarantees:
+- **Consistency**: Every read receives the most recent write
+- **Availability**: Every request receives a response
+- **Partition tolerance**: System continues despite network partitions
+
+**The reality**: Partitions happen. You must choose between CP (give up availability) or AP (give up consistency during partition).
+
+**Practical interpretation**:
+| System Type | Trade-off | Example |
+|------------|-----------|---------|
+| CP | Unavailable during partition | etcd, Zookeeper, HBase |
+| AP | May return stale data during partition | Cassandra, DynamoDB, CouchDB |
+
+**PACELC** (more nuanced):
+> In case of network Partition (P), choose between Availability (A) and Consistency (C). Else (E), when there is no partition, choose between Latency (L) and Consistency (C).
+
+**PACELC implications**:
+| System | During Partition | Normal Operation |
+|--------|-----------------|-------------------|
+| DynamoDB | Available + eventual consistency | Low latency |
+| Cassandra | Available + eventual consistency | Low latency |
+| HBase | Unavailable | Strong consistency |
+| MongoDB | Unavailable | Strong consistency |
+| etcd | Unavailable | Strong consistency |
+
+**Design implications**:
+```yaml
+# If you need strong consistency during partition:
+# Choose: etcd, Zookeeper, HBase, Spanner
+
+# If you need availability during partition:
+# Choose: DynamoDB, Cassandra, CouchDB
+# Handle inconsistency in application logic
+
+# Question to ask:
+# "Can users tolerate slightly stale data?"
+# If yes: choose AP
+# If no: choose CP
+```
+
+---
+
+**Q: Compare database sharding strategies. How do you choose the right one?**
+
+A: **Sharding approaches**:
+
+**1. Range-based sharding**:
+```sql
+-- Users 1-1000 on shard A, 1001-2000 on shard B
+CREATE TABLE users (
+  user_id BIGINT,
+  ...
+  SHARD KEY (user_id)
+);
+
+-- Problem: Hot spots on boundaries
+-- Solution: Use large ranges, monitor distribution
+```
+
+**2. Hash-based sharding**:
+```python
+shard_id = hash(user_id) % num_shards
+
+# Problem: Can't do range queries efficiently
+# Problem: Resharding is expensive
+# Solution: Consistent hashing
+```
+
+**3. Consistent hashing**:
+```
+                     0
+                      │
+           ┌──────────┼──────────┐
+           │          │          │
+         180°         │         90°
+           │          │          │
+           ▼          ▼          ▼
+         Node B  ────Ring────  Node A
+           │          │          │
+           ▼          ▼          ▼
+         270°       180°        Node C
+                      │
+                      │
+                     360°
+```
+
+**4. Directory-based sharding**:
+```sql
+-- Lookup table for shard location
+CREATE TABLE shard_map (
+  entity_id VARCHAR,
+  shard_id INT
+);
+
+-- Good for: when shard key doesn't distribute evenly
+-- Problem: Directory becomes bottleneck
+```
+
+**Choosing a sharding strategy**:
+
+| Strategy | Best For | Avoid For |
+|----------|----------|-----------|
+| Range | Time-series, append-only | Hot spots at boundaries |
+| Hash | Even distribution | Range queries |
+| Consistent | Dynamic scaling | Complex queries |
+| Directory | Multiple access patterns | Simplicity |
+
+**Sharding challenges**:
+```yaml
+# 1. Cross-shard queries
+# Solution: Denormalize, accept eventual consistency
+# Or: Scatter-gather (slow but complete)
+
+# 2. Rebalancing
+# Solution: Consistent hashing with virtual nodes
+# Minimizes data movement during resharding
+
+# 3.事务 across shards
+# Solution: Don't do it!
+# Use sagas or accept eventual consistency
+
+# 4. Join operations
+# Solution: Data locality
+# Keep related data on same shard (e.g., user + orders)
+```
+
+---
+
+**Q: How does distributed consensus work? Explain Raft vs Paxos.**
+
+A: **Why consensus matters**:
+
+In distributed systems, nodes must agree on:
+- Who is leader?
+- What is the current state?
+- Is this write committed?
+
+**Paxos** (Leslie Lamport, 1989):
+```
+Proposer: "I propose value 42. Phase 1: Is anyone listening?"
+Acceptor: "I'm listening. What's your proposal number?"
+Proposer: "OK, proposal #101, value 42"
+Acceptor: "OK, I've accepted #101 with value 42"
+Learner: "I heard value 42 was chosen!"
+```
+
+**Paxos phases**:
+1. **Prepare**: Proposer gets majority to accept its proposal number
+2. **Accept**: Proposer sends value, majority accepts
+3. **Learn**: Learners learn the committed value
+
+**Raft** (simplified Paxos, 2014):
+```
+Raft separates into:
+- Leader election (using term numbers)
+- Log replication (append-only)
+- Safety (follows Raft rules)
+```
+
+**Raft leader election**:
+```python
+# Node states: Follower, Candidate, Leader
+
+# Election timeout (randomized 150-300ms)
+# If no heartbeat from leader within timeout:
+#   → Become Candidate
+#   → Increment term
+#   → Vote for self
+#   → Request votes from others
+
+# If majority votes:
+#   → Become Leader
+#   → Send heartbeats
+
+# If higher term received:
+#   → Become Follower
+```
+
+**Raft log replication**:
+```
+Leader: "Here's entry #42: set x=42"
+Follower1: "OK, I've got entry #42"
+Follower2: "OK, I've got entry #42"
+(When majority have entry)
+Leader: "Entry #42 is committed"
+```
+
+**Paxos vs Raft comparison**:
+
+| Aspect | Paxos | Raft |
+|--------|-------|------|
+| Complexity | Very complex | More understandable |
+| Implementation | Hard | More implementable |
+| Leader | Optional | Required |
+| Partition tolerance | Yes | Yes |
+| Performance | Similar | Similar |
+| Clients | Must handle leader | Must handle leader |
+
+**Real-world usage**:
+```yaml
+# etcd uses Raft
+# Good: Simple leader-follower
+# Problem: Leader is bottleneck
+
+# Zookeeper uses Zab (Zookeeper Atomic Broadcast)
+# Similar to Raft
+
+# Spanner uses Paxos
+# With TrueTime for global consistency
+```
+
+---
+
+**Q: Explain CQRS (Command Query Responsibility Segregation). When should you use it?**
+
+A: **CQRS principle**:
+
+Separate read and write models for the same data:
+- **Command**: Writes (create, update, delete)
+- **Query**: Reads (select, search)
+
+**Traditional approach**:
+```
+┌─────────────┐     ┌─────────────┐
+│   Service   │────▶│  Database   │◀────│   Service   │
+│  (writes)   │     │             │     │   (reads)   │
+└─────────────┘     └─────────────┘     └─────────────┘
+```
+
+**CQRS approach**:
+```
+Commands (writes)              Queries (reads)
+      │                             ▲
+      ▼                             │
+┌─────────────┐              ┌──────┴──────┐
+│   Command   │──────▶ Event Store ──▶ Read Model (optimized)
+│   Handler   │              │           │
+└─────────────┘              │           │ (Elasticsearch, MongoDB, Redis)
+                            │           │
+                            └───────────┘
+```
+
+**When to use CQRS**:
+
+| Indicator | Use CQRS? |
+|-----------|-----------|
+| Read/write ratio > 10:1 | Yes |
+| Different read/write patterns | Yes |
+| Need eventual consistency | Yes |
+| Need different storage per access pattern | Yes |
+| Team size > 10 | Consider |
+| Simple CRUD | No |
+
+**Event sourcing** (often paired with CQRS):
+```yaml
+# Instead of storing current state:
+# Store all events that led to state
+
+events:
+  - event: AccountCreated
+    data: {account_id: 1, owner: "Alice"}
+  - event: DepositMade
+    data: {account_id: 1, amount: 100}
+  - event: WithdrawalMade
+    data: {account_id: 1, amount: 30}
+
+# Current state = replay all events
+# Audit log = just read events
+# Time travel = replay to any point
+```
+
+**CQRS implementation**:
+```python
+# Command side
+class CreateOrderCommand:
+    def __init__(self, customer_id, items):
+        self.customer_id = customer_id
+        self.items = items
+
+class OrderCommandHandler:
+    def handle(cmd):
+        # Validate
+        # Publish event (not write to DB directly)
+        event = OrderCreatedEvent(order_id=uuid4(), ...)
+        event_bus.publish(event)
+
+# Event handler (creates read model)
+class OrderEventHandler:
+    def handle(event):
+        if isinstance(event, OrderCreatedEvent):
+            read_db.insert("orders", event.to_dict())
+        if isinstance(event, ItemAddedEvent):
+            read_db.update("orders", event.order_id, 
+                         {"$push": {"items": event.item}})
+```
+
+---
+
+**Q: What caching strategies exist? When would you use each?**
+
+A: **Cache strategies**:
+
+**1. Cache-aside (lazy loading)**:
+```python
+def get_user(user_id):
+    # Try cache first
+    user = cache.get(f"user:{user_id}")
+    if user:
+        return user
+    
+    # Cache miss, load from DB
+    user = db.query("SELECT * FROM users WHERE id = ?", user_id)
+    
+    # Populate cache
+    cache.set(f"user:{user_id}", user, ttl=3600)
+    return user
+# PRO: Only cache what's needed
+# CON: First request is slow (cache miss)
+```
+
+**2. Write-through**:
+```python
+def update_user(user_id, data):
+    # Write to DB and cache together
+    db.update("UPDATE users SET ... WHERE id = ?", user_id, data)
+    cache.set(f"user:{user_id}", data)
+# PRO: Cache always fresh
+# CON: Write latency includes cache write
+```
+
+**3. Write-behind (write-back)**:
+```python
+def update_user(user_id, data):
+    # Write to cache, return immediately
+    cache.set(f"user:{user_id}", data)
+    # Async write to DB
+    queue.enqueue("write_user", user_id, data)
+# PRO: Fastest writes
+# CON: Risk of data loss if cache fails before DB write
+```
+
+**4. Refresh-ahead**:
+```python
+# Background refresh of frequently accessed items
+# Before TTL expires
+# PRO: Users never see cache miss
+# CON: Wasted refresh if item not accessed
+```
+
+**Cache invalidation**:
+```yaml
+# TTL-based: Simple but not precise
+ttl: 300  # 5 minutes
+
+# Event-based: Precise but complex
+# On User updated → invalidate user:{id} cache
+
+# Version-based: Simple versioning
+cache_key: "user:123:v2"  # Invalidate by bumping version
+```
+
+**Multi-level caching**:
+```
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│ Request │───▶│  L1     │───▶│  L2     │───▶│  DB    │
+│         │    │ (local) │    │ (Redis) │    │        │
+└─────────┘    │ 1MB     │    │ 10GB    │    └────────┘
+               │ <1ms    │    │ <10ms   │
+               └─────────┘    └─────────┘
+```
+
+---
+
+**Q: Explain message queue patterns. When would you use Kafka vs RabbitMQ vs SQS?**
+
+A: **Message queue patterns**:
+
+**Point-to-point** (SQS, RabbitMQ direct):
+```
+Producer ──▶ Queue ──▶ Consumer
+                   (only one reads)
+```
+
+**Pub/Sub** (Kafka, RabbitMQ exchange):
+```
+Producer ──▶ Topic ──▶ Subscriber A
+                    ──▶ Subscriber B
+                    ──▶ Subscriber C
+```
+
+**Kafka vs RabbitMQ vs SQS**:
+
+| Feature | Kafka | RabbitMQ | SQS |
+|---------|-------|----------|-----|
+| Order | Per partition | Per queue | No guarantee |
+| Replay | Yes (retain messages) | No (ack = delete) | No |
+| Throughput | Very high | Medium | Medium |
+| Latency | Low | Very low | Low |
+| Durability | Excellent | Good | Excellent |
+| Scaling | Partition count | Queue count | Auto |
+| Operations | Complex | Medium | Managed |
+
+**When to use each**:
+
+| Use Case | Choice |
+|----------|--------|
+| Event streaming, audit log | Kafka |
+| Task queue, async jobs | RabbitMQ |
+| Decoupling microservices | SQS/SNS |
+| Real-time notifications | RabbitMQ |
+| Data pipeline | Kafka |
+| Fire-and-forget | SQS |
+
+**At-least-once vs exactly-once**:
+```yaml
+# At-least-once: Message may be delivered multiple times
+# Consumer must handle duplicates (idempotency)
+
+# Exactly-once: Message delivered exactly once
+# Implementation:
+# Kafka: transactionId + deduplication
+# SQS: MessageDeduplicationId
+# RabbitMQ: Publisher confirms + consumer deduplication
+
+# Recommendation:
+# Most cases: at-least-once + idempotent consumers
+# Exactly-once is expensive and rarely necessary
+```
+
+**Saga pattern for distributed transactions**:
+```yaml
+# Instead of ACID transactions across services:
+# Use choreography or orchestration
+
+# Choreography-based saga:
+OrderService ──▶ PaymentService ──▶ InventoryService
+      ▲                ▲                  │
+      │                └──────────────────┘
+      │              (events on failure: compensate)
+
+# Orchestration-based saga:
+OrderSagaOrchestrator ──▶ PaymentService
+      │
+      ├──▶ InventoryService
+      │
+      └──▶ ShippingService
+```
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: How do you design a URL shortening service like bit.ly?**
+
+A: **Requirements gathering**:
+
+```yaml
+clarifying_questions:
+  scale:
+    reads_per_day: 10M?
+    writes_per_day: 1M?
+    target_latency: <10ms for reads?
+  
+  features:
+    custom URLs?: yes
+    analytics?: yes
+    expiration?: optional
+  
+  constraints:
+    budget: ?
+    team_size: ?
+    timeline: ?
+```
+
+**High-level design**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         URL Shortening                      │
+│                                                             │
+│  ┌─────────┐    ┌──────────┐    ┌────────────────────────┐│
+│  │ User    │───▶│  API     │───▶│   URL Table            ││
+│  │ Browser │    │  Server  │    │  short_url | long_url  ││
+│  │         │◀───│ (stateless)│◀──│  created_at | clicks  ││
+│  └─────────┘    └────┬─────┘    └────────────────────────┘│
+│                      │                                       │
+│                      ▼                                       │
+│               ┌─────────────┐                               │
+│               │   Cache     │                               │
+│               │   (Redis)   │                               │
+│               └─────────────┘                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Short URL generation**:
+```python
+# Option 1: Hash of long URL (deterministic)
+import hashlib
+def short_url(long_url):
+    hash = hashlib.md5(long_url.encode()).hexdigest()[:7]
+    return f"https://short.co/{hash}"
+# PRO: No storage needed
+# CON: Predictable, collisions
+
+# Option 2: Random (more common)
+import random
+import string
+CHARS = string.ascii_letters + string.digits  # 62 chars
+def short_url(long_url):
+    return ''.join(random.choices(CHARS, k=7))
+# PRO: Random, unpredictable
+# CON: Need collision check
+
+# Option 3: Counter (Zookeeper/etcd)
+# PRO: No collisions
+# CON: Need distributed counter
+```
+
+**Scale considerations**:
+```yaml
+# Read-heavy (10M reads/day vs 1M writes/day = 10:1)
+# Cache heavily
+
+caching:
+  - Redis cache for popular URLs
+  - 99% hit rate target
+  - TTL: 1 hour for hot URLs
+
+database:
+  - Read replicas for reads
+  - Shard by short_url (range)
+  - Or hash-based sharding
+
+sharding:
+  - shard_key = short_url[0]  # 62 shards
+  # Prevents hot spots at boundaries
+```
+
+**Analytics tracking**:
+```python
+# For click analytics, don't block on write
+def redirect(short_url):
+    # Increment counter (async)
+    kafka.produce("clicks", {"short_url": short_url, "ts": now()})
+    
+    # Return long URL immediately
+    return get_long_url(short_url)
+```
+
+---
+
+**Q: Design a real-time notification system. What are the key components?**
+
+A: **Notification system architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Notification System                          │
+│                                                                 │
+│  ┌──────────┐    ┌──────────┐    ┌───────────┐                  │
+│  │ Service  │───▶│          │    │           │                  │
+│  │ Producer │    │          │    │  WebSocket│                  │
+│  └──────────┘    │          │    │  Server   │───▶ Client      │
+│                  │  Kafka   │───▶│           │                  │
+│  ┌──────────┐    │          │    │           │                  │
+│  │ Scheduled│───▶│          │    │           │                  │
+│  │ Jobs     │    │          │    └───────────┘                  │
+│  └──────────┘    └──────────┘                                   │
+│                      │                                          │
+│            ┌─────────┼─────────┐                                │
+│            ▼         ▼         ▼                                │
+│       ┌────────┐ ┌────────┐ ┌────────┐                         │
+│       │ Email  │ │  Push  │ │   SMS  │                         │
+│       │ Worker │ │ Worker │ │ Worker │                         │
+│       └────────┘ └────────┘ └────────┘                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Real-time delivery**:
+```python
+class WebSocketServer:
+    def __init__(self):
+        self.clients = {}  # user_id -> set of connections
+    
+    async def connect(self, user_id, websocket):
+        self.clients.setdefault(user_id, set()).add(websocket)
+    
+    async def send_notification(self, user_id, notification):
+        # Fan out to all user's connections
+        for conn in self.clients.get(user_id, []):
+            await conn.send_json(notification)
+```
+
+**Scalability considerations**:
+```yaml
+# WebSocket limitations
+# 1. Connections per server (limit: ~100k)
+# 2. Sticky sessions needed
+
+# Solution: Consistent hashing
+# Each user assigned to specific WebSocket server
+# User sessions stored in Redis for server discovery
+
+redis_client:
+  get_server: "get user:{user_id}:server"
+
+websocket_server:
+  # On connect: register in Redis
+  redis.set(f"user:{user_id}:servers", {server1, server2})
+
+# Fan-out to all servers holding user's connections:
+for server in redis.get(f"user:{user_id}:servers"):
+    redis.publish(f"ws:{server}", notification)
+```
+
+**Notification delivery modes**:
+```yaml
+modes:
+  real_time:
+    - WebSocket (immediate)
+    - Server-Sent Events (for web)
+  
+  near_real_time:
+    - Kafka → Push worker → FCM/APNS (seconds)
+  
+  batch:
+    - Daily digest (24 hour delay acceptable)
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: How do you design a highly available database architecture?**
+
+A: **Database HA patterns**:
+
+**PostgreSQL HA**:
+```
+                    ┌─────────────┐
+                    │   HAProxy   │
+                    │  (LB write) │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │Primary   │ │Standby 1 │ │Standby 2 │
+        │(Writer)  │ │(Sync HA) │ │(Async RO)│
+        └────┬─────┘ └──────────┘ └──────────┘
+             │
+             ▼ (replication)
+        ┌──────────────────────────┐
+        │  Replication slot        │
+        │  WAL streaming           │
+        └──────────────────────────┘
+```
+
+**Configuration**:
+```yaml
+# Patroni for automatic failover
+patroni:
+  name: postgres-1
+  restapi:
+    listen: 0.0.0.0:8008
+  etcd:
+    host: etcd:2379
+  postgresql:
+    listen: 0.0.0.0:5432
+    data_dir: /data/postgresql
+    authentication:
+      replication:
+        username: replicator
+        password: "***"
+    create_replica_methods:
+      - basebackup
+    parameters:
+      wal_level: replica
+      max_wal_senders: 10
+      wal_keep_size: 1GB
+```
+
+**Aurora-style distributed databases**:
+```yaml
+# 6 copies across 3 AZs
+# Can tolerate 2 AZ failure
+# Quorum: 4 of 6 writes
+
+quorum:
+  read_quorum: 3
+  write_quorum: 4
+  
+  # R + W > N  ensures consistency
+  # 3 + 4 > 6 ✓
+```
+
+**Read replicas with traffic routing**:
+```yaml
+# Read replica topology
+application:
+  write_endpoint: primary.db.internal
+  read_endpoints:
+    - replica1.db.internal
+    - replica2.db.internal
+    - replica3.db.internal
+  
+  # Strategy: round-robin, least connections, or latency-based
+  routing:
+    read_strategy: "least_connections"
+    # Or: send reads to nearest replica
+    # Or: p95 latency based
+```
+
+**Cross-region replication**:
+```yaml
+# Active-passive (for DR)
+# Primary: us-east-1
+# DR: eu-west-1
+
+# Sync: impossible for distant regions (latency)
+# Solution: Async replication with lag monitoring
+
+monitoring:
+  replication_lag_seconds: 5  # Alert if higher
+  replication_slot: "slot_name"  # Prevent WAL removal
+```
+
+---
+
+**Q: Design an observability stack. What components do you need?**
+
+A: **Observability pillars**:
+
+```
+Metrics                          Logs                          Traces
+   │                               │                               │
+   ▼                               ▼                               ▼
+┌────────┐                  ┌────────┐                      ┌────────┐
+│Prometheus│                │Loki/   │                      │Jaeger/ │
+│/Thanos  │                │Elastic │                      │Tempo   │
+└────┬─────┘                └────┬───┘                      └────┬────┘
+     │                            │                               │
+     └────────────────────────────┴───────────────────────────────┘
+                                 │
+                           ┌─────┴─────┐
+                           │  Grafana  │
+                           │  (unified │
+                           │  views)   │
+                           └───────────┘
+```
+
+**Metrics (RED/USE method)**:
+```yaml
+# Rate: requests per second
+rate_requests = rate(http_requests_total[5m])
+
+# Errors: error rate
+error_rate = rate(http_requests_total{status=~"5.."}[5m])
+
+# Duration: latency
+latency_p99 = histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# For infrastructure:
+# Utilization: % CPU used
+# Saturation: queue depth, memory pressure
+# Errors: kernel errors, disk errors
+```
+
+**Distributed tracing**:
+```python
+# OpenTelemetry instrumentation
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+def handle_request(request):
+    with tracer.start_as_current_span("handle_request") as span:
+        span.set_attribute("http.method", request.method)
+        
+        with tracer.start_as_current_span("db_call") as span:
+            result = db.query("SELECT * FROM users")
+            span.set_attribute("db.statement", "SELECT")
+            span.set_attribute("db.system", "postgresql")
+        
+        with tracer.start_as_current_span("cache_call") as span:
+            result = cache.get("key")
+            span.set_attribute("cache.hit", result is not None)
+```
+
+**Log aggregation**:
+```yaml
+# Structured logging is essential
+logs:
+  format: json
+  required_fields:
+    - timestamp
+    - level
+    - message
+    - trace_id
+    - span_id
+    - service
+    - environment
+  
+  sampling:
+    # High traffic: sample 1% + 100% of errors
+    normal: 0.01
+    errors: 1.0
+
+# Loki (log aggregation)
+loki:
+  ingestion_rate_limit: 10MB/s
+  schema_config:
+    store: boltdb-shipper
+  storage_config:
+    boltdb:
+      directory: /loki/index
+    aws:
+      bucketnames: loki-chunks
+```
+
+**Dashboards**:
+```yaml
+# Standard dashboard layout
+dashboards:
+  - name: Service Overview
+    panels:
+      - Request rate (graph)
+      - Error rate (graph)
+      - Latency p50/p95/p99 (graph)
+      - Active users (stat)
+  
+  - name: Infrastructure
+    panels:
+      - CPU utilization (graph)
+      - Memory usage (graph)
+      - Disk I/O (graph)
+      - Network (graph)
+  
+  - name: Dependencies
+    panels:
+      - Upstream service latency
+      - Database connection pool
+      - Cache hit rate
+```
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Not asking clarifying questions**: Never jump into design without understanding requirements and constraints.
+
+2. **Over-engineering**: Start simple, scale as needed. Don't design for 10x if 2x is the requirement.
+
+3. **Ignoring operational concerns**: How will you monitor, debug, and maintain this?
+
+4. **Forgetting about failures**: Assume components will fail. Design for it.
+
+5. **Skipping trade-off discussion**: Always explain why you chose A over B.
+
+## How to Structure Your Answers
+
+For **design questions**: Requirements → High-level design → Data model/API → Scaling → Trade-offs.
+
+For **trade-off questions**: Explain both sides, then justify your choice based on requirements.
+
+For **scaling questions**: Vertical → Caching → Read replicas → Sharding → New services.
+
+## Related Topics
+
+- [SRE Questions](./sre-questions.mdx)
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [Networking Questions](./networking-questions.mdx)
+- [Scenario Questions](./scenario-questions.mdx)

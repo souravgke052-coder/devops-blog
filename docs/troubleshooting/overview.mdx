@@ -1,0 +1,497 @@
+---
+sidebar_position: 1
+---
+
+# Troubleshooting Overview
+
+## Overview
+
+Welcome to the DevOps Troubleshooting documentation. This guide provides systematic approaches to diagnosing and resolving common infrastructure, application, and operational problems in production environments.
+
+Effective troubleshooting is a core DevOps skill that combines knowledge of systems, debugging methodology, and investigative intuition. This documentation covers everything from Linux system issues to Kubernetes cluster problems, network connectivity to CI/CD pipeline failures.
+
+## When To Use
+
+Use this documentation when you encounter:
+
+- **System Performance Issues**: High CPU, memory leaks, disk I/O bottlenecks
+- **Network Connectivity Problems**: Timeouts, connection refused, DNS failures
+- **Application Failures**: Crashes, restart loops, degraded performance
+- **Infrastructure Issues**: Cloud provider quota limits, authentication failures
+- **CI/CD Pipeline Breakdowns**: Build failures, deployment errors, webhook issues
+- **Post-Incident Root Cause Analysis**: Understanding what went wrong after an outage
+
+## When NOT To Use
+
+Do not use this documentation for:
+
+- **New Feature Development**: This is for debugging, not implementation
+- **Capacity Planning**: While related, detailed capacity planning has its own guides
+- **Security Incidents**: Security incidents require separate incident response procedures
+- **Vendor Escalation Preparation**: While logs from here help, vendor tickets need their own format
+- **Basic Learning**: Start with individual technology documentation before troubleshooting guides
+
+## Core Concepts / Methodology
+
+### The Diagnostic Loop
+
+All effective troubleshooting follows this iterative cycle:
+
+```
+Observe → Hypothesize → Test → Iterate
+```
+
+1. **Observe**: Gather data from logs, metrics, system state
+2. **Hypothesize**: Form a testable explanation for the observed behavior
+3. **Test**: Run diagnostic commands to confirm or deny the hypothesis
+4. **Iterate**: Refine understanding based on test results
+
+### Zero-Trust Debugging
+
+Never assume anything. Verify every assumption:
+
+- The service you think is running might be crashed
+- The configuration you deployed might not have applied
+- The network path you believe exists might be blocked
+- The cache you trust might be stale
+
+### Golden Signals
+
+When debugging any system, prioritize these four signals:
+
+| Signal | What It Measures | Warning Signs |
+|--------|-----------------|---------------|
+| **Latency** | Time to process requests | P99 latency spikes, timeout errors |
+| **Traffic** | System throughput | Sudden drops, unexpected spikes |
+| **Errors** | Failed requests | Error rate increases, specific error types |
+| **Saturation** | Resource utilization | CPU at 100%, memory exhausted, disk full |
+
+### Breadcrumb Debugging
+
+Start from the symptom and work toward root cause. Each diagnostic command should eliminate possibilities and narrow the search space.
+
+## Diagnostic Commands / Tools
+
+### Essential Toolkit
+
+| Category | Tools |
+|----------|-------|
+| **System** | `top`, `htop`, `vmstat`, `iostat`, `free`, `df`, `du` |
+| **Network** | `netstat`, `ss`, `tcpdump`, `curl`, `dig`, `traceroute`, `mtr` |
+| **Logs** | `journalctl`, `dmesg`, `tail`, `grep`, `awk` |
+| **Processes** | `ps`, `pkill`, `strace`, `lsof` |
+| **Files** | `ls`, `cat`, `find`, `stat`, `inode` |
+| **Cloud** | `gcloud`, `aws`, `kubectl`, `terraform` |
+
+### Quick Reference Commands
+
+```bash
+# System resource snapshot
+top -bn1 | head -20
+free -h
+df -h
+iostat -x 1 5
+
+# Network connections
+ss -tulnp
+netstat -anp | grep ESTABLISHED
+
+# Recent errors
+journalctl -p err --since "1 hour ago" --no-pager
+dmesg | tail -100
+```
+
+## Real Production Scenarios
+
+### Scenario 1: Application Server Randomly Returns 503 Errors
+
+**Symptom:**
+- Users report intermittent 503 Service Unavailable errors
+- Errors occur randomly throughout the day, lasting 30 seconds to 2 minutes
+- Load balancer health checks show backend as "failing" during incidents
+
+**Diagnostic Commands:**
+```bash
+# Check backend service health
+curl -v http://backend:8080/health
+
+# Check for OOM kills in kernel logs
+dmesg -T | grep -i "killed process"
+
+# Check container/pod memory limits
+kubectl describe pod application-xyz | grep -A 5 "Limits"
+
+# Check system memory pressure
+vmstat 1 10
+```
+
+**Root Cause:**
+The application pod was configured with a memory limit of 512Mi, but the JVM heap was set to use 2GB. When memory usage exceeded the container limit, the OOM killer terminated the process, causing 503s until Kubernetes restarted it.
+
+**Fix:**
+```yaml
+# Update resource limits to match JVM heap + overhead
+resources:
+  limits:
+    memory: "3Gi"
+  requests:
+    memory: "1Gi"
+```
+
+**Prevention:**
+- Set container resource limits >= JVM heap + native memory + OS overhead
+- Enable memory usage monitoring with alerts at 70% and 85%
+- Implement proper JVM ergonomics using `-XX:+UseContainerSupport`
+
+---
+
+### Scenario 2: Database Queries Suddenly Timing Out
+
+**Symptom:**
+- Application latency spiked from 50ms to 30+ seconds
+- Database connection pool exhausted errors in logs
+- Only specific tables affected
+
+**Diagnostic Commands:**
+```bash
+# Check active connections
+psql -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"
+
+# Find long-running queries
+psql -c "SELECT pid, now() - query_start AS duration, query FROM pg_stat_activity WHERE state != 'idle' ORDER BY duration DESC LIMIT 10;"
+
+# Check locks
+psql -c "SELECT blocked_locks.pid AS blocked_pid, blocking_locks.pid AS blocking_pid FROM pg_catalog.pg_locks blocked_locks JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid AND blocking_locks.pid != blocking_locks.pid WHERE NOT blocked_locks.granted;"
+
+# Check table size
+psql -c "SELECT pg_size_pretty(pg_total_relation_size('large_table'));"
+```
+
+**Root Cause:**
+A migration job running without a `LIMIT` clause was updating all 50 million rows in a single transaction, causing table bloat and row-level locks that blocked all other queries.
+
+**Fix:**
+```sql
+-- Kill the blocking query
+SELECT pg_terminate_backend(pid);
+
+-- Partition the large migration
+ALTER TABLE large_table ADD PARTITION new_partition;
+```
+
+**Prevention:**
+- Always include WHERE clauses in UPDATE/DELETE statements
+- Batch large migrations using chunking with LIMIT/OFFSET
+- Use `CREATE INDEX CONCURRENTLY` for online index builds
+- Set `lock_timeout` to prevent indefinite locks
+
+---
+
+### Scenario 3: TLS Certificate Suddenly Rejected by Clients
+
+**Symptom:**
+- Mobile apps failing to connect with "certificate is not valid" errors
+- Web browsers showing SSL handshake failures
+- API consumers reporting trust anchor errors
+
+**Diagnostic Commands:**
+```bash
+# Check certificate expiration
+openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null | openssl x509 -noout -dates
+
+# Check certificate chain
+openssl s_client -connect api.example.com:443 -showcerts 2>/dev/null | openssl x509 -noout -text | grep -A 5 "Issuer"
+
+# Verify chain with openssl
+echo | openssl s_client -CAfile /etc/ssl/certs/ca-certificates.crt -connect api.example.com:443 2>&1 | grep -E "Verify|error"
+
+# Check DNS resolution
+dig +short api.example.com
+```
+
+**Root Cause:**
+The production TLS certificate expired at 2024-01-15T23:59:59 UTC, but the monitoring system was checking a different hostname's certificate. The renewal automation had failed because the Let's Encrypt rate limit was hit due to repeated failed renewal attempts.
+
+**Fix:**
+```bash
+# Manually renew certificate
+certbot renew --force-renewal --cert-name example.com
+
+# Reload nginx/apache
+nginx -s reload
+# or
+systemctl reload httpd
+```
+
+**Prevention:**
+- Monitor certificate expiration for ALL domains at 90, 30, 14, 7, and 1 days
+- Implement automated renewal with pre-validation
+- Use certificate transparency logs for early warning
+- Set up alerting for renewal failures
+
+---
+
+### Scenario 4: Scheduled Jobs Not Running
+
+**Symptom:**
+- Cron jobs not executing at scheduled times
+- Dependencies not completing on schedule
+- Reports not being generated
+
+**Diagnostic Commands:**
+```bash
+# Check cron service status
+systemctl status cron
+
+# View cron logs
+journalctl -u cron --since "1 day ago" --no-pager
+
+# Check scheduled jobs
+crontab -l
+cat /etc/crontab
+
+# Check if cron ran
+grep CRON /var/log/syslog | tail -20
+
+# Verify system timezone
+timedatectl
+```
+
+**Root Cause:**
+A system administrator had manually stopped the cron service during a maintenance window two weeks prior, intending to restart it. The restart command was added to the maintenance runbook but was never executed due to a shift change handover gap.
+
+**Fix:**
+```bash
+# Restart cron service
+systemctl start cron
+systemctl enable cron
+
+# Manually trigger missed jobs
+# Run job manually and verify output
+```
+
+**Prevention:**
+- Use systemd timers instead of cron for critical jobs (they persist through service restarts)
+- Implement job monitoring with alerts for missed executions
+- Include service status in maintenance checklists
+- Use distributed job schedulers (e.g., Apache Airflow) for critical workflows
+
+---
+
+### Scenario 5: Container Registry Push Failures
+
+**Symptom:**
+- Docker push commands failing with "net/http: request canceled"
+- Build pipelines hanging at push stage
+- Sporadic authentication errors
+
+**Diagnostic Commands:**
+```bash
+# Test registry connectivity
+curl -v https://registry.example.com/v2/
+
+# Check Docker daemon logs
+journalctl -u docker --since "30 minutes ago" --no-pager
+
+# Verify credentials
+docker login registry.example.com
+
+# Test push with smaller image
+docker tag alpine:latest registry.example.com/test:latest
+docker push registry.example.com/test:latest
+
+# Check DNS resolution
+nslookup registry.example.com
+```
+
+**Root Cause:**
+The corporate proxy was terminating long-lived HTTPS connections after 60 seconds. Docker's push operation was taking longer due to rate limiting, causing the proxy to close the connection mid-push.
+
+**Fix:**
+```bash
+# Configure Docker to use HTTP for proxy
+# Add to /etc/docker/daemon.json:
+{
+  "proxies": {
+    "http-proxy": "http://proxy.corp:8080",
+    "https-proxy": "http://proxy.corp:8080",
+    "no-proxy": "localhost,127.0.0.1,registry.example.com"
+  }
+}
+
+# Restart Docker
+systemctl restart docker
+```
+
+**Prevention:**
+- Configure proxy timeouts appropriately for long-running operations
+- Use registry mirroring for frequently used images
+- Implement retry logic with exponential backoff in CI/CD pipelines
+- Monitor network throughput during large uploads
+
+## Step-by-Step Debugging Playbooks
+
+### Debugging Flowchart
+
+```
+Problem Reported
+       │
+       ▼
+┌─────────────────┐
+│ Gather Context  │ ← What changed? When? Who?
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Check Basic     │ ← Is service running? Can it be reached?
+│ Health          │
+└────────┬────────┘
+         │
+         ▼
+    ┌────┴────┐
+    │Healthy? │──No──► Check Service Status
+    └────┬────┘         │
+         │Yes           ▼
+         │         Check Logs / Events
+         │              │
+         │              ▼
+         │         Resource Issues?
+         │              │
+         └──────────────┴─────────────────┐
+                                          ▼
+                              ┌───────────────────┐
+                              │ Check: CPU, MEM,  │
+                              │ Disk, Network     │
+                              └─────────┬─────────┘
+                                        │
+                                        ▼
+                              ┌───────────────────┐
+                              │ Isolate Component │
+                              │ (network, compute,│
+                              │  storage, app)    │
+                              └─────────┬─────────┘
+                                        │
+                                        ▼
+                              ┌───────────────────┐
+                              │ Verify Hypothesis │
+                              │ with Test         │
+                              └───────────────────┘
+```
+
+### Decision Tree: High Latency
+
+```
+High Latency Detected
+        │
+        ▼
+┌───────────────────┐
+│ Which layer?      │
+│ App │ DB │ Network│
+└───────┴───┴───────┘
+      │
+      ▼
+┌───────────────────┐     ┌───────────────────┐
+│ APP               │     │ DATABASE          │
+│ - Profiler        │     │ - Query analysis  │
+│ - Thread dump     │     │ - Explain plan    │
+│ - GC logs         │     │ - Locks           │
+└───────────────────┘     └───────────────────┘
+
+┌───────────────────┐
+│ NETWORK           │
+│ - Latency to      │
+│   dependencies    │
+│ - Bandwidth       │
+│ - Connection pool │
+└───────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Connection refused` | Service not running or port mismatch | Check service status, verify port binding |
+| `Timeout connecting to host` | Firewall blocking or service down | Check security groups, verify service health |
+| `Permission denied (publickey)` | SSH key mismatch | Verify key fingerprint, check authorized_keys |
+| `No space left on device` | Disk full | Find large files, implement log rotation |
+| `Address already in use` | Port conflict | Find and kill conflicting process |
+| `Too many open files` | Ulimit exceeded | Increase file descriptor limit |
+| `Connection reset by peer` | Remote end crashed | Check peer logs, verify health checks |
+| `broken pipe` | Write to closed connection | Implement proper connection handling |
+
+## Monitoring / Log Analysis
+
+### Key Log Sources
+
+| Source | What It Contains | How to Access |
+|--------|------------------|---------------|
+| **Application Logs** | Business logic errors, exceptions | File system, stdout |
+| **System Logs** | Kernel events, OOMs, hardware | `journalctl`, `dmesg` |
+| **Access Logs** | HTTP requests, response times | Nginx/Apache logs |
+| **Error Logs** | 4xx/5xx responses | Application error logger |
+| **Audit Logs** | Authentication, authorization | Cloud audit logs |
+
+### Log Analysis Commands
+
+```bash
+# Search for errors in last hour
+journalctl --since "1 hour ago" -p err
+
+# Follow logs in real-time
+tail -f /var/log/application.log | grep ERROR
+
+# Count errors by type
+cat /var/log/application.log | grep ERROR | awk '{print $NF}' | sort | uniq -c
+
+# Find requests by duration
+awk '$NF > 5 {print}' /var/log/access.log
+```
+
+## Interview Questions
+
+### Junior Level
+
+1. **What is the first thing you check when a server is unresponsive?**
+   - Answer: Check basic connectivity (ping), verify service is running, check system resources
+
+2. **How do you find which process is using the most memory?**
+   - Answer: `top` or `ps aux --sort=-%mem | head`
+
+3. **What command would you use to check network connections?**
+   - Answer: `netstat -tulpn` or `ss -tulnp`
+
+### Senior Level
+
+4. **How do you debug a performance issue in a distributed system?**
+   - Answer: Identify which component is slow using distributed tracing, check each service independently, look for resource contention
+
+5. **A service is responding slowly. How do you isolate whether it's CPU, memory, I/O, or network bound?**
+   - Answer: Use `vmstat` for CPU wait, `iostat` for I/O, `free` for memory, `iftop` for network
+
+6. **How would you investigate intermittent failures?**
+   - Answer: Enable debug logging, capture state at time of failure, use correlation IDs to trace requests
+
+## Cheat Sheet
+
+| Issue | Quick Check | Fix Command |
+|-------|-------------|-------------|
+| Service down | `systemctl status <svc>` | `systemctl start <svc>` |
+| High CPU | `top -bn1` | Identify process, check for infinite loops |
+| OOM | `dmesg \| grep -i oom` | Add memory or optimize usage |
+| Disk full | `df -h` | `journalctl --vacuum-size=500M` |
+| Port conflict | `ss -tulnp \| grep <port>` | Kill conflicting process |
+| Network timeout | `ping <host>` | Check firewall, routing |
+| DNS failure | `dig <domain>` | Check nameserver config |
+| SSL error | `openssl s_client -connect <host>:443` | Renew certificate |
+| Docker stuck | `docker ps -a` | `docker system prune` |
+| Cron not running | `systemctl status cron` | `systemctl start cron` |
+
+## Related Topics
+
+- [Linux Troubleshooting](./linux-troubleshooting) - System-level debugging
+- [Network Troubleshooting](./network-troubleshooting) - Connectivity issues
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - Container orchestration issues
+- [GCP Troubleshooting](./gcp-troubleshooting) - Google Cloud Platform debugging
+- [Terraform Troubleshooting](./terraform-troubleshooting) - IaC debugging
+- [CI/CD Troubleshooting](./cicd-troubleshooting) - Pipeline debugging
+- [Common Issues](./common-issues) - Frequently occurring problems

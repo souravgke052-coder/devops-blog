@@ -1,0 +1,291 @@
+---
+sidebar_position: 2
+title: Beginner Path
+description: DevOps learning path for beginners
+---
+
+# Beginner Cloud Engineer
+
+## Target Audience
+
+This path is for:
+- Software developers moving into infrastructure
+- IT professionals new to cloud and DevOps
+- System administrators transitioning to cloud
+- Career changers entering tech
+
+**You should know**: Basic computer usage, some programming knowledge helpful but not required
+
+**You don't need**: Prior cloud experience, DevOps knowledge, or professional IT background
+
+## Estimated Duration
+
+| Learning Mode | Duration |
+|---------------|----------|
+| Part-time (10 hrs/week) | 12-16 weeks |
+| Full-time (20 hrs/week) | 6-8 weeks |
+| Accelerated (40 hrs/week) | 3-4 weeks |
+
+## Prerequisites
+
+### Required Before Starting
+- [ ] Basic computer literacy
+- [ ] Text editor proficiency (VS Code recommended)
+- [ ] Git basics: commit, push, pull (try [Git Tutorial](https://git-scm.com/docs/gittutorial))
+- [ ] Command line familiarity: navigate directories, run commands
+- [ ] Internet connection for cloud labs
+
+### Recommended (Not Required)
+- One programming language basics (Python, Go, or JavaScript)
+- Basic networking concepts (IP addresses, DNS)
+- Virtual machine concepts
+
+---
+
+## Phase 1: Linux Fundamentals
+
+### Read
+- [Linux Basics](/docs/linux/basics)
+- [Linux File System](/docs/linux/filesystem)
+- [Linux Permissions](/docs/linux/permissions)
+- [Getting Started with the Command Line](https://www.digitalocean.com/community/tutorials/linux-commands)
+
+### Practice
+- Complete [Linux Labs 1-2](/labs/linux-labs) (User Management, Process Management)
+- Practice commands in Cloud Shell or WSL2
+- Complete Linux exercises on [Bandit](https://overthewire.org/wargames/bandit/) levels 1-20
+
+### Validate
+```bash
+# Can you perform these tasks?
+ls -la /var/log
+ps aux | grep nginx
+useradd testuser && id testuser && userdel testuser
+chmod 755 script.sh && ./script.sh
+```
+
+**Checkpoint**: Pass Linux basics assessment (quiz in Discord #linux channel)
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Phase 2: Containers Introduction
+
+### Read
+- [Docker Basics](/docs/containers/docker)
+- [Container Fundamentals](/docs/containers/fundamentals)
+- [Docker vs Containers](/docs/containers/docker-vs-containers)
+- [What is a Container?](https://www.docker.com/resources/what-container/)
+
+### Practice
+- Complete [Docker installation](https://docs.docker.com/get-docker/)
+- Run your first container: `docker run hello-world`
+- Complete [Docker Labs](/labs/docker-basics) exercises 1-3
+- Build and run a simple web application in Docker
+- Create Dockerfile for an existing application
+
+### Validate
+```bash
+# Can you perform these tasks?
+docker build -t myapp:v1 .
+docker run -d -p 8080:80 myapp:v1
+docker ps -a
+docker exec -it container_name sh
+docker logs container_name
+docker stop container_name && docker rm container_name
+```
+
+**Checkpoint**: Successfully containerize a simple Node.js or Python application
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Phase 3: Version Control and Collaboration
+
+### Read
+- [Git Fundamentals](/docs/git/fundamentals)
+- [Git Branching](/docs/git/branching)
+- [Git Workflows](/docs/git/workflows)
+- [GitHub Quickstart](https://docs.github.com/en/get-started/quickstart)
+
+### Practice
+- Complete GitImmersion tutorial or Git Tower exercises
+- Set up Git on your machine
+- Create GitHub account and first repository
+- Practice branching: feature branch workflow
+- Complete Git exercises on [Learn Git Branching](https://learngitbranching.js.org/)
+
+### Validate
+```bash
+# Can you perform these tasks?
+git init && git clone && git add && git commit
+git checkout -b feature && git merge feature
+git rebase main && git push --force-with-lease
+git stash && git stash pop
+git reset --hard HEAD~1 && git reflog
+```
+
+**Checkpoint**: Contribute to an open source project (fix typo, update docs)
+
+**Time Estimate**: 1-2 weeks
+
+---
+
+## Phase 4: Cloud Foundations
+
+### Read
+- [Cloud Computing Basics](/docs/cloud/basics)
+- [Cloud Deployment Models](/docs/cloud/deployment)
+- [Introduction to GCP](/docs/gcp/introduction)
+- [GCP Fundamentals](/docs/gcp/fundamentals)
+- [GCP Compute Engine](/docs/gcp/compute)
+
+### Practice
+- Create GCP account with $300 free credits
+- Complete GCP console tour
+- Complete [GCP Lab 1: Compute Engine](/labs/gcp-labs) (VM Management)
+- Create and connect to a VM instance
+- Deploy a simple web server on VM
+
+### Validate
+```bash
+# Can you perform these tasks?
+gcloud compute instances list
+gcloud compute ssh instance-name
+gcloud compute scp file.txt instance-name:/tmp/
+gcloud compute instances delete instance-name
+```
+
+**Checkpoint**: Deploy a simple web application on a cloud VM with firewall rules
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Phase 5: Infrastructure as Code Introduction
+
+### Read
+- [Infrastructure as Code](/docs/iac/introduction)
+- [Terraform Basics](/docs/terraform/basics)
+- [Terraform Getting Started](https://developer.hashicorp.com/terraform/tutorials/google-cloud-get-started)
+
+### Practice
+- Install Terraform
+- Complete [Terraform Lab 1](/labs/terraform-labs) (Basic Resource Management)
+- Create a VM using Terraform
+- Modify and destroy infrastructure
+- Explore Terraform state
+
+### Validate
+```bash
+# Can you perform these tasks?
+terraform init && terraform plan && terraform apply
+terraform validate && terraform fmt
+terraform show && terraform state list
+terraform destroy
+```
+
+**Checkpoint**: Create a Terraform configuration that provisions a VM with startup script
+
+**Time Estimate**: 2 weeks
+
+---
+
+## Phase 6: CI/CD Introduction
+
+### Read
+- [CI/CD Basics](/docs/cicd/basics)
+- [GitHub Actions](/docs/cicd/github-actions)
+- [Continuous Integration](/docs/cicd/continuous-integration)
+- [What is CI/CD?](https://resources.github.com/ci-cd/)
+
+### Practice
+- Complete [CI/CD Lab 1](/labs/cicd-labs) (GitHub Actions Basic Pipeline)
+- Create a workflow that runs tests on push
+- Add lint and test stages to pipeline
+- Set up branch protection rules
+
+### Validate
+```bash
+# Can you perform these tasks?
+# In GitHub Actions:
+# - Create workflow with push trigger
+# - Run npm test on PR
+# - Build Docker image
+# - Use secrets for credentials
+```
+
+**Checkpoint**: Build a CI pipeline that tests, lints, and builds a Docker image
+
+**Time Estimate**: 2 weeks
+
+---
+
+## Portfolio Projects
+
+Complete these projects to build your portfolio:
+
+### Project 1: Personal Blog Infrastructure
+Deploy a static blog (Hugo/Jekyll) on cloud VM using:
+- Terraform for infrastructure
+- Nginx for web server
+- CI/CD for automatic deployment
+
+**Deliverables**: GitHub repo with Terraform code + working deployment
+
+### Project 2: Containerized Application
+Build and deploy a simple web application:
+- Docker container with multi-stage build
+- Push to container registry
+- Deploy on cloud VM
+
+**Deliverables**: Dockerfile + deployed application URL
+
+### Project 3: Automated Testing Pipeline
+Create CI pipeline for a sample application:
+- Run tests on every PR
+- Build Docker image on merge
+- Deploy to staging environment
+
+**Deliverables**: GitHub Actions workflow file + test results
+
+---
+
+## Certification Alignment
+
+This path prepares you for:
+
+| Certification | Notes |
+|--------------|-------|
+| [GCP Associate Cloud Engineer](https://cloud.google.com/certification/cloud-engineer) | Primary certification for this path |
+| [HashiCorp Terraform Associate](https://www.hashicorp.com/certification/terraform-associate) | After completing Terraform section |
+| [Docker Certified Associate](https://docker.com/certification) | After completing containers section |
+
+---
+
+## Time Estimates Summary
+
+| Phase | Part-time | Full-time |
+|-------|-----------|-----------|
+| 1. Linux Fundamentals | 3 weeks | 1.5 weeks |
+| 2. Containers | 3 weeks | 1.5 weeks |
+| 3. Version Control | 2 weeks | 1 week |
+| 4. Cloud Foundations | 3 weeks | 1.5 weeks |
+| 5. IaC Introduction | 2 weeks | 1 week |
+| 6. CI/CD Introduction | 2 weeks | 1 week |
+| **Total** | **12-16 weeks** | **6-8 weeks** |
+
+---
+
+## Next Steps
+
+After completing this path:
+
+1. **Practice**: Continue with [Intermediate Path](/learning-paths/intermediate)
+2. **Specialize**: Choose a [Role-Based Path](/learning-paths/role-based)
+3. **Certify**: Schedule your GCP ACE exam
+4. **Apply**: Look for Junior DevOps/SRE positions
+
+**Join the community**: Share progress in our Discord #beginner-path channel

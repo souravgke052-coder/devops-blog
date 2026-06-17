@@ -1,0 +1,681 @@
+# Folders
+
+## Overview
+
+Folders are optional organizational containers in GCP that sit between the Organization node and Projects in the resource hierarchy. They provide a way to group projects and apply policies at a collective level. Folders enable logical grouping by team, product, environment, or any business structure that doesn't map directly to individual projects.
+
+Folders support nesting up to 10 levels deep, allowing complex organizational structures. A project can belong to exactly one folder (or directly to the organization), and all resources within that project inherit folder-level IAM policies and organization policies. This inheritance makes folders powerful for applying consistent governance across many projects.
+
+Common use cases include grouping projects by environment (production, staging, development), by team (platform, data, frontend), or by application (ecommerce, crm, analytics). The folder structure should mirror your organization's reporting structure and governance needs.
+
+## When To Use
+
+- **Environment separation**: Group projects by environment (prod/staging/dev)
+- **Team organization**: Organize projects by team or department
+- **Policy inheritance**: Apply consistent IAM or org policies to groups of projects
+- **Billing aggregation**: Track costs by folder using billing exports
+- **Access control**: Grant folder-level permissions to team leads
+- **Multi-tenant isolation**: Separate tenants in different folders
+- **Application grouping**: Group related microservices into logical applications
+
+## When NOT To Use
+
+- **Only one or two projects**: Folders add complexity without benefit for small deployments
+- **Flat organization**: If all projects have the same governance needs, organization-level policies suffice
+- **Over-nesting**: Deep folder hierarchies become hard to manage and audit
+- **Replacing projects**: Folders don't replace projects—they group them
+
+## Architecture
+
+**Folder Hierarchy:**
+```
+Organization (root)
+├── Folder: Environments
+│   ├── Folder: Production
+│   │   ├── Project: app-prod
+│   │   └── Project: api-prod
+│   ├── Folder: Staging
+│   │   └── Project: app-staging
+│   └── Folder: Development
+│       └── Project: app-dev
+└── Folder: Teams
+    ├── Folder: Platform
+    │   └── Project: platform-services
+    └── Folder: Data
+        └── Project: data-warehouse
+```
+
+**Folder Properties:**
+- **Folder ID**: System-assigned unique identifier (`folders/123456789012`)
+- **Display Name**: Human-readable name (can be changed)
+- **Parent**: Organization or parent folder
+- **IAM Policy**: Who can access this folder and its children
+- **Org Policies**: Constraints applied to this folder and children
+
+**Inheritance Behavior:**
+- Policies cascade down (parent to child)
+- Child policies can be more restrictive but not more permissive
+- Folder-level policies apply to all descendant projects and resources
+
+## Core Concepts
+
+### Folder Operations
+
+```bash
+# Create folder
+gcloud resource-manager folders create "folders/production" \
+    --organization=123456789012 \
+    --display-name="Production"
+
+# Create nested folder
+gcloud resource-manager folders create "folders/production/apps" \
+    --organization=123456789012 \
+    --display-name="Production Applications"
+
+# List folders
+gcloud resource-manager folders list --organization=123456789012
+
+# Describe folder
+gcloud resource-manager folders describe folders/123456789012
+
+# Update folder
+gcloud resource-manager folders update folders/123456789012 \
+    --display-name="Updated Name"
+
+# Move folder
+gcloud resource-manager folders move folders/CHILD_ID \
+    --folder=folders/PARENT_ID
+
+# Delete folder (must be empty)
+gcloud resource-manager folders delete folders/123456789012
+```
+
+### Moving Projects Between Folders
+
+```bash
+# Move project to folder
+gcloud projects move my-project --folder=folders/123456789012
+
+# Move project to organization root
+gcloud projects move my-project --organization=123456789012
+
+# Move project out of any folder
+gcloud projects move my-project --folder=""
+```
+
+### Folder IAM
+
+```bash
+# Get folder IAM policy
+gcloud resource-manager folders get-iam-policy folders/123456789012
+
+# Set folder IAM policy
+gcloud resource-manager folders set-iam-policy folders/123456789012 policy.json
+
+# Add IAM binding
+gcloud resource-manager folders add-iam-policy-binding folders/123456789012 \
+    --member="group:team@company.com" \
+    --role="roles/viewer"
+
+# Remove IAM binding
+gcloud resource-manager folders remove-iam-policy-binding folders/123456789012 \
+    --member="group:team@company.com" \
+    --role="roles/viewer"
+```
+
+### Folder Org Policies
+
+```bash
+# Set org policy at folder level
+gcloud org-policies set-policy policy.yaml \
+    --folder=folders/123456789012
+
+# Reset org policy to inherited default
+gcloud org-policies reset compute.disableSerialPortAccess \
+    --folder=folders/123456789012
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Folders per organization | 1,000 |
+| Folder nesting depth | 10 levels |
+| Projects per folder | Unlimited |
+| IAM bindings per folder | 1,500 |
+
+### Key Gotchas
+
+- **Folders can only be created by users with `resourcemanager.folderAdmin`** role
+- **Deleting a folder requires it to be empty**—move or delete all projects first
+- **Moving folders is slow**—changes can take 30+ minutes to propagate
+- **Folder IAM inherits but doesn't replace project IAM**—both apply (union of permissions)
+- **Org policies at folder level can only restrict further**, not expand Organization-level permissions
+- **Folder display names can be duplicated** but folder IDs are unique
+- **Moving projects between folders can affect IAM** if using conditional bindings with folder references
+
+## Real Production Example
+
+Production folder structure setup:
+
+```bash
+# 1. Create environment folders
+gcloud resource-manager folders create "folders/environments" \
+    --organization=123456789012 \
+    --display-name="Environments"
+
+gcloud resource-manager folders create "folders/environments/production" \
+    --organization=123456789012 \
+    --display-name="Production"
+
+gcloud resource-manager folders create "folders/environments/staging" \
+    --organization=123456789012 \
+    --display-name="Staging"
+
+gcloud resource-manager folders create "folders/environments/development" \
+    --organization=123456789012 \
+    --display-name="Development"
+
+# 2. Create team folders
+gcloud resource-manager folders create "folders/teams" \
+    --organization=123456789012 \
+    --display-name="Teams"
+
+gcloud resource-manager folders create "folders/teams/platform" \
+    --organization=123456789012 \
+    --display-name="Platform Team"
+
+gcloud resource-manager folders create "folders/teams/data" \
+    --organization=123456789012 \
+    --display-name="Data Team"
+
+# 3. Apply folder-level IAM
+# Grant platform team admin on production folders
+gcloud resource-manager folders add-iam-policy-binding folders/PROD_ID \
+    --member="group:platform-team@company.com" \
+    --role="roles/resourcemanager.folderAdmin"
+
+# Grant dev team viewer on all environments
+gcloud resource-manager folders add-iam-policy-binding folders/ENVIRONMENTS_ID \
+    --member="group:developers@company.com" \
+    --role="roles/viewer"
+
+# 4. Apply org policies at folder level
+# More restrictive policy on production
+cat > prod-restrictions.yaml << 'EOF'
+name: folders/PROD_ID/policies/compute.vmExternalIp
+spec:
+  rules:
+  - enforce: false
+EOF
+gcloud org-policies set-policy prod-restrictions.yaml \
+    --folder=folders/PROD_ID
+
+# 5. Create projects under folders
+gcloud projects create my-app-prod \
+    --folder=folders/PROD_ID \
+    --name="My App Production"
+
+gcloud projects create my-app-staging \
+    --folder=folders/STAGING_ID \
+    --name="My App Staging"
+
+# 6. Set billing at folder level (via organization)
+# Projects inherit billing from billing account
+```
+
+```hcl
+# Terraform: Folder structure
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "organization_id" {
+  description = "The organization ID"
+  type        = string
+}
+
+# Root folders
+resource "google_folder" "environments" {
+  display_name = "Environments"
+  parent       = "organizations/${var.organization_id}"
+}
+
+resource "google_folder" "teams" {
+  display_name = "Teams"
+  parent       = "organizations/${var.organization_id}"
+}
+
+# Environment folders
+resource "google_folder" "production" {
+  display_name = "Production"
+  parent       = google_folder.environments.id
+}
+
+resource "google_folder" "staging" {
+  display_name = "Staging"
+  parent       = google_folder.environments.id
+}
+
+resource "google_folder" "development" {
+  display_name = "Development"
+  parent       = google_folder.environments.id
+}
+
+# Team folders
+resource "google_folder" "platform_team" {
+  display_name = "Platform Team"
+  parent       = google_folder.teams.id
+}
+
+resource "google_folder" "data_team" {
+  display_name = "Data Team"
+  parent       = google_folder.teams.id
+}
+
+# Folder IAM
+resource "google_folder_iam_member" "platform_admin" {
+  folder = google_folder.platform_team.id
+  role   = "roles/resourcemanager.folderAdmin"
+  member = "group:platform-team@company.com"
+}
+
+resource "google_folder_iam_member" "devops_viewer" {
+  folder = google_folder.environments.id
+  role   = "roles/viewer"
+  member = "group:devops@company.com"
+}
+
+# Folder org policies
+resource "google_org_policy_policy" "prod_no_external_ip" {
+  folder   = google_folder.production.id
+  name     = "folders/${google_folder.production.id}/policies/compute.vmExternalIp"
+  policy {
+    boolean_policy {
+      enforced = false
+    }
+  }
+}
+
+# Project under production folder
+resource "google_project" "prod_app" {
+  name       = "Production App"
+  project_id = "my-prod-app"
+  folder     = google_folder.production.id
+  billing_account = var.billing_account
+
+  labels = {
+    environment = "production"
+    managed_by  = "terraform"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create folder
+gcloud resource-manager folders create "folders/name" \
+    --organization=ORG_ID \
+    --display-name="Display Name"
+
+# List all folders
+gcloud resource-manager folders list --organization=ORG_ID
+
+# Describe folder
+gcloud resource-manager folders describe folders/FOLDER_ID
+
+# Update folder display name
+gcloud resource-manager folders update folders/FOLDER_ID \
+    --display-name="New Name"
+
+# Move folder (reparent)
+gcloud resource-manager folders move folders/FOLDER_ID \
+    --folder=folders/NEW_PARENT_ID
+
+# Delete folder
+gcloud resource-manager folders delete folders/FOLDER_ID
+
+# Get folder IAM policy
+gcloud resource-manager folders get-iam-policy folders/FOLDER_ID
+
+# Set folder IAM policy
+gcloud resource-manager folders set-iam-policy folders/FOLDER_ID policy.json
+
+# Add IAM binding
+gcloud resource-manager folders add-iam-policy-binding folders/FOLDER_ID \
+    --member="user:user@company.com" \
+    --role="roles/role"
+
+# Remove IAM binding
+gcloud resource-manager folders remove-iam-policy-binding folders/FOLDER_ID \
+    --member="user:user@company.com" \
+    --role="roles/role"
+
+# Move project to folder
+gcloud projects move PROJECT --folder=folders/FOLDER_ID
+```
+
+## Terraform Example
+
+```hcl
+# Complete folder hierarchy with IAM and policies
+provider "google" {
+  organization = "123456789012"
+}
+
+# Environment root folder
+resource "google_folder" "env_root" {
+  display_name = "Environments"
+  parent       = "organizations/123456789012"
+}
+
+# Production folder
+resource "google_folder" "production" {
+  display_name = "Production"
+  parent       = google_folder.env_root.id
+}
+
+# Production subfolders
+resource "google_folder" "prod_apps" {
+  display_name = "Applications"
+  parent       = google_folder.production.id
+}
+
+resource "google_folder" "prod_infra" {
+  display_name = "Infrastructure"
+  parent       = google_folder.production.id
+}
+
+# Team root folder
+resource "google_folder" "team_root" {
+  display_name = "Teams"
+  parent       = "organizations/123456789012"
+}
+
+# Platform team folder
+resource "google_folder" "platform_team" {
+  display_name = "Platform"
+  parent       = google_folder.team_root.id
+}
+
+# IAM at folder level
+resource "google_folder_iam_member" "platform_admin" {
+  folder = google_folder.platform_team.id
+  role   = "roles/resourcemanager.folderAdmin"
+  member = "group:platform@company.com"
+}
+
+resource "google_folder_iam_member" "prod_viewer" {
+  folder = google_folder.production.id
+  role   = "roles/viewer"
+  member = "group:all-employees@company.com"
+}
+
+# Org policy at folder level (restrictive for prod)
+resource "google_org_policy_policy" "prod_no_serial_port" {
+  folder = google_folder.production.id
+  name   = "folders/${google_folder.production.id}/policies/compute.disableSerialPortAccess"
+  policy {
+    enforce = true
+  }
+}
+
+resource "google_org_policy_policy" "prod_no_external_ip" {
+  folder = google_folder.production.id
+  name   = "folders/${google_folder.production.id}/policies/compute.vmExternalIp"
+  policy {
+    boolean_policy {
+      enforced = false  # More restrictive: no external IPs in prod
+    }
+  }
+}
+
+# Project in production folder
+resource "google_project" "prod_app" {
+  name       = "Production App"
+  project_id = "my-prod-app"
+  folder     = google_folder.prod_apps.id
+  billing_account = "XXXXXX-XXXXXX-XXXXXX"
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create folder | `gcloud resource-manager folders create PATH --organization=ORG` |
+| List folders | `gcloud resource-manager folders list --organization=ORG` |
+| Describe folder | `gcloud resource-manager folders describe FOLDER_ID` |
+| Update folder | `gcloud resource-manager folders update FOLDER_ID [FLAGS]` |
+| Move folder | `gcloud resource-manager folders move FOLDER_ID --folder=PARENT` |
+| Delete folder | `gcloud resource-manager folders delete FOLDER_ID` |
+| Get IAM policy | `gcloud resource-manager folders get-iam-policy FOLDER_ID` |
+| Set IAM policy | `gcloud resource-manager folders set-iam-policy FOLDER_ID FILE` |
+| Add IAM binding | `gcloud resource-manager folders add-iam-policy-binding FOLDER_ID --member=M --role=R` |
+| Move project | `gcloud projects move PROJECT --folder=FOLDER_ID` |
+
+## Monitoring
+
+**Folder-Level Monitoring:**
+
+1. **Cost Monitoring by Folder**
+   ```sql
+   -- Cost breakdown by folder
+   SELECT
+     folder.id as folder_id,
+     folder.display_name,
+     SUM(cost) as total_cost
+   FROM billing_export.gcp_billing_export_v1
+   WHERE folder.id IS NOT NULL
+   GROUP BY folder.id, folder.display_name
+   ORDER BY total_cost DESC
+   ```
+
+2. **Resource Inventory by Folder**
+   ```bash
+   # List all projects in a folder
+   gcloud projects list --filter="parent.id=FOLDER_ID"
+   
+   # List resources across all projects in folder
+   gcloud compute instances list \
+       --filter="project:my-proj-1 OR project:my-proj-2"
+   ```
+
+3. **IAM Audit at Folder Level**
+   ```bash
+   # Log IAM changes at folder level
+   gcloud logging read 'resource.type="folder" AND protoPayload.methodName="SetIAMPolicy"' \
+       --folder=FOLDER_ID
+   
+   # Alert on folder admin role grants
+   gcloud logging read 'resource.type="folder" AND protoPayload.authorization.grantedRole:"admin"'
+   ```
+
+**Recommended Alerts:**
+- New projects created outside approved folders
+- Folder policy changes
+- Excessive IAM grants at folder level
+
+## Security
+
+**Folder Security Best Practices:**
+
+1. **Use folders for least-privilege access**
+   ```bash
+   # Grant folder admin only to team leads
+   gcloud resource-manager folders add-iam-policy-binding folders/TEAM_FOLDER \
+       --member="group:team-leads@company.com" \
+       --role="roles/resourcemanager.folderAdmin"
+   ```
+
+2. **Apply restrictive org policies at folder level**
+   ```bash
+   # Strict production policies
+   gcloud org-policies set-policy prod-strict.yaml --folder=folders/PROD_ID
+   ```
+
+3. **Use folder-level service accounts for cross-project access**
+   ```bash
+   # Create service account in folder-level project
+   gcloud iam service-accounts create folder-sa \
+       --display-name="Folder Service Account"
+   
+   # Grant cross-project access from folder project
+   gcloud projects add-iam-policy-binding target-project \
+       --member="serviceAccount:folder-sa@folders-project.iam.gserviceaccount.com" \
+       --role="roles/bigquery.dataViewer"
+   ```
+
+4. **Enable Data Access audit logs at folder level**
+   ```bash
+   # Enable audit logs for folder
+   gcloud logging write audit-log 'IAM policy change in folder' \
+       --folder=FOLDER_ID
+   ```
+
+## Cost Optimization
+
+**Folder-Level Cost Strategies:**
+
+1. **Track costs by folder**
+   ```bash
+   # Budget alerts per folder
+   gcloud billing budgets create \
+       --billing-account=XXXXXX \
+       --display-name="Production Folder Budget" \
+       --amount=100000USD \
+       --filter-projects=projects/my-prod-1,projects/my-prod-2
+   ```
+
+2. **Apply cost controls at folder level**
+   ```bash
+   # Restrict expensive regions at folder level
+   gcloud org-policies set-policy restrict-regions.yaml --folder=folders/DEV_ID
+   ```
+
+3. **Clean up unused projects in folders**
+   ```bash
+   # List projects in folder
+   gcloud projects list --filter="parent.id=FOLDER_ID"
+   
+   # Find unused projects (no resources)
+   # Schedule for review or deletion
+   ```
+
+4. **Use labels within projects** for granular cost allocation
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Can't create folder**
+   ```bash
+   # Check permissions (need resourcemanager.folderAdmin)
+   gcloud organizations get-iam-policy 123456789012
+   
+   # Check organization exists
+   gcloud organizations list
+   
+   # Check quota (max 1000 folders per org)
+   ```
+
+2. **Can't delete folder**
+   ```bash
+   # Folder must be empty
+   gcloud projects list --filter="parent.id=FOLDER_ID"
+   
+   # Move projects out first
+   gcloud projects move PROJECT --folder=NEW_FOLDER_ID
+   
+   # Then delete empty folder
+   gcloud resource-manager folders delete folders/FOLDER_ID
+   ```
+
+3. **Folder move failing**
+   ```bash
+   # Check folder depth limit (10 levels)
+   # Check permissions (need folder admin on both source and target)
+   # Verify target is not a child of source (can't move folder under its child)
+   ```
+
+4. **Org policies not applying to folder children**
+   ```bash
+   # Check policy is set correctly
+   gcloud org-policies describe CONSTRAINT --folder=FOLDER_ID
+   
+   # Check inheritance (folder can only restrict, not expand)
+   # Some policies only affect new resources
+   ```
+
+5. **IAM not working on folder**
+   ```bash
+   # Check effective policy
+   gcloud resource-manager folders get-iam-policy folders/FOLDER_ID
+   
+   # IAM can take up to 7 minutes to propagate
+   # Verify user is not in excluded group
+   ```
+
+## Interview Questions
+
+1. **What's the purpose of folders in GCP and how do they relate to the resource hierarchy?**
+
+2. **How would you design a folder structure for a company with multiple business units and environments?**
+
+3. **Explain how policy inheritance works with folders. Can a folder-level policy be more permissive than an organization-level policy?**
+
+4. **What are the limits on folder nesting and why do these limits exist?**
+
+5. **How would you move a project from one folder to another? What are the implications?**
+
+## Cheat Sheet
+
+```
+# Folder Operations
+gcloud resource-manager folders create PATH --organization=ORG --display-name=NAME
+gcloud resource-manager folders list --organization=ORG
+gcloud resource-manager folders describe FOLDER_ID
+gcloud resource-manager folders update FOLDER_ID --display-name=NAME
+gcloud resource-manager folders move FOLDER_ID --folder=NEW_PARENT
+gcloud resource-manager folders delete FOLDER_ID
+
+# Folder IAM
+gcloud resource-manager folders get-iam-policy FOLDER_ID
+gcloud resource-manager folders set-iam-policy FOLDER_ID FILE
+gcloud resource-manager folders add-iam-policy-binding FOLDER_ID --member=M --role=R
+gcloud resource-manager folders remove-iam-policy-binding FOLDER_ID --member=M --role=R
+
+# Project Operations
+gcloud projects move PROJECT --folder=FOLDER_ID
+
+# Folder Org Policies
+gcloud org-policies set-policy POLICY.yaml --folder=FOLDER_ID
+gcloud org-policies reset CONSTRAINT --folder=FOLDER_ID
+
+# Key Roles
+roles/resourcemanager.folderAdmin     # Create/delete folders
+roles/resourcemanager.folderIamAdmin  # Manage folder IAM
+roles/viewer                          # Read-only access
+```
+
+## Labs
+
+1. **Folder Setup**: Create folder hierarchy for a multi-team organization
+2. **Folder IAM**: Configure folder-level permissions for different teams
+3. **Folder Policies**: Apply org policies at folder level, verify inheritance
+4. **Project Organization**: Move projects between folders, verify IAM changes
+5. **Folder Cleanup**: Delete unused folders, handle non-empty folder errors
+
+## Related Services
+
+- [Organization Node](./organization)
+- [Resource Hierarchy](./resource-hierarchy)
+- [Projects](./projects)
+- [IAM](./iam)
+- [Billing](./billing)

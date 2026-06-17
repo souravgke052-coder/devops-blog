@@ -1,0 +1,667 @@
+# Workflows
+
+## Overview
+
+Google Cloud Workflows is a fully managed orchestration service for automating GCP and HTTP-based API workflows. It provides sequencing of services, support for human approval steps, error handling with retries, and built-in retry logic. Workflows scale automatically and can connect to any HTTP-based API, including GCP services, external APIs, and other workflows.
+
+## When To Use
+
+- Orchestrating multi-step business processes
+- Connecting microservices into cohesive flows
+- Automating DevOps pipelines
+- Implementing human approval workflows
+- Complex data processing pipelines
+- Scheduled job orchestration
+- Long-running background tasks
+
+## When NOT To Use
+
+- Simple single-step invocations (use Cloud Functions)
+- Real-time request-response (use direct API calls)
+- High-frequency micro-orchestrations
+- Stream processing (use Dataflow)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Workflows                               │
+├─────────────────────────────────────────────────────────────┤
+│  Components:                                                │
+│  ├── Workflow Definition (YAML/JSON)                       │
+│  ├── Execution (run instance)                               │
+│  ├── Connector (pre-built integrations)                    │
+│  └── Callback (human approval endpoint)                    │
+├─────────────────────────────────────────────────────────────┤
+│  Steps:                                                     │
+│  ├── Call (HTTP request)                                   │
+│  ├── Assign (variable assignment)                          │
+│  ├── Switch (conditional branching)                        │
+│  ├── ForEach (iteration)                                   │
+│  ├── Try/Catch (error handling)                            │
+│  └── Return (exit workflow)                                │
+├─────────────────────────────────────────────────────────────┤
+│  Features:                                                 │
+│  ├── Built-in OAuth 2.0 support                            │
+│  ├── Service connectors for GCP                           │
+│  ├── Subworkflows (call another workflow)                  │
+│  └── Parallel execution                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Workflow
+A definition of steps and logic in YAML or JSON format.
+
+### Execution
+An instance of a running workflow.
+
+### Step
+Individual action within a workflow (call, assign, switch, etc.).
+
+### Connector
+Pre-built integration for GCP services (BigQuery, Cloud Storage, etc.).
+
+### Callback
+Endpoint for pausing workflow and waiting for external input.
+
+### Transition
+Connection between steps defining execution flow.
+
+## Real Production Example
+
+**Order Processing Pipeline**
+
+```hcl
+# Terraform configuration for order processing workflow
+
+# Create workflow
+resource "google_workflows_workflow" "order_processing" {
+  name        = "order-processing-${var.environment}"
+  region      = var.region
+  description = "Order processing pipeline with human approval"
+  
+  workflow_contents = file("${path.module}/workflows/order_processing.yaml")
+  
+  service_account = google_service_account.workflow_sa.email
+  
+  labels = {
+    environment = var.environment
+    team        = "orders"
+  }
+  
+  user_env_vars {
+    variables = {
+      notification_email = "orders@company.com"
+    }
+  }
+}
+
+# Workflow definition YAML
+# main.tf reference:
+data "local_file" "order_workflow" {
+  filename = "${path.module}/workflows/order_processing.yaml"
+}
+
+resource "google_workflows_workflow" "order_processing" {
+  # ... other config ...
+  workflow_contents = data.local_file.order_workflow.content
+}
+
+# Scheduler to trigger workflow
+resource "google_cloud_scheduler_job" "order_workflow_trigger" {
+  name        = "order-processing-scheduler"
+  description = "Trigger order processing workflow every hour"
+  schedule    = "0 * * * *"  # Every hour
+  time_zone   = "UTC"
+  region      = var.region
+  
+  http_target {
+    http_method = "POST"
+    uri         = "https://workflowexecutions.googleapis.com/v1/projects/${var.project}/locations/${var.region}/workflows/${google_workflows_workflow.order_processing.name}/executions"
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    
+    oauth_token {
+      service_account_email = google_service_account.scheduler_sa.email
+    }
+    
+    body = base64encode(jsonencode({
+      argument = jsonencode({
+        batch_id    = "scheduled-${timestamp()}"
+        source      = "scheduler"
+        priority    = "normal"
+      })
+    }))
+  }
+}
+
+# IAM for workflow service account
+resource "google_project_iam_member" "workflow_bigquery" {
+  project = var.project
+  role    = "roles/bigquery.dataEditor"
+  member  = "serviceAccount:${google_workflows_workflow.order_processing.service_account}"
+}
+
+resource "google_project_iam_member" "workflow_storage" {
+  project = var.project
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_workflows_workflow.order_processing.service_account}"
+}
+
+resource "google_project_iam_member" "workflow_pubsub" {
+  project = var.project
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:${google_workflows_workflow.order_processing.service_account}"
+}
+
+resource "google_project_iam_member" "workflow_workflows" {
+  project = var.project
+  role    = "roles/workflows.admin"
+  member  = "serviceAccount:${google_workflows_workflow.order_processing.service_account}"
+}
+```
+
+### Workflow Definition (order_processing.yaml)
+
+```yaml
+# Order Processing Workflow
+- init:
+    assign:
+      - project_id: "${sys.get_env("GOOGLE_CLOUD_PROJECT_NUMBER")}"
+      - region: "us-central1"
+      - notification_email: "orders@company.com"
+
+- fetch_pending_orders:
+    call: googleapis.bigquery.v2.jobs.query
+    args:
+      projectId: ${project_id}
+      query: |
+        SELECT order_id, customer_id, total_amount, created_at
+        FROM orders.pending
+        WHERE status = 'pending'
+        ORDER BY created_at
+        LIMIT 100
+      location: ${region}
+      useLegacySql: false
+    result: orders
+
+- process_order:
+    for-each: order in ${orders.rows}:
+      steps:
+        - validate_inventory:
+            call: httpget
+            args:
+              url: ${"https://inventory.api.example.com/check/" + order.order_id}
+            result: inventory_check
+
+        - check_inventory:
+            switch:
+              - condition: ${inventory_check.available == true}
+                steps:
+                  - reserve_inventory:
+                      call: httppost
+                      args:
+                        url: ${"https://inventory.api.example.com/reserve/" + order.order_id}
+                        body:
+                          quantity: ${order.quantity}
+                        headers:
+                          Authorization: ${"Bearer " + sys.get_env("INVENTORY_TOKEN")}
+                      result: reservation
+
+                  - process_payment:
+                      try:
+                        call: httppost
+                        args:
+                          url: ${"https://payment.api.example.com/charge/" + order.customer_id}
+                          body:
+                            amount: ${order.total_amount}
+                            order_id: ${order.order_id}
+                          headers:
+                            Authorization: ${"Bearer " + sys.get_env("PAYMENT_TOKEN")}
+                        result: payment_result
+                      except:
+                        steps:
+                          - payment_failed:
+                              call: httppost
+                              args:
+                                url: ${"https://notification.api.example.com/alert"}
+                                body:
+                                  type: "PAYMENT_FAILED"
+                                  order_id: ${order.order_id}
+                                  error: ${context.error.message}
+                          
+                          - mark_order_failed:
+                              call: googleapis.bigquery.v2.jobs.query
+                              args:
+                                projectId: ${project_id}
+                                query: ${"UPDATE orders.pending SET status = 'failed' WHERE order_id = '" + order.order_id + "'"}
+                                location: ${region}
+                                useLegacySql: false
+                              
+                              raise: ${"Payment failed: " + context.error.message}
+
+                  - update_inventory:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project_id}
+                        query: ${"UPDATE orders.pending SET status = 'confirmed', updated_at = CURRENT_TIMESTAMP() WHERE order_id = '" + order.order_id + "'"}
+                        location: ${region}
+                        useLegacySql: false
+
+                  - send_confirmation:
+                      call: httppost
+                      args:
+                        url: ${"https://notification.api.example.com/email/" + order.customer_id}
+                        body:
+                          template: "order_confirmation"
+                          order_id: ${order.order_id}
+                          total: ${order.total_amount}
+                        headers:
+                          Authorization: ${"Bearer " + sys.get_env("NOTIFICATION_TOKEN")}
+                
+              - condition: true  # Default: inventory not available
+                steps:
+                  - handle_out_of_stock:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project_id}
+                        query: ${"UPDATE orders.pending SET status = 'out_of_stock' WHERE order_id = '" + order.order_id + "'"}
+                        location: ${region}
+                        useLegacySql: false
+                      
+                      raise: ${"Item out of stock for order: " + order.order_id}
+
+- send_summary:
+    call: httppost
+    args:
+      url: ${"https://notification.api.example.com/webhook"}
+      body:
+        workflow: "order_processing"
+        processed: ${len(orders.rows)}
+        timestamp: ${sys.now()}
+
+- return:
+    return:
+      status: "completed"
+      processed_count: ${len(orders.rows)}
+      timestamp: ${sys.now()}
+```
+
+## CLI Examples
+
+```bash
+# Create workflow
+gcloud workflows create my-workflow \
+  --location=us-central1 \
+  --description="My workflow"
+
+# Update workflow with YAML file
+gcloud workflows update my-workflow \
+  --location=us-central1 \
+  --source=workflow.yaml
+
+# Execute workflow
+gcloud workflows run my-workflow \
+  --location=us-central1 \
+  --argument='{"key": "value"}'
+
+# Execute with YAML source
+gcloud workflows run my-workflow \
+  --location=us-central1 \
+  --source=workflow.yaml \
+  --argument='{"batch_id": "test-001"}'
+
+# List workflow executions
+gcloud workflows executions list my-workflow --location=us-central1
+
+# Describe execution
+gcloud workflows executions describe EXEC_ID \
+  --workflow=my-workflow \
+  --location=us-central1
+
+# Cancel execution
+gcloud workflows executions cancel EXEC_ID \
+  --workflow=my-workflow \
+  --location=us-central1
+
+# Get execution history
+gcloud workflows executions describe EXEC_ID \
+  --workflow=my-workflow \
+  --location=us-central1 \
+  --format=json
+
+# Connectors (available in workflow)
+# Use connectors in workflow for GCP services
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Workflow with YAML definition
+resource "google_workflows_workflow" "example" {
+  name        = "example-workflow"
+  region      = "us-central1"
+  description = "Example workflow"
+  
+  service_account = google_service_account.workflow_sa.email
+  
+  workflow_contents = <<-EOF
+  # Main routine
+  - init:
+      assign:
+        - version: "1.0"
+
+  - getTime:
+      call: httpget
+      args:
+        url: https://worldtimeapi.org/api/timezone/Etc/UTC
+      result: timeResponse
+
+  - parseTime:
+      call: sys.jsfn.parse
+      args:
+        script: "JSON.parse(content).datetime"
+        content: ${timeResponse.body}
+      result: parsedTime
+
+  - return:
+      return:
+        version: ${version}
+        currentTime: ${parsedTime}
+
+  # Callback example
+  - awaitApproval:
+      call: httppost
+      args:
+        url: ${sys.get_env("CALLBACK_URL")}
+        body:
+          execution_id: ${sys.get_var("sys.execution.id")}
+          status: "pending_approval"
+      result: callback_response
+
+  - checkApproval:
+      switch:
+        - condition: ${callback_response.body.approved == true}
+          steps:
+            - proceedWithApproval
+        - condition: true
+          steps:
+            - handleRejection
+
+  - proceedWithApproval:
+      return:
+        status: "approved"
+
+  - handleRejection:
+      raise: "Approval denied"
+  EOF
+  
+  labels = {
+    environment = "production"
+  }
+}
+
+# Workflow with external definition file
+data "local_file" "workflow_definition" {
+  filename = "path/to/workflow.yaml"
+}
+
+resource "google_workflows_workflow" "from_file" {
+  name = "workflow-from-file"
+  region = "us-central1"
+  
+  workflow_contents = data.local_file.workflow_definition.content
+  service_account = google_service_account.workflow_sa.email
+}
+
+# Service account for workflow
+resource "google_service_account" "workflow_sa" {
+  account_id = "workflow-sa"
+}
+```
+
+## Common Commands
+
+```bash
+# Workflow management
+gcloud workflows create WORKFLOW --location=LOC [--source=FILE]
+gcloud workflows list --location=LOC
+gcloud workflows describe WORKFLOW --location=LOC
+gcloud workflows update WORKFLOW --location=LOC --source=FILE
+gcloud workflows delete WORKFLOW --location=LOC [--quiet]
+
+# Execution
+gcloud workflows run WORKFLOW --location=LOC [--argument=JSON] [--source=FILE]
+gcloud workflows executions list WORKFLOW --location=LOC
+gcloud workflows executions describe WORKFLOW EXEC --location=LOC
+gcloud workflows executions cancel WORKFLOW EXEC --location=LOC
+```
+
+## Monitoring
+
+### Key Metrics
+- **Execution count**: Number of workflow runs
+- **Execution latency**: Total execution time
+- **Step latency**: Per-step timing
+- **Error rate**: Failed executions
+- **Retry count**: Number of retries
+
+### Cloud Monitoring
+
+```bash
+# Create alert for failed executions
+gcloud monitoring policies create \
+  --display-name="Workflow Failure Alert" \
+  --condition-display-name="Failure rate > 5%" \
+  --condition-filter='resource.type="workflows" AND metric.type="workflowexecutions.googleapis.com/execution/failure_count"' \
+  --condition-threshold-value=0.05 \
+  --notification-channels=CHANNEL_ID
+
+# View execution metrics
+gcloud monitoring metrics read \
+  "workflowexecutions.googleapis.com/execution/step_count"
+```
+
+### Logging
+```bash
+# Workflow execution logs are in Cloud Logging
+# Filter by workflow
+gcloud logging read "resource.type=workflows" --limit=50
+
+# Filter by specific workflow
+gcloud logging read "resource.type=workflows AND resource.labels.workflow_id=my-workflow"
+```
+
+## Security
+
+### Service Account Permissions
+```bash
+# Workflow service account needs specific roles for connectors
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:workflow@project.iam.gserviceaccount.com \
+  --role=roles/workflows.admin
+
+# For BigQuery connector
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:workflow@project.iam.gserviceaccount.com \
+  --role=roles/bigquery.dataViewer
+
+# For Cloud Storage connector
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:workflow@project.iam.gserviceaccount.com \
+  --role=roles/storage.objectViewer
+```
+
+### Secrets Management
+```bash
+# Store secrets in Secret Manager
+gcloud secrets create workflow-api-key --replication-policy=automatic
+
+# Grant workflow access
+gcloud secrets add-iam-policy-binding workflow-api-key \
+  --member=serviceAccount:workflow@project.iam.gserviceaccount.com \
+  --role=roles/secretmanager.secretAccessor
+
+# Access in workflow
+- useSecret:
+    call: httpget
+    args:
+      url: ${"https://api.example.com/data"}
+      headers:
+        Authorization: ${"Bearer " + sys.get_env("WORKFLOW_API_KEY")}
+```
+
+## Cost Optimization
+
+### Pricing
+| Resource | Price |
+|----------|-------|
+| Workflow execution steps | $0.025/1,000 steps |
+| Transition/step | $0.000025/step |
+
+### Optimization Tips
+- Minimize number of steps
+- Use parallel execution where possible
+- Cache repeated API calls
+- Batch operations within steps
+
+## Troubleshooting
+
+### Workflow Fails to Start
+```bash
+# Check service account permissions
+gcloud iam get-iam-policy projects/my-project/serviceAccounts/workflow-sa@my-project.iam.gserviceaccount.com
+
+# Verify workflow definition syntax
+gcloud workflows update my-workflow --source=workflow.yaml --location=us-central1
+```
+
+### Execution Timeout
+```bash
+# Default timeout is 1 hour
+# Check execution status
+gcloud workflows executions describe EXEC_ID --workflow=my-workflow --location=us-central1
+
+# Long-running workflows should use callback pattern
+```
+
+### Step Errors
+```bash
+# View execution history
+gcloud workflows executions describe EXEC_ID --workflow=my-workflow --location=us-central1
+
+# Check step-level errors in the response
+# Look for error.message in the step results
+```
+
+## Interview Questions
+
+**Q: How does Workflows handle errors and retries?**
+A: Workflows supports try/catch blocks for error handling. Use `try` and `except` steps to define error handling logic. Retries can be configured with exponential backoff using the `retry` section within a step. Each step can have its own retry policy.
+
+**Q: What is the difference between steps and subworkflows?**
+A: Steps are individual actions within a workflow (call, assign, switch, etc.). Subworkflows are separate workflow definitions that can be called from within a parent workflow, enabling code reuse and modularity. Use `call: workflow_name` to invoke a subworkflow.
+
+**Q: How do you implement human approval in Workflows?**
+A: Use the callback pattern: pause the workflow with an HTTP call to an external approval service, which returns a callback URL. The workflow waits at that step until the callback is invoked with approval/rejection. Store the execution ID to resume later.
+
+**Q: How does Workflows scale?**
+A: Workflows is fully managed and scales automatically. It handles concurrent executions without configuration. The service manages infrastructure, scaling, and availability transparently.
+
+**Q: What connectors are available in Workflows?**
+A: Workflows provides connectors for many GCP services: BigQuery, Cloud Spanner, Cloud SQL, Cloud Storage, Pub/Sub, Firestore, Secret Manager, and more. These connectors simplify authentication and provide pre-built request/response handling.
+
+## Cheat Sheet
+
+```yaml
+# Basic workflow structure
+- init:
+    assign:
+      - var: value
+
+- stepName:
+    call: service.method
+    args:
+      param: value
+    result: resultVar
+
+- conditional:
+    switch:
+      - condition: ${var == "value"}
+        steps:
+          - doThis
+      - condition: true
+        steps:
+          - doThat
+
+- iterate:
+    for-each: item in ${array}:
+      steps:
+        - process: ${item}
+
+- errorHandle:
+    try:
+      steps:
+        - riskyStep
+    except:
+      steps:
+        - handleError
+
+- return:
+    return:
+      result: ${resultVar}
+```
+
+```bash
+# CLI
+gcloud workflows create NAME --location=REGION
+gcloud workflows update NAME --source=workflow.yaml
+gcloud workflows run NAME --argument='{"key":"value"}'
+gcloud workflows executions list NAME
+```
+
+## Labs
+
+### Lab 1: Multi-Step Data Pipeline
+Build ETL workflow with BigQuery.
+1. Define workflow with fetch, transform, load steps
+2. Use BigQuery connector
+3. Add error handling
+4. Implement retry logic
+5. Schedule execution
+
+### Lab 2: Approval Workflow
+Implement human-in-the-loop process.
+1. Create workflow with approval step
+2. Set up approval endpoint
+3. Test approval/rejection paths
+4. Add notification on completion
+5. Monitor workflow state
+
+### Lab 3: Microservice Orchestration
+Coordinate multiple services.
+1. Create workflow with multiple HTTP calls
+2. Handle conditional branching
+3. Use subworkflows for common patterns
+4. Implement timeout handling
+5. Add observability
+
+## Related Services
+
+- **Cloud Functions**: Single-step serverless functions
+- **Cloud Scheduler**: Cron job triggers for workflows
+- **Pub/Sub**: Async messaging
+- **BigQuery**: Data processing
+- **Cloud Run**: Containerized workloads

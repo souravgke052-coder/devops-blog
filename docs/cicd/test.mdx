@@ -1,0 +1,830 @@
+---
+id: testing
+title: Testing in CI/CD
+description: Unit, integration, E2E testing, SAST, DAST, and container scanning in pipelines
+sidebar_position: 5
+---
+
+# Testing in CI/CD
+
+## Overview
+
+Testing is the foundation of reliable software delivery. A comprehensive testing strategy catches bugs early, enables confident deployments, and provides fast feedback to developers. This guide covers the testing pyramid, CI/CD integration patterns, and security testing methodologies.
+
+## When To Use
+
+- All production software deployments
+- Compliance-required testing evidence
+- Teams practicing TDD or BDD
+- High-stakes applications (finance, healthcare, safety)
+- Any CI/CD pipeline
+
+## When NOT To Use
+
+- Proof-of-concept projects with short lifecycles
+- Scripts run once and discarded
+- Documentation-only changes
+
+## Core Concepts
+
+### Testing Pyramid
+
+```
+                    /\
+                   /E2E\
+                  /------\
+                 /Integration\
+                /--------------\
+               /    Unit Tests   \
+              /--------------------\
+```
+
+| Level | Quantity | Speed | Scope |
+|-------|----------|-------|-------|
+| E2E | 5-10% | Slow (minutes) | Full system |
+| Integration | 20-30% | Medium (seconds) | Service boundaries |
+| Unit | 60-70% | Fast (milliseconds) | Single function/class |
+
+### Test Quality Metrics
+
+| Metric | Target | Description |
+|--------|--------|-------------|
+| Coverage | > 80% | Lines covered by tests |
+| Flakiness | < 1% | Non-deterministic tests |
+| Speed | < 10 min total | Full pipeline runtime |
+| Reliability | > 95% | Tests pass consistently |
+
+## Real Production Example
+
+### Complete Testing Pipeline
+
+```yaml
+name: Testing Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # ============================================
+  # UNIT TESTS
+  # ============================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run unit tests
+        run: npm run test:unit -- --coverage --reporter=junit --outputFile=test-results.xml
+        env:
+          NODE_ENV: test
+          REDIS_URL: redis://localhost:6379
+          DATABASE_URL: postgresql://test:test@localhost:5432/test
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: test-results.xml
+          retention-days: 7
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ============================================
+  # INTEGRATION TESTS
+  # ============================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+      
+      elasticsearch:
+        image: elasticsearch:8.11.0
+        env:
+          - discovery.type=single-node
+          - xpack.security.enabled=false
+        ports:
+          - 9200:9200
+      
+      kafka:
+        image: confluentinc/cp-kafka:7.5.0
+        env:
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "kafka-topics --bootstrap-server localhost:9092 --list"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 5
+      
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.5.0
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+        ports:
+          - 2181:2181
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run integration tests
+        run: npm run test:integration -- --reporter=junit --outputFile=test-results.xml
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test:test@localhost:5432/testdb
+          REDIS_URL: redis://localhost:6379
+          ELASTICSEARCH_URL: http://localhost:9200
+          KAFKA_BROKER: localhost:9092
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: test-results.xml
+          retention-days: 7
+
+  # ============================================
+  # E2E TESTS
+  # ============================================
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          BASE_URL: https://staging.example.com
+      
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+      
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-screenshots
+          path: test-results/screenshots/
+          retention-days: 14
+
+  # ============================================
+  # SECURITY SCANS
+  # ============================================
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    
+    permissions:
+      security-events: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      # SAST - Static Application Security Testing
+      - name: Run Trivy filesystem scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          scanners: vuln,secret,misconfig
+      
+      - name: Upload Trivy FS results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+      
+      # Dependency scanning
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+      
+      # CodeQL
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript
+          queries: security-extended
+      
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+  # ============================================
+  # CONTAINER SCAN
+  # ============================================
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Pull image
+        run: docker pull ${{ env.IMAGE_TAG }}
+      
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_TAG }}'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+      
+      - name: Grype container scan
+        uses: anchore/scan-action@v3
+        with:
+          image: '${{ env.IMAGE_TAG }}'
+          fail-build: true
+          severity-cutoff: high
+      
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-scan-results
+          path: |
+            trivy-results.json
+            grype-results.json
+          retention-days: 30
+
+  # ============================================
+  # LOAD TESTS
+  # ============================================
+  load-tests:
+    name: Load Testing
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+      
+      - name: Run k6 load test
+        run: k6 run tests/load/smoke.js
+        env:
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+          TARGET_URL: https://staging.example.com
+      
+      - name: Run k6 stress test
+        run: k6 run tests/load/stress.js --out cloud
+        env:
+          K6_CLOUD_TOKEN: ${{ secrets.K6_CLOUD_TOKEN }}
+          TARGET_URL: https://staging.example.com
+```
+
+### Test Configuration Examples
+
+#### Jest Configuration
+
+```javascript
+// jest.config.js
+module.exports = {
+  testEnvironment: 'node',
+  coverageDirectory: 'coverage',
+  collectCoverageFrom: [
+    'src/**/*.js',
+    '!src/**/*.test.js',
+    '!src/**/index.js',
+  ],
+  coverageThreshold: {
+    global: {
+      branches: 80,
+      functions: 80,
+      lines: 80,
+      statements: 80,
+    },
+  },
+  testMatch: [
+    '**/tests/unit/**/*.test.js',
+  ],
+  testPathIgnorePatterns: [
+    '/node_modules/',
+    '/dist/',
+  ],
+  setupFilesAfterEnv: ['<rootDir>/tests/setup.js'],
+  testTimeout: 10000,
+  maxWorkers: '50%',
+  verbose: true,
+};
+```
+
+#### Playwright Configuration
+
+```javascript
+// playwright.config.js
+const { defineConfig, devices } = require('@playwright/test');
+
+module.exports = defineConfig({
+  testDir: './tests/e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: [
+    ['html', { outputFolder: 'playwright-report' }],
+    ['json', { outputFile: 'test-results.json' }],
+  ],
+  use: {
+    baseURL: process.env.BASE_URL || 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'firefox',
+      use: { ...devices['Desktop Firefox'] },
+    },
+    {
+      name: 'mobile',
+      use: { ...devices['iPhone 13'] },
+    },
+  ],
+});
+```
+
+#### k6 Load Test
+
+```javascript
+// tests/load/smoke.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Rate } from 'k6/metrics';
+
+const errorRate = new Rate('errors');
+
+export const options = {
+  stages: [
+    { duration: '2m', target: 10 },   // Ramp up
+    { duration: '5m', target: 10 },   // Stay at 10 users
+    { duration: '2m', target: 0 },    // Ramp down
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<500'],  // 95% under 500ms
+    http_req_failed: ['rate<0.01'],    // Error rate < 1%
+    errors: ['rate<0.01'],
+  },
+};
+
+export default function () {
+  const res = http.get(`${__ENV.TARGET_URL}/api/health`);
+  
+  check(res, {
+    'status is 200': (r) => r.status === 200,
+    'response has data': (r) => r.json('status') === 'ok',
+  }) || errorRate.add(1);
+  
+  sleep(1);
+}
+```
+
+## Configuration / Pipeline Examples
+
+### Google Cloud Build Testing
+
+```yaml
+# cloudbuild.yaml
+steps:
+  # Run unit tests
+  - name: 'node:20-alpine'
+    entrypoint: npm
+    args: ['ci']
+    id: 'install'
+  
+  - name: 'node:20-alpine'
+    entrypoint: npm
+    args: ['run', 'test:unit', '--', '--coverage', '--reporter=junit', '--outputFile=test-results.xml']
+    id: 'unit-tests'
+    waitFor: ['install']
+  
+  # Security scan
+  - name: 'aquasec/trivy:latest'
+    args: ['fs', '--scanners', 'vuln,secret,misconfig', '--exit-code', '1', '--severity', 'CRITICAL,HIGH', '.']
+    id: 'security-scan'
+    waitFor: ['unit-tests']
+  
+  # Build and scan image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA', '.']
+    id: 'build'
+    waitFor: ['security-scan']
+  
+  - name: 'aquasec/trivy:latest'
+    args: ['image', '--exit-code', '1', '--severity', 'CRITICAL,HIGH', 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA']
+    id: 'image-scan'
+    waitFor: ['build']
+  
+  # Push image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '-t', 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA']
+    id: 'push'
+    waitFor: ['image-scan']
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+```
+
+### SonarQube Integration
+
+```yaml
+- name: SonarQube Scan
+  uses: sonarsource/sonarqube-scan-action@master
+  env:
+    SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    scannerProps: |
+      sonar.projectKey=myapp
+      sonar.sources=src
+      sonar.tests=tests
+      sonar.test.inclusions=**/*.test.js
+      sonar.javascript.lcov.reportPaths=coverage/lcov.info
+      sonar.coverage.exclusions=**/*.test.js,**/node_modules/**
+      sonar.qualitygate.wait=true
+```
+
+## Common Commands / Steps
+
+### Running Tests
+
+```bash
+# Jest
+npm run test                # Run all tests
+npm run test:unit           # Unit tests only
+npm run test:integration    # Integration tests only
+npm run test:watch          # Watch mode
+npm run test:coverage       # With coverage
+npm test -- --grep "pattern" # Run matching tests
+
+# Playwright
+npx playwright test                    # Run all
+npx playwright test tests/api/         # Specific folder
+npx playwright test --grep "login"     # Matching tests
+npx playwright show-report             # View report
+
+# k6
+k6 run tests/load/smoke.js             # Local run
+k6 run tests/load/smoke.js --out cloud # Cloud output
+k6 run tests/load/stress.js --vus 100  # 100 virtual users
+
+# Trivy
+trivy fs .                             # Scan filesystem
+trivy image myapp:latest               # Scan image
+trivy image --severity CRITICAL,HIGH myapp:latest
+trivy image --format sarif --output results.sarif myapp:latest
+
+# Grype
+grype dir:.                            # Scan directory
+grype image myapp:latest               # Scan image
+grype image --fail-on HIGH myapp:latest # Fail on severity
+```
+
+### Test Debugging
+
+```bash
+# Run single test file
+npm test -- tests/unit/auth.test.js
+
+# Run with verbose output
+npm test -- --verbose
+
+# Debug in VS Code
+# Add launch.json:
+# {
+#   "type": "node",
+#   "request": "launch",
+#   "name": "Debug Tests",
+#   "program": "${workspaceFolder}/node_modules/.bin/jest",
+#   "args": ["--runInBand", "--no-cache"]
+# }
+
+# Playwright debug
+DEBUG=pw:api npx playwright test
+
+# Inspect network
+PLAYWRIGHT_SHOW_HTTP_RESPONSE_HEADERS=1 npx playwright test
+```
+
+## Monitoring
+
+### Test Metrics
+
+| Metric | Target | Alert |
+|--------|--------|-------|
+| Test pass rate | > 95% | < 90% |
+| Flaky tests | < 1% | > 5% |
+| Test duration | Varies by suite | Growing trend |
+| Coverage | > 80% | < 70% |
+
+### Coverage Reports
+
+```bash
+# Generate coverage report
+npm run test:coverage
+
+# View locally (after upload to codecov)
+gh api repos/$owner/$repo/code_scanning/analyses | jq '.[0]'
+
+# Aggregate coverage across services
+curl -s https://api.codecov.io/v5/owner/repo \
+  -H "Authorization: Bearer $CODECOV_TOKEN" | jq '.repos[].coverage'
+```
+
+### Test Results Dashboard
+
+```promql
+# Test success rate
+sum(rate(test_results_total{status="passed"}[5m])) /
+sum(rate(test_results_total[5m])) * 100
+
+# Average test duration
+histogram_quantile(0.95, 
+  rate(test_duration_seconds_bucket[5m])
+)
+
+# Flaky test rate
+sum(rate(test_results_total{status="flaky"}[5m])) /
+sum(rate(test_results_total[5m])) * 100
+```
+
+## Security
+
+### Security Testing Types
+
+| Type | Tool | Purpose |
+|------|------|---------|
+| SAST | SonarQube, CodeQL | Scan source code for vulnerabilities |
+| DAST | OWASP ZAP, Burp | Test running application |
+| SCA | Dependency-check, Snyk | Analyze dependencies |
+| Container Scan | Trivy, Grype | Scan container images |
+
+### SAST Configuration
+
+```yaml
+# CodeQL configuration
+- name: Initialize CodeQL
+  uses: github/codeql-action/init@v3
+  with:
+    languages: javascript, typescript
+    queries: security-extended
+
+- name: Autobuild
+  uses: github/codeql-action/autobuild@v3
+
+- name: Perform Analysis
+  uses: github/codeql-action/analyze@v3
+```
+
+### DAST Integration
+
+```yaml
+# OWASP ZAP Scan
+- name: OWASP ZAP Scan
+  uses: zaproxy/action-baseline@v0.9.0
+  with:
+    target: 'https://staging.example.com'
+    docker_name: 'owasp/zap2docker-stable'
+    cmd: 'zap-baseline.py -t https://staging.example.com -J zap-results.json'
+    token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### Secret Scanning
+
+```yaml
+- name: Scan for secrets
+  uses: trufflesecurity/trufflehog@main
+  with:
+    path: ./
+    base: ${{ github.event.repository.default_branch }}
+    head: HEAD
+```
+
+## Cost Optimization
+
+### Test Execution Strategies
+
+| Strategy | Benefit | Implementation |
+|----------|---------|----------------|
+| Parallel execution | 3-5x faster | Jest `--maxWorkers`, Playwright workers |
+| Test selection | Skip irrelevant | `--testPathPattern`, Code coverage |
+| Sharding | Distribute load | `--shard=N/M`, Playwright shards |
+| Caching | Skip unchanged | Jest cache, test result caching |
+| Mock external services | Faster, reliable | MSW, WireMock |
+
+### Test Sharding
+
+```yaml
+# Playwright shard
+- name: Run E2E tests (shard 1/3)
+  run: npx playwright test --shard=1/3
+
+- name: Run E2E tests (shard 2/3)
+  run: npx playwright test --shard=2/3
+
+- name: Run E2E tests (shard 3/3)
+  run: npx playwright test --shard=3/3
+```
+
+### Skipping Expensive Tests
+
+```yaml
+# Only run full test suite on main
+if: github.ref == 'refs/heads/main'
+
+# Or with labels
+- name: Run full tests
+  if: contains(github.event.pull_request.labels.*.name, 'run-full-tests')
+```
+
+## Troubleshooting
+
+### Common Test Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Flaky tests | Race conditions, timing | Add retries, mock time, increase timeout |
+| Tests hang | Deadlock, infinite loop | Set timeout, check cleanup |
+| Database pollution | Shared state | Use transactions, cleanup after each test |
+| Network timeouts | External dependencies | Mock external calls, use local services |
+| Coverage mismatch | Missing source | Check coverage path patterns |
+
+### Debug Commands
+
+```bash
+# Jest verbose
+npm test -- --verbose --detectOpenHandles
+
+# Jest watch
+npm test -- --watch --testPathPattern=auth
+
+# Playwright with trace
+npx playwright test --trace on
+
+# View trace locally
+npx playwright show-trace trace.zip
+
+# Check flaky tests
+npm test -- --detectFlakes
+```
+
+## Interview Questions
+
+### Q1: Explain the testing pyramid and why it matters.
+
+**Answer:** The testing pyramid (Unit -> Integration -> E2E) prioritizes fast, abundant unit tests at the base for quick feedback, fewer integration tests in the middle for service boundaries, and minimal E2E tests at the top for critical user flows. This structure optimizes for speed (unit tests run in milliseconds), cost (E2E is expensive), and reliability (fewer false positives). Anti-patterns include over-reliance on E2E (slow, brittle) or too few unit tests (misses edge cases).
+
+### Q2: How do you handle flaky tests in CI?
+
+**Answer:** 1) Identify flaky tests through rerun tracking, 2) Fix or remove truly flaky tests, 3) Increase timeout for timing-sensitive tests, 4) Add retries for network-dependent tests (with `retry` config), 5) Isolate tests to prevent shared state, 6) Use deterministic test data, 7) Mock external services. For persistent flakes, implement test quarantining to prevent blocking deployment.
+
+### Q3: What's the difference between SAST and DAST?
+
+**Answer:** SAST (Static Application Security Testing) analyzes source code without executing it - tools like CodeQL, SonarQube run at compile time. DAST (Dynamic Application Security Testing) tests running applications by sending requests and analyzing responses - tools like OWASP ZAP run against deployed apps. SAST catches issues early but has false positives; DAST finds runtime issues but requires deployed environment.
+
+### Q4: How would you implement contract testing?
+
+**Answer:** Use Pact or Spring Cloud Contract for consumer-driven contract testing. Define contracts in consumer tests, publish to Pact Broker, verify against provider. Benefits: catch API breaking changes before deployment, enable independent service deployment, document API behavior. In CI/CD, run provider contract verification as part of the build.
+
+### Q5: Describe your testing strategy for microservices.
+
+**Answer:** 1) Unit tests for business logic, 2) Integration tests for database and service calls (using testcontainers), 3) Contract tests for API compatibility, 4) E2E tests for critical user journeys, 5) Performance tests for latency-sensitive endpoints, 6) Chaos tests for resilience validation. Key: fast feedback on code changes (unit), confidence on deployment (integration), reliability in production (E2E).
+
+## Cheat Sheet
+
+```bash
+# Jest
+npm test                              # Run all
+npm run test:unit -- --coverage       # With coverage
+npm test -- --watch                   # Watch mode
+npm test -- --grep "pattern"          # Filter tests
+
+# Playwright
+npx playwright test                   # Run all
+npx playwright test --ui              # UI mode
+npx playwright test --grep "login"    # Filter
+npx playwright show-report            # View report
+
+# k6
+k6 run load.js                        # Run load test
+k6 run load.js --vus 100 --duration 30s  # Custom load
+
+# Trivy
+trivy fs .                            # Scan files
+trivy image myapp:latest              # Scan image
+trivy image --format sarif results.sarif  # SARIF output
+
+# Grype
+grype image myapp:latest              # Scan image
+grype dir:.                           # Scan directory
+grype sbom:sbom.json                  # From SBOM
+
+# SonarQube
+sonar-scanner -Dsonar.projectKey=myapp
+```
+
+## Related Topics
+
+- [CI/CD Overview](./overview.mdx)
+- [GitHub Actions](./github.mdx)
+- [Build Automation](./build.mdx)
+- [Artifact Management](./artifact-management.mdx)
+- [Security Best Practices](./overview.mdx#security)

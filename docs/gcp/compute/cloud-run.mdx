@@ -1,0 +1,648 @@
+# Cloud Run
+
+## Overview
+
+Cloud Run is a fully managed serverless platform for containerized applications. It automatically scales your containers from zero to thousands of instances based on incoming requests, and scales back down to zero when there are no requests—only paying for actual usage. Cloud Run is based on open standards (Knative), making it portable and easy to migrate between platforms.
+
+Cloud Run supports both fully managed execution (Google handles everything) and Cloud Run for Anthos (run on your own GKE cluster). It integrates seamlessly with other GCP services, supports custom domains, and provides built-in traffic management for blue-green deployments and canary releases. The simplicity of "container to production" makes it ideal for microservices, APIs, and event-driven workloads.
+
+Key features include instant scaling (from 0 to thousands in seconds), pay-per-use pricing (only when handling requests), automatic TLS termination, native Knative compatibility, and strong integration with Cloud Build, Cloud Code, and other GCP developer tools.
+
+## When To Use
+
+- **Microservices and APIs**: Build and deploy containerized REST APIs quickly
+- **Event-driven workloads**: Process events from Cloud Events, Pub/Sub, or Cloud Storage
+- **Web applications**: Host stateless web applications and frontend frameworks
+- **Batch jobs**: Run background processing jobs (with tasks feature)
+- **CI/CD pipelines**: Integrate into deployment pipelines
+- **Prototyping**: Quick deployment of containerized applications
+- **Serverless containers**: When you want containers without managing infrastructure
+
+## When NOT To Use
+
+- **Long-running processes**: Jobs that take >15 minutes per request
+- **GPU/TPU workloads**: Cloud Run doesn't support accelerators
+- **Stateful applications**: Applications requiring persistent connections or local storage
+- **Streaming responses**: HTTP responses >32MB
+- **Binary runs**: Executables not in containers
+- **High-performance computing**: Needs dedicated hardware
+
+## Architecture
+
+**Cloud Run Architecture:**
+```
+Request from Internet
+    ↓
+Google Cloud Load Balancer (with Cloud Run)
+    ↓
+Cold Start: Pull container image
+    ↓
+Container starts (if not running)
+    ↓
+Container handles request
+    ↓
+Autoscaling: Scale to N instances or scale to 0
+```
+
+**Container Lifecycle:**
+```
+Image → Instance 0 (receiving requests) → Scale up N instances
+                                    ↓
+                              No traffic (10+ min)
+                                    ↓
+                              Instance → 0 (scale to zero)
+```
+
+**Request Flow:**
+- Requests arrive through Global HTTP Load Balancer
+- Cloud Run manages container lifecycle
+- Containers can be shared across revisions (if no changes)
+- Traffic can be split between revisions for gradual rollouts
+
+## Core Concepts
+
+### Deploying a Service
+
+```bash
+# Deploy container to Cloud Run
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --platform=managed
+
+# Deploy with specific settings
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --platform=managed \
+    --min-instances=1 \
+    --max-instances=100 \
+    --cpu=2 \
+    --memory=512Mi \
+    --concurrency=80 \
+    --timeout=60s \
+    --port=8080
+
+# Deploy from source (Cloud Build)
+gcloud run deploy my-service \
+    --source . \
+    --region=us-central1
+
+# Deploy with environment variables
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --set-env-vars="ENV=production,VERSION=1" \
+    --add-cloudsql-instances=my-project:us-central1:my-db
+
+# Deploy with secrets
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --set-secrets="DB_PASSWORD=db-password:latest,API_KEY=api-key:latest"
+
+# Deploy with VPC connector
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --vpc-connector=my-vpc-connector \
+    --set-env-vars="GOOGLE_CLOUD_PROJECT=my-project"
+
+# Deploy with service account
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --service-account=my-sa@my-project.iam.gserviceaccount.com
+```
+
+### Managing Services
+
+```bash
+# List services
+gcloud run services list --region=us-central1
+
+# Describe service
+gcloud run services describe my-service --region=us-central1
+
+# Update service
+gcloud run services update my-service \
+    --region=us-central1 \
+    --min-instances=2 \
+    --max-instances=50
+
+# Set environment variables
+gcloud run services update my-service \
+    --region=us-central1 \
+    --set-env-vars="NEW_VAR=value" \
+    --remove-env-vars="OLD_VAR"
+
+# Update traffic
+gcloud run services update-traffic my-service \
+    --region=us-central1 \
+    --to-latest \
+    --allow-failure
+
+# Split traffic between revisions
+gcloud run services update-traffic my-service \
+    --region=us-central1 \
+    --to-revisions=my-service-00001=90,my-service-00002=10
+
+# Delete service
+gcloud run services delete my-service --region=us-central1
+
+# Get service URL
+gcloud run services describe my-service --region=us-central1 --format="value(status.url)"
+```
+
+### Revisions
+
+```bash
+# List revisions
+gcloud run revisions list --service=my-service --region=us-central1
+
+# Describe revision
+gcloud run revisions describe my-service-00001-abc --region=us-central1
+
+# Delete revision
+gcloud run revisions delete my-service-00001-abc --region=us-central1
+
+# Get revision logs
+gcloud run revisions logs my-service-00001-abc --region=us-central1
+```
+
+### IAM and Security
+
+```bash
+# Make service public (allow unauthenticated)
+gcloud run services add-iam-policy-binding my-service \
+    --region=us-central1 \
+    --member="allUsers" \
+    --role="roles/run.invoker"
+
+# Allow specific user
+gcloud run services add-iam-policy-binding my-service \
+    --region=us-central1 \
+    --member="user:alice@company.com" \
+    --role="roles/run.invoker"
+
+# Allow service account
+gcloud run services add-iam-policy-binding my-service \
+    --region=us-central1 \
+    --member="serviceAccount:sa@project.iam.gserviceaccount.com" \
+    --role="roles/run.invoker"
+
+# Remove public access
+gcloud run services remove-iam-policy-binding my-service \
+    --region=us-central1 \
+    --member="allUsers" \
+    --role="roles/run.invoker"
+
+# Get IAM policy
+gcloud run services get-iam-policy my-service --region=us-central1
+```
+
+### Connecting to Cloud SQL
+
+```bash
+# Deploy with Cloud SQL connection
+gcloud run deploy my-service \
+    --image=gcr.io/my-project/my-app:v1 \
+    --region=us-central1 \
+    --add-cloudsql-instances=my-project:us-central1:my-db \
+    --set-env-vars="DATABASE_HOST=/cloudsql/my-project:us-central1:my-db"
+
+# Or use Unix socket (application handles this)
+# Application connects to /cloudsql/INSTANCE_CONNECTION_NAME
+```
+
+### Cloud Run Jobs
+
+```bash
+# Create a job
+gcloud run jobs create my-job \
+    --image=gcr.io/my-project/my-job:v1 \
+    --region=us-central1 \
+    --set-env-vars="ENV=production" \
+    --max-retries=3 \
+    --task-timeout=300s \
+    --parallelism=4 \
+    --tasks=10
+
+# Execute job
+gcloud run jobs execute my-job --region=us-central1
+
+# Execute with overrides
+gcloud run jobs execute my-job \
+    --region=us-central1 \
+    --max-retries=2 \
+    --task-timeout=600s
+
+# List jobs
+gcloud run jobs list --region=us-central1
+
+# Describe job
+gcloud run jobs describe my-job --region=us-central1
+
+# View job executions
+gcloud run jobs executions list my-job --region=us-central1
+
+# Delete job
+gcloud run jobs delete my-job --region=us-central1
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Requests timeout | 15 minutes (max) |
+| Max instances | 1000 (configurable) |
+| Min instances | 0 (scale to zero) |
+| Request body size | 32MB |
+| Concurrency per instance | 80 (default), up to 1000 |
+| Memory | 512Mi - 4Gi |
+| CPU | 1-4 vCPUs |
+| Job task timeout | 3600 seconds |
+| Job parallelism | 100 |
+| Job tasks | 1000 |
+
+### Key Gotchas
+
+- **Cold starts**: First request after scale-from-zero takes longer
+- **Container port**: Must listen on PORT environment variable (default 8080)
+- **No root by default**: Container runs as non-root user
+- **Stateless only**: No filesystem writes persist between requests
+- **Scaling is fast but not instant**: Allow for burst handling
+- **Max instances limit**: Prevents runaway costs
+- **Min instances > 0**: Prevents cold starts but costs money
+
+## Real Production Example
+
+Production Cloud Run deployment:
+
+```bash
+#!/bin/bash
+set -e
+
+PROJECT="my-project"
+REGION="us-central1"
+SERVICE="api-service"
+IMAGE="gcr.io/${PROJECT}/${SERVICE}:v1.2.3"
+
+# 1. Build and push container
+gcloud builds submit --tag $IMAGE --project=$PROJECT
+
+# 2. Create service account
+gcloud iam service-accounts create $SERVICE-sa \
+    --display-name="${SERVICE} Service Account"
+
+gcloud projects add-iam-policy-binding $PROJECT \
+    --member="serviceAccount:${SERVICE}-sa@${PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/cloudsql.client"
+
+gcloud projects add-iam-policy-binding $PROJECT \
+    --member="serviceAccount:${SERVICE}-sa@${PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/storage.objectViewer"
+
+# 3. Deploy to Cloud Run
+gcloud run deploy $SERVICE \
+    --image=$IMAGE \
+    --region=$REGION \
+    --platform=managed \
+    --service-account="${SERVICE}-sa@${PROJECT}.iam.gserviceaccount.com" \
+    --min-instances=2 \
+    --max-instances=100 \
+    --cpu=2 \
+    --memory=1Gi \
+    --concurrency=80 \
+    --timeout=60s \
+    --port=8080 \
+    --no-allow-unauthenticated \
+    --add-cloudsql-instances="${PROJECT}:${REGION}:api-db" \
+    --set-env-vars="NODE_ENV=production,DATABASE_HOST=/cloudsql/${PROJECT}:${REGION}:api-db" \
+    --vpc-connector=api-vpc-connector \
+    --vpc-egress=all-traffic
+
+# 4. Configure IAM for authenticated access
+gcloud run services add-iam-policy-binding $SERVICE \
+    --region=$REGION \
+    --member="serviceAccount:api-gateway@${PROJECT}.iam.gserviceaccount.com" \
+    --role="roles/run.invoker"
+
+gcloud run services add-iam-policy-binding $SERVICE \
+    --region=$REGION \
+    --member="group:api-developers@company.com" \
+    --role="roles/run.invoker"
+
+# 5. Set up custom domain (optional)
+gcloud run domain-mappings create \
+    --service=$SERVICE \
+    --domain=api.example.com \
+    --region=$REGION
+
+# 6. Update traffic (for rolling updates)
+gcloud run services update-traffic $SERVICE \
+    --region=$REGION \
+    --to-latest \
+    --allow-failure
+
+# 7. Get service URL
+SERVICE_URL=$(gcloud run services describe $SERVICE --region=$REGION --format="value(status.url)")
+echo "Service URL: $SERVICE_URL"
+
+# 8. Test service
+curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" $SERVICE_URL/health
+
+# 9. Create job for batch processing
+gcloud run jobs create ${SERVICE}-batch \
+    --image=$IMAGE \
+    --region=$REGION \
+    --set-env-vars="JOB_MODE=batch" \
+    --max-retries=3 \
+    --task-timeout=600s \
+    --parallelism=5 \
+    --tasks=50
+
+# Execute batch job
+gcloud run jobs execute ${SERVICE}-batch --region=$REGION
+
+# 10. Create cloud schedule trigger for job
+gcloud scheduler jobs create http ${SERVICE}-cron \
+    --location=$REGION \
+    --schedule="0 2 * * *" \
+    --uri="${SERVICE_URL}/batch" \
+    --http-method=POST \
+    --oidc-service-account-email=${SERVICE}-sa@${PROJECT}.iam.gserviceaccount.com
+```
+
+```hcl
+# Terraform: Cloud Run service
+resource "google_cloud_run_service" "api" {
+  name     = "api-service"
+  location = "us-central1"
+  platform = "managed"
+
+  template {
+    spec {
+      service_account_name = google_service_account.api_sa.email
+      
+      containers {
+        image = "gcr.io/my-project/api:v1"
+        
+        resources {
+          limits = {
+            cpu    = "2"
+            memory = "1Gi"
+          }
+        }
+
+        env {
+          name  = "NODE_ENV"
+          value = "production"
+        }
+
+        ports {
+          container_port = 8080
+        }
+      }
+
+      scaling {
+        min_instance_count = 2
+        max_instance_count = 100
+      }
+
+      vpc_access {
+        connector = google_vpc_access_connector.connector.id
+        egress    = "all-traffic"
+      }
+    }
+
+    metadata {
+      annotations = {
+        "autoscaling.knative.dev/minScale" = "2"
+        "autoscaling.knative.dev/maxScale" = "100"
+      }
+    }
+  }
+
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+}
+
+resource "google_cloud_run_service_iam_member" "public" {
+  location = google_cloud_run_service.api.location
+  name     = google_cloud_run_service.api.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+resource "google_service_account" "api_sa" {
+  account_id   = "api-service-sa"
+  display_name = "API Service Account"
+}
+```
+
+## CLI Examples
+
+```bash
+# Deploy
+gcloud run deploy NAME --image=IMAGE --region=REGION
+gcloud run deploy NAME --source . --region=REGION
+
+# Service management
+gcloud run services list --region=REGION
+gcloud run services describe NAME --region=REGION
+gcloud run services update NAME --region=REGION [FLAGS]
+gcloud run services delete NAME --region=REGION
+
+# Traffic
+gcloud run services update-traffic NAME --region=REGION --to-latest
+gcloud run services update-traffic NAME --region=REGION --to-revisions=REV1=PCT,REV2=PCT
+
+# IAM
+gcloud run services add-iam-policy-binding NAME --region=REGION --member=M --role=roles/run.invoker
+gcloud run services get-iam-policy NAME --region=REGION
+
+# Jobs
+gcloud run jobs create NAME --image=IMAGE --region=REGION [FLAGS]
+gcloud run jobs execute NAME --region=REGION
+gcloud run jobs list --region=REGION
+```
+
+## Terraform Example
+
+```hcl
+# Complete Cloud Run service
+resource "google_cloud_run_service" "app" {
+  name     = "my-app"
+  location = "us-central1"
+
+  template {
+    spec {
+      service_account_name = google_service_account.sa.email
+      
+      containers {
+        image = "gcr.io/my-project/app:v1"
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name  = "ENV"
+          value = "production"
+        }
+      }
+
+      scaling {
+        min_instance_count = 1
+        max_instance_count = 10
+      }
+    }
+
+    metadata {
+      annotations = {
+        "autoscaling.knative.dev/maxScale" = "10"
+      }
+    }
+  }
+
+  traffic {
+    percent = 100
+  }
+}
+
+resource "google_cloud_run_service_iam_member" "public" {
+  location = google_cloud_run_service.app.location
+  name     = google_cloud_run_service.app.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Deploy | `gcloud run deploy NAME --image=IMAGE --region=REGION` |
+| List | `gcloud run services list --region=REGION` |
+| Update | `gcloud run services update NAME --region=REGION [FLAGS]` |
+| Traffic | `gcloud run services update-traffic NAME --region=REGION --to-latest` |
+| IAM | `gcloud run services add-iam-policy-binding NAME --region=REGION --member=M --role=roles/run.invoker` |
+| Jobs | `gcloud run jobs create NAME --image=IMAGE --region=REGION` |
+
+## Monitoring
+
+**Key Metrics:**
+- Request latency (p50, p90, p99)
+- Request count
+- Container instance count
+- CPU utilization
+- Memory utilization
+
+```bash
+# View metrics in Console
+# Cloud Console > Cloud Run > my-service > Metrics
+
+# View logs
+gcloud logging read 'resource.type="cloud_run_revision" AND resource.labels.service_name="my-service"'
+```
+
+## Security
+
+- Run as non-root user (default)
+- Use service accounts with minimal permissions
+- Enable VPC for private connectivity
+- Use Secret Manager for sensitive data
+- Restrict public access unless needed
+- Use Cloud Armor for WAF protection
+
+## Cost Optimization
+
+**Cloud Run Pricing:**
+- First 2 million requests/month: Free
+- Additional per million: ~$0.40
+- CPU: $0.00002400/vCPU-second (only when handling requests)
+- Memory: $0.00000250/GiB-second (only when handling requests)
+- Minimum instance (always-on): Charged 24/7
+
+**Optimization:**
+- Keep containers small for faster cold starts
+- Use min-instances=0 for infrequent workloads
+- Set appropriate max-instances to prevent runaway costs
+- Use concurrency to maximize resource utilization
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Cold start latency**
+   ```bash
+   # Set min-instances to keep warm
+   gcloud run services update my-service --region=REGION --min-instances=2
+   
+   # Optimize container startup time
+   # Check logs: gcloud run services logs my-service --region=REGION
+   ```
+
+2. **Container won't start**
+   ```bash
+   # Check logs
+   gcloud run services logs my-service --region=REGION
+   
+   # Verify image exists
+   gcloud container images list
+   
+   # Check resource limits
+   ```
+
+3. **Timeout errors**
+   ```bash
+   # Increase timeout
+   gcloud run services update my-service --region=REGION --timeout=120s
+   ```
+
+## Interview Questions
+
+1. **How does Cloud Run handle scaling, including scale-to-zero?**
+2. **What's the difference between Cloud Run and Cloud Functions?**
+3. **How do you secure a Cloud Run service?**
+4. **Explain Cloud Run revision management and traffic splitting.**
+
+## Cheat Sheet
+
+```
+# Deploy
+gcloud run deploy NAME --image=IMAGE --region=REGION
+
+# Settings
+--min-instances=N      # Keep N instances warm
+--max-instances=N      # Max instances
+--concurrency=N        # Requests per instance
+--cpu=N                # CPU allocation
+--memory=MEM           # Memory allocation
+--timeout=SECONDS      # Request timeout
+--port=PORT            # Container port
+
+# IAM
+--no-allow-unauthenticated  # Require authentication
+```
+
+## Labs
+
+1. Deploy container to Cloud Run
+2. Configure autoscaling
+3. Set up IAM authentication
+4. Implement VPC connectivity
+5. Create Cloud Run Job
+
+## Related Services
+
+- [GKE](./gke)
+- [Cloud Functions](./cloud-functions)
+- [Cloud Build](https://cloud.google.com/build)
+- [VPC](../network/vpc)

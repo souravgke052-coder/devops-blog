@@ -1,0 +1,990 @@
+# Terraform Testing
+
+## Overview
+
+Terraform testing ensures infrastructure code is correct, secure, and performs as expected before deployment. Testing infrastructure is critical because mistakes can be expensive, affect production systems, and be difficult to rollback.
+
+## When To Use
+
+- **Before applying changes**: Always validate and test before `terraform apply`
+- **CI/CD pipelines**: Automate testing in deployment pipelines
+- **Module development**: Test modules in isolation before publishing
+- **Complex infrastructure**: Test resources with many dependencies
+- **Security compliance**: Scan for security vulnerabilities
+
+## When NOT To Use
+
+- **Trivial one-time changes**: Simple resource creation with no dependencies
+- **Exploratory testing**: When you need to understand infrastructure quickly
+- **Emergency fixes**: When immediate action is required (but test after!)
+
+## Core Concepts
+
+### Testing Pyramid
+
+```
+       /\
+      /  \     E2E Tests (expensive, slow)
+     /----\
+    /      \    Integration Tests (moderate)
+   /--------\
+  /          \   Unit Tests (cheap, fast)
+ /------------\
+```
+
+### Terraform Testing Tools
+
+| Tool | Purpose | Type |
+|------|---------|------|
+| `terraform validate` | Syntax and configuration validation | Static |
+| `terraform plan` | Dry-run to preview changes | Plan |
+| `tflint` | Linting for best practices | Lint |
+| `tfsec` | Security scanning | Security |
+| `checkov` | Compliance and security scanning | Security |
+| `Terratest` | Go-based infrastructure testing | Integration |
+| `Kitchen-Terraform` | Chef InSpec for Terraform | Integration |
+
+## Real Production Example
+
+### Project Structure with Testing
+
+```
+infrastructure/
+├── main.tf
+├── variables.tf
+├── outputs.tf
+├── versions.tf
+├── .tflint.hcl
+├── .tfsec.yml
+├── checkov.yaml
+├── test/
+│   ├── unit/
+│   │   └── module_test.go
+│   ├── integration/
+│   │   └── infrastructure_test.go
+│   └── fixtures/
+│       ├── dev/
+│       └── prod/
+└── scripts/
+    ├── validate.sh
+    ├── test.sh
+    └── scan.sh
+```
+
+### .tflint.hcl (TFLint Configuration)
+
+```hcl
+config {
+  module = true
+  force = false
+  disabled_by_default = false
+}
+
+plugin "google" {
+  enabled = true
+  version = "0.26.0"
+  source  = "github.com/terraform-linters/tflint-ruleset-google"
+}
+
+rule "google_storage_bucket_public_access" {
+  enabled = true
+}
+
+rule "google_sql_database_instance_backup" {
+  enabled = true
+}
+
+rule "google_compute_firewall_no_port_22" {
+  enabled = true
+}
+
+rule "terraform_documented_outputs" {
+  enabled = true
+}
+
+rule "terraform_documented_variables" {
+  enabled = true
+}
+
+rule "terraform_naming_convention" {
+  enabled = true
+  format  = "snake_case"
+}
+
+rule "terraform_required_version" {
+  enabled = true
+}
+
+rule "terraform_required_providers" {
+  enabled = true
+}
+
+rule "terraform_unused_declarations" {
+  enabled = true
+}
+```
+
+### .tfsec.yml (tfsec Configuration)
+
+```yaml
+exclude:
+  - aws-s3-enable-bucket-encryption
+  - aws-s3-enable-bucket-logging
+
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+  - LOW
+
+checks:
+  exclude:
+    - rule:exposed-gcp-service-account-key
+    - rule:gcp-storage-rule-public-access-broken
+
+config:
+  gcp:
+    filter_override:
+      - exclude:
+          - gcp-secure-operator-command
+```
+
+### checkov.yaml (Checkov Configuration)
+
+```yaml
+branch: main
+directory:
+  - .
+  - ./modules
+  - ./environments
+show-check: true
+check:
+  download-external-modules: true
+  framework:
+    - terraform
+    - terraform_plan
+skip-path:
+  - tests/fixtures/
+  - .terraform/modules/
+
+blocklist-artifacts-search: false
+secrets-scan:
+  file-upload-limit: 5242880  # 5MB
+  scan-hidden-files: false
+
+framework:
+  - terraform
+```
+
+### Terratest Example (Go)
+
+```go
+// test/unit/module_test.go
+package test
+
+import (
+    "testing"
+    "github.com/gruntwork-io/terratest/modules/terraform"
+    "github.com/stretchr/testify/assert"
+    "fmt"
+)
+
+func TestTerraformInstanceTemplate(t *testing.T) {
+    terraformOptions := &terraform.Options{
+        TerraformDir: "../../modules/compute/instance-template",
+        Vars: map[string]interface{}{
+            "project_id":       "test-project",
+            "environment":      "test",
+            "machine_type":     "e2-medium",
+            "service_account":  "test@test-project.iam.gserviceaccount.com",
+        },
+        BackendConfig: map[string]interface{}{
+            "bucket": "test-terraform-state",
+            "prefix": "test",
+        },
+    }
+
+    defer terraform.Destroy(t, terraformOptions)
+    terraform.InitAndApply(t, terraformOptions)
+
+    // Get the instance template name
+    instanceTemplate := terraform.Output(t, terraformOptions, "self_link")
+    assert.NotEmpty(t, instanceTemplate)
+    assert.Contains(t, instanceTemplate, "instanceTemplates")
+}
+
+func TestTerraformVPCNetwork(t *testing.T) {
+    terraformOptions := &terraform.Options{
+        TerraformDir: "../../modules/networking/vpc",
+        Vars: map[string]interface{}{
+            "project_id":   "test-project",
+            "environment":  "test",
+            "vpc_cidr":     "10.0.0.0/16",
+        },
+    }
+
+    defer terraform.Destroy(t, terraformOptions)
+    terraform.InitAndApply(t, terraformOptions)
+
+    vpcSelfLink := terraform.Output(t, terraformOptions, "vpc_self_link")
+    assert.NotEmpty(t, vpcSelfLink)
+    assert.Contains(t, vpcSelfLink, "networks")
+}
+
+func TestTerraformCloudSQL(t *testing.T) {
+    terraformOptions := &terraform.Options{
+        TerraformDir: "../../modules/database/cloudsql",
+        Vars: map[string]interface{}{
+            "project_id":       "test-project",
+            "environment":      "test",
+            "database_version": "POSTGRES_15",
+            "db_name":          "testdb",
+            "db_tier":          "db-custom-2-8192",
+            "db_disk_size":     20,
+        },
+    }
+
+    defer terraform.Destroy(t, terraformOptions)
+    terraform.InitAndApply(t, terraformOptions)
+
+    privateIP := terraform.Output(t, terraformOptions, "private_ip")
+    assert.NotEmpty(t, privateIP)
+    assert.Contains(t, privateIP, "10.")
+}
+```
+
+### Integration Test with Multiple Resources
+
+```go
+// test/integration/infrastructure_test.go
+package test
+
+import (
+    "testing"
+    "time"
+    "github.com/gruntwork.io/terratest/modules/terraform"
+    "github.com/gruntwork-io/terratest/modules/gcloud"
+    "github.com/stretchr/testify/assert"
+)
+
+func TestTerraformInfrastructureIntegration(t *testing.T) {
+    projectID := "test-project"
+    region := "us-central1"
+    environment := "integration-test"
+    
+    terraformOptions := &terraform.Options{
+        TerraformDir: "../../.",
+        Vars: map[string]interface{}{
+            "project_id":       projectID,
+            "environment":      environment,
+            "region":           region,
+            "vpc_cidr":         "10.0.0.0/16",
+            "mig_target_size":  2,
+        },
+        Timeouts: &terraform.Options{
+            Apply: 30 * time.Minute,
+            Init:  10 * time.Minute,
+        },
+    }
+
+    defer terraform.Destroy(t, terraformOptions)
+    terraform.InitAndApply(t, terraformOptions)
+
+    // Verify VPC was created
+    vpcOutput := terraform.Output(t, terraformOptions, "vpc_self_link")
+    assert.NotEmpty(t, vpcOutput)
+
+    // Verify MIG was created
+    migOutput := terraform.Output(t, terraformOptions, "mig_self_link")
+    assert.NotEmpty(t, migOutput)
+
+    // Verify Cloud SQL was created
+    sqlOutput := terraform.Output(t, terraformOptions, "cloudsql_private_ip")
+    assert.NotEmpty(t, sqlOutput)
+
+    // Verify using gcloud CLI
+    instances := gcloud.GetInstanceInstances(t, projectID, region, "--filter", "labels.environment="+environment)
+    assert.Equal(t, 2, len(instances), "Expected 2 MIG instances")
+}
+```
+
+## HCL Examples
+
+### Testing Configurations
+
+```hcl
+# Module with validation
+variable "instance_type" {
+  type    = string
+  default = "e2-medium"
+  
+  validation {
+    condition     = contains(["e2-micro", "e2-small", "e2-medium", "e2-large"], var.instance_type)
+    error_message = "Instance type must be a valid GCP machine type."
+  }
+}
+
+# Resource with lifecycle validation
+resource "google_compute_instance" "server" {
+  name         = "test-server"
+  machine_type = var.instance_type
+  
+  lifecycle {
+    precondition {
+      condition     = var.instance_type != "" || var.instance_type != null
+      error_message = "Instance type must be specified."
+    }
+    
+    postcondition {
+      condition     = self.status == "RUNNING"
+      error_message = "Instance must be in RUNNING state after creation."
+    }
+  }
+}
+
+# Output with validation
+output "instance_ip" {
+  value = google_compute_instance.server.network_interface[0].access_config[0].nat_ip
+  
+  precondition {
+    condition     = length(google_compute_instance.server.network_interface) > 0
+    error_message = "Instance must have at least one network interface."
+  }
+}
+```
+
+### Test Fixtures
+
+```hcl
+# test/fixtures/dev/terraform.tfvars
+project_id     = "dev-project"
+environment    = "dev"
+region         = "us-central1"
+vpc_cidr       = "10.0.0.0/16"
+machine_type   = "e2-micro"
+mig_target_size = 1
+
+# test/fixtures/prod/terraform.tfvars
+project_id     = "prod-project"
+environment    = "prod"
+region         = "us-east1"
+vpc_cidr       = "10.1.0.0/16"
+machine_type   = "e2-medium"
+mig_target_size = 3
+db_tier        = "db-custom-4-16384"
+```
+
+## CLI Examples
+
+### terraform validate
+
+```bash
+# Validate all configuration
+terraform validate
+
+# Validate with exit code check
+terraform validate && echo "Validation passed"
+
+# Validate with JSON output
+terraform validate -json
+
+# Validate in CI/CD
+if terraform validate; then
+  echo "Configuration is valid"
+else
+  echo "Configuration has errors"
+  exit 1
+fi
+```
+
+### tflint
+
+```bash
+# Run tflint on current directory
+tflint
+
+# Run tflint on specific directory
+tflint --dir ./modules/networking
+
+# Initialize tflint plugins
+tflint --init
+
+# Run with configuration file
+tflint --config .tflint.hcl
+
+# Output in JSON format
+tflint --format json
+
+# Output in compact format
+tflint --format compact
+
+# Enable debug mode
+tflint --debug
+
+# Run on changed files only
+git diff --name-only | xargs tflint
+
+# Fix issues automatically (where possible)
+tflint --fix
+```
+
+### tfsec
+
+```bash
+# Scan current directory
+tfsec .
+
+# Scan specific directory
+tfsec ./modules
+
+# Scan with custom rules directory
+tfsec . --rules-dir ./custom-rules
+
+# Output formats
+tfsec . --format json        # JSON output
+tfsec . --format sarif       # SARIF for GitHub
+tfsec . --format csv         # CSV output
+tfsec . --format table       # Table output (default)
+
+# Exclude specific rules
+tfsec . --exclude-rules aws-s3-enable-bucket-encryption
+
+# Exclude specific paths
+tfsec . --excluded-paths ".terraform/,vendor/"
+
+# Add custom data directories
+tfsec . --add-template-dir ./custom-templates
+
+# Use with CI/CD
+tfsec . --exit-code 0        # Exit 0 even with warnings
+tfsec . --exit-code 1        # Exit 1 if issues found
+
+# Combine with tflint
+tflint && tfsec .
+```
+
+### checkov
+
+```bash
+# Scan Terraform directory
+checkov -d ./ --framework terraform
+
+# Scan specific Terraform file
+checkov -f main.tf
+
+# Scan Terraform plan
+terraform plan -out tfplan
+checkov -f tfplan --framework terraform_plan
+
+# Output formats
+checkov -d . --outputFormat json
+checkov -d . --outputFormat sarif
+checkov -d . --outputFormat junitxml
+checkov -d . --outputFormat github_failed_only
+
+# Skip specific checks
+checkov -d . --skip-check CKV_GCP_1,CKV_GCP_2
+
+# Use custom policy directory
+checkov -d . --external-checks-dir ./custom-policies
+
+# Use baseline file
+checkov -d . --baseline ./results/baseline.json
+
+# Directory-specific config
+checkov -d ./modules --show-check-helps
+
+# Download external modules before scanning
+checkov -d . --download-external-modules true
+
+# Scan with custom variables
+checkov -d . --var-file ./test.tfvars
+```
+
+### Comprehensive Test Script
+
+```bash
+#!/bin/bash
+# scripts/test.sh
+
+set -e
+
+echo "=== Terraform Testing Suite ==="
+echo ""
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Track overall status
+FAIL_COUNT=0
+
+run_test() {
+    local name=$1
+    shift
+    echo -e "${YELLOW}Running: $name${NC}"
+    if "$@"; then
+        echo -e "${GREEN}✓ PASSED: $name${NC}"
+        echo ""
+    else
+        echo -e "${RED}✗ FAILED: $name${NC}"
+        echo ""
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+}
+
+# 1. Format check
+run_test "Terraform format check" terraform fmt -check -recursive
+
+# 2. Validate configuration
+run_test "Terraform validate" terraform validate
+
+# 3. TFLint
+run_test "TFLint" tflint --config .tflint.hcl
+
+# 4. TFSec
+run_test "TFSec security scan" tfsec . --format table --exit-code 1 || true
+
+# 5. Checkov
+run_test "Checkov compliance scan" checkov -d . --framework terraform
+
+# 6. Terratest (if Go is available)
+if command -v go &> /dev/null; then
+    run_test "Terratest unit tests" go test -v ./test/unit/...
+fi
+
+# Summary
+echo "==================================="
+if [ $FAIL_COUNT -eq 0 ]; then
+    echo -e "${GREEN}All tests passed!${NC}"
+    exit 0
+else
+    echo -e "${RED}$FAIL_COUNT test(s) failed${NC}"
+    exit 1
+fi
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform validate` | Validate syntax and configuration |
+| `terraform fmt -check` | Check formatting |
+| `tflint --init` | Initialize TFLint plugins |
+| `tflint` | Run TFLint linter |
+| `tfsec .` | Run security scan |
+| `checkov -d .` | Run compliance scan |
+| `go test ./...` | Run Terratest |
+| `kitchen test` | Run Kitchen-Terraform |
+
+## Best Practices
+
+### 1. Test in CI/CD Before Production
+
+```yaml
+# GitHub Actions - test.yml
+name: Terraform Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        
+      - name: Terraform Init
+        run: terraform init -backend=false
+        
+      - name: Terraform Validate
+        run: terraform validate
+        
+      - name: TFLint
+        uses: terraform-linters/setup-tflint@v3
+        with:
+          tflint_version: v0.47.0
+      - run: tflint --config .tflint.hcl
+      
+      - name: TFSec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: true
+          
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+```
+
+### 2. Test Modules in Isolation
+
+```hcl
+# modules/networking/vpc/test/unit.tftest.hcl
+mock_provider "google" {}
+
+run "test_vpc_creation" {
+  command = plan
+
+  assert {
+    condition     = google_compute_network.vpc.name == "test-vpc"
+    error_message = "VPC name mismatch"
+  }
+}
+```
+
+### 3. Use Remote State for Test Isolation
+
+```bash
+# Use separate test backend
+terraform init \
+  -backend-config="bucket=test-terraform-state" \
+  -backend-config="prefix=test/${BRANCH_NAME}"
+
+# Clean up test state after tests
+terraform state mv ... || true
+terraform destroy -auto-approve
+```
+
+### 4. Pin Provider Versions
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "= 5.0.0"  # Pin exact version for tests
+    }
+  }
+}
+```
+
+### 5. Preconditions and Postconditions
+
+```hcl
+resource "google_compute_instance" "server" {
+  name         = var.instance_name
+  machine_type = var.machine_type
+  zone         = var.zone
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+    }
+  }
+  
+  lifecycle {
+    postcondition {
+      condition     = self.status == "RUNNING"
+      error_message = "Instance ${self.name} is not running. Actual status: ${self.status}"
+    }
+    
+    precondition {
+      condition     = var.machine_type != "" && can(regex("^[a-z0-9-]+$", var.machine_type))
+      error_message = "Invalid machine type: ${var.machine_type}"
+    }
+  }
+}
+```
+
+## Monitoring / State Management
+
+### Test Results Tracking
+
+```bash
+# Store test results
+terraform validate -json > test-results/validate.json
+tflint --format json > test-results/tflint.json
+checkov -d . -o json > test-results/checkov.json
+
+# Generate summary
+jq -s '{
+  validate: (.[] | select(.format == "validate") | .passed),
+  tflint: (.[] | select(.format == "tflint") | .issues),
+  checkov: (.[] | select(.format == "checkov") | .passed)
+}' test-results/*.json
+```
+
+### Test State Management
+
+```bash
+# Separate test state buckets
+export TF_STATE_BUCKET="test-terraform-state-${BRANCH_NAME}"
+export TF_STATE_PREFIX="test"
+
+# Clean up old test states
+gsutil ls gs://test-terraform-state-*/ | while read bucket; do
+  age=$(gsutil ls -l "$bucket" | tail -1 | awk '{print $1}')
+  if [ "$age" -gt 7 ]; then
+    echo "Cleaning up $bucket (age: $age days)"
+    gsutil rm -r "$bucket"
+  fi
+done
+```
+
+## Security
+
+### Security Scanning in CI/CD
+
+```yaml
+# GitHub Actions - security-scan.yml
+name: Security Scans
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily scan
+  pull_request:
+    branches: [main]
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: TFSec Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: true
+          sarif_file: results/tfsec.sarif
+          
+      - name: Checkov Security Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: sarif
+          output: results/checkov.sarif
+          
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: results/
+```
+
+### Secret Detection
+
+```bash
+# Scan for secrets in Terraform files
+grep -r "password\s*=" --include="*.tf" . || echo "No passwords found"
+grep -r "secret\s*=" --include="*.tf" . || echo "No secrets found"
+grep -r "key\s*=\s*\"[a-zA-Z0-9/+]{40}\"" --include="*.tf" . || echo "No API keys found"
+
+# Use truffleHog for deep scanning
+trufflehog filesystem . --only-verified
+
+# Use git-secrets
+git secrets --scan -r .
+```
+
+### Compliance Scanning
+
+```bash
+# Run CIS benchmark checks
+checkov -d . --check CKV_CIS_*
+
+# Run HIPAA compliance checks
+checkov -d . --check CKV2_GCP_*
+
+# Run PCI DSS compliance checks
+checkov -d . --check CKV2_AWS_*
+
+# Custom policy enforcement
+checkov -d . --external-checks-dir ./policies
+```
+
+## Cost Optimization
+
+### Cost Estimation
+
+```bash
+# Infracost integration
+infracost breakdown --path . --terraform-plan-file tfplan.binary
+
+# Compare costs between plans
+infracost diff --path . --terraform-plan-file tfplan.binary --compare-to previous.tfplan.binary
+```
+
+### Test Cost Optimization
+
+```bash
+# Use small/free tier for tests
+# Use preemptible instances for test environments
+# Limit test run time
+go test -timeout 10m -short ./...
+
+# Run tests in parallel
+go test -parallel 4 ./...
+
+# Skip slow tests by default
+go test -short ./...  # Skip integration tests
+```
+
+## Troubleshooting
+
+### Common Issues
+
+#### TFLint Plugin Errors
+
+```bash
+# Error: Failed to install plugin
+# Solution: Run tflint --init
+tflint --init
+
+# Error: Plugin not found
+# Solution: Check version compatibility
+tflint --version
+tflint --plugin-dir /path/to/plugins
+```
+
+#### TFSec False Positives
+
+```yaml
+# .tfsec.yml
+exclude:
+  - aws-s3-enable-bucket-encryption  # Exclude specific rule
+  - general-secrets-plaintext        # Exclude secret detection
+
+# Or use inline comments
+resource "aws_s3_bucket" "example" {
+  # tfsec:ignore:aws-s3-enable-bucket-encryption
+  bucket = "my-bucket"
+}
+```
+
+#### Checkov False Positives
+
+```bash
+# Skip specific checks
+checkov -d . --skip-check CKV_GCP_1,CKV_GCP_2
+
+# Add inline skip
+# checkov:skip=CKV_GCP_1:This is a test bucket
+resource "google_storage_bucket" "test" {
+  name = "test-bucket"
+}
+```
+
+#### Terratest Timeout
+
+```go
+// Increase timeout for long-running tests
+terraformOptions := &terraform.Options{
+    TerraformDir: "../../.",
+    Timeouts: &terraform.Options{
+        Apply: 60 * time.Minute,  // Increased from 30m
+        Init:  20 * time.Minute,
+    },
+}
+```
+
+## Interview Questions
+
+### Q1: What is the difference between terraform validate and terraform plan?
+**A:** `terraform validate` checks configuration syntax and internal consistency. `terraform plan` shows what changes would be made, requiring real provider communication for resource state.
+
+### Q2: Why is infrastructure testing important?
+**A:** Infrastructure mistakes can be expensive, affect production, and be difficult to rollback. Testing catches issues before deployment, reducing risk and cost.
+
+### Q3: What tools are available for Terraform testing?
+**A:** terraform validate, tflint (linting), tfsec (security), checkov (compliance), Terratest (Go integration testing), Kitchen-Terraform (InSpec-based testing), terraform plan (dry-run).
+
+### Q4: How do you test Terraform modules in isolation?
+**A:** Use test fixtures with mock_provider, create isolated state buckets, and test module outputs independently before integrating into larger configurations.
+
+### Q5: What is preconditions and postconditions in Terraform?
+**A:** Lifecycle blocks that validate resource state before creation (precondition) and after apply (postcondition). Used to enforce configuration requirements.
+
+### Q6: How do you handle flaky tests in Terraform?
+**A:** Use retry logic for eventual consistency, increase timeouts, mock external dependencies, and use terraform refresh to sync state.
+
+### Q7: What's the difference between tfsec and checkov?
+**A:** tfsec focuses on security scanning with custom rules. checkov provides broader compliance checking including security, best practices, and regulatory frameworks (CIS, HIPAA, PCI).
+
+### Q8: How do you integrate Terraform testing in CI/CD?
+**A:** Run format check, validate, lint (tflint), scan (tfsec/checkov), then plan. Apply only after manual approval or automated checks pass.
+
+### Q9: What is Terratest?
+**A:** Go-based testing framework for infrastructure. Enables writing integration tests that apply real resources and verify behavior.
+
+### Q10: How do you test for security vulnerabilities?
+**A:** Use tfsec for security-specific scanning, checkov for compliance, and manual review of sensitive resources (IAM, encryption, networking).
+
+## Cheat Sheet
+
+### Quick Test Commands
+
+```bash
+# Format and validate
+terraform fmt -check -recursive && terraform validate
+
+# Lint with tflint
+tflint --init && tflint
+
+# Security scan
+tfsec . --format table
+checkov -d .
+
+# Full pipeline
+#!/bin/bash
+set -e
+terraform fmt -check -recursive
+terraform init -backend=false
+terraform validate
+tflint
+tfsec . --exit-code 1
+checkov -d .
+terraform plan -out=tfplan
+```
+
+### Test Tool Comparison
+
+| Tool | Purpose | Language | Cost |
+|------|---------|----------|------|
+| validate | Syntax check | Go | Free |
+| tflint | Linting | Go | Free |
+| tfsec | Security | Go | Free |
+| checkov | Compliance | Python | Free |
+| Terratest | Integration | Go | Free |
+| Infracost | Cost estimation | Go | Free/Paid |
+
+### Configuration Files
+
+```bash
+# .tflint.hcl
+config { module = true }
+plugin "google" { enabled = true }
+
+# .tfsec.yml
+exclude: [rule-id]
+severity: [CRITICAL, HIGH]
+
+# checkov.yaml
+framework: [terraform]
+check: [CKV_GCP_*]
+skip-check: [CKV_GCP_1]
+```
+
+## Related Topics
+
+- [CI/CD](./cicd.mdx) - Terraform in pipelines
+- [GCP Automation](./gcp-automation.mdx) - GCP automation patterns
+- [Modules](./modules.mdx) - Module development
+- [Security](./secrets.mdx) - Secrets management
+- [Lifecycle](./lifecycle.mdx) - Resource lifecycle

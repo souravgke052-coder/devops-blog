@@ -1,0 +1,330 @@
+# Subnets
+
+## Overview
+
+Subnets are contiguous IP address ranges within a VPC that segment the network. A well-designed subnet topology enables security isolation, high availability across availability zones, and clear network boundaries. Understanding subnet sizing, private vs public designation, and CIDR allocation across zones is foundational to cloud networking.
+
+In cloud environments, subnets are AZ-scoped (AWS) or regional (GCP). AWS recommends one subnet per AZ for high availability. The distinction between "public" and "private" is purely semantic—it's determined by routing (whether the subnet's route table has a route to an Internet Gateway).
+
+## When To Use
+
+- **Multi-tier architecture**: Public for load balancers, private for apps, isolated for databases
+- **High availability**: Distribute subnets across AZs
+- **Network segmentation**: Compliance, security isolation
+- **Resource placement**: Control which resources get public IPs
+
+## When NOT To Use
+
+- **Small deployments**: Single subnet may suffice
+- **Simple applications**: Over-engineering adds complexity
+
+## Core Concepts
+
+### Subnet Types
+
+**Public Subnet**: Route table includes 0.0.0.0/0 → Internet Gateway. Instances can have public IPs and receive inbound traffic from internet.
+
+**Private Subnet**: No route to Internet Gateway. Instances cannot be reached from internet. Access internet via NAT Gateway in public subnet.
+
+**Isolated Subnet**: No route to Internet Gateway, no NAT Gateway route. Completely isolated from internet. Used for databases, internal services.
+
+```
+VPC (10.0.0.0/16)
+│
+├── Public Subnet 10.0.0.0/24 (AZ-1)
+│   ├── Route Table: 0.0.0.0/0 → IGW
+│   ├── ALB (public IP)
+│   └── NAT Gateway (for private subnets)
+│
+├── Private Subnet 10.0.1.0/24 (AZ-1)
+│   ├── Route Table: 0.0.0.0/0 → NAT-GW
+│   └── Application servers (no public IP)
+│
+└── Isolated Subnet 10.0.2.0/24 (AZ-1)
+    ├── Route Table: No internet route
+    └── RDS (no internet access)
+```
+
+### Subnet Sizing
+
+```bash
+# /24 subnet: 256 addresses, 254 usable (254 = 256 - network - broadcast)
+# Usable: 10.0.0.1 - 10.0.0.254
+
+# /25 subnet: 128 addresses, 126 usable
+# Usable: 10.0.0.1 - 10.0.0.126
+
+# /26 subnet: 64 addresses, 62 usable
+# Usable: 10.0.0.1 - 10.0.0.62
+
+# /27 subnet: 32 addresses, 30 usable
+# Good for small groups, DMZ segments
+
+# /28 subnet: 16 addresses, 14 usable
+# Minimum for AWS (some services require minimum)
+
+# /29 subnet: 8 addresses, 6 usable
+# Used for VPN, Direct Connect endpoints
+
+# /30 subnet: 4 addresses, 2 usable
+# Point-to-point links (VPC peering, VPN tunnels)
+# Network: 10.0.0.0, Broadcast: 10.0.0.3, Usable: 10.0.0.1, 10.0.0.2
+```
+
+### Reserved Addresses in VPC Subnet
+
+Every VPC subnet reserves 5 IP addresses:
+
+| Address | Purpose |
+|---------|---------|
+| Network address | First IP (e.g., 10.0.0.0) |
+| VPC router | Second IP (e.g., 10.0.0.1) |
+| DNS | Third IP (e.g., 10.0.0.2) |
+| Future use | Fourth IP (e.g., 10.0.0.3) |
+| Broadcast | Last IP (e.g., 10.0.0.255) |
+
+```bash
+# AWS also reserves 5 addresses per subnet
+# So a /24 has 256 - 5 = 251 usable IPs
+
+# GCP reserves fewer (no broadcast in GCP)
+# Generally /24 works the same
+```
+
+### Subnet Design Patterns
+
+```bash
+# Standard 3-tier pattern (1 VPC, 3 AZs, 3 subnet types)
+VPC: 10.0.0.0/16
+
+# AZ-1
+Public-1: 10.0.0.0/24   # 251 usable
+PrivateApp-1: 10.0.1.0/24
+PrivateData-1: 10.0.2.0/24
+
+# AZ-2
+Public-2: 10.0.4.0/24
+PrivateApp-2: 10.0.5.0/24
+PrivateData-2: 10.0.6.0/24
+
+# AZ-3
+Public-3: 10.0.8.0/24
+PrivateApp-3: 10.0.9.0/24
+PrivateData-3: 10.0.10.0/24
+
+# Note the gaps (10.0.3.0/24, 10.0.7.0/24, etc.)
+# Reserved for future AZs or other uses
+```
+
+## Real Production Example
+
+### AWS Subnet Creation
+
+```bash
+# Create VPC first
+VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --query 'Vpc.VpcId' --output text)
+
+# Create subnets across 3 AZs
+# Public subnets
+aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.0.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=Public-1a},{Key=Tier,Value=Public}]'
+
+aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.1.0/24 \
+  --availability-zone us-east-1b \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=Public-1b},{Key=Tier,Value=Public}]'
+
+# Private subnets
+aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.2.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=Private-1a},{Key=Tier,Value=Private}]'
+
+aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.3.0/24 \
+  --availability-zone us-east-1b \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=Private-1b},{Key=Tier,Value=Private}]'
+
+# Isolated subnets (for RDS)
+aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.4.0/24 \
+  --availability-zone us-east-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=Isolated-1a},{Key=Tier,Value=Data}]'
+
+aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.5.0/24 \
+  --availability-zone us-east-1b \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=Isolated-1b},{Key=Tier,Value=Data}]'
+```
+
+### Subnet CIDR for Kubernetes
+
+```bash
+# Kubernetes requires:
+# VPC CIDR (minimum /16)
+# Pod CIDR (CNIs like Calico, flannel)
+# Service CIDR
+
+# Example VPC design for EKS
+VPC: 10.0.0.0/16
+
+# Node subnets (where EC2 instances run)
+Node-1a: 10.0.0.0/20  # 10.0.0.1 - 10.0.15.254 (4094 hosts)
+Node-1b: 10.0.16.0/20  # (in AZ-2)
+Node-1c: 10.0.32.0/20  # (in AZ-3)
+
+# Pod CIDR (for CNI, must not overlap)
+# Each /20 gives room for ~4000 pods per AZ
+Pod-1a: 10.0.128.0/20
+Pod-1b: 10.0.144.0/20
+Pod-1c: 10.0.160.0/20
+
+# Service CIDR
+Service: 10.96.0.0/16  # 65K services possible
+
+# Make sure these don't overlap with each other or VPC CIDR
+# VPC CIDR: 10.0.0.0/16
+# Pod: starts at 10.0.128.0 (fine, inside VPC)
+# Service: 10.96.0.0 (inside VPC)
+```
+
+## CLI Examples
+
+```bash
+# List subnets
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=vpc-xxx"
+
+# Find subnets by tag
+aws ec2 describe-subnets --filters "Name=tag:Name,Values=Private-*"
+
+# Get subnet CIDR
+aws ec2 describe-subnets --subnet-ids subnet-xxx | jq '.Subnets[0].CidrBlock'
+
+# Find available CIDRs in VPC
+# Calculate based on existing subnets
+# VPC: 10.0.0.0/16
+# Existing: 10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24
+# Next available: 10.0.3.0/24 (or larger if /24 taken)
+```
+
+## Common Commands
+
+| Platform | Command | Purpose |
+|----------|---------|---------|
+| AWS | `aws ec2 describe-subnets` | List subnets |
+| AWS | `aws ec2 create-subnet` | Create subnet |
+| AWS | `aws ec2 modify-subnet-attribute` | Enable auto-assign public IP |
+| GCP | `gcloud compute networks subnets list` | List subnets |
+| GCP | `gcloud compute networks subnets create` | Create subnet |
+
+## Security
+
+### Subnet Security
+
+```bash
+# Enable public IP auto-assignment only for public subnets
+aws ec2 modify-subnet-attribute \
+  --subnet-id subnet-xxx \
+  --map-public-ip-on-launch
+
+# Disable for private subnets (should already be disabled)
+aws ec2 modify-subnet-attribute \
+  --subnet-id subnet-private-xxx \
+  --no-map-public-ip-on-launch
+
+# Network ACLs for subnet-level security (optional)
+aws ec2 create-network-acl --vpc-id vpc-xxx
+
+# Allow HTTP/HTTPS outbound, deny everything else
+aws ec2 create-network-acl-entry \
+  --network-acl-id acl-xxx \
+  --rule-number 100 \
+  --egress \
+  --protocol tcp \
+  --port-range From=80,To=80 \
+  --cidr-block 0.0.0.0/0 \
+  --rule-action allow
+
+aws ec2 create-network-acl-entry \
+  --network-acl-id acl-xxx \
+  --rule-number 110 \
+  --egress \
+  --protocol tcp \
+  --port-range From=443,To=443 \
+  --cidr-block 0.0.0.0/0 \
+  --rule-action allow
+
+aws ec2 create-network-acl-entry \
+  --network-acl-id acl-xxx \
+  --rule-number 200 \
+  --egress \
+  --protocol all \
+  --cidr-block 0.0.0.0/0 \
+  --rule-action deny
+```
+
+## Cost Optimization
+
+Subnets themselves are free. Cost comes from resources in subnets (NAT Gateway, NAT instances). No direct subnet cost optimization—optimize the resources.
+
+## Troubleshooting
+
+### Common Subnet Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Can't assign public IP | Subnet doesn't allow it | Enable map-public-ip-on-launch |
+| Instance can't reach internet | Wrong subnet type | Use private subnet with NAT |
+| Subnet full | Too small CIDR | Use larger subnet (split existing) |
+| Can't create RDS | Need subnets in 2+ AZs | Create subnet in another AZ |
+
+## Interview Questions
+
+**Q1: What's the difference between a public subnet and a private subnet?**
+
+A: Public subnets have a route to the Internet Gateway in their route table. Instances with public IPs can send and receive traffic directly with the internet. Private subnets have no route to the Internet Gateway. Instances cannot be reached from internet, and outbound traffic must go through a NAT Gateway or Instance in a public subnet. Both types can exist in the same VPC—the difference is purely routing.
+
+**Q2: How do you calculate the number of usable hosts in a subnet?**
+
+A: Usable hosts = 2^(32 - prefix_length) - 2 (for IPv4). For a /24: 2^8 - 2 = 254. The -2 accounts for network address (first) and broadcast address (last). AWS/GCP reserve 5 addresses in VPC subnets (network, router, DNS, future use, broadcast), so usable in practice is 2^(32-prefix) - 5. For example, AWS /24 has 256 - 5 = 251 usable. Also note: RFC 1918 broadcast is used by AWS, but GCP doesn't use broadcast, so GCP may have one more usable address.
+
+## Cheat Sheet
+
+### Subnet Sizes
+
+| CIDR | Total IPs | Usable (AWS) | Use Case |
+|------|-----------|--------------|----------|
+| /28 | 16 | 11 | Small services, point-to-point |
+| /27 | 32 | 27 | Small groups, DMZ |
+| /26 | 64 | 59 | Small application tier |
+| /25 | 128 | 123 | Medium application tier |
+| /24 | 256 | 251 | Standard tier (ALBs, app servers) |
+| /20 | 4096 | 4091 | Large Kubernetes node pool |
+| /16 | 65536 | 65531 | VPC |
+
+### Reserved AWS Subnet Addresses
+
+| Offset | Address | Purpose |
+|--------|---------|---------|
+| +0 | x.x.x.0 | Network |
+| +1 | x.x.x.1 | VPC router |
+| +2 | x.x.x.2 | AWS DNS |
+| +3 | x.x.x.3 | Future use |
+| +4 | x.x.x.4 | Future use |
+| -1 | x.x.x.255 | Broadcast |
+
+## Related Topics
+
+- [VPC](./vpc) — VPC design
+- [CIDR](./cidr) — CIDR notation
+- [Routing](./routing) — Route tables
+- [Firewall](./firewall) — Network ACLs

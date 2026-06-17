@@ -1,0 +1,496 @@
+---
+sidebar_position: 12
+description: Linux storage management, LVM, RAID, filesystems, mounting, disk quotas, and troubleshooting.
+---
+
+# Storage Management
+
+## Overview
+
+Storage management encompasses everything from raw disks to filesystems. Linux provides software RAID (mdadm), Logical Volume Management (LVM) for flexible partition resizing, and various filesystems (ext4, XFS, Btrfs). Understanding device mapping (/dev/sd*, /dev/nvme*), partition tables (MBR/GPT), and the block layer is essential for capacity planning and troubleshooting.
+
+Modern NVMe drives have different characteristics than SATA SSDs or HDDs. NVMe uses PCIe with multiple queues (IO queues), while SATA uses AHCI with single queue. Choosing the right filesystem and mount options affects performance significantly. XFS excels at large files; ext4 is proven and simple; Btrfs offers snapshots and checksums.
+
+## When To Use
+
+- Initial server setup with multiple disks
+- Resizing partitions without downtime
+- Setting up software RAID
+- Configuring disk quotas
+- Performance tuning for storage-heavy workloads
+
+## When NOT To Use
+
+- When cloud provider manages storage (EBS, managed disks)
+- When using container storage (Docker/Kubernetes volumes)
+
+## Core Concepts
+
+### Block Devices
+
+```bash
+# List block devices
+lsblk
+NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sda      8:0    0   50G  0 disk
+├─sda1   8:1    0   47G  0 part /
+├─sda2   8:2    0    1K  0 part
+└─sda5   8:5    0    3G  0 part [SWAP]
+sdb      8:16   0  100G  0 disk
+nvme0n1 259:0   0  200G  0 disk
+
+# Show UUIDs and types
+blkid
+/dev/sda1: UUID="abc123" TYPE="ext4"
+/dev/sdb1: UUID="def456" TYPE="xfs"
+
+# Show filesystem info
+lsblk -f
+```
+
+### Partitioning
+
+```bash
+# MBR (msdos) - legacy
+fdisk /dev/sdb
+# n (new), p (primary), +50G (size), w (write)
+
+# GPT - modern
+gdisk /dev/sdb
+# n (new), default partition, +50G, type (linux, efi, etc), w (write)
+
+# parted - scriptable
+parted /dev/sdb --align optimal --script \
+    mklabel gpt \
+    mkpart primary xfs 0% 50% \
+    mkpart primary xfs 50% 100% \
+    print
+
+# Show partition table
+fdisk -l /dev/sda
+parted /dev/sda print
+```
+
+### LVM (Logical Volume Manager)
+
+```bash
+# Physical volumes (PV)
+pvcreate /dev/sdb1
+pvdisplay
+pvs
+
+# Volume groups (VG)
+vgcreate vg_data /dev/sdb1
+vgdisplay
+vgs
+vgextend vg_data /dev/sdc1
+
+# Logical volumes (LV)
+lvcreate -L 50G -n lv_mysql vg_data
+lvcreate -l 100%FREE -n lv_data vg_data
+lvs
+lvdisplay
+lvm
+
+# Create filesystem on LV
+mkfs.xfs /dev/vg_data/lv_mysql
+
+# Resize (online for XFS)
+# XFS only grows online, shrinks offline
+lvextend -L +100G /dev/vg_data/lv_mysql
+xfs_growfs /mount/point
+
+# ext4 (grow and shrink)
+lvextend -L +100G /dev/vg_data/lv_data
+resize2fs /dev/vg_data/lv_data
+# Shrink:
+umount /mount
+e2fsck -f /dev/vg_data/lv_data
+resize2fs /dev/vg_data/lv_data 50G
+lvreduce -L 50G /dev/vg_data/lv_data
+
+# Snapshot
+lvcreate -L 10G -n mysql_snap -s /dev/vg_data/lv_mysql
+# Merge: lvconvert --merge /dev/vg_data/lv_mysql
+```
+
+### Software RAID (mdadm)
+
+```bash
+# Create RAID array
+mdadm --create /dev/md0 \
+    --level=5 \
+    --raid-devices=3 \
+    /dev/sdb /dev/sdc /dev/sdd
+
+# Monitor RAID
+cat /proc/mdstat
+mdadm --detail /dev/md0
+
+# Add spare
+mdadm --add /dev/md0 /dev/sde
+
+# Remove failed disk
+mdadm /dev/md0 --remove /dev/sdb
+mdadm /dev/md0 --add /dev/sdf
+
+# RAID 1 (mirroring)
+mdadm --create /dev/md1 \
+    --level=1 \
+    --raid-devices=2 \
+    /dev/sdg /dev/sdh
+
+# Stop/start array
+mdadm --stop /dev/md0
+mdadm --assemble /dev/md0
+
+# RAID configuration persistence
+mdadm --examine --scan >> /etc/mdadm.conf
+```
+
+### Filesystems
+
+```bash
+# Create
+mkfs.ext4 /dev/sdb1
+mkfs.xfs /dev/sdb1
+mkfs.btrfs /dev/sdb1
+mkfs.ext4 -E discard /dev/sdb1  # SSD trim
+
+# Check/repair
+fsck.ext4 /dev/sdb1
+xfs_repair /dev/sdb1
+btrfs check /dev/sdb1
+
+# Tune ext4 options (before mounting)
+tune2fs -o journal_data_writeback /dev/sdb1
+tune2fs -E mount_opts=extended_attributes /dev/sdb1
+
+# UUID management
+tune2fs -U <uuid> /dev/sdb1
+uuidgen | xargs -I{} tune2fs -U {} /dev/sdb1
+```
+
+### Mount Options
+
+```bash
+# Common options
+# defaults = rw,suid,dev,exec,auto,nouser,async
+# noatime = don't update access time (faster)
+# nodiratime = don't update dir access time
+# nosuid = ignore setuid bit
+# noexec = no binary execution
+# ro = read-only
+# rw = read-write
+
+# Mount with options
+mount -o noatime,nosuid,nodev /dev/sdb1 /data
+
+# NFS mounts
+mount -t nfs -o rw,sync,hard,intr 192.168.1.10:/export /mnt/nfs
+
+# Remount (change options on existing)
+mount -o remount,noatime /
+
+# Bind mount
+mount --bind /opt/data /var/www/data
+mount --bind -o ro /opt/source /mnt/readonly
+```
+
+### Disk Quotas
+
+```bash
+# Enable quotas (add to fstab)
+# /dev/sda1 /data ext4 defaults,usrquota,grpquota 0 2
+
+# Remount and enable
+mount -o remount,usrquota,grpquota /data
+quotacheck -cum /data
+quotaon /data
+
+# Set user quota
+edquota -u username
+# Disk blocks: soft=1000000 hard=1200000 (blocks = 1K units)
+# Inodes: soft=10000 hard=12000
+
+# Set group quota
+edquota -g developers
+
+# Check quotas
+quota -u username
+quota -g developers
+repquota /data
+
+# Grace period
+edquota -t   # Set soft limit grace period
+```
+
+## Real Production Example
+
+Setting up a production database server with LVM and XFS:
+
+```bash
+#!/bin/bash
+# setup-db-storage.sh
+
+set -euo pipexit
+
+DEVICE="/dev/sdb"
+VG_NAME="vg_mysql"
+LV_DATA="lv_mysql_data"
+LV_LOG="lv_mysql_log"
+MOUNT_DATA="/data/mysql"
+MOUNT_LOG="/var/log/mysql"
+
+# Create partition (GPT)
+parted ${DEVICE} --align optimal --script \
+    mklabel gpt \
+    mkpart primary xfs 0% 70% \
+    mkpart primary xfs 70% 85% \
+    mkpart primary xfs 85% 100% \
+    set 1 lvm on \
+    set 2 lvm on \
+    set 3 lvm on
+
+# Create PVs
+pvcreate ${DEVICE}1 ${DEVICE}2 ${DEVICE}3
+
+# Create VG
+vgcreate ${VG_NAME} ${DEVICE}1
+
+# Extend VG with log volume space
+vgextend ${VG_NAME} ${DEVICE}2
+
+# Create LVs
+# Data volume (70%)
+lvcreate -l 70%VG -n ${LV_DATA} ${VG_NAME}
+
+# Log volume (15%)
+lvcreate -L 50G -n ${LV_LOG} ${VG_NAME}
+
+# Fast storage for temp (remaining SSD portion)
+lvcreate -l 100%FREE -n ${LV_TEMP} ${DEVICE}3
+
+# Create filesystems
+mkfs.xfs -L mysql_data ${VG_NAME}/${LV_DATA}
+mkfs.xfs -L mysql_log ${VG_NAME}/${LV_LOG}
+mkfs.xfs -L mysql_temp ${VG_NAME}/${LV_TEMP}
+
+# Mount
+mkdir -p ${MOUNT_DATA} ${MOUNT_LOG}
+mount /dev/mapper/${VG_NAME}-${LV_DATA} ${MOUNT_DATA}
+mount /dev/mapper/${VG_NAME}-${LV_LOG} ${MOUNT_LOG}
+
+# Add to fstab with optimized options
+UUID_DATA=$(blkid -s UUID -o value /dev/mapper/${VG_NAME}-${LV_DATA})
+UUID_LOG=$(blkid -s UUID -o value /dev/mapper/${VG_NAME}-${LV_LOG})
+
+cat >> /etc/fstab <<EOF
+UUID=${UUID_DATA} ${MOUNT_DATA} xfs defaults,noatime,nodiratime,logbufs=8,logdev=/dev/mapper/${VG_NAME}-${LV_LOG} 0 0
+UUID=${UUID_LOG} ${MOUNT_LOG} xfs defaults,noatime,nodiratime 0 0
+EOF
+```
+
+## CLI Examples
+
+```bash
+# List devices
+lsblk
+blkid
+fdisk -l
+
+# Partition
+fdisk /dev/sdb
+gdisk /dev/sdb
+parted /dev/sdb
+
+# LVM
+pvs, vgs, lvs
+pvcreate, vgcreate, lvcreate
+lvextend, resize2fs, xfs_growfs
+
+# RAID
+mdadm --create /dev/md0
+cat /proc/mdstat
+mdadm --detail /dev/md0
+
+# Filesystem
+mkfs.ext4 /dev/sdb1
+mkfs.xfs /dev/sdb1
+fsck /dev/sdb1
+
+# Mount
+mount
+df -h
+du -sh /path/*
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `lsblk` | Block device tree | Show devices and mounts |
+| `blkid` | Device UUIDs/types | Get filesystem info |
+| `fdisk` | MBR partitioning | `fdisk /dev/sdb` |
+| `gdisk` | GPT partitioning | `gdisk /dev/sdb` |
+| `parted` | Scriptable partitioner | `parted /dev/sdb` |
+| `pvcreate` | Create physical volume | `pvcreate /dev/sdb1` |
+| `vgcreate` | Create volume group | `vgcreate vg /dev/sdb1` |
+| `lvcreate` | Create logical volume | `lvcreate -L 50G -n data vg` |
+| `mdadm` | Software RAID | `mdadm --create /dev/md0` |
+
+## Monitoring
+
+```bash
+# Disk usage
+df -h
+du -sh /var/*
+
+# I/O stats
+iostat -x 1
+iotop
+pidstat -d 1
+
+# LVM
+lvs -o lv_name,lv_size,data_percent,meta_percent
+pvs -o pv_name,pv_size,free
+vgs -o vg_name,vg_size,pv_count
+
+# RAID status
+cat /proc/mdstat
+mdadm --query --detail /dev/md0
+
+# SMART
+smartctl -a /dev/sda
+smartctl -H /dev/sda
+
+# NVMe
+nvme list
+nvme smart-log /dev/nvme0n1
+```
+
+## Security
+
+**Storage hardening:**
+
+```bash
+# Secure delete (slow, unrecoverable)
+shred -v -n 3 /dev/sdb
+
+# Encrypt at rest (LUKS)
+cryptsetup luksFormat /dev/sdb
+cryptsetup luksOpen /dev/sdb mydata
+mkfs.ext4 /dev/mapper/mydata
+# Add to /etc/crypttab for boot unlock
+
+# Mount options for security
+# /etc/fstab:
+/dev/sdb1 /data ext4 defaults,noexec,nosuid,nodev 0 0
+
+# Disable atime updates (performance + security)
+mount -o noatime,nodiratime /dev/sdb1 /data
+```
+
+## Troubleshooting
+
+**"No space left on device" but df shows space:**
+
+```bash
+# Check inodes
+df -i
+# If exhausted, find directories with many small files
+find / -xdev -printf '%i\n' | sort | uniq -c | sort -rn | head
+
+# Find deleted but open files (holding space)
+lsof +L1
+```
+
+**Filesystem corruption:**
+
+```bash
+# Unmount first (or boot recovery)
+umount /dev/sdb1
+
+# ext4
+fsck.ext4 -f -y /dev/sdb1
+
+# XFS (repair not fsck)
+xfs_repair /dev/sdb1
+xfs_repair -L /dev/sdb1  # Force log zeroing (destructive)
+
+# Btrfs
+btrfs check --repair /dev/sdb1
+```
+
+**LVM won't activate:**
+
+```bash
+# Check PV status
+pvscan
+pvdisplay
+
+# Scan for PVs (after disk move)
+pvscan --cache
+lvm pvchange -ay /dev/sdb1
+
+# Check VG
+vgscan
+vgchange -ay
+```
+
+## Interview Questions
+
+1. **What's the difference between ext4, XFS, and Btrfs?**
+
+ext4 is the mature, proven Linux filesystem with journaling, extents, and online resize. XFS excels at large files and parallel I/O, commonly used for databases. Btrfs is copy-on-write with snapshots, checksums, compression, and built-in RAID — but less mature. ext4 is general purpose; XFS is high-throughput; Btrfs is data-integrity focused.
+
+2. **How does LVM thin provisioning work?**
+
+Thin provisioning allocates space from a pool on-demand. Create a thin pool (`lvcreate --type thin-pool`), then create thin volumes (`lvcreate --type thin -V 100G --thinpool pool`). The thin pool has a data LV and optional metadata LV. If the data pool runs out, writes fail. Use `lvs -o thin_percent` to monitor. Requires monitoring and proactive extension.
+
+3. **What's the difference between MBR and GPT partition tables?**
+
+MBR (Master Boot Record) uses 32-bit sector addresses, limiting to 2TB disks and 4 primary partitions. GPT (GUID Partition Table) uses 64-bit addresses, supports 128 partitions and 8ZB disks, and includes protective MBR for legacy compatibility. GPT is the modern standard.
+
+4. **How does XFS handle journaling differently from ext4?**
+
+Both use journaling (write-ahead logging). XFS journals only metadata by default; ext4 can journal data. XFS's journal is circular and separate; it can be on a dedicated device. XFS supports larger filesystems and more parallel operations. ext4's journal mode options: writeback (data not journaled), ordered (data before metadata), journal (both journaled).
+
+5. **What's RAID5's "write hole" and how does RAID6 address it?**
+
+RAID5 write hole: power failure during write can leave inconsistent parity. On restart, RAID can't determine which data/parity is valid. RAID6 has dual parity (P+DP) allowing reconstruction even with two failed drives. RAID10 has no write hole because it mirrors data. Battery-backed write cache (BBU) on RAID controllers mitigates the write hole.
+
+## Cheat Sheet
+
+```
+# Device listing
+lsblk                    # Tree view
+blkid                    # UUIDs
+fdisk -l                 # Partitions
+
+# LVM
+pvs|vgs|lvs              # Status
+pvcreate, vgcreate, lvcreate
+lvextend -L +50G /dev/vg/lv
+xfs_growfs /mount
+
+# RAID
+/proc/mdstat             # Status
+mdadm --detail /dev/md0
+
+# Filesystem
+mkfs.ext4 /dev/sdb1
+mkfs.xfs /dev/sdb1
+mount -o noatime /dev/sdb1 /mnt
+
+# Usage
+df -h
+du -sh /path
+```
+
+## Related Topics
+
+- [Filesystem](./filesystem) — FHS, /proc, /dev
+- [Memory](./memory) — Swap on storage
+- [Performance](./performance) — I/O tuning
+- [Monitoring](./monitoring) — Storage monitoring

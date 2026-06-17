@@ -1,0 +1,983 @@
+---
+title: "Kubernetes Architecture"
+description: "Deep dive into Kubernetes architecture - control plane, worker nodes, etcd, and cluster design patterns"
+sidebar_position: 2
+---
+
+# Kubernetes Architecture
+
+## Overview
+
+Kubernetes architecture consists of a **control plane** that manages the cluster state and **worker nodes** that run the actual workloads. Understanding this architecture is essential for operating Kubernetes in production, troubleshooting issues, and designing highly available clusters.
+
+## When To Use
+
+- **Planning a new cluster** - understanding components helps right-sizing
+- **Troubleshooting cluster issues** - knowing which component is responsible for what
+- **Designing high availability** - understanding failure domains and replication
+- **Performance optimization** - knowing where bottlenecks can occur
+- **Security hardening** - understanding attack surfaces in each component
+- **Cost optimization** - right-sizing control plane and worker nodes
+
+## When NOT To Use
+
+- **Using managed Kubernetes** (GKE, EKS, AKS) - most control plane concerns are handled for you
+- **Quick development setups** - local clusters like minikube/kind abstract architecture
+- **Single-node development** - full architecture is unnecessary overhead
+
+## Core Concepts
+
+### High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CONTROL PLANE                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                         kube-apiserver                                │   │
+│  │   - Authenticates requests                                           │   │
+│  │   - Authorizes requests (RBAC)                                       │   │
+│  │   - Validates and mutates resources                                  │   │
+│  │   - Persists to etcd                                                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                    ▲                                        │
+│  ┌──────────────┐  ┌──────────────┐  │  ┌──────────────────────────┐       │
+│  │    etcd      │  │   scheduler  │  │  │   kube-controller-manager│       │
+│  │ (state store)│  │ (node assign)│  │  │  - Node controller       │       │
+│  └──────────────┘  └──────────────┘  │  │  - Replication controller│       │
+│                                       │  │  - Endpoint controller   │       │
+│                                       │  │  - Service account ctrl  │       │
+│                                       │  └──────────────────────────┘       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    │             API (TLS)                │
+                    └─────────────────────────────────────┘
+                                       │
+     ┌─────────────────────────────────┼─────────────────────────────────┐
+     │                                 │                                 │
+     ▼                                 ▼                                 ▼
+┌─────────────┐                 ┌─────────────┐                 ┌─────────────┐
+│  Node 1     │                 │  Node 2     │                 │  Node 3     │
+│ ┌─────────┐ │                 │ ┌─────────┐ │                 │ ┌─────────┐ │
+│ │ kubelet │ │                 │ │ kubelet │ │                 │ │ kubelet │ │
+│ │  proxy  │ │                 │ │  proxy  │ │                 │ │  proxy  │ │
+│ │runtime  │ │                 │ │runtime  │ │                 │ │runtime  │ │
+│ └─────────┘ │                 └─────────┘ │                 │ └─────────┘ │
+│ ┌─────────┐ │                   ┌─────────┐ │                   ┌─────────┐ │
+│ │  pods   │ │                   │  pods   │ │                   │  pods   │ │
+│ └─────────┘ │                   └─────────┘ │                   └─────────┘ │
+└─────────────┘                   └─────────────┘                   └─────────────┘
+```
+
+### Control Plane Components
+
+| Component | Description | Critical for |
+|-----------|-------------|--------------|
+| kube-apiserver | REST API entry point for all operations | Everything |
+| etcd | Distributed key-value store for cluster state | Persistence |
+| kube-scheduler | Assigns pods to nodes | Scheduling |
+| kube-controller-manager | Runs controller loops | Self-healing |
+| cloud-controller-manager | Cloud-specific integrations | Cloud features |
+
+### Worker Node Components
+
+| Component | Description | Critical for |
+|-----------|-------------|--------------|
+| kubelet | Agent ensuring containers run | Pod lifecycle |
+| kube-proxy | Network rules and load balancing | Networking |
+| container runtime | Runs containers (containerd/CRI-O) | Container execution |
+
+## Architecture / How It Works
+
+### kube-apiserver
+
+The API server is the central management entity and the only component that communicates with etcd.
+
+**Request Flow:**
+```
+Client (kubectl) 
+    │
+    ▼
+┌─────────────────┐
+│ Authentication  │ ← Certificates, OIDC, Webhooks
+│ (Who are you?)  │
+└────────┬────────┘
+         ▼
+┌─────────────────┐
+│ Authorization   │ ← RBAC, ABAC, Webhooks
+│ (What can you   │
+│  do?)           │
+└────────┬────────┘
+         ▼
+┌─────────────────┐
+│ Admission       │ ← Mutating + Validating Webhooks
+│ Controllers     │   (Resource limits, PSP, etc.)
+└────────┬────────┘
+         ▼
+┌─────────────────┐
+│ Validation      │ ← Schema validation
+└────────┬────────┘
+         ▼
+┌─────────────────┐
+│ etcd            │ ← Persistent storage
+└─────────────────┘
+```
+
+**Scaling:** Multiple API server instances can run behind a load balancer. They are stateless and scale horizontally.
+
+### etcd
+
+etcd is a distributed, consistent, key-value store used for configuration and service discovery.
+
+**Best Practices:**
+- Use 3, 5, or 7 nodes for HA (odd numbers for raft consensus)
+- Separate from application workloads
+- Use SSD storage for performance
+- Enable encryption at rest
+- Regular backups with etcd snapshot
+
+**Key Spaces:**
+```
+/registry/apiregistration.k8s.io/apiservices/     # API services
+/registry/configmaps/                              # ConfigMaps
+/registry/deployments/                             # Deployments
+/registry/events/                                  # Events
+/registry/namespaces/                              # Namespaces
+/registry/nodes/                                   # Node status
+/registry/pods/                                    # Pod specs
+/registry/secrets/                                 # Secrets
+/registry/services/                                # Service endpoints
+/registry/statefulsets/                            # StatefulSets
+```
+
+### kube-scheduler
+
+The scheduler watches for unscheduled pods and assigns them to nodes.
+
+**Scheduling Process:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Scheduling Cycle                          │
+├─────────────────────────────────────────────────────────────┤
+│  1. Filtering                                                │
+│     - Check resource requirements                            │
+│     - Apply node selector/affinity                           │
+│     - Check taints/tolerations                               │
+│     - Check persistent volume constraints                    │
+│     → Reduces to "feasible nodes"                            │
+│                                                              │
+│  2. Scoring                                                  │
+│     - Resource balancing (prefer less utilized)              │
+│     - Affinity rules                                         │
+│     - Data locality                                          │
+│     - Node taint count                                       │
+│     → Assigns score to each feasible node                    │
+│                                                              │
+│  3. Selection                                                │
+│     - Select highest scoring node                            │
+│     - If tie, use consistent hashing (for even distribution) │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Plugins (v1.26+):**
+- NodeResourcesBalancedAllocation
+- ImageLocality
+- TaintToleration
+- NodeAffinity
+- PodTopologySpread
+- VolumeBinding
+
+### kube-controller-manager
+
+Runs controller loops that regulate cluster state.
+
+**Controllers:**
+| Controller | Function |
+|------------|----------|
+| Node Controller | Monitors node health, marks Ready/NotReady |
+| Replication Controller | Ensures desired replica count |
+| Endpoint Controller | Populates Endpoints (service → pods) |
+| Service Account Controller | Creates service accounts + tokens |
+| PV Controller | Binds persistent volume claims |
+| PV Binder Controller | Provisions volumes |
+| Job Controller | Tracks job completion |
+| Deployment Controller | Manages deployment lifecycle |
+| ReplicaSet Controller | Manages ReplicaSet lifecycle |
+
+### kubelet
+
+The kubelet is the primary agent on each node.
+
+**Responsibilities:**
+- Register node with API server
+- Create/update/delete pods
+- Mount volumes
+- Report node and pod status
+- Execute health probes
+- Pull images
+
+**Pod Creation Flow:**
+```
+API Server → kubelet receives PodSpec
+    │
+    ▼
+┌─────────────────────┐
+│ Sync Pod Status     │ ← Update API server
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ Pull Images         │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ Create Containers   │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ Run Init Containers │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ Run Main Containers │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ Run Probes          │
+└─────────┬───────────┘
+          ▼
+┌─────────────────────┐
+│ Report Running      │
+└─────────────────────┘
+```
+
+### kube-proxy
+
+kube-proxy maintains network rules on nodes to enable service communication.
+
+**Modes:**
+
+| Mode | Implementation | Pros | Cons |
+|------|----------------|------|------|
+| iptables | Netfilter rules | Stable | O(n) lookup, slow with many services |
+| ipvs | IP Virtual Server | O(1) lookup, more algorithms | Kernel support required |
+| nftables | nftables rules | Modern, flexible | Less mature in Kubernetes |
+
+**Service Load Balancing:**
+```
+Service A (10.0.0.1:80) → iptables/ipvs rules
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+         Pod A:80         Pod B:80        Pod C:80
+```
+
+## Real Production Example
+
+### GKE Production Cluster Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          GOOGLE CLOUD                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │                   VPC Network                                   │ │
+│  │  ┌──────────────────────────────────────────────────────────┐  │ │
+│  │  │ Subnet: us-central1 (10.0.0.0/20)                        │  │ │
+│  │  │  └─ Secondary ranges for pods (10.4.0.0/14)              │  │ │
+│  │  │  └─ Secondary ranges for services (10.0.4.0/20)          │  │ │
+│  │  └──────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │              Control Plane (Managed by Google)                  │ │
+│  │  - Multi-zone replication                                       │ │
+│  │  - Automatic upgrades                                           │ │
+│  │  - Auto-repair                                                  │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │                    Node Pools                                   │ │
+│  │  ┌────────────────────────────────────────────────────────────┐│ │
+│  │  │ system-pool (n2-standard-4, 3 nodes)                       ││ │
+│  │  │ - Runs system pods                                          ││ │
+│  │  │ - node selectors: node-pool=system                         ││ │
+│  │  └────────────────────────────────────────────────────────────┘│ │
+│  │  ┌────────────────────────────────────────────────────────────┐│ │
+│  │  │ workloads-pool (n2-standard-8, 5-20 nodes)                 ││ │
+│  │  │ - Application workloads                                     ││ │
+│  │  │ - Autoscaling enabled                                       ││ │
+│  │  └────────────────────────────────────────────────────────────┘│ │
+│  │  ┌────────────────────────────────────────────────────────────┐│ │
+│  │  │ spot-pool (n2-standard-8, 0-20 nodes)                      ││ │
+│  │  │ - Spot instances for batch workloads                       ││ │
+│  │  │ - Taint: spot=true:NoSchedule                              ││ │
+│  │  └────────────────────────────────────────────────────────────┘│ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Production Network Design
+
+```yaml
+# GKE cluster configuration
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: production-cluster
+  namespace: config-management
+spec:
+  # Network configuration
+  networkRef:
+    name: production-vpc
+  subnetworkRef:
+    name: production-subnet
+  
+  # IP allocation
+  ipAllocationPolicy:
+    clusterIpv4CidrBlock: 10.4.0.0/14
+    servicesIpv4CidrBlock: 10.0.4.0/20
+    clusterSecondaryRangeName: pods
+    servicesSecondaryRangeName: services
+  
+  # Networking
+  networkingMode: VPC_NATIVE
+  
+  # Security
+  networkPolicy:
+    enabled: true
+    provider: CALICO
+  
+  # Private cluster
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+    masterIpv4CidrBlock: 172.16.0.0/28
+  
+  # Master authorized networks
+  masterAuthorizedNetworksConfig:
+    enabled: true
+    cidrBlocks:
+    - displayName: "VPN"
+      cidrBlock: "10.0.0.0/8"
+  
+  # Vertical Pod Autoscaling
+  verticalPodAutoscaling:
+    enabled: true
+  
+  # Workload Identity
+  workloadIdentity:
+    enabled: true
+```
+
+## YAML Examples
+
+### Node Pool with Taints and Tolerations
+
+```yaml
+# Node pool configuration for specialized workloads
+apiVersion: v1
+kind: NodePool
+metadata:
+  name: gpu-pool
+  namespace: production
+spec:
+  # Taints applied to nodes in this pool
+  taints:
+  - key: "nvidia.com/gpu"
+    value: "present"
+    effect: "NoSchedule"
+  - key: "workload-type"
+    value: "ml"
+    effect: "NoExecute"
+  
+  nodeSelector:
+    node-pool: gpu-pool
+  
+  # Tolerations allow specific pods to schedule on this pool
+  # (This goes in the Pod spec, not the node pool)
+  # tolerations:
+  # - key: "nvidia.com/gpu"
+  #   operator: "Exists"
+  #   effect: "NoSchedule"
+```
+
+### Pod with Node Affinity and Tolerations
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ml-workload
+  namespace: production
+spec:
+  # Only schedule on GPU nodes
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: "nvidia.com/gpu"
+            operator: "Exists"
+    
+    # Prefer nodes in the same zone
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      preference:
+        matchExpressions:
+        - key: "topology.kubernetes.io/zone"
+          operator: "In"
+          values:
+          - "us-central1-a"
+  
+  # Tolerate the GPU taint
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  - key: "workload-type"
+    operator: "Equal"
+    value: "ml"
+    effect: "NoExecute"
+    tolerationSeconds: 3600
+  
+  containers:
+  - name: ml-inference
+    image: tensorflow/serving:latest-gpu
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        memory: "16Gi"
+        cpu: "4"
+```
+
+### Pod Disruption Budget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+  namespace: production
+spec:
+  # Ensure at least 2 pods are always available
+  minAvailable: 2
+  # Alternative: use percentage
+  # maxUnavailable: 25%
+  
+  selector:
+    matchLabels:
+      app: api-service
+      tier: backend
+```
+
+## CLI Examples (kubectl)
+
+### Exploring Cluster Components
+
+```bash
+# Get cluster information
+kubectl cluster-info
+kubectl version --short
+
+# Get component status (etcd, scheduler, controller-manager)
+kubectl get componentstatuses
+kubectl get cs
+
+# Get API server endpoints
+kubectl get endpoints kube-apiserver -n default
+
+# View API server logs (control plane node)
+kubectl logs -n kube-system kube-apiserver-control-plane --tail=100
+
+# Check controller manager logs
+kubectl logs -n kube-system kube-controller-manager-control-plane --tail=100
+
+# Check scheduler logs
+kubectl logs -n kube-system kube-scheduler-control-plane --tail=100
+```
+
+### Node Operations
+
+```bash
+# List all nodes with conditions
+kubectl get nodes -o wide
+kubectl get nodes --show-labels
+
+# Describe node in detail
+kubectl describe node node-name
+
+# View node allocatable resources
+kubectl get node node-name -o jsonpath='{.status.allocatable}'
+
+# Cordon a node (mark as unschedulable)
+kubectl cordon node-name
+
+# Drain a node (evict all pods)
+kubectl drain node-name --ignore-daemonsets --delete-emptydir-data --force
+
+# Uncordon a node
+kubectl uncordon node-name
+
+# Drain multiple nodes
+kubectl drain node-1 node-2 node-3 --ignore-daemonsets --delete-emptydir-data
+```
+
+### Resource Quotas and Limits
+
+```bash
+# Create namespace with resource quota
+kubectl create namespace production
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: production-quota
+  namespace: production
+spec:
+  hard:
+    requests.cpu: "40"
+    requests.memory: 80Gi
+    limits.cpu: "80"
+    limits.memory: 160Gi
+    pods: "100"
+    services: "20"
+    persistentvolumeclaims: "50"
+EOF
+
+# Create limit range
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: production-limits
+  namespace: production
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: 500m
+      memory: 512Mi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+    max:
+      cpu: "8"
+      memory: 16Gi
+    min:
+      cpu: 50m
+      memory: 32Mi
+EOF
+```
+
+### etcd Operations
+
+```bash
+# Backup etcd (on control plane node)
+ETCDCTL_API=3 etcdctl snapshot save snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# Restore etcd
+ETCDCTL_API=3 etcdctl snapshot restore snapshot.db \
+  --data-dir=/var/lib/etcd/restore
+
+# Check etcd health
+ETCDCTL_API=3 etcdctl endpoint health \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# Get etcd endpoint status
+ETCDCTL_API=3 etcdctl endpoint status \
+  --endpoints=https://127.0.0.1:2379 \
+  --write-out=table
+```
+
+## Common Commands
+
+### Cluster Health Checks
+
+```bash
+# Check all system components
+kubectl get pods -n kube-system
+
+# Check node status with custom columns
+kubectl get nodes -o custom-columns='NAME:{metadata.name},STATUS:{status.conditions[?(@.type=="Ready")].status},CPU:{status.capacity.cpu},MEMORY:{status.capacity.memory}'
+
+# Check events sorted by time
+kubectl get events --all-namespaces --sort-by='.lastTimestamp'
+
+# Check for problematic pods
+kubectl get pods --all-namespaces | grep -v Running | grep -v Completed
+
+# Certificate expiration check
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -dates
+```
+
+### Upgrading Cluster Components
+
+```bash
+# Check available Kubernetes versions (GKE)
+gcloud container get-server-config --region=us-central1
+
+# Upgrade control plane (GKE)
+gcloud container clusters upgrade CLUSTER_NAME \
+  --master \
+  --cluster-version=1.28.3
+
+# Upgrade node pools
+gcloud container node-pools upgrade POOL_NAME \
+  --cluster=CLUSTER_NAME \
+  --region=us-central1
+
+# Rolling update node image
+gcloud container node-pools upgrade POOL_NAME \
+  --cluster=CLUSTER_NAME \
+  --image-type=cos_containerd \
+  --region=us-central1
+```
+
+## Monitoring
+
+### Key Metrics to Monitor
+
+| Component | Metrics | Alert Threshold |
+|-----------|---------|-----------------|
+| etcd | Disk usage, WAL fsync latency, peer latency | WAL fsync > 10ms |
+| API Server | Request latency, error rate, queue depth | P99 latency > 1s |
+| Scheduler | Scheduling latency, pending pods | P99 latency > 5s |
+| kubelet | Pod start latency, image pull latency | Pod start > 1min |
+| Node | CPU, memory, disk, network | CPU > 80%, memory > 85% |
+
+### Prometheus Rules for Control Plane
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: control-plane-alerts
+  namespace: monitoring
+spec:
+  groups:
+  - name: kubernetes-control-plane
+    rules:
+    - alert: KubeAPIServerDown
+      expr: up{job="apiserver"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        description: "API server is down"
+    
+    - alert: etcdInsufficientMembers
+      expr: count(up{job="etcd"} == 1) < (count(up{job="etcd"}) / 2)
+      for: 3m
+      labels:
+        severity: critical
+      annotations:
+        description: "etcd cluster has fewer than half the expected members"
+    
+    - alert: KubeSchedulerDown
+      expr: up{job="kube-scheduler"} == 0
+      for: 5m
+      labels:
+        severity: critical
+```
+
+### GKE Monitoring
+
+```bash
+# Enable GKE monitoring
+gcloud container clusters update my-cluster \
+  --zone=us-central1-a \
+  --enable-monitoring
+
+# View GKE control plane metrics
+# In Cloud Monitoring → Kubernetes → Control Plane
+
+# Key metrics to monitor in Cloud Monitoring:
+# - kubernetes.io/container/cpu/core_usage_time
+# - kubernetes.io/container/memory/usage_bytes  
+# - kubernetes.io/anthos/controller_manager/sync_duration_seconds
+```
+
+## Security
+
+### API Server Security
+
+```yaml
+# Recommended API server flags for production
+spec:
+  kubeAPIServer:
+    # Authentication
+    --anonymous-auth=false
+    --authentication-token-webhook-config-file=/etc/kubernetes/webhook.yaml
+    --authentication-token-webhook-cache-ttl=2m0s
+    
+    # Authorization
+    --authorization-mode=RBAC,Node
+    --authorization-webhook-config-file=/etc/kubernetes/webhook.yaml
+    
+    # Encryption
+    --encryption-provider-config=/etc/kubernetes/encryption-config.yaml
+    
+    # Audit
+    --audit-policy-file=/etc/kubernetes/audit-policy.yaml
+    --audit-log-path=/var/log/kubernetes/audit.log
+    --audit-log-maxage=30
+    --audit-log-maxbackup=10
+    --audit-log-maxsize=100
+```
+
+### etcd Security
+
+```bash
+# etcd should be configured with:
+# - TLS for all communication
+# - Peer authentication
+# - Client authentication
+# - Encryption at rest
+
+# Verify etcd security
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  endpoint health
+```
+
+### Node Security
+
+```yaml
+# Node security context
+apiVersion: v1
+kind: Node
+metadata:
+  name: node-name
+spec:
+  taints:  # Restrict what can run on this node
+  - key: "node-type"
+    value: "compute-optimized"
+    effect: "NoSchedule"
+  # Tolerations in pods needed to schedule here
+```
+
+## Cost Optimization
+
+### Control Plane Sizing
+
+| Cluster Size | Recommended Control Plane | Notes |
+|--------------|---------------------------|-------|
+| < 50 nodes | n2-standard-4 x 3 | Minimum for production |
+| 50-200 nodes | n2-standard-8 x 3 | API load increases |
+| 200-500 nodes | n2-standard-16 x 3 | Multiple API servers |
+| 500+ nodes | n2-standard-16 or custom | Per-node overhead |
+
+### Node Pool Strategies
+
+```yaml
+# Cost-efficient node pool configuration
+# GKE example
+gcloud container node-pools create cost-optimized \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --node-count=3 \
+  --enable-autoscaling \
+  --min-nodes=0 \
+  --max-nodes=20 \
+  --spot \
+  --node-labels=workload-type=batch \
+  --node-taints=spot=true:NoSchedule
+```
+
+### Resource Recommendations
+
+| Component | Minimum | Recommended | Production |
+|-----------|---------|-------------|------------|
+| etcd | 8GB RAM, 50GB SSD | 16GB RAM, 100GB SSD | 32GB RAM, 200GB SSD |
+| API Server | 2 CPU, 4GB RAM | 4 CPU, 8GB RAM | 8 CPU, 16GB RAM |
+| Scheduler | 1 CPU, 2GB RAM | 2 CPU, 4GB RAM | 2 CPU, 4GB RAM |
+| Controller Manager | 1 CPU, 2GB RAM | 2 CPU, 4GB RAM | 2 CPU, 4GB RAM |
+
+## Troubleshooting
+
+### Common Architecture Issues
+
+| Issue | Symptoms | Resolution |
+|-------|----------|------------|
+| API server unreachable | "Connection refused", timeout | Check API server pods, network policies, load balancer |
+| Scheduler not scheduling | Pods stuck in Pending | Check scheduler logs, node resources, affinity rules |
+| etcd leader election failure | Cluster unstable | Check etcd health, disk latency, network between nodes |
+| Node NotReady | Pods not scheduling | SSH to node, check kubelet, container runtime |
+| High API latency | kubectl slow | Scale API servers, check etcd, optimize requests |
+
+### Diagnostic Commands
+
+```bash
+# Full cluster diagnostics
+kubectl get nodes -o wide
+kubectl get pods -A -o wide
+kubectl get events --all-namespaces --sort-by='.lastTimestamp'
+
+# API server debugging
+kubectl auth can-i --list  # Check permissions
+kubectl api-resources  # Check available resources
+
+# Scheduler debugging
+kubectl get events --field-selector involvedObject.kind=Pod,reason=FailedScheduling
+
+# Node debugging
+kubectl describe node node-name
+kubectl top node node-name
+
+# Network debugging
+kubectl run netshoot --image=nicolaka/netshoot:latest --rm -it -- /bin/bash
+
+# etcd debugging (requires SSH to control plane)
+ETCDCTL_API=3 etcdctl endpoint status --cluster -w table
+```
+
+### etcd Troubleshooting
+
+```bash
+# Check etcd logs
+kubectl logs -n kube-system etcd-control-plane --tail=100
+
+# Check member list
+ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member list -w table
+
+# Check db size
+ETCDCTL_API=3 etcdctl endpoint status \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  -w json | jq '.[].Status.dbSize'
+```
+
+## Interview Questions
+
+### Basic Architecture Questions
+
+**Q: What are the main components of the Kubernetes control plane?**
+A: The control plane consists of kube-apiserver (REST API and authentication/authorization), etcd (distributed key-value store for cluster state), kube-scheduler (assigns pods to nodes), kube-controller-manager (runs controller loops), and cloud-controller-manager (cloud-specific integrations).
+
+**Q: How does Kubernetes store cluster state?**
+A: All cluster state is stored in etcd, a distributed key-value store. Only the API server communicates directly with etcd. Components watch the API server for changes rather than querying etcd directly.
+
+**Q: What is the role of kubelet?**
+A: kubelet is the primary agent running on each node. It registers the node with the cluster, watches for pod assignments via the API server, creates/stops containers, reports node and pod status, and executes health probes.
+
+### Intermediate Questions
+
+**Q: How does the scheduler decide which node to place a pod on?**
+A: The scheduler uses a two-phase approach: filtering (removes nodes that can't run the pod based on resources, affinity, taints, etc.) and scoring (ranks remaining nodes based on resource balance, affinity rules, data locality). The highest-scoring node is selected.
+
+**Q: What is the difference between a daemon set and a deployment?**
+A: A DaemonSet ensures one copy of a pod runs on every node (or nodes matching a selector). A Deployment manages replica count and can run anywhere. DaemonSets are ideal for node-level services like log collectors, monitoring agents, and CNI plugins.
+
+**Q: How does kube-proxy implement services?**
+A: kube-proxy watches the API server for service and endpoint changes, then maintains network rules (iptables or IPVS) on each node. When traffic is sent to a service IP:port, kube-proxy's rules redirect it to backend pods.
+
+### Advanced Questions
+
+**Q: How would you design a highly available control plane?**
+A: Use 3 or 5 control plane nodes in different availability zones. Run etcd in HA mode with 3, 5, or 7 members. Load balance API server instances. Configure scheduler and controller manager to run as leader-elected singletons. Test failover scenarios regularly.
+
+**Q: How does Kubernetes handle node failure?**
+A: The node controller monitors node health via heartbeat signals. After 40 seconds of no heartbeat, the node is marked Unknown. After 5 minutes, pods on the failed node are marked for deletion. ReplicaSets and Deployments then create replacement pods on healthy nodes (if they have sufficient capacity).
+
+**Q: Explain the difference between NoExecute and NoSchedule taints.**
+A: NoSchedule prevents new pods from being scheduled unless they tolerate the taint. NoExecute additionally evicts existing pods that don't tolerate the taint (optionally after a tolerance period).
+
+## Cheat Sheet
+
+### Control Plane Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              Control Plane Components                    │
+├─────────────────────────────────────────────────────────┤
+│ kube-apiserver     │ REST API, authentication,          │
+│                    │ authorization, admission           │
+├────────────────────┼────────────────────────────────────┤
+│ etcd               │ Distributed key-value store        │
+│                    │ for cluster state                  │
+├────────────────────┼────────────────────────────────────┤
+│ kube-scheduler     │ Assigns pods to nodes              │
+│                    │ (filtering + scoring)              │
+├────────────────────┼────────────────────────────────────┤
+│ kube-controller-   │ Runs controller loops              │
+│ manager            │ (Node, RC, Endpoint, etc.)         │
+├────────────────────┼────────────────────────────────────┤
+│ cloud-controller-  │ Cloud provider integration         │
+│ manager            │ (LoadBalancer, Routes, Volumes)    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Node Components
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Node Components                         │
+├─────────────────────────────────────────────────────────┤
+│ kubelet          │ Pod lifecycle, image management,     │
+│                  │ health checks, resource reporting    │
+├──────────────────┼──────────────────────────────────────┤
+│ kube-proxy       │ Network rules, service load         │
+│                  │ balancing (iptables/IPVS)            │
+├──────────────────┼──────────────────────────────────────┤
+│ container        │ Container runtime                    │
+│ runtime          │ (containerd, CRI-O, Docker)          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Key Ports and Protocols
+
+| Component | Port | Protocol | Purpose |
+|-----------|------|----------|---------|
+| kube-apiserver | 6443 | TCP | Kubernetes API |
+| kubelet | 10250 | TCP | kubelet API |
+| kube-scheduler | 10251 | TCP | Health checks |
+| kube-controller-manager | 10252 | TCP | Health checks |
+| etcd | 2379-2380 | TCP | etcd client/peer |
+| NodePort | 30000-32767 | TCP | NodePort services |
+
+### Quick Reference
+
+```bash
+# Cluster info
+kubectl cluster-info
+kubectl get nodes -o wide
+
+# Component status
+kubectl get cs
+
+# System pods
+kubectl get pods -n kube-system
+
+# Events
+kubectl get events --sort-by='.lastTimestamp'
+
+# Node allocation
+kubectl describe node | grep -A 5 "Allocated resources"
+```
+
+## Related Topics
+
+- [Pods](./pods) - Pod specifications and lifecycle
+- [Deployments](./deployments) - Deployment strategies
+- [Services](./services) - Service discovery and networking
+- [Networking](./networking) - Cluster networking deep dive
+- [Security](./security) - Kubernetes security
+- [GKE](./gke) - GKE-specific architecture

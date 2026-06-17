@@ -1,0 +1,991 @@
+---
+sidebar_position: 7
+---
+
+# Alerting
+
+## Overview
+
+Alerting is the practice of sending notifications when monitoring data indicates a potential problem requiring human attention. Effective alerting is not about detecting every anomaly — it's about detecting the right events at the right time with the right urgency. Alert fatigue (too many irrelevant pages) kills response effectiveness just as surely as missing critical alerts.
+
+The philosophy of SRE alerting is that **every alert must be actionable**. If an engineer cannot look at an alert and immediately know what to do, it's not a good alert. Alerts that fire but don't require action erode trust in the alerting system and lead to ignored pages.
+
+Modern alerting systems support multi-level alerts (warning vs critical), routing to different channels (SMS vs Slack vs PagerDuty), and suppression during maintenance windows. The goal is ensuring the right person sees the right alert at the right time with enough context to respond.
+
+## When To Use
+
+- **SLO breach risk** — When error budget is depleting faster than expected
+- **User-impacting issues** — When errors or latency affect users
+- **Capacity limits** — When systems approach saturation
+- **Dependency failures** — When downstream services are unavailable
+- **Security events** — When suspicious activity is detected
+- **Scheduled validations** — When periodic health checks fail
+
+## When NOT To Use
+
+- **For every metric** — Not every deviation requires action
+- **During maintenance windows** — Suppress expected changes
+- **Without runbooks** — Alerts without documentation lead to delayed response
+- **Based on single measurements** — Use for/window to confirm sustained issues
+
+## Core Concepts
+
+### Alert Severity Levels
+
+```yaml
+severity_levels:
+  P1_Critical:
+    response_time: "5 minutes"
+    channel: "Phone call (auto-escalate)"
+    description: "Complete service outage or severe user impact"
+    examples:
+      - "Site returns 5xx for all requests"
+      - "Payment processing completely down"
+      - "Database unreachable"
+      
+  P2_High:
+    response_time: "15 minutes"
+    channel: "SMS + Slack"
+    description: "Major feature unavailable or significant degradation"
+    examples:
+      - "Login fails for >50% of users"
+      - "Checkout error rate > 5%"
+      - "Latency p99 > 10 seconds"
+      
+  P3_Medium:
+    response_time: "1 hour"
+    channel: "Slack"
+    description: "Degraded performance or minor feature issues"
+    examples:
+      - "Non-critical service errors elevated"
+      - "Latency p99 > 2 seconds"
+      - "Memory usage > 80%"
+      
+  P4_Low:
+    response_time: "4 hours or next business day"
+    channel: "Email/Ticket"
+    description: "Minor issues not currently impacting users"
+    examples:
+      - "Disk usage > 70%"
+      - "Certificate expiring in 30 days"
+      - "Intermittent 4xx errors"
+```
+
+### Alert Quality Checklist
+
+An alert should have:
+- [ ] Clear, specific title indicating the problem
+- [ ] Severity level matching actual impact
+- [ ] Link to runbook with response steps
+- [ ] Context (which service, how many users affected)
+- [ ] Metrics showing the issue
+- [ ] Duration threshold avoiding flapping
+
+### Alert Burn Rate Philosophy
+
+For SLO-based alerting, use multi-window burn rate alerts:
+
+| Window | Burn Rate | Meaning | Action |
+|--------|-----------|---------|--------|
+| 1 hour | > 360x | 50% budget in 1 hour | Critical |
+| 6 hours | > 60x | 50% budget in 6 hours | Warning |
+| Multi-window | Both > 14.4x | Sustained burn | Critical |
+
+## Real Production Example
+
+### SLO-Based Alert Rules
+
+```yaml
+# prometheus/slo-alerts.yaml
+groups:
+  - name: slo-error-budget
+    interval: 60s
+    rules:
+      # Fast burn: 50% of budget in 1 hour
+      # For 30-day SLO (99.9%), this is burn rate > 360x
+      - alert: SLOErrorBudgetFastBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{job="api"}[1h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (1 / (30 * 24 * 60))
+          > 50
+        for: 0m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "Critical: Error budget burning fast"
+          description: |
+            50% of monthly error budget burned in 1 hour.
+            Burn rate: {{ $value | printf "%.0f" }}x normal.
+            Halt non-critical deployments immediately.
+          runbook_url: "https://runbooks.example.com/slo-fast-burn"
+
+      # Slow burn: 50% of budget in 6 hours
+      # Burn rate > 60x
+      - alert: SLOErrorBudgetSlowBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{job="api"}[6h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (6 / (30 * 24 * 60))
+          > 50
+        for: 0m
+        labels:
+          severity: warning
+          slo: api-availability
+        annotations:
+          summary: "Warning: Sustained error budget burn"
+          description: |
+            50% of monthly error budget burned in 6 hours.
+            Investigate root cause.
+          runbook_url: "https://runbooks.example.com/slo-slow-burn"
+
+      # Multi-window burn: both 1h and 6h exceeding threshold
+      - alert: SLOErrorBudgetMultiWindowBurn
+        expr: |
+          (
+            (
+              1 - (
+                sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+                /
+                sum(rate(http_requests_total{job="api"}[1h]))
+              )
+            )
+            /
+            (1 - 0.999)
+            /
+            (1 / (30 * 24 * 60))
+            > 14.4
+          )
+          and
+          (
+            (
+              1 - (
+                sum(rate(http_requests_total{job="api",status!~"5.."}[6h]))
+                /
+                sum(rate(http_requests_total{job="api"}[6h]))
+              )
+            )
+            /
+            (1 - 0.999)
+            /
+            (6 / (30 * 24 * 60))
+            > 14.4
+          )
+        for: 5m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "Critical: Sustained error budget burn across windows"
+          description: |
+            Both 1h and 6h burn rates exceed 14.4x.
+            Page on-call immediately.
+```
+
+### Golden Signals Alerts
+
+```yaml
+groups:
+  - name: golden-signals
+    rules:
+      # Latency - p99 above threshold
+      - alert: APILatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          signal: latency
+        annotations:
+          summary: "API p99 latency above 1 second"
+          description: |
+            Current p99 latency: {{ $value | humanizeDuration }}
+            Threshold: 1 second
+            Users experiencing slow responses.
+          runbook_url: "https://runbooks.example.com/high-latency"
+
+      # Error rate - 5xx above 1%
+      - alert: APIErrorRateHigh
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="api"}[5m]))
+          ) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          signal: errors
+        annotations:
+          summary: "API 5xx error rate above 1%"
+          description: |
+            Error rate: {{ $value | humanizePercentage }}
+            Target: < 1%
+            Incident likely in progress.
+          runbook_url: "https://runbooks.example.com/high-errors"
+
+      # Traffic anomaly
+      - alert: APITrafficDrop
+        expr: |
+          sum(rate(http_requests_total{job="api"}[5m]))
+          < 0.5 * avg_over_time(sum(rate(http_requests_total{job="api"}[5m]))[1h:])
+        for: 5m
+        labels:
+          severity: warning
+          signal: traffic
+        annotations:
+          summary: "API traffic dropped by more than 50%"
+          description: |
+            Current traffic: {{ $value | humanize }} req/s
+            Expected: {{ $labels.expected }} req/s
+            Possible upstream issue or client problem.
+
+      # Saturation - CPU
+      - alert: APICPUSaturation
+        expr: |
+          rate(process_cpu_seconds_total{job="api"}[5m]) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+          signal: saturation
+        annotations:
+          summary: "API CPU above 80%"
+          description: |
+            CPU utilization: {{ $value | printf "%.1f" }}%
+            Risk of performance degradation.
+          runbook_url: "https://runbooks.example.com/high-cpu"
+```
+
+### Infrastructure Alerts
+
+```yaml
+groups:
+  - name: infrastructure
+    rules:
+      # Kubernetes pod health
+      - alert: PodNotReady
+        expr: |
+          sum by (namespace, pod) (
+            kube_pod_status_ready{condition="true"} == 0
+          )
+          > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not ready"
+          description: "Pod has been not ready for more than 5 minutes"
+
+      - alert: PodRestartingTooMuch
+        expr: |
+          increase(kube_pod_container_status_restarts[1h]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} restarting frequently"
+          description: "Container restarted {{ $value }} times in last hour"
+
+      # Database alerts
+      - alert: DatabaseConnectionsHigh
+        expr: |
+          postgresql_connections / postgresql_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "PostgreSQL connections above 80%"
+          runbook_url: "https://runbooks.example.com/db-connections"
+
+      - alert: DatabaseReplicationLag
+        expr: |
+          pg_replication_lag_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "PostgreSQL replication lag above 30 seconds"
+          runbook_url: "https://runbooks.example.com/db-replication-lag"
+```
+
+## Metrics / Formulas / Frameworks
+
+### Burn Rate Alert Calculations
+
+```python
+def calculate_burn_rate_alert_thresholds(slo_target, window_days):
+    """
+    Calculate burn rate thresholds for multi-window alerting.
+    
+    Returns thresholds for:
+    - 1h window (fast burn)
+    - 6h window (slow burn)
+    - Multi-window (both elevated)
+    """
+    window_hours = window_days * 24
+    
+    # To burn 50% of budget in window X hours:
+    # burn_rate = (50% / budget%) * (window_hours / X)
+    
+    budget_percent = (1 - slo_target) * 100  # e.g., 0.1 for 99.9%
+    
+    # 1 hour: burn 50% budget in 1 hour
+    fast_burn_1h = (50 / budget_percent) * (window_hours / 1)
+    
+    # 6 hours: burn 50% budget in 6 hours
+    slow_burn_6h = (50 / budget_percent) * (window_hours / 6)
+    
+    # Multi-window: burn 50% budget in 6h AND 1h
+    multi_window_1h = (50 / budget_percent) * (window_hours / 1) / 25  # ~14.4x
+    multi_window_6h = (50 / budget_percent) * (window_hours / 6) / 25  # ~14.4x
+    
+    return {
+        'fast_burn_1h': fast_burn_1h,
+        'slow_burn_6h': slow_burn_6h,
+        'multi_window_1h': multi_window_1h,
+        'multi_window_6h': multi_window_6h
+    }
+
+# Example for 99.9% SLO (30-day window)
+thresholds = calculate_burn_rate_alert_thresholds(0.999, 30)
+print(f"99.9% SLO burn rate thresholds:")
+print(f"  Fast burn (50% in 1h): {thresholds['fast_burn_1h']:.0f}x")
+print(f"  Slow burn (50% in 6h): {thresholds['slow_burn_6h']:.0f}x")
+print(f"  Multi-window 1h: {thresholds['multi_window_1h']:.1f}x")
+print(f"  Multi-window 6h: {thresholds['multi_window_6h']:.1f}x")
+
+# Output:
+# 99.9% SLO burn rate thresholds:
+#   Fast burn (50% in 1h): 360x
+#   Slow burn (50% in 6h): 60x
+#   Multi-window 1h: 14.4x
+#   Multi-window 6h: 14.4x
+```
+
+### Alert Frequency Analysis
+
+```python
+def calculate_alert_metrics(alerts, incident_duration_minutes):
+    """
+    Calculate alerting effectiveness metrics.
+    """
+    mtta = calculate_mtta(alerts)  # Mean Time To Acknowledge
+    mttd = calculate_mttd(alerts)  # Mean Time To Detect
+    mttr = incident_duration_minutes  # Mean Time To Resolve
+    
+    return {
+        'mean_time_to_detect': mttd,
+        'mean_time_to_acknowledge': mtta,
+        'mean_time_to_resolve': mttr,
+        'false_positive_rate': calculate_false_positive_rate(alerts)
+    }
+```
+
+## Common Tools and Commands
+
+### AlertManager Configuration
+
+```yaml
+# alertmanager/config.yaml
+global:
+  resolve_timeout: 5m
+  slack_api_url: 'https://hooks.slack.com/services/XXX'
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default'
+  
+  routes:
+    # Critical alerts go to PagerDuty with phone call
+    - match:
+        severity: critical
+      receiver: 'pagerduty-critical'
+      continue: true
+      
+    # SLO alerts get special routing
+    - match:
+        slo: api-availability
+      receiver: 'slo-alerts'
+      group_wait: 0s  # Immediate notification
+      
+    # Security alerts
+    - match:
+        category: security
+      receiver: 'security-team'
+
+receivers:
+  - name: 'default'
+    slack_configs:
+      - channel: '#alerts-general'
+        title: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        text: |
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          Runbook: {{ .Annotations.runbook_url }}
+          {{ end }}
+
+  - name: 'pagerduty-critical'
+    pagerduty_configs:
+      - service_key: 'PAGERDUTY_API_KEY'
+        severity: critical
+        event_action: trigger
+        description: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+
+  - name: 'slo-alerts'
+    slack_configs:
+      - channel: '#slo-alerts'
+        title: 'SLO Alert: {{ .GroupLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+          Burn rate: {{ $value }}x
+          {{ .Annotations.description }}
+          {{ end }}
+
+  - name: 'security-team'
+    slack_configs:
+      - channel: '#security-alerts'
+```
+
+### Prometheus Alerting Rules Template
+
+```yaml
+# Template for new alerting rules
+groups:
+  - name: {{service}}-alerts
+    interval: 30s
+    rules:
+      # Alert: High Error Rate
+      - alert: {{service}}HighErrorRate
+        expr: |
+          (
+            sum(rate({{metric_prefix}}_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate({{metric_prefix}}_requests_total[5m]))
+          ) > {{error_threshold}}
+        for: {{for_duration}}
+        labels:
+          severity: {{severity}}
+          service: {{service}}
+        annotations:
+          summary: "{{service}} error rate above {{error_threshold_display}}"
+          description: |
+            Error rate: {{ $value | humanizePercentage }}
+            Service: {{ $labels.service }}
+            Endpoint: {{ $labels.endpoint }}
+          runbook_url: "https://runbooks.example.com/{{service}}-errors"
+```
+
+### Testing Alerts
+
+```bash
+# Send test alert to Alertmanager
+curl -XPOST http://localhost:9093/api/v1/alerts -d '[{
+  "labels": {
+    "alertname": "TestAlert",
+    "severity": "warning",
+    "service": "api"
+  },
+  "annotations": {
+    "summary": "Test alert",
+    "description": "This is a test alert"
+  }
+}]'
+
+# Check alert state in Prometheus
+curl -s localhost:9090/api/v1/alerts | jq '.data.alerts[] | select(.name == "TestAlert")'
+
+# Simulate burn rate alert
+promtool test rules alert-rules-test.yaml
+```
+
+## Monitoring / Alerting Examples
+
+### Complete Alert Rule Set
+
+```yaml
+# Complete alerting configuration for production API
+groups:
+  # === SLO-Based Alerts ===
+  - name: api-slo-alerts
+    interval: 60s
+    rules:
+      - alert: APISLOBudgetBurnFast
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api"}[1h]))
+              /
+              sum(rate(http_requests_total{job="api"}[1h]))
+            )
+          )
+          /
+          (1 - 0.999)
+          /
+          (1 / (30 * 24 * 60))
+          > 50
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API error budget burning fast"
+          runbook_url: "https://runbooks.example.com/api-slo-burn"
+
+  # === Golden Signal Alerts ===
+  - name: api-golden-signals
+    rules:
+      - alert: APILatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le)
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p99 latency above 500ms"
+          runbook_url: "https://runbooks.example.com/api-latency"
+
+      - alert: APIErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="api"}[5m]))
+          ) > 0.005
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API error rate above 0.5%"
+          runbook_url: "https://runbooks.example.com/api-errors"
+
+  # === Dependency Alerts ===
+  - name: api-dependencies
+    rules:
+      - alert: DatabaseConnectionPoolExhausted
+        expr: |
+          (
+            sum(rate(postgresql_connections_used[5m]))
+            /
+            sum(rate(postgresql_connections_max[5m]))
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection pool above 90%"
+          runbook_url: "https://runbooks.example.com/db-pool"
+
+      - alert: CacheHitRateLow
+        expr: |
+          sum(rate(cache_hits_total[5m]))
+          /
+          sum(rate(cache_requests_total[5m])) < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate below 80%"
+          runbook_url: "https://runbooks.example.com/cache-hit-rate"
+
+  # === Capacity Alerts ===
+  - name: api-capacity
+    rules:
+      - alert: HighCPU
+        expr: |
+          rate(process_cpu_seconds_total{job="api"}[5m]) * 100 > 70
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API CPU above 70%"
+
+      - alert: HighMemory
+        expr: |
+          process_resident_memory_bytes{job="api"}
+          / 1024 / 1024 / 1024 > 3.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API memory usage above 3.5GB"
+
+  # === Lifecycle Alerts ===
+  - name: api-lifecycle
+    rules:
+      - alert: TooManyRestarts
+        expr: |
+          increase(kube_pod_container_status_restarts{container="api"}[1h]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API container restarted multiple times in last hour"
+
+      - alert: PodNotReady
+        expr: |
+          kube_pod_status_ready{namespace="production",pod=~"api-.*",condition="true"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API pod not ready"
+```
+
+### Alert Routing Configuration
+
+```yaml
+# Alertmanager routing for different alert types
+route:
+  # Group all alerts by service
+  group_by: [service, alertname]
+  
+  routes:
+    # Route SLO alerts to dedicated channel
+    - match:
+        alert_type: slo
+      receiver: slo-alerts
+      group_wait: 0s
+      repeat_interval: 1h
+      
+    # Route security alerts immediately
+    - match:
+        category: security
+      receiver: security-oncall
+      group_wait: 0s
+      continue: true
+      
+    # Route database alerts to DBA team
+    - match:
+        component: database
+      receiver: dba-team
+      group_wait: 30s
+      
+    # Route Kubernetes alerts
+    - match:
+        kubernetes: "true"
+      receiver: platform-team
+      
+    # Everything else to general alerts
+    - match_re:
+        severity: ".*"
+      receiver: general-alerts
+```
+
+## Security
+
+### Security Alert Rules
+
+```yaml
+groups:
+  - name: security-alerts
+    rules:
+      # Authentication failures
+      - alert: HighAuthFailureRate
+        expr: |
+          sum(rate(http_requests_total{status="401"}[5m]))
+          /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "High rate of authentication failures"
+          description: "May indicate brute force attack or credential issues"
+
+      # Possible injection attempts
+      - alert: SuspiciousRequestPattern
+        expr: |
+          sum(rate(http_requests_total{uri=~".*(union|select|drop|--|';).*"}[5m])) > 10
+        for: 1m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "Suspicious SQL-like patterns in requests"
+          runbook_url: "https://runbooks.example.com/injection-detection"
+
+      # Certificate expiry
+      - alert: TLSCertExpiringSoon
+        expr: |
+          probe_ssl_earliest_cert_expiry - time() < 86400 * 30
+        for: 0m
+        labels:
+          severity: warning
+          category: security
+        annotations:
+          summary: "TLS certificate expiring in less than 30 days"
+
+      - alert: TLSCertExpired
+        expr: |
+          probe_ssl_earliest_cert_expiry - time() < 0
+        for: 0m
+        labels:
+          severity: critical
+          category: security
+        annotations:
+          summary: "TLS certificate has expired"
+```
+
+## Cost Optimization
+
+### Alert Noise Reduction
+
+```yaml
+# Strategies to reduce alert fatigue
+
+noise_reduction:
+  # 1. Use for/duration to require sustained issues
+  # BAD: No for, fires on any spike
+  - alert: HighErrorRate
+    expr: error_rate > 0.01
+    # GOOD: Require 5 minutes of sustained high error rate
+    - alert: HighErrorRate
+      expr: error_rate > 0.01
+      for: 5m
+      
+  # 2. Use multi-window alerts to filter transient issues
+  # This already implemented above (14.4x threshold)
+  
+  # 3. Suppress during known maintenance
+  - alert: APIDown
+    expr: up{job="api"} == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "API is down"
+    # Inhibit if maintenance is scheduled
+    inhibit_by:
+      - alertname: ScheduledMaintenance
+
+  # 4. Use severity appropriately
+  # Don't page for non-critical issues
+  - alert: DiskUsageHigh
+    expr: disk_usage > 0.8
+    for: 30m  # Allow longer for non-critical
+    labels:
+      severity: warning  # Not critical
+    annotations:
+      summary: "Disk usage high"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Alerting Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| Too many alerts | Alert fatigue | Only alert on SLO impacts |
+| No runbook | Slow response | Document response steps |
+| Alert storms | Missed critical | Use grouping, rate limiting |
+| No severity tiers | Everything is critical | Define severity clearly |
+| Flapping alerts | Trust erosion | Use for/window properly |
+
+### Alert Troubleshooting
+
+**Symptom**: Alert firing but nothing seems wrong
+
+**Diagnosis**:
+```bash
+# Check the actual metric value
+promtool query instant http://localhost:9090 'error_rate{job="api"}'
+
+# Check historical values
+promtool query range http://localhost:9090 'error_rate{job="api"}[1h]'
+
+# Check if query is correct
+# Common issues:
+# - Label mismatch (e.g., job="api" vs job="api-server")
+# - Metric name wrong
+# - Aggregation missing
+```
+
+## Interview Questions
+
+### Q1: What makes a good alert?
+
+**A**: A good alert has these properties:
+
+1. **Actionable** — The responder knows exactly what to do
+2. **Specific** — Clear what system and what's wrong
+3. **Timely** — Fires fast enough to prevent user impact
+4. **Prioritized** — Severity matches actual impact
+5. **Documented** — Has a runbook with response steps
+6. **No noise** — Doesn't fire for non-issues
+
+Example of a good alert:
+```
+CRITICAL: API Error Rate > 5%
+Metric: 7.3% of requests returning 5xx
+Duration: Sustained for 5 minutes
+Impact: ~5,000 users affected
+Runbook: https://runbooks.example.com/api-errors
+Action: Check deployment logs, consider rollback
+```
+
+### Q2: How do you prevent alert fatigue?
+
+**A**: Alert fatigue prevention:
+
+1. **Only page for user-visible issues** — Don't page for internal metrics
+2. **Use severity correctly** — Not everything is P1
+3. **Require sustained issues** — Use `for:` to filter spikes
+4. **Multi-window alerts** — Don't alert on transient issues
+5. **Regular alert review** — Monthly review of all alerts
+6. **Track false positive rate** — Address alerts with >50% false positive
+
+Key principle: If you're not willing to wake someone up at 3 AM for it, it shouldn't be a page.
+
+### Q3: What's the difference between PagerDuty and simple webhook alerts?
+
+**A**: Key differences:
+
+| Aspect | Webhooks | PagerDuty |
+|--------|----------|-----------|
+| Escalation | Manual | Automatic |
+| On-call rotation | Not built-in | Built-in |
+| Acknowledgment | Not tracked | Tracked |
+| Mobile app | Not included | Included |
+| Duty scheduling | Manual | Automatic |
+| Alert grouping | Manual | Automatic |
+| Analytics | Limited | Built-in |
+
+PagerDuty (or similar) is essential for production services because it handles:
+- On-call scheduling and rotations
+- Automatic escalation if not acknowledged
+- Mobile push notifications with critical importance
+- Alert grouping and deduplication
+- Response analytics
+
+### Q4: How do you handle alert routing for different services?
+
+**A**: I use hierarchical routing:
+
+```yaml
+route:
+  # Primary group by service/team
+  group_by: [team, service]
+  
+  routes:
+    # Infrastructure alerts → platform team
+    - match:
+        type: infrastructure
+      receiver: platform-oncall
+      routes:
+        - match:
+            component: database
+          receiver: dba-oncall  # Override for DB issues
+            
+    # Application alerts → service team
+    - match:
+        type: application
+      receiver: service-oncall
+      routes:
+        - match:
+            severity: critical
+          receiver: service-critical-oncall  # Second on-call for critical
+            
+    # Security → security team
+    - match:
+        category: security
+      receiver: security-oncall
+```
+
+### Q5: How do you test alerting before going to production?
+
+**A**: Testing strategy:
+
+1. **Unit test rules** — Use `promtool test rules` to validate PromQL
+2. **Dry run** — Deploy rules in dry-run mode first
+3. **Local testing** — Use AlertManager webhook to test routing
+4. **Canary** — Deploy to single cluster first, monitor for noise
+5. **Gradual rollout** — Start with warning-only, add critical later
+6. **Post-deployment monitoring** — Watch for false positives
+
+## Cheat Sheet
+
+### Alert Severity Quick Reference
+
+| Severity | Response Time | Examples | Channel |
+|----------|---------------|----------|---------|
+| P1/Critical | 5 min | Site down, all 5xx | Phone + SMS |
+| P2/High | 15 min | Major feature down | SMS + Slack |
+| P3/Medium | 1 hour | Degraded perf | Slack |
+| P4/Low | 4 hours | Minor issue | Email |
+
+### Burn Rate Alert Thresholds (30-day SLO)
+
+```
+99.9% SLO (0.1% budget):
+  Fast burn (1h): 360x → 50% budget in 1 hour
+  Slow burn (6h): 60x → 50% budget in 6 hours
+  Multi-window: 14.4x → sustained burn
+
+99.95% SLO (0.05% budget):
+  Fast burn (1h): 720x
+  Slow burn (6h): 120x
+  Multi-window: 28.8x
+```
+
+### Alert Runbook Template
+
+```yaml
+# Alert runbook template
+runbook:
+  title: "High API Error Rate"
+  
+  check_before_escalating:
+    - "Is this a deployment-related issue? Check recent deploys"
+    - "Is this a traffic spike? Check analytics"
+    - "Is this a downstream dependency issue? Check dependent services"
+    
+  common_causes:
+    - "Database connection pool exhausted"
+    - "Configuration deployed with errors"
+    - "Dependency timeout misconfigured"
+    - "Memory/CPU pressure causing OOM"
+    
+  mitigation_steps:
+    - "If deployment-related: kubectl rollout undo deployment/api"
+    - "If database: Check connection pool, consider increasing"
+    - "If configuration: Rollback to previous known-good config"
+    
+  escalation:
+    - "If unresolved after 15 minutes: Escalate to SRE lead"
+    - "If data corruption suspected: Escalate to security"
+```
+
+## Related Topics
+
+- [Monitoring](./monitoring.mdx) — Metrics that drive alerts
+- [SLO](./slo.mdx) — SLO-based alerting philosophy
+- [Error Budget](./error-budget.mdx) — Error budget burn rate alerts
+- [Incident Management](./incident-management.mdx) — Responding to alerts

@@ -1,0 +1,1046 @@
+# Event-Driven Architecture
+
+sidebar_position: 5
+
+## Overview
+
+Event-driven architecture (EDA) decouples services through asynchronous event communication. Rather than services calling each other directly, they emit events and react to events from other services. GCP provides Pub/Sub for messaging, Eventarc for event routing, and Cloud Functions/Cloud Run for event processing.
+
+## When To Use
+
+- Building loosely coupled microservices
+- Processing asynchronous workflows (order fulfillment, notifications)
+- Handling variable traffic with buffering
+- Maintaining eventual consistency across services
+- Building real-time data pipelines
+- Implementing audit logs and audit trails
+
+## When NOT To Use
+
+- Operations requiring immediate response (not eventual consistency tolerance)
+- Simple request-response APIs where async doesn't add value
+- Transactions requiring strong consistency (consider synchronous patterns)
+- Low-latency requirements where queue overhead is unacceptable
+- When debugging complexity exceeds benefits
+
+## Core Concepts
+
+### Event Types
+- **Domain Events**: Business significant occurrences (OrderPlaced, PaymentSucceeded)
+- **Integration Events**: Cross-service communication (UserCreated triggers EmailService)
+- **System Events**: Infrastructure notifications (Cloud Storage ObjectFinalized)
+
+### Messaging Patterns
+- **Pub/Sub**: One-to-many fan-out messaging
+- **Event Streaming**: Ordered, durable event log (via Pub/Sub Lite or Dataflow)
+- **Command Messages**: Request-response style via reply topic
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Event Sources                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │   Cloud     │  │   Cloud     │  │    Cloud    │  │  Cloud      │    │
+│  │   Storage   │  │   SQL       │  │  Build      │  │  Scheduler  │    │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘    │
+└─────────┼────────────────┼────────────────┼────────────────┼────────────┘
+          │                │                │                │
+          ▼                ▼                ▼                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Pub/Sub Layer                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                        Topics                                    │    │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │    │
+│  │  │   order.    │  │    user.    │  │   billing.  │              │    │
+│  │  │   events    │  │   events    │  │   events    │              │    │
+│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘              │    │
+│  │         │                │                │                      │    │
+│  └─────────┼────────────────┼────────────────┼──────────────────────┘    │
+│            │                │                │                          │
+│    ┌───────┴───────┐        │        ┌───────┴───────┐                 │
+│    ▼               ▼        ▼        ▼               ▼                 │
+│  ┌─────────┐  ┌─────────┐ ┌─────────┐  ┌─────────┐  ┌─────────┐       │
+│  │Email Svc│  │Ship Svc │ │Auth Svc │  │Analytics│  │Webhook  │       │
+│  │(Func)   │  │(Func)   │ │(Run)    │  │(Dataflow│  │(Func)   │       │
+│  └─────────┘  └─────────┘ └─────────┘  └─────────┘  └─────────┘       │
+│                                                                           │
+│                        Eventarc Triggers                                 │
+│                        (Cloud Events)                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Processing & State                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  Cloud      │  │  Cloud      │  │  BigQuery   │  │  Cloud      │    │
+│  │  Functions  │  │  Run        │  │  (Analytics)│  │  Spanner    │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘    │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Uber-Style Event-Driven Order Processing
+
+```typescript
+// Order Service - Publishes domain events
+import { PubSub } from '@google-cloud/pubsub';
+import express from 'express';
+
+const pubsub = new PubSub();
+
+const app = express();
+
+// POST /orders
+app.post('/orders', async (req, res) => {
+  const { items, customerId, deliveryAddress } = req.body;
+
+  const db = await getPool().connect();
+
+  try {
+    await db.query('BEGIN');
+
+    // Create order
+    const orderResult = await db.query(`
+      INSERT INTO orders (customer_id, status, delivery_address, created_at)
+      VALUES ($1, 'PENDING', $2, NOW())
+      RETURNING *
+    `, [customerId, JSON.stringify(deliveryAddress)]);
+
+    const order = orderResult.rows[0];
+
+    // Create order items
+    for (const item of items) {
+      await db.query(`
+        INSERT INTO order_items (order_id, product_id, quantity, price)
+        VALUES ($1, $2, $3, $4)
+      `, [order.id, item.productId, item.quantity, item.price]);
+    }
+
+    await db.query('COMMIT');
+
+    // Publish domain event (async, don't await)
+    publishEvent('order.created', {
+      orderId: order.id,
+      customerId,
+      items,
+      total: calculateTotal(items),
+      timestamp: new Date().toISOString()
+    }).catch(err => console.error('Failed to publish event:', err));
+
+    res.status(201).json(order);
+  } catch (error) {
+    await db.query('ROLLBACK');
+    throw error;
+  } finally {
+    db.release();
+  }
+});
+
+// PATCH /orders/:id/confirm - confirmation flow
+app.patch('/orders/:id/confirm', async (req, res) => {
+  const { id } = req.params;
+  const { paymentMethodId } = req.body;
+
+  const db = await getPool().connect();
+
+  try {
+    await db.query('BEGIN');
+
+    // Lock order row
+    const orderResult = await db.query(
+      'SELECT * FROM orders WHERE id = $1 FOR UPDATE',
+      [id]
+    );
+
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orderResult.rows[0];
+
+    if (order.status !== 'PENDING') {
+      return res.status(400).json({ error: 'Invalid order state' });
+    }
+
+    // Process payment (external call)
+    const paymentResult = await processPayment(order.id, paymentMethodId);
+
+    if (paymentResult.success) {
+      await db.query(`
+        UPDATE orders SET status = 'CONFIRMED', updated_at = NOW()
+        WHERE id = $1
+      `, [id]);
+
+      // Publish events
+      await Promise.all([
+        publishEvent('order.confirmed', { orderId: id, paymentId: paymentResult.paymentId }),
+        publishEvent('payment.captured', {
+          orderId: id,
+          amount: paymentResult.amount,
+          paymentId: paymentResult.paymentId
+        })
+      ]);
+
+      res.json({ status: 'CONFIRMED', paymentId: paymentResult.paymentId });
+    } else {
+      await db.query(`
+        UPDATE orders SET status = 'PAYMENT_FAILED', updated_at = NOW()
+        WHERE id = $1
+      `, [id]);
+
+      await publishEvent('order.payment_failed', {
+        orderId: id,
+        reason: paymentResult.error
+      });
+
+      res.status(400).json({ error: 'Payment failed', reason: paymentResult.error });
+    }
+
+    await db.query('COMMIT');
+  } catch (error) {
+    await db.query('ROLLBACK');
+    throw error;
+  } finally {
+    db.release();
+  }
+});
+
+// Event publishing helper
+async function publishEvent(type: string, data: any): Promise<void> {
+  const topic = pubsub.topic(getTopicForEvent(type));
+
+  await topic.publishMessage({
+    attributes: {
+      eventType: type,
+      timestamp: new Date().toISOString(),
+      source: 'order-service',
+      version: '1.0'
+    },
+    data: Buffer.from(JSON.stringify(data))
+  });
+}
+
+function getTopicForEvent(type: string): string {
+  const topicMap: Record<string, string> = {
+    'order.created': 'order-events',
+    'order.confirmed': 'order-events',
+    'order.payment_failed': 'order-events',
+    'payment.captured': 'payment-events'
+  };
+  return topicMap[type] || 'generic-events';
+}
+```
+
+### Event Consumers - Cloud Functions with Eventarc
+
+```typescript
+// Email Service - Processes order events
+import { CloudEvent } from '@google-cloud/functions-framework';
+import { PubSub } from '@google-cloud/pubsub';
+import { MailerSend } from 'mailersend';
+
+const mailer = new MailerSend({
+  apiKey: process.env.MAILERSEND_API_KEY!
+});
+
+interface OrderEvent {
+  orderId: string;
+  customerId: string;
+  timestamp: string;
+}
+
+// Triggered by Pub/Sub push subscription
+exportconst sendOrderConfirmation = async (cloudEvent: CloudEvent<any>) => {
+  const eventData = JSON.parse(
+    Buffer.from(cloudEvent.data.message.data, 'base64').toString()
+  ) as OrderEvent;
+
+  if (cloudEvent.type !== 'order.confirmed') {
+    console.log('Skipping non-confirmation event');
+    return;
+  }
+
+  try {
+    const customer = await getCustomer(eventData.customerId);
+    const order = await getOrderDetails(eventData.orderId);
+
+    await mailer.send({
+      from: { email: 'orders@example.com', name: 'DevOps Blog' },
+      to: [{ email: customer.email, name: customer.name }],
+      subject: `Order Confirmed: #${order.id}`,
+      html: generateOrderEmail(order, customer),
+      text: generateOrderText(order, customer)
+    });
+
+    console.log(`Confirmation email sent for order ${eventData.orderId}`);
+  } catch (error) {
+    console.error('Failed to send confirmation email:', error);
+    throw error; // Will retry via dead letter queue
+  }
+};
+
+// Eventarc trigger - Cloud Storage events
+exportconst handleImageUpload = async (cloudEvent: CloudEvent<any>) => {
+  const { bucket, name } = cloudEvent.data;
+
+  console.log(`Processing image: gs://${bucket}/${name}`);
+
+  // Generate thumbnails
+  const thumbnails = await generateThumbnails(bucket, name);
+
+  // Publish completion event
+  const pubsub = new PubSub();
+  await pubsub.topic('image-processing-complete').publish({
+    attributes: {
+      eventType: 'image.processed',
+      bucket,
+      originalName: name
+    },
+    data: Buffer.from(JSON.stringify({
+      originalBucket: bucket,
+      originalName: name,
+      thumbnails,
+      processedAt: new Date().toISOString()
+    }))
+  });
+};
+
+// Scheduled consumer - Daily digest
+exportconst sendDailyDigest = async (cloudEvent: CloudEvent<any>) => {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const stats = await calculateDailyStats(yesterday);
+
+  const subscribers = await getActiveSubscribers();
+
+  await Promise.all(subscribers.map(subscriber =>
+    mailer.send({
+      to: [{ email: subscriber.email }],
+      subject: `Daily Digest - ${yesterday.toDateString()}`,
+      html: generateDigestEmail(stats)
+    })
+  ));
+
+  console.log(`Sent digest to ${subscribers.length} subscribers`);
+};
+```
+
+### Terraform for Event-Driven Infrastructure
+
+```hcl
+# Terraform - Pub/Sub and Eventarc Configuration
+
+variable "project_id" {
+  type = string
+}
+
+variable "region" {
+  type    = string
+  default = "us-central1"
+}
+
+# Pub/Sub Topics
+resource "google_pubsub_topic" "order_events" {
+  name = "order-events"
+
+  labels = {
+    environment = "production"
+    team        = "commerce"
+  }
+
+  message_retention_duration = "86400s"  # 24 hours
+}
+
+resource "google_pubsub_topic" "payment_events" {
+  name = "payment-events"
+
+  message_retention_duration = "86400s"
+}
+
+resource "google_pubsub_topic" "notification_events" {
+  name = "notification-events"
+}
+
+# Dead Letter Topics
+resource "google_pubsub_topic" "order_events_dlq" {
+  name = "order-events-dlq"
+}
+
+resource "google_pubsub_topic" "payment_events_dlq" {
+  name = "payment-events-dlq"
+}
+
+# Subscriptions with retry and dead letter configuration
+resource "google_pubsub_subscription" "email_service_order_sub" {
+  name  = "email-service-order-sub"
+  topic = google_pubsub_topic.order_events.name
+
+  ack_deadline_seconds = 60
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.order_events_dlq.id
+    max_delivery_attempts = 5
+  }
+
+  expiration_policy {
+    ttl = ""  # Never expires
+  }
+
+  enable_exactly_once_delivery = true  # Exactly-once semantics
+  retain_acked_messages        = true
+  retention_duration           = "604800s"  # 7 days
+}
+
+resource "google_pubsub_subscription" "analytics_order_sub" {
+  name  = "analytics-order-sub"
+  topic = google_pubsub_topic.order_events.name
+
+  ack_deadline_seconds = 30
+
+  # Analytics doesn't need retries, just process what we get
+  retry_policy {
+    minimum_backoff = "5s"
+    maximum_backoff = "30s"
+  }
+}
+
+resource "google_pubsub_subscription" "sms_service_payment_sub" {
+  name  = "sms-service-payment-sub"
+  topic = google_pubsub_topic.payment_events.name
+
+  ack_deadline_seconds = 45
+  retry_policy {
+    minimum_backoff = "15s"
+    maximum_backoff = "300s"
+  }
+
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.payment_events_dlq.id
+    max_delivery_attempts = 3
+  }
+
+  filter = "attributes.eventType IN [\""payment.captured\", \"payment.failed\"]"
+}
+
+# Cloud Storage trigger for Eventarc
+resource "google_storage_bucket" "uploads" {
+  name          = "${var.project_id}-uploads"
+  location      = var.region
+  storage_class = "STANDARD"
+
+  uniform_bucket_level_access = true
+
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+    condition {
+      age = 30  # Delete after 30 days
+    }
+  }
+}
+
+# Eventarc trigger for Cloud Storage
+resource "google_eventarc_trigger" "image_upload_trigger" {
+  name     = "image-upload-trigger"
+  location = var.region
+
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.storage.object.v1.finalized"
+  }
+
+  matching_criteria {
+    attribute = "bucket"
+    value     = google_storage_bucket.uploads.name
+  }
+
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.image_processor.name
+      region  = var.region
+    }
+  }
+
+  service_account = google_service_account.eventarc_trigger.email
+
+  transport {
+    pubsub_topic = google_pubsub_topic.storage_events.name
+  }
+}
+
+resource "google_pubsub_topic" "storage_events" {
+  name = "storage-events"
+}
+
+# Audit trigger for Cloud SQL events
+resource "google_eventarc_trigger" "database_audit_trigger" {
+  name     = "database-audit-trigger"
+  location = var.region
+
+  matching_criteria {
+    attribute = "type"
+    value     = "google.cloud.audit.log.v1.written"
+  }
+
+  matching_criteria {
+    attribute = "serviceName"
+    value     = "cloudsql.googleapis.com"
+  }
+
+  matching_criteria {
+    attribute = "methodName"
+    value     = "cloudsql.instances.connect"
+  }
+
+  destination {
+    cloud_run_service {
+      service = google_cloud_run_v2_service.audit_logger.name
+      region  = var.region
+    }
+  }
+}
+
+# Cloud Run - Image Processor Service
+resource "google_cloud_run_v2_service" "image_processor" {
+  name     = "image-processor"
+  location = var.region
+
+  template {
+    service_account = google_service_account.image_processor.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/image-processor:latest"
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "1Gi"
+        }
+      }
+    }
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 10
+    }
+  }
+}
+
+# Cloud Run - Audit Logger Service
+resource "google_cloud_run_v2_service" "audit_logger" {
+  name     = "audit-logger"
+  location = var.region
+
+  template {
+    service_account = google_service_account.audit_logger.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/audit-logger:latest"
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+      }
+    }
+
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 5
+    }
+  }
+}
+
+# Service Accounts
+resource "google_service_account" "eventarc_trigger" {
+  account_id = "eventarc-trigger-sa"
+}
+
+resource "google_service_account" "image_processor" {
+  account_id = "image-processor-sa"
+}
+
+resource "google_service_account" "audit_logger" {
+  account_id = "audit-logger-sa"
+}
+
+# IAM for Pub/Sub
+resource "google_pubsub_subscription_iam_member" "email_sub_publisher" {
+  subscription = google_pubsub_subscription.email_service_order_sub.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${google_service_account.image_processor.email}"
+}
+
+resource "google_pubsub_topic_iam_member" "order_topic_publisher" {
+  topic  = google_pubsub_topic.order_events.name
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${google_service_account.order_service.email}"
+}
+
+# BigQuery for event analytics
+resource "google_bigquery_dataset" "event_analytics" {
+  dataset_id    = "event_analytics"
+  friendly_name = "Event Analytics"
+  description   = "Stores processed event data for analytics"
+  location      = var.region
+
+  default_table_expiration = null  # No expiration for event data
+
+  labels = {
+    environment = "production"
+    team        = "analytics"
+  }
+}
+
+resource "google_bigquery_table" "order_events" {
+  dataset_id = google_bigquery_dataset.event_analytics.dataset_id
+  table_id   = "order_events"
+
+  time_partitioning {
+    type  = "DAY"
+    field = "event_timestamp"
+  }
+
+  clustering = ["event_type", "customer_id"]
+
+  schema = <<EOF
+[
+  {"name": "event_id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "event_type", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "event_timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
+  {"name": "order_id", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "customer_id", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "payload", "type": "JSON", "mode": "NULLABLE"},
+  {"name": "processed_at", "type": "TIMESTAMP", "mode": "REQUIRED"}
+]
+EOF
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### Pattern 1: Event Sourcing
+
+```typescript
+// Event Store implementation
+interface Event<T = any> {
+  id: string;
+  aggregateId: string;
+  type: string;
+  payload: T;
+  metadata: {
+    timestamp: string;
+    userId?: string;
+    correlationId?: string;
+  };
+  version: number;
+}
+
+class EventStore {
+  constructor(private db: Pool) {}
+
+  async append<T>(aggregateId: string, event: Omit<Event<T>, 'id' | 'version'>): Promise<Event<T>> {
+    const client = await this.db.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // Get current version
+      const versionResult = await client.query(`
+        SELECT COALESCE(MAX(version), 0) as version
+        FROM events WHERE aggregate_id = $1
+      `, [aggregateId]);
+
+      const newVersion = versionResult.rows[0].version + 1;
+
+      // Insert event
+      const insertResult = await client.query(`
+        INSERT INTO events (aggregate_id, type, payload, metadata, version, created_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        RETURNING *
+      `, [
+        aggregateId,
+        event.type,
+        JSON.stringify(event.payload),
+        JSON.stringify(event.metadata),
+        newVersion
+      ]);
+
+      await client.query('COMMIT');
+
+      return {
+        id: insertResult.rows[0].id,
+        aggregateId,
+        type: event.type,
+        payload: event.payload,
+        metadata: event.metadata,
+        version: newVersion
+      };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getEvents(aggregateId: string): Promise<Event[]> {
+    const result = await this.db.query(`
+      SELECT * FROM events
+      WHERE aggregate_id = $1
+      ORDER BY version ASC
+    `, [aggregateId]);
+
+    return result.rows.map(row => ({
+      id: row.id,
+      aggregateId: row.aggregate_id,
+      type: row.type,
+      payload: row.payload,
+      metadata: row.metadata,
+      version: row.version
+    }));
+  }
+
+  // Rebuild aggregate state
+  async rebuildState<T>(aggregateId: string): Promise<T> {
+    const events = await this.getEvents(aggregateId);
+
+    return events.reduce((state, event) => {
+      return applyEvent(state, event);
+    }, {} as T);
+  }
+}
+```
+
+### Pattern 2: Outbox Pattern for Reliable Events
+
+```typescript
+// Outbox pattern implementation
+class OrderService {
+  constructor(
+    private db: Pool,
+    private pubsub: PubSub
+  ) {}
+
+  async createOrder(orderData: OrderData): Promise<Order> {
+    const client = await this.db.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      // Insert order
+      const orderResult = await client.query(`
+        INSERT INTO orders (customer_id, total, status)
+        VALUES ($1, $2, 'PENDING')
+        RETURNING *
+      `, [orderData.customerId, orderData.total]);
+
+      const order = orderResult.rows[0];
+
+      // Insert into outbox table (transactional outbox)
+      await client.query(`
+        INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+        VALUES ('Order', $1, 'OrderCreated', $2)
+      `, [order.id, JSON.stringify({
+        orderId: order.id,
+        customerId: orderData.customerId,
+        total: orderData.total
+      })]);
+
+      await client.query('COMMIT');
+
+      return order;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+// Outbox processor (runs as separate service)
+exportconst processOutbox = async () => {
+  const outboxDb = await getOutboxPool();
+  const pubsub = new PubSub();
+
+  while (true) {
+    const events = await outboxDb.query(`
+      SELECT * FROM outbox
+      WHERE processed = false
+      ORDER BY created_at ASC
+      LIMIT 100
+      FOR UPDATE SKIP LOCKED
+    `);
+
+    for (const event of events.rows) {
+      try {
+        const topic = getTopicForEvent(event.event_type);
+
+        await pubsub.topic(topic).publishMessage({
+          attributes: {
+            eventType: event.event_type,
+            aggregateId: event.aggregate_id
+          },
+          data: Buffer.from(event.payload)
+        });
+
+        await outboxDb.query(
+          'UPDATE outbox SET processed = true, processed_at = NOW() WHERE id = $1',
+          [event.id]
+        );
+
+        console.log(`Published event ${event.id}`);
+      } catch (error) {
+        console.error(`Failed to publish event ${event.id}:`, error);
+      }
+    }
+
+    // Process every 100ms
+    await sleep(100);
+  }
+};
+```
+
+### Anti-patterns
+
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| Chatty events | Many small messages | Batch events, use message schemas |
+| Event versioning | Schema changes break consumers | Version in payload, backward compatibility |
+| Synchronous events | Tight coupling, cascade failures | Use async publishing |
+| No dead letter handling | Poison messages block queue | Configure DLQ, alerting |
+| Eventual consistency confusion | Data appears stale | Document consistency guarantees |
+
+## Monitoring
+
+### Event Processing Metrics
+
+```yaml
+# Cloud Monitoring metrics for Pub/Sub
+metrics:
+  - name: pubsub_subscription_backlog
+    type: pubsub.googleapis.com/subscription/num_undelivered_messages
+    filter: |
+      resource.type="pubsub_subscription" AND
+      resource.labels.subscription_id=~"order-events.*"
+
+  - name: event_processing_latency
+    type: custom.googleapis.com/event_processing_latency
+    filter: resource.type="cloud_run_revision"
+
+  - name: dlq_messages
+    type: pubsub.googleapis.com/subscription/dead_letter_message_count
+```
+
+### Alerting Configuration
+
+```hcl
+resource "google_monitoring_alert_policy" "dlq_backlog" {
+  display_name = "Dead Letter Queue Has Messages"
+  conditions {
+    display_name = "DLQ message count > 0"
+    condition_threshold {
+      filter = |
+        resource.type="pubsub_subscription" AND
+        metric.type="pubsub.googleapis.com/subscription/dead_letter_message_count" AND
+        metric.value > 0
+      duration = 300s
+      comparison = comparison.GT
+      threshold_value = 0
+    }
+  }
+}
+
+resource "google_monitoring_alert_policy" "high_backlog" {
+  display_name = "High Subscription Backlog"
+  conditions {
+    display_name = "Backlog > 10000 messages"
+    condition_threshold {
+      filter = |
+        resource.type="pubsub_subscription" AND
+        metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages" AND
+        metric.value > 10000
+      duration = 300s
+      comparison = comparison.GT
+      threshold_value = 10000
+    }
+  }
+}
+```
+
+## Security
+
+### Event Security Best Practices
+
+```typescript
+// Verify event authenticity
+import { CloudEvent } from '@google-cloud/functions-framework';
+
+exportconst secureEventHandler = async (cloudEvent: CloudEvent<any>) => {
+  // Eventarc provides verified events with signature
+  const authorization = cloudEvent.headers['ce-authorization'];
+
+  if (!authorization) {
+    throw new Error('Missing authorization header');
+  }
+
+  // Verify JWT from Eventarc
+  const token = authorization.replace('Bearer ', '');
+  const claims = await verifyJWT(token, process.env.EVENTARC_AUDIENCE!);
+
+  if (!claims) {
+    throw new Error('Invalid token');
+  }
+
+  // Process event
+  const data = cloudEvent.data;
+  // ...
+};
+```
+
+### IAM for Pub/Sub
+
+```hcl
+# Principle of least privilege for Pub/Sub
+resource "google_pubsub_subscription_iam_member" "email_subscriber" {
+  project    = var.project_id
+  subscription = google_pubsub_subscription.email_service_order_sub.name
+  role       = "roles/pubsub.subscriber"
+  member     = "serviceAccount:email-service@${var.project_id}.iam.gserviceaccount.com"
+}
+
+# Topic publishers restricted to specific services
+resource "google_pubsub_topic_iam_member" "order_service_publisher" {
+  project = var.project_id
+  topic   = google_pubsub_topic.order_events.name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:order-service@${var.project_id}.iam.gserviceaccount.com"
+}
+```
+
+## Cost Optimization
+
+### Pub/Sub Cost Management
+
+| Strategy | Savings | Implementation |
+|----------|---------|----------------|
+| Message batching | 30-50% | Accumulate messages, send every 100ms or 1KB |
+| Subscription filtering | 50%+ | Filter at subscription to avoid unnecessary processing |
+| Schema registration | 10-20% | Smaller messages, no JSON parsing |
+| Cloud Storage retention | Varies | 7 days vs 24 hours based on requirements |
+
+```hcl
+# Optimize subscription with filtering
+resource "google_pubsub_subscription" "filtered_sub" {
+  name  = "filtered-analytics-sub"
+  topic = google_pubsub_topic.order_events.name
+
+  # Only receive high-value events
+  filter = "attributes.eventType IN [\"order.completed\", \"order.refunded\"]"
+}
+```
+
+## Troubleshooting
+
+### Common Event-Driven Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| Events not processing | Subscription not created | Check Eventarc triggers |
+| Duplicate events | No exactly-once delivery | Enable exactly-once on subscription |
+| Events in DLQ | Processing failures | Check error logs, fix consumer |
+| High backlog | Consumer underprovisioned | Scale consumers, check errors |
+| Events out of order | Parallel processing | Use ordering key for critical events |
+
+### Debug Commands
+
+```bash
+# Check subscription backlog
+gcloud pubsub subscriptions describe email-service-order-sub --format=json
+
+# View unacked messages
+gcloud pubsub subscriptions seek email-service-order-sub \
+  --time=2024-01-01T00:00:00Z
+
+# View DLQ messages
+gcloud pubsub subscriptions describe order-events-dlq --format=json
+
+# Test event publishing
+gcloud pubsub topics publish order-events \
+  --message='{"orderId":"test-123","type":"order.created"}'
+
+# List Eventarc triggers
+gcloud eventarc triggers list --location=us-central1
+
+# Check Cloud Function logs
+gcloud functions logs read processOrderEvents --region us-central1
+```
+
+## Interview Questions
+
+### Q1: How do you ensure exactly-once delivery in event-driven systems?
+**Answer**: Enable `enable_exactly_once_delivery` on Pub/Sub subscriptions. On the consumer side, implement idempotency using deduplication keys (store processed event IDs with TTL). Use transactional outbox pattern to guarantee event publication alongside business data.
+
+### Q2: What is the outbox pattern and why use it?
+**Answer**: The outbox pattern solves the dual-write problem where updating a database and publishing an event aren't atomic. By writing events to an "outbox" table in the same transaction as business data, and having a separate process poll and publish those events, you guarantee at-least-once delivery without distributed transactions.
+
+### Q3: How do you handle schema evolution in events?
+**Answer**: Use versioning in the event type or payload. Maintain backward compatibility by adding optional fields rather than required. Version migrations should be handled by upcasters. Document schema changes and support old versions for a migration period. Consider schema registry for validation.
+
+### Q4: When would you use Eventarc over Pub/Sub directly?
+**Answer**: Eventarc for GCP event sources (Cloud Storage, Cloud Build, Cloud Scheduler) where you want Cloud Events standard format. Direct Pub/Sub for application-level events, cross-project communication, or when you need more control over message delivery.
+
+### Q5: How do you debug event flow issues?
+**Answer**: Use correlation IDs across all events. Enable Cloud Audit logs. Check subscription metrics (backlog, age). Use Cloud Trace for distributed tracing. Implement event replay testing. Monitor DLQ depth.
+
+## Cheat Sheet
+
+```bash
+# Create Pub/Sub topic
+gcloud pubsub topics create order-events
+
+# Create subscription with dead letter
+gcloud pubsub subscriptions create email-order-sub \
+  --topic=order-events \
+  --dead-letter-topic=order-events-dlq \
+  --max-delivery-attempts=5
+
+# Publish test message
+gcloud pubsub topics publish order-events \
+  --message='{"orderId":"123"}' \
+  --attribute=eventType=order.created
+
+# Create Eventarc trigger for Cloud Storage
+gcloud eventarc triggers create image-trigger \
+  --location=us-central1 \
+  --destination-run-service=image-processor \
+  --matching-criteria type=google.cloud.storage.object.v1.finalized \
+  --matching-criteria bucket=${BUCKET_NAME}
+
+# Check subscription metrics
+gcloud monitoring metrics list \
+  --filter "metric.type:pub"
+
+# View DLQ
+gcloud pubsub subscriptions describe order-events-dlq
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Platform architecture introduction
+- [Microservices](./microservices.mdx) - Service communication
+- [Serverless](./serverless.mdx) - Cloud Functions and Cloud Run
+- [Multi-Region](./multi-region.mdx) - Event replication across regions
+- [Disaster Recovery](./disaster-recovery.mdx) - Event recovery strategies

@@ -1,0 +1,764 @@
+---
+sidebar_position: 7
+---
+
+# Terraform Troubleshooting Guide
+
+## Overview
+
+Terraform is an infrastructure-as-code tool that manages complex, multi-cloud environments. When things go wrong, troubleshooting requires understanding Terraform's state management, provider interactions, and dependency resolution. This guide covers systematic approaches to diagnosing and fixing Terraform issues.
+
+## When To Use
+
+- **Plan/Apply Failures**: Terraform can't create or modify resources
+- **State Issues**: State drift, corruption, locking problems
+- **Provider Problems**: Authentication, version conflicts, API errors
+- **Dependency Issues**: Circular dependencies, resource ordering
+- **Configuration Errors**: Syntax issues, invalid references
+
+## When NOT To Use
+
+- **Cloud API Issues**: Direct debugging of provider APIs
+- **Application Deployment Issues**: These require app-level debugging
+- **Kubernetes Application Bugs**: Use K8s troubleshooting guide
+- **Network Infrastructure**: Use network troubleshooting guide
+
+## Core Concepts / Methodology
+
+### Terraform Debugging Philosophy
+
+Terraform has three phases that each have distinct debugging needs:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              TERRAFORM EXECUTION PHASES                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. INIT                                                   │
+│     └─ Download providers, modules                          │
+│     └─ Configure backends                                   │
+│     └─ Debug: TF_LOG=TRACE, provider version issues         │
+│                                                             │
+│  2. PLAN                                                   │
+│     ├─ Read current state                                  │
+│     ├─ Compare with desired state                          │
+│     ├─ Build dependency graph                              │
+│     └─ Debug: TF_LOG=DEBUG, state corruption               │
+│                                                             │
+│  3. APPLY                                                  │
+│     ├─ Execute resource creation/modification              │
+│     ├─ Handle provider API calls                           │
+│     ├─ Update state                                        │
+│     └─ Debug: TF_LOG=TRACE, concurrent updates             │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### The State Machine
+
+Understanding Terraform state is central to debugging:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              TERRAFORM STATE FLOW                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   Terraform Config                                          │
+│         │                                                   │
+│         ▼                                                   │
+│   ┌─────────────┐    ┌─────────────┐                       │
+│   │  Old State  │◄──►│ Backend     │                       │
+│   │  (local)    │    │ (S3, etc)   │                       │
+│   └─────────────┘    └─────────────┘                       │
+│         │                                                   │
+│         ▼                                                   │
+│   ┌─────────────┐    ┌─────────────┐                       │
+│   │ Provider    │◄──►│   Cloud     │                       │
+│   │  API        │    │   APIs      │                       │
+│   └─────────────┘    └─────────────┘                       │
+│         │                                                   │
+│         ▼                                                   │
+│   ┌─────────────┐                                          │
+│   │  New State  │                                          │
+│   └─────────────┘                                          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Diagnostic Commands / Tools
+
+### TF_LOG - Terraform Logging
+
+Terraform provides detailed logging through the `TF_LOG` environment variable:
+
+```bash
+# Enable debug logging
+export TF_LOG=DEBUG
+
+# Enable trace logging (most verbose)
+export TF_LOG=TRACE
+
+# Save logs to file
+export TF_LOG_PATH=/tmp/terraform.log
+
+# Log levels: TRACE, DEBUG, INFO, WARN, ERROR
+
+# Example trace output:
+# 2026-06-16T10:00:00.000Z [DEBUG] terraform.context: Evaluating Variable (expand_context)
+# 2026-06-16T10:00:00.001Z [TRACE] terraform.context: ReferenceTransformer: "var.environment" before: var.environment
+# 2026-06-16T10:00:00.002Z [DEBUG] plugin.terraform-provider: Calling provider defined
+```
+
+### terraform init - Initialization Debugging
+
+```bash
+# Verbose init
+TF_LOG=TRACE terraform init
+
+# Upgrade providers
+terraform init -upgrade
+
+# Force re-download providers
+rm -rf .terraform
+terraform init
+
+# Check provider versions
+terraform providers
+# Output:
+# provider registry.terraform.io/hashicorp/aws ~> 4.0
+```
+
+### terraform validate - Configuration Validation
+
+```bash
+# Validate configuration
+terraform validate
+
+# Output:
+# Success! The configuration is valid.
+
+# Common errors:
+# Error: Missing required argument
+#   on main.tf line 10:
+#   10: resource "aws_instance" "web" {
+#
+# An argument named "ami" is not expected here.
+
+# Check formatting
+terraform fmt -check
+```
+
+### terraform plan - Planning Debugging
+
+```bash
+# Detailed plan
+terraform plan -out=tfplan
+
+# Show plan details
+terraform show tfplan
+
+# Plan with variables file
+terraform plan -var-file=prod.tfvars
+
+# Target specific resource
+terraform plan -target=aws_instance.web
+
+# Refresh-only (update state without changes)
+terraform plan -refresh-only
+
+# State manipulation
+terraform state list                    # List all resources
+terraform state show aws_instance.web   # Show resource details
+terraform state pull                    # Pull remote state
+terraform state push                    # Force push state
+```
+
+### terraform graph - Dependency Visualization
+
+```bash
+# Generate dependency graph
+terraform graph | head -50
+
+# Output (DOT format):
+# digraph {
+#   compound = "true"
+#   newrank = "true"
+#   subgraph "root" {
+#     "[root] var.project_id" -> "[root] provider.aws"
+#     "[root] aws_vpc.main" -> "[root] provider.aws"
+#     "[root] aws_subnet.public" -> "[root] aws_vpc.main"
+#   }
+# }
+```
+
+### Backend Configuration Debugging
+
+```bash
+# S3 backend state operations
+aws s3 ls s3://my-terraform-state/
+
+# DynamoDB table for state locking
+aws dynamodb describe-table --table-name terraform-locks
+
+# Check for locks
+aws dynamodb scan --table-name terraform-locks --output json
+
+# Unlock state manually (use with caution!)
+terraform force-unlock <lock-id>
+```
+
+## Real Production Scenarios
+
+### Scenario 1: "Error: Provider Produced Inconsistent Result Plan"
+
+**Symptom:**
+- `terraform plan` fails with "Provider produced inconsistent result plan"
+- Error appears after configuration changes
+- Plan worked before but now fails
+
+**Diagnostic Commands:**
+```bash
+# Enable verbose logging
+TF_LOG=TRACE terraform plan 2>&1 | tail -200
+
+# Check state
+terraform state list
+terraform state show aws_instance.web
+
+# Verify actual infrastructure
+aws ec2 describe-instances --filters "Name=tag:Name,Values=web" --query 'Reservations[*].Instances[*].[InstanceId,State,Tags]'
+```
+
+**Sample error:**
+```
+Error: Provider produced inconsistent result plan
+
+  on main.tf line 20:
+  20: resource "aws_instance" "web" {
+
+Provider "provider[\"registry.terraform.io/hashicorp/aws\"]" planned an
+inconsistent value for module.web.aws_instance.compute:
+
+  Planned: <error: InvalidSnapshot.NotFound>
+  The plugin encountered an error.
+```
+
+**Root Cause:**
+Terraform state referenced an EBS snapshot that was deleted outside of Terraform. The AWS provider tried to create an instance with a snapshot that no longer existed, causing an inconsistent plan.
+
+**Fix:**
+```bash
+# Import the existing instance into state
+terraform import aws_instance.web i-0123456789abcdef0
+
+# Or remove stale state and let Terraform recreate
+terraform state mv aws_instance.web aws_instance.web-old
+terraform plan  # Now shows plan to create new instance
+
+# Verify what AWS actually has
+aws ec2 describe-instances --instance-ids i-0123456789abcdef0
+```
+
+**Prevention:**
+- Use remote state with versioning (S3 with versioning)
+- Implement state lock (DynamoDB)
+- Always run `terraform plan` before `apply`
+- Tag all resources for identification
+- Set up state file backup and versioning
+
+---
+
+### Scenario 2: Terraform State Lock Stuck
+
+**Symptom:**
+- `terraform apply` hangs forever
+- Error: "Error: Error acquiring the state lock"
+- Lock was not released after interrupted apply
+
+**Diagnostic Commands:**
+```bash
+# Check if lock exists
+terraform state pull | jq '.terraform_version'
+
+# List state resources
+terraform state list
+
+# With AWS backend, check DynamoDB
+aws dynamodb scan --table-name terraform-locks \
+  --output json --filter-expression "LockID = :lockid" \
+  --expression-attribute-values '{":lockid":{"S":"my-project/terraform.tfstate"}}'
+
+# Sample output showing locked state:
+# {
+#     "Items": [
+#         {
+#             "LockID": {"S": "my-project/terraform.tfstate"},
+#             "ID": {"S": "abc-123-def-456"},
+#             "Operation": {"S": "OperationTypeApply"},
+#             "Who": {"S": "user@host"},
+#             "Created": {"S": "2026-06-16T10:00:00Z"},
+#             "Info": {"S": "{\"Reason\":\"...\"}"}
+#         }
+#     ]
+# }
+```
+
+**Root Cause:**
+The previous `terraform apply` was interrupted (Ctrl+C or network failure) and the state lock was not released. The lock automatically expires after a timeout, but in some cases it can get stuck.
+
+**Fix:**
+```bash
+# Force unlock (use only if you're sure no other operation is running)
+terraform force-unlock abc-123-def-456
+
+# Output:
+# Do you really want to force-unlock?
+#   Terraform will delete the lock from the state file.
+#   Your infrastructure will not be modified.
+
+# If terraform force-unlock doesn't work (older versions)
+# Manually remove lock from DynamoDB:
+aws dynamodb delete-item \
+  --table-name terraform-locks \
+  --key '{"LockID": {"S": "my-project/terraform.tfstate"}}'
+
+# Verify unlock
+terraform plan  # Should not hang now
+```
+
+**Prevention:**
+- Set `lock_timeout` in backend configuration
+- Never interrupt running terraform operations
+- Use `-lock-timeout` flag for long operations
+- Implement proper CI/CD pipeline that handles interrupts gracefully
+
+---
+
+### Scenario 3: Circular Dependency Detected
+
+**Symptom:**
+- `terraform plan` fails with circular dependency error
+- Error: "Cycle: resource A depends on resource B, which depends on resource A"
+- Configuration changed, then broke
+
+**Diagnostic Commands:**
+```bash
+# Show dependency graph
+terraform graph | grep -A5 -B5 "aws_instance"
+
+# State the error clearly
+# Error: Cycle: "aws_alb" depends on "aws_instance"
+#                           "aws_instance" depends on "aws_security_group"
+#                           "aws_security_group" depends on "aws_alb"
+
+# Check for implicit dependencies
+terraform graph | dot -Tpng > dependencies.png
+
+# Analyze the cycle
+grep -r "depends_on" *.tf | grep -E "aws_alb|aws_instance|aws_security_group"
+```
+
+**Root Cause:**
+The ALB was configured with a security group that allowed traffic only from instances registered with the ALB. This created a circular dependency:
+1. ALB needs security group to be created
+2. Security group rule allows traffic from ALB's subnet
+3. But ALB needs to be created first to know the subnet
+
+**Fix:**
+```hcl
+# Solution 1: Use separate security group for ALB
+resource "aws_security_group" "alb" {
+  name        = "alb-sg"
+  vpc_id      = aws_vpc.main.id
+
+  # No dependency on instance security group
+  ingress {
+    from        = 0.0.0.0/0
+    to_port     = 443
+    protocol    = "tcp"
+  }
+}
+
+resource "aws_alb" "main" {
+  security_groups = [aws_security_group.alb.id]
+  # ALB doesn't need instance security group
+}
+
+resource "aws_security_group" "instance" {
+  name        = "instance-sg"
+  vpc_id      = aws_vpc.main.id
+
+  # Can now reference ALB security group (no cycle)
+  ingress {
+    from                = aws_security_group.alb.id
+    to_port             = 8080
+    protocol            = "tcp"
+  }
+}
+```
+
+**Prevention:**
+- Avoid circular dependencies by design
+- Use separate security groups with explicit, non-circular dependencies
+- Document dependency requirements before writing Terraform
+- Review `terraform graph` output before applying
+
+---
+
+### Scenario 4: Resource Recreation Storms After State Drift
+
+**Symptom:**
+- `terraform plan` shows massive infrastructure changes
+- Almost all resources show as needing recreation
+- No actual configuration changes were made
+
+**Diagnostic Commands:**
+```bash
+# Check plan output
+terraform plan 2>&1 | grep -E "Plan:|-+|~|-|Plan: 0 to add"
+
+# Sample output showing recreation storm:
+# Plan: 150 to add, 0 to change, 200 to destroy  ← RED FLAG!
+
+# Verify what's actually changed
+terraform plan -detailed-exitcode
+
+# Check for differences between state and config
+terraform show
+terraform config 2>/dev/null || cat terraform.tf
+
+# Check state file modification time
+stat terraform.tfstate
+
+# Compare with actual resources
+aws ec2 describe-instances --query 'Reservations[*].Instances[*].{ID:InstanceId,Tags:Tags,AMI:ImageId}'
+```
+
+**Root Cause:**
+The Terraform state file was manually edited to add a new instance, but the actual AWS resource was deleted by a separate process. When Terraform ran, it detected the state had an instance but AWS didn't, so it planned to recreate it along with 199 other resources due to interdependent relationships.
+
+**Fix:**
+```bash
+# Option 1: Reconcile state with reality
+terraform refresh
+# This updates state to match actual infrastructure
+
+# Option 2: Remove stale resources from state
+terraform state rm aws_instance.stale-instance
+terraform state rm aws_ebs_volume.stale-volume
+
+# Option 3: Import missing resources into state
+terraform import aws_instance.existing-instance i-0123456789abcdef0
+
+# After cleanup, verify clean plan
+terraform plan  # Should show minimal or no changes
+```
+
+**Prevention:**
+- Never manually edit state file
+- Use `-refresh=true` (default) to detect drift
+- Implement drift detection in CI/CD
+- Use `lifecycle` blocks to prevent unwanted recreation:
+```hcl
+resource "aws_instance" "web" {
+  ami           = var.ami
+  instance_type = "t3.micro"
+
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy       = false  # Set true for critical resources
+    ignore_changes        = [tags]  # Ignore tag changes
+  }
+}
+```
+
+---
+
+### Scenario 5: Backend Authentication Failure with S3
+
+**Symptom:**
+- `terraform init` fails with authentication error
+- Error: "Error configuring the backend S3: No valid credential sources found"
+- Previously working configuration now fails
+
+**Diagnostic Commands:**
+```bash
+# Run with verbose logging
+TF_LOG=TRACE terraform init 2>&1 | grep -i "error\|auth\|credential"
+
+# Sample error:
+# 2026-06-16T10:00:00.000Z [ERROR] terraform.backend: Failed to configure backend:
+# 2026-06-16T10:00:00.001Z [ERROR] terraform.backend: S3: No valid credential sources found
+# 2026-06-16T10:00:00.002Z [ERROR] terraform.backend: Details: NoCredentialProviders: no valid providers in chain
+
+# Check AWS environment
+env | grep AWS
+# AWS_DEFAULT_REGION=us-east-1
+# (but no AWS_ACCESS_KEY_ID!)
+
+# Check AWS config
+cat ~/.aws/config
+cat ~/.aws/credentials
+
+# Verify AWS CLI works
+aws sts get-caller-identity
+# If this fails, fix AWS credentials first
+```
+
+**Root Cause:**
+The AWS access key used by Terraform had been rotated 30 days prior, but the `~/.aws/credentials` file was not updated. The IAM user was disabled after rotation grace period expired.
+
+**Fix:**
+```bash
+# Option 1: Update credentials file
+cat >> ~/.aws/credentials << 'EOF'
+[default]
+aws_access_key_id = AKIA_NEW_KEY_ID
+aws_secret_access_key = new-secret-access-key
+EOF
+
+# Option 2: Use environment variables
+export AWS_ACCESS_KEY_ID=AKIA_NEW_KEY_ID
+export AWS_SECRET_ACCESS_KEY=new-secret-access-key
+
+# Option 3: Use IAM roles (for EC2)
+# Attach IAM role to EC2 instance
+aws ec2 associate-iam-instance-profile \
+  --instance-id i-0123456789abcdef0 \
+  --iam-instance-profile Name=TerraformRole
+
+# Option 4: Use Assume Role
+# Configure role assumption in backend:
+# backend "s3" {
+#   role_arn = "arn:aws:iam::123456789:role/TerraformRole"
+# }
+
+# Verify fix
+terraform init
+```
+
+**Prevention:**
+- Use IAM roles instead of access keys where possible
+- Implement automatic credential rotation
+- Use Workload Identity Federation for CI/CD
+- Set up credential expiration alerts
+- Document credential refresh procedures
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Terraform Apply Fails
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: IDENTIFY THE FAILING RESOURCE                       │
+├─────────────────────────────────────────────────────────────┤
+│ Check the error output:                                     │
+│ Error: Error creating EC2 instance: InvalidAMIID.NotFound   │
+│   on main.tf line 25, in resource "aws_instance" "web"     │
+│                                                              │
+│ The error tells you which resource and what failed          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK PLAN FILE                                     │
+├─────────────────────────────────────────────────────────────┤
+│ # Run plan to see exactly what will be created              │
+│ terraform plan -out=tfplan                                 │
+│ terraform show tfplan | grep -A20 "aws_instance.web"        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: VERIFY RESOURCE EXISTS IN CLOUD                     │
+├─────────────────────────────────────────────────────────────┤
+│ # For the failing resource, check if it already exists      │
+│ aws ec2 describe-instances --filters "Name=tag:Name,Values=web"│
+│                                                              │
+│ If it exists but plan tries to create → State mismatch      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK PROVIDER DOCUMENTATION                        │
+├─────────────────────────────────────────────────────────────┤
+│ # The AMI might be deprecated or region-specific            │
+│ Check AWS provider docs for correct AMI IDs                 │
+│                                                              │
+│ # Use AWS Systems Manager for latest AMI                    │
+│ data "aws_ssm_parameter" "latest_ami" {                     │
+│   name = "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2" │
+│ }                                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: State Drift
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: DETECT DRIFT                                        │
+├─────────────────────────────────────────────────────────────┤
+│ # Run plan to see differences                               │
+│ terraform plan -refresh=true                                │
+│                                                              │
+│ If changes exist but you made no changes → Drift detected   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: IDENTIFY DRIFTED RESOURCES                          │
+├─────────────────────────────────────────────────────────────┤
+│ # Focus on resources that show changes                      │
+│ terraform plan 2>&1 | grep "~" | head -20                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: DECIDE RESOLUTION STRATEGY                          │
+├─────────────────────────────────────────────────────────────┤
+│ Option A: Update state to match actual (if changes are OK)  │
+│ $ terraform apply -refresh-only                             │
+│                                                              │
+│ Option B: Update infrastructure to match config             │
+│ $ terraform apply                                           │
+│                                                              │
+│ Option C: Import existing resource                          │
+│ $ terraform import RESOURCE.ID ACTUAL_ID                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: PREVENT FUTURE DRIFT                                │
+├─────────────────────────────────────────────────────────────┤
+│ - Use `lifecycle { ignore_changes }` for managed attributes │
+│ - Set up drift detection in CI/CD                           │
+│ - Implement policy as code (Sentinel, OPA)                 │
+│ - Use immutable infrastructure patterns                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `inconsistent result plan` | State/resource mismatch | `terraform refresh`, `terraform import` |
+| `acquiring lock` timeout | State locked by another operation | Wait, or `terraform force-unlock` |
+| `circular dependency` | Resource A depends on B which depends on A | Restructure dependencies |
+| `provider not initialized` | Run `terraform init` | Download providers |
+| `invalid reference` | Variable not defined | Check variable spelling, references |
+| `resource already exists` | State/actual mismatch | `terraform import` or remove resource |
+| `attribute required` | Missing required argument | Add required attribute |
+| `timeout while waiting` | Resource creation took too long | Use `timeouts` block to increase timeout |
+
+## Monitoring / Log Analysis
+
+### Terraform State Management Best Practices
+
+```bash
+# Enable state locking (S3 + DynamoDB)
+# backend "s3" {
+#   bucket         = "terraform-state"
+#   key            = "prod/terraform.tfstate"
+#   region         = "us-east-1"
+#   dynamodb_table = "terraform-locks"
+#   encrypt        = true
+# }
+
+# State versioning (S3)
+# S3 bucket versioning should be enabled
+
+# Verify state integrity
+terraform state pull | jq '.resources | length'
+```
+
+### CI/CD Terraform Monitoring
+
+```bash
+# Set required environment for CI
+export TF_IN_AUTOMATION=true
+export TF_LOG=ERROR  # Reduce log noise in CI
+
+# Enable cost estimation (requires Terraform Cloud)
+# terraform plan -cost-estimation
+
+# Check for security issues
+tfsec /path/to/terraform
+checkov -d /path/to/terraform
+```
+
+## Interview Questions
+
+### Question 1: State Corruption
+
+**Q:** Your Terraform state file is corrupted and `terraform plan` produces incorrect results. How do you fix it?
+
+**A:**
+1. **Never panic or directly edit state** - manual edits can make things worse
+2. If backed up, restore from backup: `terraform state push` backup
+3. Use `terraform refresh` to reconcile with actual state
+4. If unrecoverable, consider:
+   - `terraform import` critical resources to new state
+   - `terraform state rm` for orphaned resources
+   - Rebuild from scratch (last resort)
+5. Implement proper state backup and versioning going forward
+
+### Question 2: Provider Issues
+
+**Q:** Terraform provider keeps failing with authentication errors. Walk me through debugging.
+
+**A:**
+1. Check provider version compatibility: `terraform providers`
+2. Verify provider authentication method:
+   - Environment variables set?
+   - Shared credentials file present?
+   - IAM role configured (for EC2)?
+3. Run with `TF_LOG=TRACE` to see exact auth flow
+4. Test credentials outside Terraform: `aws sts get-caller-identity`
+5. Check if provider requires explicit credentials config
+6. Try updating provider version (breaking changes in major versions)
+
+### Question 3: Large Plan Output
+
+**Q:** `terraform plan` shows 500+ resources to change but you only made minor config edits. What's happening?
+
+**A:**
+This usually indicates state drift or provider bug:
+
+1. **State drift**: Infrastructure changed outside Terraform
+   - Check: `terraform plan -refresh=true`
+   - Fix: `terraform apply -refresh-only` or import missing resources
+
+2. **Provider bug**: Some providers recreate resources unnecessarily
+   - Check: Provider changelog for known issues
+   - Fix: Update provider or use `lifecycle.ignore_changes`
+
+3. **Imported resources**: Resources were imported without proper lifecycle
+   - Fix: Add `lifecycle { prevent_destroy = true }` where appropriate
+
+4. **Workspace issues**: Wrong workspace selected
+   - Check: `terraform workspace show`
+
+## Cheat Sheet
+
+| Command | Purpose |
+|---------|---------|
+| `terraform init` | Initialize working directory |
+| `terraform validate` | Validate configuration |
+| `terraform plan` | Create execution plan |
+| `terraform apply` | Apply changes |
+| `terraform destroy` | Destroy managed resources |
+| `terraform state list` | List resources in state |
+| `terraform state show` | Show resource details |
+| `terraform state mv` | Rename resource in state |
+| `terraform state rm` | Remove from state |
+| `terraform import` | Import existing resource |
+| `terraform refresh` | Update state to match reality |
+| `terraform graph` | Show dependency graph |
+| `terraform force-unlock` | Remove state lock |
+| `TF_LOG=TRACE` | Enable verbose logging |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [GCP Troubleshooting](./gcp-troubleshooting) - Cloud infrastructure debugging
+- [Common Issues](./common-issues) - Frequently occurring problems

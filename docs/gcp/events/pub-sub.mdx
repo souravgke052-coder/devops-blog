@@ -1,0 +1,574 @@
+# Pub/Sub
+
+## Overview
+
+Google Cloud Pub/Sub is a fully managed, real-time messaging service that enables asynchronous communication between services. It provides at-least-once delivery with replay, fan-out patterns, and dead-letter queues for failed message handling. Pub/Sub decouples senders and receivers, allowing independent scaling and fault tolerance.
+
+## When To Use
+
+- Real-time analytics pipelines
+- Event-driven microservices
+- Game event processing
+- IoT data ingestion
+- Workflow orchestration triggers
+- Fan-out to multiple consumers
+- Building event-driven architectures
+
+## When NOT To Use
+
+- Synchronous request-response patterns (use gRPC/HTTP)
+- Message ordering guarantees required (use partitioning)
+- Transactional message groups (use dedicated queue)
+- Very low latency (< 10ms) requirements
+- Mobile push notifications (use FCM)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Cloud Pub/Sub                          │
+├─────────────────────────────────────────────────────────────┤
+│  Components:                                                │
+│  ├── Topic     (Message channel)                           │
+│  ├── Subscription (Consumer endpoint)                      │
+│  ├── Message   (Data payload with attributes)              │
+│  └── Dead Letter Topic (Failed message storage)            │
+├─────────────────────────────────────────────────────────────┤
+│  Delivery:                                                  │
+│  ├── At-least-once delivery                                │
+│  ├── Message replay (configurable retention)               │
+│  ├── Acknowledgment deadline (10s - 10min)                 │
+│  └── Retry with exponential backoff                        │
+├─────────────────────────────────────────────────────────────┤
+│  Patterns:                                                  │
+│  ├── Push (HTTP endpoint)                                  │
+│  ├── Pull (Client-controlled)                              │
+│  └── BigQuery subscription (streaming insert)              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Topic
+Named channel for messages. Publishers send messages to topics.
+
+### Subscription
+Link between topic and consumer. Defines how messages are delivered.
+
+### Message
+Data payload with optional attributes (key-value metadata).
+
+### Publisher
+Service that sends messages to topics.
+
+### Subscriber
+Service that receives messages from subscriptions.
+
+### Dead Letter Topic
+Subscription for messages that fail processing after max retries.
+
+## Real Production Example
+
+**Real-time Analytics Pipeline**
+
+```hcl
+# Terraform configuration for event streaming pipeline
+
+# Create topic for user events
+resource "google_pubsub_topic" "user_events" {
+  name = "user-events-${var.environment}"
+  
+  labels = {
+    environment = var.environment
+    component   = "events"
+  }
+  
+  message_retention_duration = "86400s"  # 24 hours
+}
+
+# Create topic for analytics
+resource "google_pubsub_topic" "analytics" {
+  name = "analytics-${var.environment}"
+  
+  labels = {
+    environment = var.environment
+  }
+}
+
+# Dead letter topic for failed messages
+resource "google_pubsub_topic" "user_events_dlq" {
+  name = "user-events-dlq-${var.environment}"
+}
+
+# Subscription for Dataflow processing
+resource "google_pubsub_subscription" "analytics_processor" {
+  name  = "analytics-processor-${var.environment}"
+  topic = google_pubsub_topic.user_events.name
+  
+  ack_deadline_seconds       = 60
+  message_retention_duration = "604800s"  # 7 days
+  retain_acked_messages      = false
+  
+  expiration_policy {
+    ttl = ""  # Never expires
+  }
+  
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.user_events_dlq.id
+    max_delivery_attempts = 5
+  }
+  
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+  
+  labels = {
+    consumer = "dataflow"
+  }
+}
+
+# Fan-out subscription for real-time dashboard
+resource "google_pubsub_subscription" "dashboard" {
+  name  = "dashboard-${var.environment}"
+  topic = google_pubsub_topic.analytics.name
+  
+  ack_deadline_seconds = 30
+  
+  filter = "attributes.event_type = \"purchase\" OR attributes.event_type = \"signup\""
+  
+  labels = {
+    consumer = "dashboard"
+  }
+}
+
+# BigQuery subscription for data warehouse
+resource "google_pubsub_subscription" "bigquery" {
+  name  = "bigquery-${var.environment}"
+  topic = google_pubsub_topic.user_events.name
+  
+  bigquery_config {
+    table = "${var.project}:analytics.user_events"
+    
+    use_topic_schema = true
+    drop_unknown_fields = true
+  }
+  
+  labels = {
+    consumer = "bigquery"
+  }
+}
+
+# Subscription for push to Cloud Functions
+resource "google_pubsub_subscription" "function_trigger" {
+  name  = "function-trigger-${var.environment}"
+  topic = google_pubsub_topic.user_events.name
+  
+  push_config {
+    push_endpoint = google_cloudfunctions2_function.event_handler.https_trigger.url
+    
+    attributes = {
+      x-goog-channel = "my-channel"
+    }
+    
+    oidc_token {
+      service_account_email = google_service_account.pubsub_sa.email
+      audience             = google_cloudfunctions2_function.event_handler.https_trigger.url
+    }
+  }
+  
+  ack_deadline_seconds = 30
+  
+  labels = {
+    consumer = "functions"
+  }
+}
+
+# IAM for Pub/Sub
+resource "google_pubsub_topic_iam_member" "publisher" {
+  topic  = google_pubsub_topic.user_events.name
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${google_service_account.app_sa.email}"
+}
+
+resource "google_pubsub_subscription_iam_member" "subscriber" {
+  subscription = google_pubsub_subscription.analytics_processor.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${google_service_account.dataflow_sa.email}"
+}
+```
+
+## CLI Examples
+
+```bash
+# Create topic
+gcloud pubsub topics create my-topic
+
+# Create topic with message retention
+gcloud pubsub topics create my-topic \
+  --message-retention-duration=86400s
+
+# List topics
+gcloud pubsub topics list
+
+# Publish message
+gcloud pubsub topics publish my-topic \
+  --message="Hello World" \
+  --attribute=type=greeting
+
+# Create subscription
+gcloud pubsub subscriptions create my-subscription \
+  --topic=my-topic
+
+# Create pull subscription
+gcloud pubsub subscriptions create my-pull-sub \
+  --topic=my-topic \
+  --ack-deadline=60
+
+# Create push subscription
+gcloud pubsub subscriptions create my-push-sub \
+  --topic=my-topic \
+  --push-endpoint=https://my-function.cloudfunctions.net/my-function
+
+# Create BigQuery subscription
+gcloud pubsub subscriptions create my-bq-sub \
+  --topic=my-topic \
+  --bigquery-table=my-project:dataset.table
+
+# List subscriptions
+gcloud pubsub subscriptions list
+
+# Pull messages (ack to acknowledge)
+gcloud pubsub subscriptions pull my-subscription \
+  --auto-ack \
+  --limit=10
+
+# Pull without ack (manual processing)
+gcloud pubsub subscriptions pull my-subscription --limit=5
+
+# Seek to timestamp (reprocess messages)
+gcloud pubsub subscriptions seek my-subscription \
+  --time=2024-01-15T10:00:00Z
+
+# Seek to snapshot
+gcloud pubsub subscriptions seek my-subscription \
+  --snapshot=my-snapshot
+
+# Update subscription
+gcloud pubsub subscriptions update my-subscription \
+  --ack-deadline=120 \
+  --retain-acked-messages
+
+# Configure dead letter policy
+gcloud pubsub subscriptions update my-subscription \
+  --dead-letter-topic=my-dlq-topic \
+  --max-delivery-attempts=5
+
+# Create snapshot for replay
+gcloud pubsub snapshots create my-snapshot \
+  --subscription=my-subscription
+
+# Delete subscription
+gcloud pubsub subscriptions delete my-subscription
+
+# Delete topic
+gcloud pubsub topics delete my-topic
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Topic with schema
+resource "google_pubsub_topic" "events" {
+  name = "events"
+  
+  message_retention_duration = "86400s"
+  
+  schema_settings {
+    schema   = google_pubsub_schema.schema.id
+    encoding = "JSON"
+  }
+  
+  labels = {
+    environment = "production"
+  }
+}
+
+# Schema for Avro/Protobuf
+resource "google_pubsub_schema" "schema" {
+  name = "event-schema"
+  type = "AVRO"
+  
+  definition = jsonencode({
+    type = "record",
+    name = "Event",
+    fields = [
+      { name = "event_id", type = "string" },
+      { name = "event_type", type = "string" },
+      { name = "timestamp", type = "string" },
+      { name = "user_id", type = "string" },
+    ]
+  })
+}
+
+# Subscription with retry and dead letter
+resource "google_pubsub_subscription" "events_sub" {
+  name  = "events-sub"
+  topic = google_pubsub_topic.events.name
+  
+  ack_deadline_seconds       = 60
+  message_retention_duration = "604800s"
+  retain_acked_messages      = false
+  
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.dlq.id
+    max_delivery_attempts = 5
+  }
+  
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+}
+
+# Push subscription with OIDC
+resource "google_pubsub_subscription" "push_sub" {
+  name  = "push-sub"
+  topic = google_pubsub_topic.events.name
+  
+  push_config {
+    push_endpoint = "https://api.example.com/webhook"
+    
+    oidc_token {
+      service_account_email = "sa@project.iam.gserviceaccount.com"
+      audience             = "https://api.example.com"
+    }
+  }
+}
+
+# BigQuery subscription
+resource "google_pubsub_subscription" "bq_sub" {
+  name  = "bq-sub"
+  topic = google_pubsub_topic.events.name
+  
+  bigquery_config {
+    table               = "project.dataset.table"
+    use_topic_schema    = true
+    drop_unknown_fields = true
+  }
+}
+
+# IAM
+resource "google_pubsub_topic_iam_member" "publisher" {
+  topic = google_pubsub_topic.events.name
+  role  = "roles/pubsub.publisher"
+  member = "serviceAccount:app@project.iam.gserviceaccount.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Topics
+gcloud pubsub topics create TOPIC [flags]
+gcloud pubsub topics list
+gcloud pubsub topics describe TOPIC
+gcloud pubsub topics publish TOPIC --message=MSG [--attribute=KEY=VALUE]
+gcloud pubsub topics delete TOPIC
+
+# Subscriptions
+gcloud pubsub subscriptions create SUB --topic=TOPIC [flags]
+gcloud pubsub subscriptions list
+gcloud pubsub subscriptions describe SUB
+gcloud pubsub subscriptions pull SUB [--auto-ack] [--limit=N]
+gcloud pubsub subscriptions update SUB [flags]
+gcloud pubsub subscriptions delete SUB
+
+# Snapshots and Seek
+gcloud pubsub snapshots create SNAP --subscription=SUB
+gcloud pubsub subscriptions seek SUB --snapshot=SNAP
+gcloud pubsub subscriptions seek SUB --time=TIMESTAMP
+```
+
+## Monitoring
+
+### Key Metrics
+- **Published messages**: Messages published per second
+- **Publish latency**: Time to publish
+- **Subscription backlog**: Unprocessed messages
+- **Ack latency**: Time to acknowledge
+- **Dead letter messages**: Failed messages
+- **Byte traffic**: Publish/download rates
+
+### Cloud Monitoring
+
+```bash
+# Create alert for backlog
+gcloud monitoring policies create \
+  --display-name="Pub/Sub Backlog Alert" \
+  --condition-display-name="Backlog > 1000" \
+  --condition-filter='resource.type="pubsub_subscription" AND metric.type="pubsub.googleapis.com/subscription/num_undelivered_messages"' \
+  --condition-threshold-value=1000 \
+  --notification-channels=CHANNEL_ID
+
+# Monitor publish rate
+gcloud monitoring metrics read \
+  "pubsub.googleapis.com/topic/publish_request_count"
+```
+
+## Security
+
+### IAM Permissions
+```bash
+# Publisher role
+gcloud pubsub topics add-iam-policy-binding my-topic \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/pubsub.publisher
+
+# Subscriber role
+gcloud pubsub subscriptions add-iam-policy-binding my-sub \
+  --member=serviceAccount:worker@project.iam.gserviceaccount.com \
+  --role=roles/pubsub.subscriber
+
+# Admin role
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:admin@company.com \
+  --role=roles/pubsub.admin
+```
+
+### Encryption
+- At rest: Google-managed encryption
+- In transit: TLS 1.2+
+- CMEK: Not available for Pub/Sub
+
+## Cost Optimization
+
+### Pricing
+| Operation | Price |
+|-----------|-------|
+| Publish (per 64KB) | $0.04/million |
+| Deliver (per 64KB) | $0.04/million |
+| Storage (per byte-day) | $0.00005 |
+
+### Optimization Tips
+- Batch messages before publishing
+- Use message attributes efficiently (small payloads)
+- Configure appropriate ack deadlines
+- Set retention duration based on reprocessing needs
+
+## Troubleshooting
+
+### Messages Not Delivered
+```bash
+# Check subscription exists
+gcloud pubsub subscriptions list
+
+# Check backlog
+gcloud pubsub subscriptions describe my-sub --format="yaml(backlogLocation,numUndelliveredMessages)"
+
+# Check IAM permissions
+gcloud pubsub subscriptions get-iam-policy my-sub
+```
+
+### Push Not Working
+```bash
+# Verify push endpoint
+curl -X POST https://push-endpoint.com/webhook -d "{}"
+
+# Check push config
+gcloud pubsub subscriptions describe my-sub --format="yaml(pushConfig)")
+
+# Check OIDC audience
+gcloud pubsub subscriptions describe my-sub --format="yaml(pushConfig.oidcToken)"
+```
+
+### Duplicate Messages
+```bash
+# Pub/Sub provides at-least-once delivery
+# Enable idempotent processing in subscribers:
+# - Use message ID for deduplication
+# - Store processed message IDs with TTL
+```
+
+## Interview Questions
+
+**Q: What is the difference between push and pull subscriptions?**
+A: Pull subscriptions let your subscriber code request messages when ready - you control the polling rate. Push subscriptions push messages to your endpoint - Google handles delivery. Pull is better for batch processing; push for real-time event handling.
+
+**Q: How does Pub/Sub ensure message delivery?**
+A: Pub/Sub provides at-least-once delivery with acknowledgments. Messages remain in subscription until acked or until ack deadline expires. Unacked messages are redelivered. For exactly-once semantics (in preview), enable exactly-once delivery on the subscription.
+
+**Q: What is a dead letter topic and when use it?**
+A: A dead letter topic receives messages that fail processing after max delivery attempts. Use it to separate problematic messages for later analysis, prevent blocking processing of good messages, and implement retry queues.
+
+**Q: How do you process messages in order?**
+A: Pub/Sub doesn't guarantee global ordering. For ordering, use message ordering key (same key = same consumer) or use a single consumer. For partial ordering, use per-key partitioning with separate subscriptions.
+
+**Q: What's the difference between retain_acked_messages and message_retention_duration?**
+A: `message_retention_duration` controls how long unacked messages are kept (1-7 days). `retain_acked_messages` controls whether acked messages are kept for replay. If you need message replay, enable `retain_acked_messages=true`.
+
+## Cheat Sheet
+
+```bash
+# Topic management
+gcloud pubsub topics create my-topic
+gcloud pubsub topics publish my-topic --message="hello"
+
+# Subscription management
+gcloud pubsub subscriptions create my-sub --topic=my-topic
+gcloud pubsub subscriptions pull my-sub --auto-ack --limit=10
+
+# Dead letter configuration
+gcloud pubsub subscriptions update my-sub \
+  --dead-letter-topic=my-dlq --max-delivery-attempts=5
+
+# Retry policy
+gcloud pubsub subscriptions update my-sub \
+  --min-retry-delay=10s --max-retry-delay=600s
+
+# Replay messages
+gcloud pubsub subscriptions seek my-sub --time=TIMESTAMP
+```
+
+## Labs
+
+### Lab 1: Event Streaming Pipeline
+Build real-time event processing.
+1. Create topic and subscription
+2. Implement publisher with batching
+3. Create Dataflow streaming job
+4. Configure BigQuery subscription
+5. Monitor with Cloud Monitoring
+
+### Lab 2: Event-Driven Architecture
+Implement event-driven microservices.
+1. Create topic per event type
+2. Configure push to Cloud Functions
+3. Implement dead letter handling
+4. Add circuit breaker pattern
+5. Test failover scenarios
+
+### Lab 3: Analytics Pipeline
+Build real-time analytics.
+1. Create fan-out topology
+2. Configure filtering subscriptions
+3. Implement aggregation functions
+4. Set up alerting
+5. Test replay scenarios
+
+## Related Services
+
+- **Eventarc**: Event routing from GCP services
+- **Dataflow**: Stream/batch processing
+- **Cloud Functions**: Event-driven serverless
+- **BigQuery**: Analytics storage
+- **Cloud Storage**: Message archival

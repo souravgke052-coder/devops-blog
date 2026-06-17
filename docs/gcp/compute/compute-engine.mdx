@@ -1,0 +1,622 @@
+# Compute Engine
+
+## Overview
+
+Compute Engine is GCP's Infrastructure-as-a-Service (IaaS) offering that provides virtual machines running in Google's data centers. It offers a wide range of machine types, from small burstable instances to large high-memory or high-CPU machines, as well as GPU support for machine learning and high-performance computing workloads.
+
+Compute Engine provides fine-grained control over your virtual machines—full root access, custom kernels, and the ability to run any operating system. It integrates with the rest of GCP through VPC networking, persistent disks, and Cloud Load Balancing. Understanding Compute Engine is fundamental because it underlies many other GCP services like GKE (which runs on Compute Engine VMs) and App Engine (which uses Compute Engine under the hood).
+
+Key features include live migration (maintenance without downtime), automatic high availability with managed instance groups, sustained-use discounts for committed workloads, and preemptible VMs for batch processing. Compute Engine is the most flexible compute option in GCP when you need direct control over your infrastructure.
+
+## When To Use
+
+- **Custom infrastructure**: Applications requiring specific OS configuration or kernel modifications
+- **Long-running workloads**: State-heavy applications that don't fit container patterns
+- **Legacy applications**: Monolithic apps being migrated from on-premises
+- **High-performance computing**: GPU instances for ML training, rendering, simulations
+- **Windows workloads**: SQL Server, ASP.NET, and other Windows applications
+- **Lift-and-shift migrations**: Moving VMs from on-premises VMware/Hyper-V
+
+## When NOT To Use
+
+- **Containerized applications**: Use Cloud Run or GKE instead
+- **Auto-scaling web apps**: Use Managed Instance Groups with Load Balancer or Cloud Run
+- **Serverless workloads**: Use Cloud Run, Cloud Functions, or App Engine
+- **Microservices**: Use GKE or Cloud Run for better abstraction
+- **Quick prototypes**: Cloud Run or App Engine are faster to deploy
+
+## Architecture
+
+**Compute Engine Architecture:**
+```
+Zone: us-central1-a
+├── Machine Type: e2-medium (2 vCPU, 4GB RAM)
+├── Boot Disk: 50GB SSD Persistent Disk
+├── Network Interface: eth0 (10.0.1.5)
+├── External IP: 203.0.113.10 (optional)
+├── Service Account: attached
+└── Labels: environment=prod
+```
+
+**Instance Lifecycle:**
+```
+PROVISIONING → STAGING → RUNNING → STOPPING → TERMINATED
+                        ↓
+                     SUSPENDING → SUSPENDED
+```
+
+**Machine Types:**
+| Family | Use Case | Examples |
+|--------|----------|----------|
+| E2 | General purpose, best value | e2-medium, e2-standard-16 |
+| N2 | General purpose, balanced | n2-standard-8, n2-highmem-64 |
+| N1 | Previous gen, good for GPUs | n1-standard-8, n1-highmem-96 |
+| C2 | Compute optimized | c2-standard-60 |
+| M2 | Memory optimized | m2-ultramem-208 |
+| M1 | Memory optimized | m1-ultramem-96 |
+| A2 | GPU optimized | a2-highgpu-1g |
+
+## Core Concepts
+
+### Creating Instances
+
+```bash
+# Basic instance
+gcloud compute instances create my-instance \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --image-family=debian-11 \
+    --image-project=debian-cloud
+
+# Instance with custom specs
+gcloud compute instances create my-instance \
+    --zone=us-central1-a \
+    --machine-type=n2-standard-8 \
+    --cpu-platform=INTEL_SKYLAKE \
+    --image-family=ubuntu-2204-lts \
+    --image-project=ubuntu-os-cloud \
+    --boot-disk-size=100GB \
+    --boot-disk-type=pd-ssd \
+    --boot-disk-auto-delete
+
+# Instance with custom network
+gcloud compute instances create my-instance \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --subnet=my-subnet \
+    --network-tier=PREMIUM \
+    --no-address \
+    --private-ipv6-google-access-zone=us-central1
+
+# Instance with GPUs
+gcloud compute instances create gpu-instance \
+    --zone=us-central1-a \
+    --machine-type=a2-highgpu-1g \
+    --accelerator=type=nvidia-tesla-t4,count=1 \
+    --image-family=tf-2-11-cu113 \
+    --image-project=deeplearning-platform-release \
+    --boot-disk-size=100GB \
+    --boot-disk-type=pd-ssd
+
+# Instance with startup script
+gcloud compute instances create my-instance \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --metadata=startup-script='#!/bin/bash
+      apt-get update && apt-get install -y nginx
+      systemctl start nginx'
+
+# Instance with service account
+gcloud compute instances create my-instance \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --service-account=my-sa@my-project.iam.gserviceaccount.com \
+    --scopes=cloud-platform
+
+# Preemptible instance (70% cheaper, can be terminated)
+gcloud compute instances create preemptible-instance \
+    --zone=us-central1-a \
+    --machine-type=e2-medium \
+    --preemptible \
+    --maintenance-policy=TERMINATE
+```
+
+### Managing Instances
+
+```bash
+# Start stopped instance
+gcloud compute instances start my-instance --zone=us-central1-a
+
+# Stop running instance
+gcloud compute instances stop my-instance --zone=us-central1-a
+
+# Restart instance
+gcloud compute instances reset my-instance --zone=us-central1-a
+
+# Delete instance
+gcloud compute instances delete my-instance --zone=us-central1-a
+
+# Describe instance
+gcloud compute instances describe my-instance --zone=us-central1-a
+
+# List instances
+gcloud compute instances list
+
+# List instances with filters
+gcloud compute instances list --filter="zone:us-central1-a AND machineType:e2-medium"
+
+# Connect via SSH
+gcloud compute ssh my-instance --zone=us-central1-a
+
+# Connect via IAP (no external IP needed)
+gcloud compute ssh my-instance --zone=us-central1-a --tunnel-through-iap
+
+# Copy files to instance
+gcloud compute scp my-file.txt my-instance:/tmp/ --zone=us-central1-a
+```
+
+### Instance Properties
+
+```bash
+# Set instance metadata
+gcloud compute instances add-metadata my-instance \
+    --zone=us-central1-a \
+    --metadata=environment=production,version=1.0
+
+# Remove metadata
+gcloud compute instances remove-metadata my-instance \
+    --zone=us-central1-a \
+    --keys=version
+
+# Add labels
+gcloud compute instances add-labels my-instance \
+    --zone=us-central1-a \
+    --labels=environment=prod,team=platform
+
+# Remove labels
+gcloud compute instances remove-labels my-instance \
+    --zone=us-central1-a \
+    --labels=version
+
+# Add tags (for firewall rules)
+gcloud compute instances add-tags my-instance \
+    --zone=us-central1-a \
+    --tags=web-server,https-server
+
+# Add disk to instance
+gcloud compute instances attach-disk my-instance \
+    --zone=us-central1-a \
+    --disk=data-disk \
+    --device-name=data-disk
+
+# Detach disk
+gcloud compute instances detach-disk my-instance \
+    --zone=us-central1-a \
+    --device-name=data-disk
+```
+
+### Disk Management
+
+```bash
+# Create persistent disk
+gcloud compute disks create my-disk \
+    --zone=us-central1-a \
+    --size=100GB \
+    --type=pd-ssd
+
+# Create disk from snapshot
+gcloud compute disks create my-disk \
+    --zone=us-central1-a \
+    --source-snapshot=my-snapshot \
+    --type=pd-ssd
+
+# Resize disk
+gcloud compute disks resize my-disk \
+    --zone=us-central1-a \
+    --size=200GB
+
+# Create snapshot
+gcloud compute disks snapshot my-disk \
+    --zone=us-central1-a \
+    --snapshot-names=my-snapshot
+
+# Delete disk
+gcloud compute disks delete my-disk --zone=us-central1-a
+```
+
+### Snapshots
+
+```bash
+# Create snapshot
+gcloud compute snapshots create my-snapshot \
+    --source-disk=my-disk \
+    --source-disk-zone=us-central1-a
+
+# List snapshots
+gcloud compute snapshots list
+
+# Delete snapshot
+gcloud compute snapshots delete my-snapshot
+
+# Create disk from snapshot
+gcloud compute disks create new-disk \
+    --zone=us-central1-a \
+    --source-snapshot=my-snapshot
+```
+
+### Machine Types
+
+```bash
+# List machine types in zone
+gcloud compute machine-types list --zone=us-central1-a
+
+# List machine types by family
+gcloud compute machine-types list --filter="name~e2-standard" --zone=us-central1-a
+
+# Get machine type details
+gcloud compute machine-types describe n2-standard-8 --zone=us-central1-a
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| CPUs per project (regular) | 8,000 |
+| CPUs per project (trusted) | 24,000 |
+| Persistent disks per project | 500 |
+| Snapshots per project | 10,000 |
+| Instances per project | 15,000 |
+
+### Key Gotchas
+
+- **Live migration happens during maintenance**—instances are migrated without stopping
+- **Preemptible instances can be terminated anytime**—don't use for critical workloads
+- **Sustained-use discounts auto-apply**—no action needed, 30-50% savings on steady state
+- **External IP costs money** when idle—use --no-address for internal-only
+- **Deletion protection available**—enable to prevent accidental deletion
+- **Instance can only be in one zone**—use MIGs for multi-zone
+- **OS Login recommended**—safer than managing SSH keys manually
+
+## Real Production Example
+
+Production instance setup:
+
+```bash
+#!/bin/bash
+set -e
+
+# 1. Create custom VPC
+gcloud compute networks create prod-vpc --subnet-mode=custom
+
+gcloud compute networks subnets create web-subnet \
+    --network=prod-vpc --region=us-central1 --range=10.0.1.0/24
+
+# 2. Create firewall rules
+gcloud compute firewall-rules create allow-health-checks \
+    --network=prod-vpc \
+    --allow=tcp:80,tcp:443 \
+    --source-ranges=130.211.0.0/22,35.191.0.0/16 \
+    --target-tags=web-server
+
+gcloud compute firewall-rules create allow-internal \
+    --network=prod-vpc --allow=tcp,udp,icmp --source-ranges=10.0.0.0/8
+
+# 3. Create service account
+gcloud iam service-accounts create app-sa \
+    --display-name="App Service Account"
+
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:app-sa@my-project.iam.gserviceaccount.com" \
+    --role="roles/storage.objectViewer"
+
+# 4. Create boot disk snapshot (for golden image)
+gcloud compute disks create golden-web-disk \
+    --zone=us-central1-a \
+    --source-snapshot=projects/my-project/global/snapshots/web-golden-image \
+    --type=pd-ssd
+
+# 5. Create production instances
+gcloud compute instances create web-1 \
+    --zone=us-central1-a \
+    --machine-type=e2-standard-4 \
+    --source-boot-disk=projects/my-project/zones/us-central1-a/disks/golden-web-disk \
+    --network-interface=network=prod-vpc,subnet=web-subnet,private-network-ip=10.0.1.10 \
+    --service-account=app-sa@my-project.iam.gserviceaccount.com \
+    --scopes=cloud-platform \
+    --tags=web-server \
+    --metadata=environment=production \
+    --labels=app=web,tier=frontend \
+    --shielded-secure-boot \
+    --shielded-vtpm \
+    --shielded-integrity-monitoring \
+    --reservation-affinity=specific \
+    --reservation=my-reservation
+
+gcloud compute instances create web-2 \
+    --zone=us-central1-b \
+    --machine-type=e2-standard-4 \
+    --source-boot-disk=projects/my-project/zones/us-central1-b/disks/golden-web-disk \
+    --network-interface=network=prod-vpc,subnet=web-subnet,private-network-ip=10.0.1.11 \
+    --service-account=app-sa@my-project.iam.gserviceaccount.com \
+    --scopes=cloud-platform \
+    --tags=web-server \
+    --metadata=environment=production \
+    --labels=app=web,tier=frontend
+
+# 6. Create data disk
+gcloud compute disks create data-disk \
+    --zone=us-central1-a \
+    --size=500GB \
+    --type=pd-ssd \
+    --replica-zones=us-central1-a,us-central1-b
+
+gcloud compute instances attach-disk web-1 \
+    --zone=us-central1-a \
+    --disk=data-disk \
+    --device-name=data-disk
+
+# 7. Enable deletion protection
+gcloud compute instances add-iam-policy-binding web-1 \
+    --zone=us-central1-a \
+    --member="user:admin@company.com" \
+    --role="roles/compute.osLogin"
+
+# 8. Configure OS Login for SSH
+gcloud compute instances add-metadata web-1 \
+    --zone=us-central1-a \
+    --metadata=enable-oslogin=TRUE
+
+# 9. Set up serial port access (for debugging)
+gcloud compute instances add-metadata web-1 \
+    --zone=us-central1-a \
+    --metadata=serial-port-enable=TRUE
+```
+
+```hcl
+# Terraform: Production Compute Engine setup
+resource "google_compute_network" "prod_vpc" {
+  name = "prod-vpc"
+}
+
+resource "google_compute_subnetwork" "web_subnet" {
+  name                     = "web-subnet"
+  network                  = google_compute_network.prod_vpc.id
+  ip_cidr_range            = "10.0.1.0/24"
+  region                   = "us-central1"
+  private_ip_google_access = true
+}
+
+resource "google_compute_firewall" "allow_health_checks" {
+  name    = "allow-health-checks"
+  network = google_compute_network.prod_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  target_tags   = ["web-server"]
+}
+
+resource "google_service_account" "app_sa" {
+  account_id   = "app-sa"
+  display_name = "App Service Account"
+}
+
+resource "google_compute_instance" "web_instance" {
+  name         = "web-instance"
+  zone         = "us-central1-a"
+  machine_type = "e2-standard-4"
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+      size  = 50
+      type  = "pd-ssd"
+    }
+  }
+
+  network_interface {
+    network    = google_compute_network.prod_vpc.name
+    subnetwork = google_compute_subnetwork.web_subnet.name
+    network_ip = "10.0.1.10"
+  }
+
+  service_account {
+    email = google_service_account.app_sa.email
+    scopes = ["cloud-platform"]
+  }
+
+  tags = ["web-server"]
+
+  labels = {
+    environment = "production"
+    app         = "web"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+
+  deletion_protection = true
+}
+
+resource "google_compute_disk" "data_disk" {
+  name  = "data-disk"
+  zone  = "us-central1-a"
+  type  = "pd-ssd"
+  size  = 500
+}
+
+resource "google_compute_attached_disk" "data" {
+  disk     = google_compute_disk.data_disk.id
+  instance = google_compute_instance.web_instance.id
+}
+```
+
+## CLI Examples
+
+```bash
+# Instance management
+gcloud compute instances create NAME --zone=ZONE --machine-type=TYPE
+gcloud compute instances start NAME --zone=ZONE
+gcloud compute instances stop NAME --zone=ZONE
+gcloud compute instances delete NAME --zone=ZONE
+gcloud compute instances list
+gcloud compute instances describe NAME --zone=ZONE
+
+# SSH
+gcloud compute ssh NAME --zone=ZONE
+gcloud compute ssh NAME --zone=ZONE --tunnel-through-iap
+gcloud compute scp FILE NAME:/PATH --zone=ZONE
+
+# Disk management
+gcloud compute disks create NAME --zone=ZONE --size=SIZE --type=TYPE
+gcloud compute disks snapshot NAME --zone=ZONE --snapshot-names=SNAP
+gcloud compute disks resize NAME --zone=ZONE --size=SIZE
+
+# Snapshots
+gcloud compute snapshots create NAME --source-disk=DISK --source-disk-zone=ZONE
+gcloud compute snapshots list
+```
+
+## Terraform Example
+
+```hcl
+# Complete Compute Engine setup
+resource "google_compute_instance" "app" {
+  name         = "app-server"
+  zone         = "us-central1-a"
+  machine_type = "e2-standard-4"
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+      size  = 50
+      type  = "pd-ssd"
+    }
+  }
+
+  network_interface {
+    network    = "prod-vpc"
+    subnetwork = "web-subnet"
+  }
+
+  service_account {
+    email = "app-sa@my-project.iam.gserviceaccount.com"
+    scopes = ["cloud-platform"]
+  }
+
+  tags = ["app-server"]
+
+  labels = {
+    environment = "production"
+    app         = "my-app"
+  }
+
+  shielded_instance_config {
+    enable_secure_boot          = true
+    enable_vtpm                 = true
+    enable_integrity_monitoring = true
+  }
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Create instance | `gcloud compute instances create NAME --zone=ZONE --machine-type=TYPE` |
+| Start/Stop | `gcloud compute instances start\|stop NAME --zone=ZONE` |
+| SSH | `gcloud compute ssh NAME --zone=ZONE` |
+| List | `gcloud compute instances list` |
+| Disk create | `gcloud compute disks create NAME --zone=ZONE --size=SIZE` |
+| Snapshot | `gcloud compute disks snapshot NAME --zone=ZONE --snapshot-names=SNAP` |
+
+## Monitoring
+
+**Key Metrics:**
+- CPU utilization
+- Memory utilization
+- Disk I/O
+- Network traffic
+- Instance health
+
+```bash
+# View metrics
+gcloud monitoring metrics list | grep compute
+
+# Instance serial port output
+gcloud compute instances get-serial-port-output NAME --zone=ZONE
+```
+
+## Security
+
+- Use service accounts instead of user credentials
+- Enable OS Login instead of managing SSH keys
+- Use shielded VMs for integrity monitoring
+- Enable VPC firewall rules properly
+- Use encrypted disks (default with CMEK option)
+
+## Cost Optimization
+
+| Strategy | Savings |
+|----------|---------|
+| Sustained-use discounts | 30-50% |
+| Committed use discounts | 70% |
+| Preemptible/spot VMs | 70% |
+| Rightsizing | 20-40% |
+| Discounted CPUs | Variable |
+
+## Troubleshooting
+
+```bash
+# Can't SSH
+gcloud compute ssh NAME --zone=ZONE --tunnel-through-iap
+
+# Check firewall
+gcloud compute firewall-rules list
+
+# Instance won't start
+gcloud compute instances describe NAME --zone=ZONE
+```
+
+## Interview Questions
+
+1. **Explain the difference between preemptible and spot instances, and when you'd use each.**
+2. **How does live migration work in Compute Engine?**
+3. **What's the difference between pd-standard and pd-ssd disks?**
+4. **How do you secure a Compute Engine instance?**
+
+## Cheat Sheet
+
+```
+# Instance Commands
+gcloud compute instances create NAME --zone=ZONE --machine-type=TYPE
+gcloud compute instances start|stop|reset NAME --zone=ZONE
+gcloud compute instances delete NAME --zone=ZONE
+gcloud compute ssh NAME --zone=ZONE
+
+# Disk Commands
+gcloud compute disks create NAME --zone=ZONE --size=SIZE --type=pd-ssd
+gcloud compute disks snapshot NAME --zone=ZONE --snapshot-names=SNAP
+gcloud compute disks resize NAME --zone=ZONE --size=SIZE
+```
+
+## Labs
+
+1. Create instance with custom specs
+2. Configure firewall rules
+3. Create and attach persistent disk
+4. Set up SSH access with OS Login
+5. Create instance template
+
+## Related Services
+
+- [Managed Instance Groups](./managed-instance-groups)
+- [VPC](../network/vpc)
+- [GKE](./gke)
+- [Cloud Run](./cloud-run)

@@ -1,0 +1,367 @@
+---
+sidebar_position: 4
+title: Advanced Path
+description: DevOps learning path for advanced practitioners
+---
+
+# Senior DevOps / Platform Engineer
+
+## Target Audience
+
+This path is for:
+- DevOps/SRE engineers with 3+ years experience
+- Platform engineers building internal developer platforms
+- Technical leads designing infrastructure
+- Anyone who has completed the Intermediate Path
+
+**You should know**: Kubernetes, Terraform, CI/CD, monitoring, cloud networking
+
+**You don't need**: Leadership experience, multi-cloud architecture at scale
+
+## Estimated Duration
+
+| Learning Mode | Duration |
+|---------------|----------|
+| Part-time (15-20 hrs/week) | 20-24 weeks |
+| Full-time (30-40 hrs/week) | 10-12 weeks |
+| Accelerated (40+ hrs/week) | 6-8 weeks |
+
+## Prerequisites
+
+### Required Before Starting
+- [ ] Production Kubernetes experience
+- [ ] Infrastructure as Code with Terraform (production)
+- [ ] CI/CD pipeline design
+- [ ] Monitoring and alerting implementation
+- [ ] Cloud networking (VPC, load balancers, DNS)
+- [ ] [Completed Intermediate Path](/learning-paths/intermediate) or equivalent 3+ years experience
+
+### Recommended
+- Multi-cloud experience
+- Leadership or mentoring experience
+- Open source contributions
+
+---
+
+## Phase 1: Platform Engineering
+
+### Read
+- [Platform Engineering](/docs/platform/overview)
+- [Internal Developer Platform](/docs/platform/idp)
+- [Developer Experience](/docs/platform/developer-experience)
+- [Backstage](https://backstage.io/docs/overview/what-is-backstage)
+
+### Practice
+- Design an Internal Developer Platform (IDP)
+- Implement Backstage for service catalog
+- Create self-service infrastructure templates
+- Build golden paths for common architectures
+- Integrate security scanning into platform
+
+### Validate
+```bash
+# Can you design:
+# - Service catalog with ownership and metadata
+# - Self-service deployment templates
+# - Automated scaffolding for new services
+# - Policy enforcement (OPA, Kyverno)
+# - Developer portal with docs integration
+```
+
+**Checkpoint**: Design and prototype an Internal Developer Platform for your organization
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 2: Service Mesh and Advanced Networking
+
+### Read
+- [Service Mesh](/docs/networking/service-mesh)
+- [Istio](/docs/mesh/istio)
+- [Linkerd](/docs/mesh/linkerd)
+- [mTLS and Service Identity](/docs/security/service-mesh)
+
+### Practice
+- Install and configure Istio or Linkerd
+- Implement mTLS between services
+- Configure traffic splitting for canary deployments
+- Set up service mesh observability
+- Implement circuit breaking and retries
+
+### Validate
+```bash
+# Can you perform these tasks?
+istioctl install --set profile=default
+kubectl apply -f VirtualService.yaml
+kubectl get destinationrules
+istioctl proxy-config stats svc -n namespace
+# Configure mTLS in STRICT mode
+# Implement weighted traffic splitting
+```
+
+**Checkpoint**: Migrate a multi-service application to service mesh with mTLS and observability
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 3: Advanced Kubernetes
+
+### Read
+- [Kubernetes Operators](/docs/kubernetes/operators)
+- [Kubernetes Performance](/docs/kubernetes/performance)
+- [Cluster Federation](/docs/kubernetes/federation)
+- [Multi-Tenant Kubernetes](/docs/kubernetes/multi-tenancy)
+
+### Practice
+- Complete [Kubernetes Lab 5](/labs/kubernetes-labs) (Helm Charts)
+- Build a Kubernetes Operator (kubebuilder or operator-sdk)
+- Configure cluster autoscaling
+- Implement multi-tenancy with namespace isolation
+- Set up cluster policies with OPA/Gatekeeper
+
+### Validate
+```bash
+# Can you perform these tasks?
+kubebuilder create API --group apps --version v1 --kind MyResource
+make install && make run
+kubectl get crds | grep myresources
+# Configure ResourceQuota and LimitRange
+# Implement network policies for tenant isolation
+```
+
+**Checkpoint**: Build a production-ready Kubernetes Operator for custom resource management
+
+**Time Estimate**: 4-5 weeks
+
+---
+
+## Phase 4: Multi-Cloud Architecture
+
+### Read
+- [Multi-Cloud Strategy](/docs/cloud/multi-cloud)
+- [Cloud Cost Optimization](/docs/cloud/cost-optimization)
+- [Cross-Cloud Networking](/docs/networking/multi-cloud)
+- [GCP Anthos](/docs/gcp/anthos)
+
+### Practice
+- Design architecture spanning multiple cloud providers
+- Implement Terraform for multi-cloud resources
+- Set up cross-cloud networking (VPN or direct connect)
+- Configure multi-cloud load balancing
+- Implement cost monitoring across providers
+
+### Validate
+```bash
+# Can you design:
+# - Terraform modules abstracting cloud differences
+# - Cross-cloud Kubernetes federation
+# - Multi-cloud object storage strategy
+# - Unified identity across clouds
+# - Cost allocation by team/project
+```
+
+**Checkpoint**: Design and implement a proof-of-concept multi-cloud deployment
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 5: Advanced SRE Practices
+
+### Read
+- [SRE Fundamentals](/docs/sre/fundamentals)
+- [SLOs and Error Budgets](/docs/sre/slos)
+- [Incident Management](/docs/sre/incident-response)
+- [On-Call Best Practices](/docs/sre/on-call)
+
+### Practice
+- Complete [SRE Labs 1-2](/labs/sre-labs) (SLOs, Alerting)
+- Complete [SRE Labs 4-5](/labs/sre-labs) (Postmortem, Chaos Engineering)
+- Define comprehensive SLOs for a service
+- Implement error budget policies
+- Run chaos engineering experiments
+- Create comprehensive runbooks
+
+### Validate
+```bash
+# Can you:
+# - Define SLI, SLO, and SLA for a service
+# - Calculate error budget burn rate
+# - Create effective alerts (signal/noise ratio)
+# - Lead incident response
+# - Write blameless postmortems
+# - Design and run chaos experiments
+```
+
+**Checkpoint**: Implement SRE practices for a production service with SLOs, alerting, and chaos testing
+
+**Time Estimate**: 4-5 weeks
+
+---
+
+## Phase 6: Security and Compliance
+
+### Read
+- [Zero Trust Architecture](/docs/security/zero-trust)
+- [Compliance as Code](/docs/security/compliance)
+- [Secrets Management](/docs/security/secrets)
+- [Supply Chain Security](/docs/security/supply-chain)
+
+### Practice
+- Implement HashiCorp Vault for secrets management
+- Set up OPA/Gatekeeper for policy enforcement
+- Configure container image signing (Cosign)
+- Implement SBOM generation and scanning
+- Set up compliance monitoring (SOC2, PCI, HIPAA)
+
+### Validate
+```bash
+# Can you:
+# - Configure Vault with dynamic secrets
+# - Implement OPA policies in Kubernetes
+# - Sign and verify container images
+# - Generate and query SBOM
+# - Run compliance scans (Trivy, Falco)
+```
+
+**Checkpoint**: Implement security controls meeting a compliance framework (SOC2 or similar)
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 7: Performance and Scalability
+
+### Read
+- [Performance Engineering](/docs/performance/overview)
+- [Horizontal Pod Autoscaling](/docs/kubernetes/hpa)
+- [Database Scaling](/docs/databases/scaling)
+- [Caching Strategies](/docs/performance/caching)
+
+### Practice
+- Implement Horizontal Pod Autoscaler (HPA) with custom metrics
+- Configure Vertical Pod Autoscaler (VPA)
+- Set up cluster autoscaler
+- Implement caching layer (Redis/Memcached)
+- Configure database connection pooling
+
+### Validate
+```bash
+# Can you:
+# - Configure HPA with custom metrics
+# - Implement cluster autoscaling
+# - Set up Redis cluster for caching
+# - Configure PgBouncer or similar
+# - Design for 10x capacity increase
+```
+
+**Checkpoint**: Scale an application to handle 10x traffic with autoscaling and caching
+
+**Time Estimate**: 3-4 weeks
+
+---
+
+## Phase 8: Leadership and Architecture
+
+### Read
+- [Technical Architecture](/docs/architecture/overview)
+- [System Design](/docs/architecture/system-design)
+- [Documentation](/docs/documentation/overview)
+- [Technology Selection](/docs/architecture/technology-selection)
+
+### Practice
+- Design complex distributed systems
+- Create Architecture Decision Records (ADRs)
+- Write technical documentation and runbooks
+- Present architecture to stakeholders
+- Mentor junior team members
+
+### Validate
+- Lead architecture review for a new system
+- Create comprehensive ADRs for decisions
+- Document system architecture for operations
+- Present technical decisions to leadership
+
+**Checkpoint**: Lead architecture design for a significant project and document decisions
+
+**Time Estimate**: 2-3 weeks
+
+---
+
+## Portfolio Projects
+
+Complete these projects to demonstrate senior-level skills:
+
+### Project 1: Internal Developer Platform
+Build a comprehensive IDP:
+- Backstage service catalog
+- Self-service deployment templates (CDE)
+- Policy enforcement
+- Security scanning integration
+- Metrics and monitoring
+
+**Deliverables**: Running IDP + architecture documentation + adoption runbook
+
+### Project 2: Multi-Region Active-Active Deployment
+Design active-active architecture:
+- Multi-region Kubernetes
+- Global load balancing
+- Data replication strategy
+- Automated failover
+- RTO/RPO < 5 minutes
+
+**Deliverables**: Architecture diagram + implementation code + DR playbook
+
+### Project 3: Chaos Engineering Program
+Establish chaos engineering practice:
+- Experiment library
+- Steady-state hypothesis framework
+- Automation with litmus or chaos-mesh
+- Integration with CI/CD
+- Regular game days
+
+**Deliverables**: Experiment library + automation + game day report
+
+---
+
+## Certification Alignment
+
+This path prepares you for:
+
+| Certification | Notes |
+|--------------|-------|
+| [GCP Professional Cloud Architect](https://cloud.google.com/certification/cloud-architect) | Advanced focus |
+| [CKA (Kubernetes Administrator)](https://www.cncf.io/certification/cka/) | If not already certified |
+| [CKS (Kubernetes Security)](https://www.cncf.io/certification/cks/) | For security section |
+| [HashiCorp Vault Associate](https://www.hashicorp.com/certification/vault-associate) | For secrets management |
+
+---
+
+## Time Estimates Summary
+
+| Phase | Part-time | Full-time |
+|-------|-----------|-----------|
+| 1. Platform Engineering | 4 weeks | 2 weeks |
+| 2. Service Mesh | 4 weeks | 2 weeks |
+| 3. Advanced K8s | 5 weeks | 2.5 weeks |
+| 4. Multi-Cloud | 4 weeks | 2 weeks |
+| 5. SRE Practices | 5 weeks | 2.5 weeks |
+| 6. Security | 4 weeks | 2 weeks |
+| 7. Performance | 4 weeks | 2 weeks |
+| 8. Leadership | 3 weeks | 1.5 weeks |
+| **Total** | **20-24 weeks** | **10-12 weeks** |
+
+---
+
+## Next Steps
+
+After completing this path:
+
+1. **Lead**: Move into Staff/Principal roles
+2. **Consult**: Offer architecture consulting
+3. **Open Source**: Contribute to major projects
+4. **Teach**: Create content, speak at conferences
+
+**Join the community**: Share progress in our Discord #advanced-path channel

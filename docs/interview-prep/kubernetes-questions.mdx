@@ -1,0 +1,1239 @@
+---
+sidebar_position: 5
+title: "Kubernetes Interview Questions"
+description: "Advanced Kubernetes interview questions covering cluster operations, networking, security, and production troubleshooting"
+---
+
+# Kubernetes Interview Questions
+
+## Overview
+
+Kubernetes expertise is essential for modern DevOps and platform engineering roles. These questions test your understanding of Kubernetes internals, your ability to debug production issues, and your knowledge of how to design resilient, scalable deployments.
+
+A senior Kubernetes engineer should understand the control plane components, how networking works, and the security model — not just how to write YAML manifests.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Explain the Kubernetes control plane components and how they interact.**
+
+A: **Control plane architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Control Plane                          │
+│                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ kube-apiserver│──│  etcd       │  │  kube-scheduler  │  │
+│  │   (REST API) │  │ (state store)│  │ (pod placement)  │  │
+│  └──────┬───────┘  └──────────────┘  └────────┬─────────┘  │
+│         │                                     │             │
+│         │         ┌───────────────────────────┘             │
+│         │         │                                        │
+│         └─────────┼────────────────────────────────┐       │
+│                   │                                  │       │
+│         ┌─────────▼─────────┐            ┌──────────▼─────┐ │
+│         │  kube-controller  │            │  cloud-controller│ │
+│         │      manager      │            │     manager    │ │
+│         └───────────────────┘            └────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                          │ API
+                          ▼
+                ┌─────────────────────────┐
+                │       Data Plane        │
+                │  ┌─────┐ ┌─────┐ ┌─────┐│
+                │  │Node1│ │Node2│ │Node3││
+                │  │kubel│ │kubel│ │kubel││
+                │  │-et  │ │-et  │ │-et  ││
+                │  └─────┘ └─────┘ └─────┘│
+                └─────────────────────────┘
+```
+
+**Components**:
+
+1. **kube-apiserver**: The front-end for the control plane. All client requests (kubectl, client libraries, workers) talk to the API server. It:
+   - Authenticates requests (certificates, tokens, OIDC)
+   - Authorizes them (RBAC, ABAC, Node, Webhook)
+   - Validates and mutates objects (admission controllers)
+   - Stores state in etcd
+
+2. **etcd**: Distributed key-value store holding all cluster state. RAFT consensus for consistency. Should never be accessed directly in production.
+
+3. **kube-scheduler**: Watches for unscheduled Pods and assigns them to nodes based on:
+   - Resource requests vs node allocatable
+   - Affinity/anti-affinity rules
+   - Taints and tolerations
+   - Priority classes
+
+4. **kube-controller-manager**: Runs controller loops:
+   - Node controller: Monitors node health
+   - Replication controller: Maintains pod count
+   - Endpoints controller: Populates endpoint objects
+   - Service account controller: Creates service accounts
+
+5. **cloud-controller-manager**: Integrates with cloud provider (GCP/AWS/Azure):
+   - Node controller: Checks cloud for node deletion
+   - Route controller: Sets up routes in cloud
+   - Service controller: Creates load balancers
+
+**Key insight**: The API server is the central hub. Everything watches it and talks to it. If the API server is down, cluster management stops.
+
+---
+
+**Q: How does the Kubernetes networking model work? Explain pod-to-pod communication.**
+
+A: **Kubernetes networking requirements** (CNI specification):
+1. Pods can communicate without NAT
+2. Nodes can communicate with pods without NAT
+3. The IP a pod sees itself as is the IP others use to reach it
+
+**Pod networking (CNI)**:
+Each pod gets its own network namespace and IP address. The CNI plugin is responsible for:
+- Creating network namespace for pod
+- Setting up veth pair (virtual ethernet)
+- Assigning IP address from pod CIDR
+- Configuring routes
+
+```
+Pod A                     Pod B
+┌─────────┐              ┌─────────┐
+│ eth0    │◀────┐    ┌───▶│ eth0    │
+│ 10.0.1.2│     │    │    │ 10.0.2.3│
+└────┬────┘     │    │    └────┬────┘
+     │          │    │         │
+     ▼          │    │         ▼
+  vethA         │    │      vethB
+     │          │    │         │
+     └──────────┼────┼─────────┘
+                │    │
+           ┌────▼────▼────┐
+           │   eth0       │
+           │   node IP    │
+           └──────────────┘
+```
+
+**Service networking**:
+Services get a virtual ClusterIP from `service-cluster-ip-range`. kube-proxy (running on each node) creates iptables/ipvs rules to NAT traffic to actual pod IPs.
+
+```
+Client → Service IP (10.96.0.1) → kube-proxy iptables → Pod IP (10.0.1.2)
+```
+
+**CNI plugins**:
+- **Calico**: BGP routing, network policies, layer 3
+- **Cilium**: eBPF-based, layer 7 visibility, encryption
+- **Flannel**: Simple VXLAN overlay
+- **Weave**: Overlay with encryption
+
+**How pod traffic reaches outside**:
+- **NodePort/LoadBalancer**: SNAT by kube-proxy
+- **HostPort**: Pod receives traffic directly, src IP preserved
+
+---
+
+**Q: Explain Kubernetes RBAC. How do you implement least privilege for service accounts?**
+
+A: **RBAC model**:
+
+```
+Subject (who) → Role/ClusterRole (what) → RoleBinding/ClusterRoleBinding (where)
+```
+
+**Role vs ClusterRole**:
+- **Role**: Namespace-scoped, defines permissions within a namespace
+- **ClusterRole**: Cluster-wide, can also be used for non-resource URLs (/healthz)
+
+**Example Role**:
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: production
+  name: pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+```
+
+**Binding to subjects**:
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-reader-binding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: my-app-sa
+    namespace: production
+  - kind: User
+    name: jane@example.com
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**Least privilege implementation**:
+
+1. **Don't use default service account**
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: my-app-sa  # Not 'default'
+  automountServiceAccountToken: false
+```
+
+2. **Create dedicated service accounts per application**
+```bash
+kubectl create serviceaccount my-app-sa -n production
+```
+
+3. **Grant only what each component needs**
+```yaml
+# Read-only configmaps
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: configmap-reader
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+    resourceNames: ["app-config"]  # Specific resource
+```
+
+4. **Use Role, not ClusterRole, when possible**
+```yaml
+# Bad: ClusterRole gives access to ALL namespaces
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-reader-all
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+# Good: Role gives access to specific namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: production
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+```
+
+5. **Aggregate ClusterRoles for organization-wide permissions**
+```yaml
+# This aggregates into a 'view' ClusterRole automatically
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: my-team-reader
+  labels:
+    rbac.example.com/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["my.crd.com"]
+    resources: ["myresources"]
+    verbs: ["get", "list"]
+```
+
+---
+
+**Q: What are admission controllers and how do they work?**
+
+A: **Admission controllers** intercept requests after authentication/authorization, before objects are persisted to etcd.
+
+**Two types**:
+1. **Mutating**: Can modify the object (add defaults, inject sidecars)
+2. **Validating**: Can only validate (reject invalid configs)
+
+**Built-in admission controllers** (common ones):
+- `NamespaceAutoProvision`: Create missing namespaces
+- `NamespaceLifecycle`: Prevent deletion of system namespaces
+- `LimitRanger`: Enforce resource limits
+- `ResourceQuota`: Enforce resource quotas
+- `PodSecurity`: Enforce Pod Security Standards
+- `MutatingAdmissionWebhook`: Call custom mutating webhooks
+- `ValidatingAdmissionWebhook`: Call custom validating webhooks
+
+**Execution order**:
+```
+Request → Authentication → Authorization → Mutating Webhooks → Validate Webhooks → etcd
+                                           ↑
+                              (mutating admission controllers)
+```
+
+**Example: OPA Gatekeeper (ValidatingAdmissionWebhook)**:
+```yaml
+# Constraint template
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: requirelabel
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireLabel
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requirelabel
+        violation {
+          not input.review.object.metadata.labels["team"]
+        } {
+          input.review.kind.kind == "Deployment"
+        }
+```
+
+**Common built-in admission**:
+```bash
+# List enabled admission controllers
+kube-apiserver -h | grep admission-plugins
+# Default in k8s 1.28+:
+# NamespaceLifecycle, LimitRanger, ServiceAccount, TaintNodesByCondition,
+# PodSecurity, Priority, DefaultTolerationSeconds, DefaultStorageClass,
+# StorageObjectInUseProtection, CertificateApproval, CertificateSigning,
+# CertificateSubjectRestriction, LimitPodHardAntiAffinity, LimitPodVerticalScaling...
+```
+
+---
+
+**Q: Explain the difference between Deployments, StatefulSets, and DaemonSets. When would you use each?**
+
+A: **Deployment** — Stateless applications
+- Pods are interchangeable
+- Rolling updates, rollbacks
+- Scaling is straightforward
+- Volume claims are NOT preserved across rescheduling
+
+**StatefulSet** — Stateful applications
+- Stable, unique network identifiers (pod name + ordinal)
+- Stable, persistent storage
+- Ordered deployment, scaling, and deletion
+- Ordered, graceful deletion and resizing
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: "postgres"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:14
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+**DaemonSet** — One pod per node
+- Exactly one pod per node (or subset via node selector)
+- New nodes automatically get DaemonSet pods
+- Use for: logging agents, monitoring, node-level networking (CNI)
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    spec:
+      hostNetwork: true
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter
+          ports:
+            - containerPort: 9100
+      tolerations:
+        - operator: Exists  # Runs on all nodes including master
+```
+
+**When to use which**:
+
+| Workload | Use Case | Example |
+|----------|----------|---------|
+| Deployment | Stateless APIs, web apps | nginx, API servers |
+| StatefulSet | Databases, message queues | PostgreSQL, Kafka |
+| DaemonSet | Node-level daemons | log collectors, node monitoring |
+
+---
+
+**Q: How does Horizontal Pod Autoscaler work? What are its limitations?**
+
+A: **HPA architecture**:
+
+```
+Metric Server (or custom metrics API)
+        │
+        │ metrics
+        ▼
+┌───────────────────┐
+│ HPA Controller    │───watch──▶ Pods
+│ (in kube-controller-manager)
+└────────┬──────────┘
+         │ scale
+         ▼
+┌───────────────────┐
+│ Deployment/ReplicaSet
+│ (updates replica count)
+└───────────────────┘
+```
+
+**HPA v2 metrics**:
+1. **Resource metrics**: CPU, memory (from Metrics API)
+2. **Custom metrics**: From external metrics providers (Prometheus, Datadog)
+3. **Object metrics**: Any Kubernetes object with metrics
+
+**HPA behavior configuration**:
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "1k"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 minutes
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+```
+
+**HPA limitations**:
+
+1. **Cannot scale to zero** (unless using KEDA or Cloud Run)
+2. **Metric lag**: HPA works on 1-minute polling intervals by default
+3. **Cannot handle bursty traffic alone**: Consider VPA for memory, or external scaling with KEDA
+4. **Cold start**: New pods take time to start; HPA doesn't account for startup time
+5. **Only scales deployments**: Can't directly scale StatefulSets
+6. **Pod startup not considered**: HPA may kill pods during rollout
+
+**KEDA for event-driven scaling**:
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: my-app-scaler
+spec:
+  scaleTargetRef:
+    name: my-app
+  minReplicaCount: 0  # Can scale to zero!
+  maxReplicaCount: 100
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        metricName: http_requests_total
+        threshold: "100"
+```
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: A pod is stuck in `ContainerCreating` state. How do you debug this?**
+
+A: **Debugging steps**:
+
+1. **Check pod events**:
+```bash
+kubectl describe pod <pod-name> -n <namespace> | grep -A 10 Events
+
+# Common causes in events:
+# - ErrImagePull: Image name wrong, registry auth missing
+# - ImagePullBackOff: Registry unreachable, auth failed
+# - CrashLoopBackOff: Application crashes on startup
+# - CreateContainerConfigError: Secret/configmap missing
+# - Error: couldn't find plugin "xx" in the plugin registry: CNI errors
+```
+
+2. **Check CNI issues**:
+```bash
+# Is CNI plugin working?
+kubectl get nodes -o wide
+kubectl get pods -n kube-system
+
+# Check CNI plugin logs (varies by plugin)
+kubectl logs -n kube-system -l k8s-app=calico-node
+kubectl logs -n kube-system -l k8s-app=cilium
+
+# Check node networking
+kubectl debug node/<node-name> -it --image=busybox -- crictl ps | grep networking
+```
+
+3. **Check storage issues (for PVC)**:
+```bash
+# Is PVC bound?
+kubectl get pvc
+
+# Check StorageClass
+kubectl get storageclass
+
+# PVC events
+kubectl describe pvc <pvc-name>
+
+# Check if CSI driver is healthy
+kubectl get pods -n kube-system -l app=csi-driver
+```
+
+4. **Check service account issues**:
+```bash
+# Is service account created?
+kubectl get sa <sa-name> -n <namespace>
+
+# Is imagePullSecrets referenced correctly?
+kubectl get pod <pod-name> -o jsonpath='{.spec.imagePullSecrets}'
+```
+
+5. **Check resource limits**:
+```bash
+# Node allocatable
+kubectl describe node <node-name> | grep -A 5 Allocatable
+
+# Are there resource quotas?
+kubectl get resourcequota -n <namespace>
+```
+
+6. **Generic debugging**:
+```bash
+# Get full pod spec
+kubectl get pod <pod-name> -n <namespace> -o yaml
+
+# Check init containers specifically
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.initContainers[*].name}'
+
+# Watch pod status
+kubectl get pod <pod-name> -n <namespace> -w
+```
+
+---
+
+**Q: How would you debug high API server latency in a production cluster?**
+
+A: **Diagnosis approach**:
+
+1. **Check API server metrics**:
+```bash
+# If Prometheus running:
+# rate(apiserver_request_duration_seconds_bucket[5m])
+# Identify slow endpoints
+
+# Check etcd latency
+curl -s --cacert /etc/kubernetes/pki/ca.crt \
+  --cert /etc/kubernetes/pki/apiserver-kubelet-client.crt \
+  --key /etc/kubernetes/pki/apiserver-kubelet-client.key \
+  https://localhost:2379/metrics | grep etcd_disk_wal_fsync_duration
+```
+
+2. **Check resource saturation**:
+```bash
+# API server CPU/memory
+kubectl top pods -n kube-system -l k8s-app=kube-apiserver
+
+# Check if OOMKilled
+kubectl describe pod kube-apiserver -n kube-system | grep -i oom
+```
+
+3. **Check request rates and concurrent requests**:
+```bash
+# Current in-flight requests
+kubectl get --raw '/metrics' | grep apiserver_current_inflight_requests
+
+# Request rate by verb
+kubectl get --raw '/metrics' | grep apiserver_request_total
+```
+
+4. **Check webhook latency**:
+```bash
+# List admission webhooks
+kubectl get validatingwebhookconfigurations
+kubectl get mutatingwebhookconfigurations
+
+# Check webhook response times (in apiserver logs)
+# On master node:
+journalctl -u kube-apiserver | grep -E "webhook|admission"
+```
+
+5. **Check etcd health**:
+```bash
+# etcd member list
+etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member list
+
+# Check db size
+etcdctl endpoint status
+
+# Check for slow commits
+etcdctl --write-out=table endpoint status | grep -E "Member|Index"
+```
+
+6. **Watch API server requests**:
+```bash
+# Using kubectl API priority and fairness
+kubectl get --raw='/apis/flowcontrol.apiserver.k8s.io/v1beta3/flowschemas' | jq
+
+# Check queuing delays
+kubectl get --raw='/metrics' | grep apiserver_flowcontrol_request_concurrency_in_use
+```
+
+---
+
+**Q: How do you perform a zero-downtime deployment of a database stateful application?**
+
+A: **Strategy for stateful applications (PostgreSQL example)**:
+
+**Pre-deployment requirements**:
+```yaml
+# Ensure PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-pdb
+spec:
+  minAvailable: 2  # Keep at least 2 pods available
+  selector:
+    matchLabels:
+      app: postgres
+```
+
+**Rolling update strategy**:
+```yaml
+# In StatefulSet spec
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxUnavailable: 1%  # For percentage
+  # For StatefulSet, pods are updated in reverse ordinal order
+  # Pod n-1 must be Running and Ready before n is updated
+```
+
+**Application-level upgrade**:
+
+```yaml
+# Use init container to run migrations before new pod starts
+spec:
+  initContainers:
+    - name: migrations
+      image: myapp:migrations
+      command: ["/run-migrations.sh"]
+  containers:
+    - name: app
+      image: myapp:v2  # Will only start after init succeeds
+```
+
+**Ordered rollout with pause**:
+```bash
+# Start rollout (it will pause if configured)
+kubectl rollout pause deployment/my-app
+
+# Check status
+kubectl rollout status deployment/my-app
+
+# If issues: rollback
+kubectl rollout undo deployment/my-app
+
+# When ready: resume
+kubectl rollout resume deployment/my-app
+```
+
+**For PostgreSQL specifically**:
+
+1. **Read replicas first**: Update replicas, then promote one to primary, then update old primary
+2. **Use Patroni or Stolon**: Automated failover and leader election
+3. **Pre-check**: Verify replication lag before each step
+
+```bash
+# Check replication status before upgrade
+kubectl exec postgres-0 -n production -- psql -c "SELECT * FROM pg_stat_replication;"
+
+# If lag > 0, wait
+# while [ $(kubectl exec postgres-0 -n production -- psql -t -c "SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))") -gt 5 ]; do
+#   sleep 5
+# done
+```
+
+---
+
+### Troubleshooting Questions
+
+**Q: A Kubernetes service can't reach some pods. The pods are running but appear unhealthy. How do you diagnose?**
+
+A: **Layered diagnosis**:
+
+1. **Check if endpoints exist**:
+```bash
+kubectl get endpoints <service-name> -n <namespace>
+# If empty: no pods selected, or selector mismatch
+
+# Compare service selector and pod labels
+kubectl get svc <service-name> -n <namespace> -o jsonpath='{.spec.selector}'
+kubectl get pods -n <namespace -l 'app=myapp' --show-labels
+```
+
+2. **Check pod readiness**:
+```bash
+kubectl get pods -n <namespace> -l app=myapp
+# Look at READY column: should be 1/1, 2/2, etc.
+
+# If not ready:
+kubectl describe pod <pod-name> -n <namespace> | grep -A 20 Conditions
+```
+
+3. **Check if pods are actually serving**:
+```bash
+# Exec into a working pod and curl the target
+kubectl exec -it -n <namespace> <working-pod> -- curl -v http://<target-pod-ip>:8080/health
+
+# Check if target pod is listening
+kubectl exec -it <target-pod> -n <namespace> -- netstat -tlnp | grep 8080
+```
+
+4. **Check network policies**:
+```bash
+# List network policies in namespace
+kubectl get networkpolicies -n <namespace>
+
+# Describe policy to see what it blocks
+kubectl describe networkpolicy <policy-name> -n <namespace>
+
+# Test by temporarily removing policy
+# (production: add to staging first)
+```
+
+5. **Check DNS resolution**:
+```bash
+# From within a pod
+kubectl exec -it <pod-name> -n <namespace> -- nslookup <service-name>
+kubectl exec -it <pod-name> -n <namespace> -- cat /etc/resolv.conf
+
+# Check CoreDNS health
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl logs -n kube-system -l k8s-app=kube-dns -c coredns
+```
+
+6. **Check kube-proxy**:
+```bash
+# Is kube-proxy running?
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+
+# Check iptables rules (on node)
+# For the service:
+sudo iptables -L -n -t nat | grep <service-name>
+
+# Check for ipvs mode
+sudo ipvs -L -n | grep <service-ip>
+```
+
+---
+
+**Q: A pod consuming high memory isn't being OOMKilled despite hitting limits. What's happening?**
+
+A: **This is likely memory overcommitment behavior**:
+
+**Understanding memory limits**:
+- `spec.containers[].resources.limits.memory`: Hard limit; container is OOMKilled if exceeded
+- BUT: Kerneloomd (kernel-level OOM killer) can kill other processes first
+
+**Diagnose**:
+```bash
+# Check pod's memory usage
+kubectl top pod <pod-name> -n <namespace>
+
+# Check actual memory usage on node (from within pod)
+kubectl exec -it <pod-name> -n <namespace> -- cat /sys/fs/cgroup/memory/memory.usage_in_bytes
+
+# Check node-level memory pressure
+kubectl describe node <node-name> | grep -E "Memory|pressure"
+
+# Check kernel messages on node
+# (from node, or check node's journal)
+dmesg | grep -i oom
+```
+
+**Why pods might not be OOMKilled**:
+
+1. **Memory limits not enforced correctly**:
+```bash
+# Verify limits are set
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[0].resources.limits}'
+
+# Check if running in Guaranteed QoS (limits == requests)
+# These get priority for memory
+```
+
+2. **Node-level OOM**:
+If the entire node is under memory pressure, the kernel's OOM killer may kill:
+- A container (not your pod)
+- A system service
+- Another pod
+
+3. **Memory accounting delay**:
+Memory usage is reported periodically, not in real-time. If limit is 1Gi and pod uses 1.1Gi for < 1 second, it might not trigger OOM before usage drops.
+
+4. **cgroup v1 vs v2**:
+Memory limits work differently:
+```bash
+# Check cgroup version
+mount | grep cgroup
+
+# cgroup v1: memory.limit_in_bytes
+# cgroup v2: memory.max
+```
+
+**Fix**:
+```yaml
+# Set appropriate limits
+resources:
+  requests:
+    memory: "512Mi"
+  limits:
+    memory: "1Gi"  # Ensure this matches what app actually needs
+
+# For Java apps, set JVM heap to 75-80% of memory limit:
+# -XX:MaxRAMPercentage=75
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: Design a multi-cluster Kubernetes strategy for a global application.**
+
+A: **Multi-cluster architectures**:
+
+**Why multi-cluster?**
+- Regulatory compliance (data residency)
+- Fault isolation (failure domain)
+- Different environments (dev/staging/prod separation)
+- Capacity management
+- Team autonomy
+
+**Architecture options**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Global Layer                         │
+│                                                             │
+│              ┌──────────────────────────┐                   │
+│              │  Kubernetes Gateway API  │                   │
+│              │  (or Ingress controller) │                   │
+│              └────────────┬─────────────┘                   │
+│                           │                                  │
+└───────────────────────────┼─────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ us-central   │    │ europe-west  │    │ asia-east    │
+│              │◀──▶│              │◀──▶│              │
+│  GKE Cluster │    │  GKE Cluster │    │  GKE Cluster │
+└──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+       │                   │                   │
+       └───────────────────┴───────────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │  Shared     │
+                    │  Data Layer │
+                    │(Spanner/    │
+                    │ Global SQL) │
+                    └─────────────┘
+```
+
+**Multi-cluster networking**:
+
+1. **Service discovery across clusters**:
+```yaml
+# Cluster Federation or Submariner
+# Or use: ExternalName service to reference remote
+apiVersion: v1
+kind: Service
+metadata:
+  name: remote-service
+  namespace: default
+spec:
+  type: ExternalName
+  externalName: remote-service.remote-namespace.svc.cluster.local
+```
+
+2. **Multi-cluster ingress**:
+```bash
+# Using GKE Multi-cluster Ingress
+gcloud container hub ingress enable \
+  --config-membership=projects/my-project/locations/global/memberships/us-cluster
+```
+
+**Cluster federation options**:
+
+| Solution | Use Case | Complexity |
+|----------|----------|------------|
+| GKE Federation | GCP-native, multi-GKE | Medium |
+| Anthos Config Management | Multi-cluster policy sync | Medium |
+| ArgoCD + ApplicationSets | GitOps everywhere | Medium |
+| Custom controller | Very specific needs | High |
+
+**Multi-cluster service discovery**:
+```yaml
+# Using Argo Rollouts with cluster federation
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: my-app
+spec:
+  strategy:
+    canary:
+      trafficRouting:
+        - plugin:
+            name: istio-multi-cluster
+            config:
+              clusters:
+                - us-central
+                - europe-west
+```
+
+---
+
+**Q: How would you design a GitOps workflow for Kubernetes?**
+
+A: **GitOps architecture**:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                         Git Repository                        │
+│                    (infra-config repo)                        │
+│                                                               │
+│   apps/                    │                                  │
+│     my-app/                │                                  │
+│       deployment.yaml      │                                  │
+│       service.yaml         │                                  │
+│       kustomization.yaml   │                                  │
+│                          │ push                              │
+│   infra/                   │                                  │
+│     base/                  │                                  │
+│     production/            │                                  │
+│                       │                                       │
+└───────────────────────┼───────────────────────────────────────┘
+                        │
+                    ┌───┴───┐
+                    │ ArgoCD │
+                    │  or    │
+                    │ Flux   │
+                    └───┬───┘
+                        │
+          ┌─────────────┼─────────────┐
+          │             │             │
+          ▼             ▼             ▼
+    ┌──────────┐  ┌──────────┐  ┌──────────┐
+    │  Prod    │  │  Staging │  │   Dev    │
+    │ Cluster  │  │ Cluster  │  │ Cluster  │
+    └──────────┘  └──────────┘  └──────────┘
+```
+
+**ArgoCD setup**:
+```yaml
+# Application definition
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app-prod
+  namespace: argocd
+spec:
+  project: production
+  source:
+    repoURL: https://github.com/org/infra-config
+    targetRevision: main
+    path: apps/my-app/production
+    kustomize:
+      images:
+        - my-app=ghcr.io/org/my-app:v1.2.3
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+**Kustomize for environment-specific overrides**:
+```yaml
+# apps/my-app/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+
+# apps/my-app/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+bases:
+  - ../base
+commonLabels:
+  environment: production
+replicas:
+  - name: my-app
+    count: 5
+patches:
+  - path: production-patch.yaml
+    target:
+      kind: Deployment
+```
+
+**Flux setup (alternative)**:
+```bash
+# Install Flux
+flux install --components=source-controller,helm-controller,kustomize-controller
+
+# Create GitRepository source
+flux create source git my-app \
+  --url=https://github.com/org/infra-config \
+  --branch=main \
+  --interval=1m
+
+# Create Kustomization
+flux create kustomization my-app-prod \
+  --source=GitRepository/my-app \
+  --path="./apps/my-app/production" \
+  --prune=true \
+  --interval=1m
+```
+
+---
+
+### Security Questions
+
+**Q: How do you implement Pod Security Standards in Kubernetes?**
+
+A: **Pod Security Standards (PSS)** replace PodSecurityPolicy in k8s 1.25+:
+
+**Three policy levels**:
+- **privileged**: Unrestricted, full access
+- **baseline**: Minimal restrictions, prevents known escalations
+- **restricted**: Hardened, follows Pod Security Best Practices
+
+**Enforcement via labels**:
+```bash
+# Namespace label for PSS
+kubectl label namespace production pod-security.kubernetes.io/enforce=baseline
+kubectl label namespace production pod-security.kubernetes.io/enforce=restricted
+```
+
+**Built-in Pod Security Admission**:
+```bash
+# Check what namespace labels are set
+kubectl get ns -A | grep -E "enforce|warn|audit"
+```
+
+**Configuring baseline policy**:
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+```
+
+**For restricted policy compliance**:
+```yaml
+# Pod must have:
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+```
+
+**Validate before applying**:
+```bash
+# dry-run to see what would fail
+kubectl apply -f pod.yaml --dry-run=server
+# Look for admission webhook errors
+```
+
+---
+
+**Q: What is a container escape and how do you prevent it?**
+
+A: **Container escape vectors**:
+
+1. **Privileged containers**:
+```bash
+# This container can access host devices
+docker run --privileged
+# Can mount host filesystems, load kernel modules
+# Prevention: Never use --privileged in production
+```
+
+2. **Host network/pid namespace sharing**:
+```bash
+docker run --network=host --pid=host
+# Container processes appear as host processes
+# Prevention: Avoid --network=host --pid=host together
+```
+
+3. **Docker socket access**:
+```bash
+docker run -v /var/run/docker.sock:/var/run/docker.sock
+# Can create new containers with root access to host
+# Prevention: Don't mount socket in containers
+```
+
+4. **Host filesystem access**:
+```bash
+docker run -v /:/host
+# Can write to /host/etc, modify host files
+# Prevention: Read-only volumes, drop CAP_SYS_ADMIN
+```
+
+**Defense in depth**:
+
+```yaml
+# Pod SecurityContext
+securityContext:
+  privileged: false
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop:
+      - ALL
+```
+
+```yaml
+# AppArmor or Seccomp
+# Use RuntimeDefault seccomp profile
+# Or custom:
+seccompProfile:
+  type: Localhost
+  localhostProfile: profiles/my-app-seccomp.json
+```
+
+**Network policies to limit blast radius**:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: restrict-all
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Thinking RBAC is the only security layer**: Network policies, Pod Security Standards, and admission controllers are equally important.
+
+2. **Not understanding the difference between `kubectl apply` and `kubectl create`**: One is declarative (uses server-side apply), the other is imperative.
+
+3. **Ignoring pod disruption budgets**: Can cause availability issues during node drain.
+
+4. **Not practicing live debugging**: Being able to walk through a broken cluster diagnosis is different from knowing the theory.
+
+5. **Confusing Kubernetes networking models**: Service vs pod vs node IP, and when NAT happens.
+
+## How to Structure Your Answers
+
+For **conceptual questions**: Start with the component you're explaining, then walk through how it interacts with other components.
+
+For **troubleshooting questions**: Follow the standard flow — check events, check resources, check networking, check logs. Be specific about commands.
+
+For **design questions**: Start with requirements, then discuss component selection, and finally address failure modes and scaling.
+
+## Related Topics
+
+- [Linux Questions](./linux-questions.mdx)
+- [Networking Questions](./networking-questions.mdx)
+- [GCP Questions](./gcp-questions.mdx)
+- [SRE Questions](./sre-questions.mdx)
+- [CI/CD Questions](./cicd-questions.mdx)

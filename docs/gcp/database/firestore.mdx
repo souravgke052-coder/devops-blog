@@ -1,0 +1,566 @@
+# Firestore
+
+## Overview
+
+Google Cloud Firestore is a serverless, NoSQL document database that automatically scales to handle millions of clients. It offers real-time sync, offline support, and mobile SDKs, making it ideal for mobile apps, web apps, and IoT devices. Firestore organizes data in documents (JSON-like) and collections, with support for subcollections and queries.
+
+## When To Use
+
+- Mobile and web applications requiring real-time sync
+- User profile and preference storage
+- Chat messages and social feeds
+- Content management with flexible schemas
+- Gaming leaderboards and state
+- IoT device data ingestion
+- Prototyping and rapid development
+
+## When NOT To Use
+
+- Highly normalized relational data
+- Complex queries requiring joins
+- Blob/file storage (use Cloud Storage)
+- Time-series data at massive scale (use Bigtable)
+- Applications requiring SQL expressiveness
+- Data warehousing and analytics (use BigQuery)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Firestore                              │
+├─────────────────────────────────────────────────────────────┤
+│  Data Model:                                                │
+│  └── Collection                                             │
+│      └── Document (JSON, up to 1MB)                        │
+│          └── Subcollection                                  │
+│              └── Document...                                │
+├─────────────────────────────────────────────────────────────┤
+│  Modes:                                                     │
+│  ├── Native mode (new projects)                            │
+│  └── Datastore mode (legacy compatibility)                 │
+├─────────────────────────────────────────────────────────────┤
+│  Deployment:                                                │
+│  ├── Regional ($0.18/GB stored, $0.03/100 writes)          │
+│  └── Multi-region ($0.36/GB stored, $0.06/100 writes)      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Document
+The basic unit of storage. Contains key-value pairs, supports nested objects, arrays, and subcollection references. Maximum size: 1 MB.
+
+### Collection
+A container for documents. Can hold documents and subcollection references.
+
+### Subcollection
+A collection nested within a document. Enables hierarchical data modeling.
+
+### Query
+Read operations that filter and order documents. Supports compound indexes.
+
+### Real-time Listeners
+SDK feature that pushes updates to clients when data changes.
+
+### Offline Persistence
+SDK feature that caches data locally, enabling offline reads and writes.
+
+## Real Production Example
+
+**Real-time Chat Application**
+
+```hcl
+# Terraform configuration for Firestore security and access
+
+# Enable Firestore API
+resource "google_project_service" "firestore" {
+  service = "firestore.googleapis.com"
+}
+
+# Firestore in Native mode (required for Terraform)
+resource "google_firestore_database" "chat_db" {
+  name          = "(default)"
+  location      = "NAM US"  # Multi-region
+  type          = "FIRESTORE_NATIVE"
+  
+  autodoes_not_exist = "This resource has issues"
+}
+
+# Note: Firestore is primarily managed via Firebase console or SDKs
+# Terraform support is limited for Native mode
+
+# For Datastore mode:
+resource "google_datastore_index" "messages_by_channel" {
+  project = var.project
+  
+  index {
+    kind = "Message"
+    
+    properties {
+      name = "channelId"
+      direction = "ASCENDING"
+    }
+    
+    properties {
+      name = "createdAt"
+      direction = "DESCENDING"
+    }
+  }
+}
+
+# IAM for Firestore access
+resource "google_project_iam_member" "firestore_writer" {
+  project = var.project
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:${google_service_account.app.email}"
+}
+
+resource "google_project_iam_member" "firestore_reader" {
+  project = var.project
+  role    = "roles/datastore.user"
+  member  = "user:developer@example.com"
+}
+```
+
+```javascript
+// Firestore Security Rules (firestore.rules)
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isValidMessage() {
+      let data = request.resource.data;
+      return data.content.size() > 0 
+        && data.content.size() < 10000
+        && data.createdAt == request.time;
+    }
+    
+    // User profiles
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId);
+    }
+    
+    // Chat channels
+    match /channels/{channelId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isOwner(resource.data.createdBy);
+    }
+    
+    // Messages in channels
+    match /channels/{channelId}/messages/{messageId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidMessage();
+      allow update, delete: if isOwner(resource.data.senderId);
+    }
+    
+    // Typing indicators (temporary data)
+    match /typing/{channelId}/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId);
+    }
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Note: Most Firestore operations are done via Firebase CLI or SDKs
+
+# Initialize Firestore in Firebase project
+firebase init firestore
+
+# Start Firestore emulator
+firebase emulators:start --only firestore
+
+# Export/Import data for backup
+gcloud firestore export gs://my-bucket/backup-$(date +%Y%m%d)
+gcloud firestore import gs://my-bucket/backup-20240115
+
+# List exports
+gsutil ls gs://my-bucket/
+
+# Set IAM policy
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:developer@example.com \
+  --role=roles/datastore.user
+
+# Manage indexes via CLI
+gcloud firestore composite-indexes list
+# Note: Indexes are typically defined in firebase.json
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Firestore Database (Datastore mode)
+resource "google_firestore_database" "app_db" {
+  name        = "(default)"
+  location_id = "nam5"  # Multi-region US
+  type        = "DATASTORE_MODE"
+  
+  # Note: For NATIVE mode, Terraform has limited support
+  # Use Firebase Console or gcloud for Native mode setup
+}
+
+# Composite index for efficient queries
+resource "google_firestore_index" "messages_composite" {
+  collection = "messages"
+  
+  fields {
+    field_path = "channelId"
+    order      = "ASCENDING"
+  }
+  
+  fields {
+    field_path = "createdAt"
+    order      = "DESCENDING"
+  }
+  
+  fields {
+    field_path = "isDeleted"
+    order      = "ASCENDING"
+  }
+}
+
+# Single-field index
+resource "google_firestore_index" "messages_sender" {
+  collection = "messages"
+  
+  fields {
+    field_path = "senderId"
+    order      = "ASCENDING"
+  }
+}
+
+# IAM for service account access
+resource "google_project_iam_member" "firestore_app" {
+  project = var.project
+  role    = "roles/datastore.user"
+  member  = "serviceAccount:app@${var.project}.iam.gserviceaccount.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Firestore Emulator (requires Firebase CLI)
+firebase init firestore
+firebase emulators:start --only firestore
+
+# Export/Import (Datastore mode)
+gcloud firestore export gs://BUCKET/PATH
+gcloud firestore import gs://BUCKET/PATH
+
+# IAM Management
+gcloud projects add-iam-policy-binding PROJECT \
+  --member=MEMBER --role=ROLE
+
+# Clear all data (use with caution)
+# Via gcloud: Not directly supported
+# Via Firebase CLI: firebase firestore:delete --all-collections
+```
+
+## Monitoring
+
+### Key Metrics
+- **Document reads/writes**: Operation counts
+- **Index usage**: Query performance
+- **Latency**: Read/write latency
+- **Connection count**: Active clients
+- **Security rule evaluations**: Cost tracking
+
+### Cloud Monitoring
+
+```bash
+# View Firestore metrics
+gcloud monitoring metrics list --filter="resource.type=firestore"
+
+# Create alert for high read operations
+gcloud monitoring policies create \
+  --display-name="High Read Operations" \
+  --condition-display-name="Reads > 10000/min" \
+  --condition-filter='resource.type="firestore" AND metric.type="firestore.googleapis.com/document/read_count"' \
+  --condition-threshold-value=10000 \
+  --notification-channels=CHANNEL_ID
+```
+
+### Firebase Console Monitoring
+- Real-time dashboard in Firebase Console
+- Performance monitoring in App Check
+- Security audit logs
+
+## Security
+
+### Security Rules
+```javascript
+// Comprehensive security rules
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Validate data types and constraints
+    function isValidUser(userId) {
+      let data = request.resource.data;
+      return data.keys().hasAll(['email', 'displayName', 'createdAt'])
+        && data.email is string
+        && data.displayName is string
+        && data.createdAt == request.time;
+    }
+    
+    function isValidPost() {
+      let data = request.resource.data;
+      return data.title.size() > 0
+        && data.title.size() < 500
+        && data.content.size() < 50000
+        && data.publishedAt == request.time
+        || resource.data.publishedAt == request.resource.data.publishedAt;
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth.uid == userId && isValidUser(userId);
+      allow update: if request.auth.uid == userId 
+        && request.resource.data.email == resource.data.email; // Immutable email
+      allow delete: if false; // Don't allow deletion
+    }
+    
+    // Posts collection
+    match /posts/{postId} {
+      allow read: if true;
+      allow create: if request.auth != null && isValidPost();
+      allow update: if request.auth.uid == resource.data.authorId;
+      allow delete: if request.auth.uid == resource.data.authorId;
+    }
+    
+    // Admin-only collection
+    match /admin/{document=**} {
+      allow read, write: if request.auth != null 
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+  }
+}
+```
+
+### App Check
+```bash
+# Enable App Check for Firestore
+# Via Firebase Console:
+# 1. Firebase Console > App Check > Firestore
+# 2. Register your app with App Check
+# 3. Enforce App Check (optional)
+
+# SDK integration
+import { initializeAppCheck, ReCaptchaEnterpriseProvider } from 'firebase/app-check';
+
+const appCheck = initializeAppCheck(app, {
+  provider: new ReCaptchaEnterpriseProvider('SITE_KEY'),
+  isTokenAutoRefreshEnabled: true
+});
+```
+
+## Cost Optimization
+
+### Pricing Structure
+| Operation | Price |
+|-----------|-------|
+| Document read | $0.03/100k (bundled), $0.06/100k (beyond) |
+| Document write | $0.05/100k (bundled), $0.18/100k (beyond) |
+| Document delete | Free |
+| Storage | $0.18/GB/month |
+| SCU (Security rule eval) | $0.03/100k |
+
+### Cost-Saving Strategies
+```javascript
+// Use queries to minimize document reads
+// Instead of fetching entire collection, query specific documents
+
+// Implement pagination
+const query = collectionGroup('comments')
+  .where('postId', '==', postId)
+  .orderBy('createdAt', 'desc')
+  .limit(20);  // Limit results
+
+// Use listeners efficiently - detach when done
+const unsubscribe = onSnapshot(query, (snapshot) => {
+  // Handle changes
+});
+
+// Cleanup when component unmounts
+unsubscribe();
+
+// Use count() for counting without reading documents
+const countQuery = query(collection(db, 'posts'), where('authorId', '==', userId));
+const count = await getCountFromServer(countQuery);
+```
+
+## Troubleshooting
+
+### Permission Denied
+```javascript
+// Check security rules in Firebase Console
+// Test rules in Console > Firestore > Rules
+
+// Check authentication
+if (!request.auth) {
+  console.log('User not authenticated');
+}
+
+// Debug: Log the auth state
+console.log('Auth:', JSON.stringify(request.auth, null, 2));
+console.log('Resource:', JSON.stringify(resource.data, null, 2));
+```
+
+### Slow Queries
+```javascript
+// Check query performance
+// Create composite indexes for multi-field queries
+
+// Via Firebase CLI
+firebase firestore:indexes
+
+// Via console: Firestore > Indexes > Add Index
+// Composite index: channelId ASC, createdAt DESC
+```
+
+### Quota Exceeded
+```javascript
+// Firestore quotas:
+// 1M concurrent connections per database
+// 10K writes/second per database
+// 1M reads/second per database
+
+// If quota exceeded:
+// 1. Implement exponential backoff
+const retryWithBackoff = async (operation, maxRetries = 3) => {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error.code === 'RESOURCE_EXHAUSTED' && i < maxRetries - 1) {
+        await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+      } else {
+        throw error;
+      }
+    }
+  }
+};
+```
+
+## Interview Questions
+
+**Q: What is the difference between Firestore and Cloud Datastore?**
+A: Firestore Native mode offers real-time sync, offline support, and mobile SDKs. Datastore mode provides backwards compatibility with older Datastore apps. New projects should use Firestore Native mode for better features.
+
+**Q: How does Firestore handle real-time synchronization?**
+A: Firestore uses WebSocket-based connections for real-time updates. The SDK maintains an open connection to Firestore servers, which push changes as they occur. Listeners are notified with the full document or query results on changes.
+
+**Q: What are the Firestore security rules evaluation costs?**
+A: Security rules are evaluated per document accessed. Reading 100 documents evaluates rules 100 times. This can become expensive at scale—use App Check and optimize rules to avoid unnecessary evaluations.
+
+**Q: How do you model hierarchical data in Firestore?**
+A: Use subcollections for one-to-many relationships (e.g., messages within channels). Use document references for many-to-one relationships. Consider flattening data for read-heavy patterns and normalizing for write-heavy patterns.
+
+**Q: What are the Firestore query limitations?**
+A: Queries can only filter on fields that have an index. You cannot query across subcollections with a single query. IN and array-contains-any are limited to 10 values. No support for JOINs or cross-collection queries.
+
+**Q: How does offline persistence work in Firestore?**
+A: The SDK caches writes and reads to IndexedDB (browser) or SQLite (mobile). When offline, reads come from the cache, writes queue locally. On reconnection, the SDK syncs pending writes and fetches updates from the server.
+
+## Cheat Sheet
+
+```javascript
+// Initialize
+import { initializeFirestore } from 'firebase/firestore';
+const db = initializeFirestore(app, { host: 'project.firebaseio.com', ssl: true });
+
+// CRUD Operations
+import { collection, doc, getDoc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+
+// Create/Update
+await setDoc(doc(db, 'users', userId), { email, name, createdAt: serverTimestamp() });
+
+// Read
+const docSnap = await getDoc(doc(db, 'users', userId));
+if (docSnap.exists()) console.log(docSnap.data());
+
+// Update
+await updateDoc(doc(db, 'users', userId), { lastLogin: serverTimestamp() });
+
+// Delete
+await deleteDoc(doc(db, 'users', userId));
+
+// Query
+import { query, where, orderBy, limit } from 'firebase/firestore';
+const q = query(collection(db, 'posts'), 
+  where('authorId', '==', userId), 
+  orderBy('createdAt', 'desc'), 
+  limit(20));
+
+// Real-time listener
+const unsubscribe = onSnapshot(q, (snapshot) => {
+  snapshot.docChanges().forEach(change => {
+    if (change.type === 'added') console.log('Added:', change.doc.data());
+    if (change.type === 'modified') console.log('Modified:', change.doc.data());
+    if (change.type === 'removed') console.log('Removed:', change.doc.id);
+  });
+});
+
+// Cleanup
+unsubscribe();
+```
+
+## Labs
+
+### Lab 1: Real-time Chat App
+Build a chat application with Firestore.
+1. Set up Firestore with security rules
+2. Implement real-time message sync
+3. Add typing indicators
+4. Implement presence system
+5. Set up automated cleanup of old messages
+
+### Lab 2: User Profile System
+Create a profile management system.
+1. Implement user profiles with validation
+2. Add profile update rules
+3. Implement profile picture storage in Cloud Storage
+4. Add App Check for production security
+5. Set up monitoring dashboard
+
+### Lab 3: Scalable Data Modeling
+Design and implement a scalable data model.
+1. Model blog with posts and comments
+2. Implement subcollection-based comments
+3. Add composite indexes for queries
+4. Implement pagination
+5. Set up backup strategy
+
+## Related Services
+
+- **Realtime Database**: Original Firebase real-time database
+- **Cloud Storage**: For file uploads
+- **Cloud Functions**: Serverless functions for Firestore triggers
+- **BigQuery**: Analytics on Firestore data
+- **Firebase Authentication**: User authentication
+- **App Check**: Fraud protection

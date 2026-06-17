@@ -1,0 +1,505 @@
+# Cloud Logging
+
+## Overview
+
+Google Cloud Logging (formerly Stackdriver) provides centralized logging for GCP and hybrid environments. It ingests logs from all GCP services, VMs, and custom applications. Logs are indexed, searchable, and can be exported to Cloud Storage, BigQuery, or Pub/Sub for analysis and archival.
+
+## When To Use
+
+- Application debugging and troubleshooting
+- Audit compliance logging
+- Security monitoring
+- Log-based metrics
+- Incident investigation
+- Compliance archiving
+
+## When NOT To Use
+
+- High-frequency trading data (use specialized solutions)
+- Real-time stream processing (use Dataflow)
+- Long-term cold storage (use Cloud Storage directly)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Cloud Logging                            │
+├─────────────────────────────────────────────────────────────┤
+│  Log Router:                                                │
+│  ├── Sinks (Cloud Storage, BigQuery, Pub/Sub)              │
+│  ├── Filters (inclusion/exclusion)                         │
+│  └── Log types (audit, platform, application)              │
+├─────────────────────────────────────────────────────────────┤
+│  Log Storage:                                              │
+│  ├── Default retention: 30 days                           │
+│  ├── Audit logs: 400 days                                 │
+│  └── Custom retention: configurable                        │
+├─────────────────────────────────────────────────────────────┤
+  Pricing:
+  ├── First 50 GB/month: Free
+  └── $0.005/GB after free tier
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Log Entry
+Individual log record with timestamp, severity, payload, and resource metadata.
+
+### Log Sink
+Destination for log routing with filter-based routing.
+
+### Log Router
+Ingests and routes logs based on sink configuration.
+
+### Log Metric
+Metric derived from log entries via filtering.
+
+### Log Bucket
+Storage container for log categories with retention settings.
+
+### Audit Log
+GCP service activity logs for compliance.
+
+## Real Production Example
+
+**Log Management Infrastructure**
+
+```hcl
+# Terraform configuration for Cloud Logging
+
+# Create log sink to Cloud Storage for archival
+resource "google_logging_project_sink" "storage_sink" {
+  name        = "storage-archive-sink"
+  destination = "storage.googleapis.com/${google_storage_bucket.audit_archive.name}"
+  
+  filter = <<-EOT
+    logName="projects/${var.project}/logs/cloudaudit.googleapis.com%2Factivity" OR
+    logName="projects/${var.project}/logs/cloudaudit.googleapis.com%2Fdata_access"
+  EOT
+  
+  unique_writer_identity = true
+}
+
+# Storage bucket for logs
+resource "google_storage_bucket" "audit_archive" {
+  name          = "${var.project}-audit-logs"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  lifecycle_rule {
+    condition {
+      age = 365  # Retain for 1 year
+    }
+    action {
+      type = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 1825  # Delete after 5 years
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+# Create sink to BigQuery for analytics
+resource "google_logging_project_sink" "bigquery_sink" {
+  name        = "bigquery-analytics-sink"
+  destination = "bigquery.googleapis.com/projects/${var.project}/datasets/${google_bigquery_dataset.analytics.dataset_id}"
+  
+  filter = <<-EOT
+    resource.type="cloud_run_revision" AND
+    severity>=WARNING
+  EOT
+  
+  unique_writer_identity = true
+}
+
+# BigQuery dataset for log analytics
+resource "google_bigquery_dataset" "analytics" {
+  dataset_id    = "logs_analytics"
+  friendly_name = "Logs Analytics"
+  description   = "Log data for analytics"
+  location      = "US"
+  
+  default_table_expiration_ms = 2592000000  # 30 days
+}
+
+# Create sink to Pub/Sub for real-time processing
+resource "google_logging_project_sink" "pubsub_sink" {
+  name        = "pubsub-realtime-sink"
+  destination = "pubsub.googleapis.com/${var.project}/${google_pubsub_topic.logs.id}"
+  
+  filter = <<-EOT
+    resource.type="k8s_container" AND
+    severity>=ERROR
+  EOT
+  
+  unique_writer_identity = true
+}
+
+# Pub/Sub topic for real-time logs
+resource "google_pubsub_topic" "logs" {
+  name = "realtime-logs"
+}
+
+# Log metrics
+resource "google_logging_metric" "error_count" {
+  name   = "error_count"
+  filter = "severity>=ERROR"
+  
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+  }
+}
+
+resource "google_logging_metric" "api_latency" {
+  name   = "api_latency"
+  filter = <<-EOT
+    resource.type="cloud_run_revision" AND
+    metric.type="run.googleapis.com/request_latencies"
+  EOT
+  
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "DISTRIBUTION"
+    unit        = "ms"
+  }
+  
+  value_extractor = "EXTRACT(protoPayload.latencyMillis)"
+}
+
+# Log bucket for custom logs
+resource "google_logging_project_bucket" "custom_logs" {
+  name         = "custom-logs"
+  location     = "US"
+  description  = "Custom application logs"
+  retention_days = 30
+  
+  lifecycle_state = "ACTIVE"
+}
+
+# Exclusions for noisy logs
+resource "google_logging_project_exclusion" "health_checks" {
+  name   = "exclude-health-checks"
+  filter = <<-EOT
+    resource.type="http_load_balancer" AND
+    httpRequest.requestUrl:"/healthz"
+  EOT
+  
+  description = "Exclude health check requests"
+}
+
+# Audit configuration
+resource "google_project_service" "logging" {
+  service = "logging.googleapis.com"
+}
+
+resource "google_project_iam_member" "logging_writer" {
+  project = var.project
+  role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.app.email}"
+}
+
+resource "google_project_iam_member" "logging_reader" {
+  project = var.project
+  role    = "roles/logging.viewer"
+  member  = "user:analyst@company.com"
+}
+```
+
+## CLI Examples
+
+```bash
+# Write log entry
+gcloud logging write my-log "Test message" --severity=INFO
+
+# Write with resource
+gcloud logging write my-log "Application error" \
+  --severity=ERROR \
+  --log-name=my-app-log \
+  --resource=gce_instance
+
+# Read logs
+gcloud logging read "severity>=ERROR" --limit=50
+gcloud logging read "resource.type=cloud_run_revision" --limit=100
+
+# Read from specific log
+gcloud logging read "logName:my-app-log" --project=my-project
+
+# Read using advanced filter
+gcloud logging read \
+  "resource.type=cloud_run_revision AND severity>=WARNING AND textPayload:exception" \
+  --format="table(timestamp,severity,textPayload)"
+
+# Write JSON log
+echo '{"message":"Error occurred","code":500}' | \
+gcloud logging write my-log --stdin --severity=ERROR
+
+# List log entries
+gcloud logging entries list --limit=100
+
+# Delete log entries (by filter)
+gcloud logging write my-old-log "" --severity=DEFAULT
+# Note: You cannot delete individual entries, only whole logs
+
+# Create sink
+gcloud logging sinks create my-sink \
+  storage.googleapis.com/my-bucket \
+  --log-filter='severity>=WARNING'
+
+# List sinks
+gcloud logging sinks list
+
+# Create log metric
+gcloud logging metrics create error-metric \
+  --description="Error count" \
+  --log-filter='severity>=ERROR'
+
+# List metrics
+gcloud logging metrics list
+
+# Write using Logger
+logger -p user.error "My application error"
+# This writes to syslog which Cloud Logging collects
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Sink to Cloud Storage
+resource "google_logging_project_sink" "storage" {
+  name        = "storage-sink"
+  destination = "storage.googleapis.com/${google_storage_bucket.logs.name}"
+  filter      = "severity >= WARNING"
+}
+
+# Sink to BigQuery
+resource "google_logging_project_sink" "bigquery" {
+  name        = "bq-sink"
+  destination = "bigquery.googleapis.com/${google_bigquery_dataset.dataset_id}"
+  filter      = "resource.type=\"cloud_run_revision\""
+}
+
+# Log metric
+resource "google_logging_metric" "error_count" {
+  name   = "error-count"
+  filter = "severity=ERROR"
+  
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+  }
+}
+
+# Log exclusion
+resource "google_logging_project_exclusion" "exclude_health" {
+  name   = "exclude-health"
+  filter = "logName:healthz"
+}
+```
+
+## Common Commands
+
+```bash
+# Write logs
+gcloud logging write LOG_NAME MESSAGE [--severity=LEVEL]
+
+# Read logs
+gcloud logging read FILTER [--limit=N] [--format=FORMAT]
+gcloud logging entries list
+
+# Manage sinks
+gcloud logging sinks create NAME DESTINATION [--log-filter=FILTER]
+gcloud logging sinks list
+gcloud logging sinks describe NAME
+
+# Manage metrics
+gcloud logging metrics create NAME [--log-filter=FILTER]
+gcloud logging metrics list
+
+# Exclusion rules
+gcloud logging sinks update SINK --add-exclusion=FILTER
+```
+
+## Monitoring
+
+### Key Log Metrics
+- Error rate (log-based metric)
+- Request count by severity
+- Latency percentiles
+- Custom business metrics
+
+### Cloud Monitoring Integration
+```bash
+# Create log-based alert
+gcloud monitoring policies create \
+  --display-name="Log Error Alert" \
+  --condition-display-name="Error rate > 10/min" \
+  --condition-filter='resource.type="logging_metric" AND metric.type="logging.googleapis.com/user/error_count"' \
+  --condition-threshold-value=10 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### Access Control
+```bash
+# Log writer
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/logging.logWriter
+
+# Log viewer
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:analyst@company.com \
+  --role=roles/logging.viewer
+
+# Private Logs Browse
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:auditor@company.com \
+  --role=roles/privateLogsViewer
+```
+
+### Audit Logs
+- Admin Activity: Always logged, no cost
+- Data Access: Configurable, billed
+- Policy Denied: Always logged
+
+## Cost Optimization
+
+### Pricing
+| Resource | Price |
+|----------|-------|
+| First 50 GB/month | Free |
+| Additional GB | $0.005/GB |
+
+### Cost-Saving Tips
+```bash
+# Exclude noisy logs
+gcloud logging sinks update SINK \
+  --add-exclusion="logName:health-check AND severity<=INFO"
+
+# Use log buckets with shorter retention for dev
+# Audit logs cannot be excluded
+```
+
+## Troubleshooting
+
+### Logs Not Appearing
+```bash
+# Check log name
+gcloud logging read "logName:matches(^projects/.*/logs/my-app)"
+
+# Verify resource type
+gcloud logging read "resource.type=gce_instance"
+
+# Check sink configuration
+gcloud logging sinks describe my-sink
+
+# Verify writer identity has permissions
+gcloud logging sinks describe my-sink --format="yaml(writerIdentity)"
+```
+
+### Permission Issues
+```bash
+# Check log sink writer permissions
+gcloud projects get-iam-policy my-project \
+  --filter="bindings.members:serviceAccount:cloud-logs@google.com"
+
+# Grant bucket access to sink writer
+gcloud storage buckets add-iam-policy-binding gs://my-bucket \
+  --member=serviceAccount:SINK_WRITER_SA \
+  --role=roles/storage.objectCreator
+```
+
+## Interview Questions
+
+**Q: What is the difference between log sinks and log buckets?**
+A: Sinks route logs to destinations (Cloud Storage, BigQuery, Pub/Sub). Buckets store logs in Cloud Logging with configurable retention. Sinks can filter what to route; buckets define storage behavior.
+
+**Q: How do you reduce logging costs?**
+A: Exclude noisy logs (health checks, debug), use log buckets with shorter retention for non-production, limit audit log scope if possible, and aggregate before sinking.
+
+**Q: What log types cannot be excluded?**
+A: Admin Activity logs and Policy Denied logs cannot be excluded. Data Access logs can be filtered but generate costs.
+
+**Q: How long are logs retained?**
+A: Default retention is 30 days for most logs. Audit logs are retained 400 days. You can configure custom retention in log buckets.
+
+**Q: What is a log-based metric?**
+A: A metric derived from log entries using a filter. Types: counter (delta) for counting occurrences, and distribution for latency/size metrics.
+
+## Cheat Sheet
+
+```bash
+# Write log
+gcloud logging write my-log "Message" --severity=INFO
+
+# Read logs
+gcloud logging read "severity>=ERROR" --limit=50
+gcloud logging read "resource.type=cloud_run_revision"
+
+# Sinks
+gcloud logging sinks create NAME DEST --log-filter=FILTER
+gcloud logging sinks list
+
+# Metrics
+gcloud logging metrics create NAME --log-filter=FILTER
+gcloud logging metrics list
+
+# Exclusions
+gcloud logging sinks update SINK --add-exclusion=FILTER
+```
+
+## Labs
+
+### Lab 1: Log Aggregation
+Set up comprehensive log collection.
+1. Create log sinks to Cloud Storage
+2. Create sink to BigQuery for analysis
+3. Create log-based metrics
+4. Configure log exclusions
+5. Verify log flow
+
+### Lab 2: Audit Logging
+Configure audit log archival.
+1. Enable audit logging
+2. Create dedicated sink
+3. Configure retention policies
+4. Set up access controls
+5. Test audit queries
+
+### Lab 3: Real-time Log Processing
+Build log processing pipeline.
+1. Create Pub/Sub sink
+2. Set up Dataflow for processing
+3. Create log metrics
+4. Configure alerting
+5. Monitor processing latency
+
+## Related Services
+
+- **Cloud Monitoring**: Metrics and alerting
+- **Cloud Storage**: Log archival
+- **BigQuery**: Log analytics
+- **Pub/Sub**: Real-time processing
+- **Dataflow**: Log ETL pipelines

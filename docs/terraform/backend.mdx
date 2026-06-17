@@ -1,0 +1,816 @@
+# Terraform Backend
+
+## Overview
+
+The backend determines how Terraform stores state and performs operations. It defines where state is kept, how operations are locked, and whether operations run locally or remotely. Configuring a backend is critical for team collaboration and production deployments.
+
+## When To Use
+
+- **Team environments**: Always use remote backend for teams
+- **CI/CD pipelines**: Remote backend enables consistent pipeline execution
+- **State locking**: Prevent concurrent modifications
+- **State encryption**: Protect sensitive state data
+- **Audit trails**: Track state changes
+
+## When NOT To Use
+
+- **Single developer, local-only**: Local backend acceptable for experimentation
+- **Completely isolated infrastructure**: For throwaway environments
+
+## Core Concepts
+
+### Backend Types
+
+```
+Local Backend
+├── State stored in local file
+├── No locking
+└── Single user only
+
+Remote Backends
+├── GCS (Google Cloud Storage)
+├── S3 (Amazon S3)
+├── Azure Blob Storage
+├── etcd / Consul
+└── Terraform Cloud / HCP Terraform
+```
+
+### Backend Configuration
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = "prod"
+  }
+}
+```
+
+## Real Production Example
+
+### GCS Backend with Full Security
+
+```hcl
+# versions.tf
+
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+  }
+  
+  # GCS Backend with encryption and versioning
+  backend "gcs" {
+    bucket      = "my-project-terraform-state-prod"
+    prefix      = "networking"
+    
+    # Encryption at rest (CMEK)
+    encryption_key = google_kms_key.terraform_state_key.id
+    
+    # State file versioning enabled automatically via bucket
+  }
+}
+
+# =============================================================================
+# KMS Key for State Encryption
+# =============================================================================
+
+resource "google_kms_key_ring" "tf_keyring" {
+  name     = "tf-keyring-${var.environment}"
+  location = "global"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+  
+  # Protect key ring deletion
+  skip_initialization = false
+}
+
+resource "google_kms_key" "terraform_state_key" {
+  name         = "tf-state-key-${var.environment}"
+  key_ring     = google_kms_key_ring.tf_keyring.key_ring
+  purpose      = "ENCRYPT_DECRYPT"
+  
+  # Automatic key rotation
+  rotation_period = "7776000s"  # 90 days
+  
+  version_template {
+    algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
+    protection_level = "HSM"  # Hardware security module
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# =============================================================================
+# GCS Bucket for Terraform State
+# =============================================================================
+
+resource "google_storage_bucket" "terraform_state" {
+  name          = "${var.project_id}-terraform-state-${var.environment}"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "state-storage"
+  }
+  
+  # Uniform bucket-level access (required for GCS backend)
+  uniform_bucket_level_access = true
+  
+  # Versioning for state history
+  versioning {
+    enabled = true
+  }
+  
+  # Server-side encryption with CMEK
+  encryption {
+    default_kms_key_name = google_kms_key.terraform_state_key.id
+  }
+  
+  # Lifecycle rules for state files
+  lifecycle_rule {
+    condition {
+      age = 365  # Keep state versions for 1 year
+    }
+    action {
+      type          = "SetStorageClass"
+      storage_class = "NEARLINE"
+    }
+  }
+  
+  lifecycle_rule {
+    condition {
+      age = 730  # 2 years
+    }
+    action {
+      type = "Delete"
+    }
+  }
+  
+  # CORS - deny cross-origin requests
+  cors {
+    origin          = []
+    method          = []
+    response_header = []
+    max_age_seconds = 0
+  }
+  
+  # Public access prevention
+  public_access_prevention = "inherited"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# =============================================================================
+# State Bucket IAM
+# =============================================================================
+
+# Terraform service account permissions
+resource "google_storage_bucket_iam_member" "terraform_state_admin" {
+  bucket = google_storage_bucket.terraform_state.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.terraform_service_account}"
+  
+  condition {
+    title       = "terraform-state-access"
+    description = "Allow Terraform to manage state objects"
+    expression  = "resource.name.startsWith(\"projects/_/buckets/${google_storage_bucket.terraform_state.name}\")"
+  }
+}
+
+# State versioning requires bucket admin
+resource "google_storage_bucket_iam_member" "terraform_state_version_admin" {
+  bucket = google_storage_bucket.terraform_state.name
+  role   = "roles/storage.admin"
+  member = "serviceAccount:${var.terraform_service_account}"
+}
+
+# =============================================================================
+# State Access Logs
+# =============================================================================
+
+# Separate bucket for access logs
+resource "google_storage_bucket" "terraform_state_logs" {
+  name          = "${var.project_id}-terraform-state-logs-${var.environment}"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Enable access logging on state bucket
+resource "google_storage_bucket" "terraform_state" {
+  # ... (add logging config)
+  logging {
+    log_bucket        = google_storage_bucket.terraform_state_logs.name
+    log_object_prefix = "state-access-logs"
+  }
+}
+
+# =============================================================================
+# Additional Backend Configuration
+# =============================================================================
+
+# For environments requiring state locking via DynamoDB (AWS cross-account)
+# terraform {
+#   backend "s3" {
+#     bucket         = "my-terraform-state"
+#     key            = "prod/terraform.tfstate"
+#     region         = "us-east-1"
+#     encrypt        = true
+#     dynamodb_table = "terraform-state-locks"
+#     state_lock     = true
+#   }
+# }
+```
+
+### Partial Backend Configuration
+
+```hcl
+# versions.tf
+terraform {
+  backend "gcs" {
+    # Bucket specified at runtime
+    # prefix specified at runtime
+  }
+}
+```
+
+```bash
+# Initialize with partial config
+terraform init \
+  -backend-config="bucket=my-project-terraform-state" \
+  -backend-config="prefix=prod"
+```
+
+### S3 Backend (AWS Alternative)
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state-prod"
+    key            = "network/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    
+    # SSE-KMS encryption
+    kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/xxxx-xxxx"
+    
+    # State locking via DynamoDB
+    dynamodb_table = "terraform-state-locks"
+    
+    # S3-specific options
+    acl            = "private"
+    external       = false
+    access_key     = var.aws_access_key
+    secret_key     = var.aws_secret_key
+    
+    # Replicate state
+    replication {
+      enabled = true
+      rules {
+        destination {
+          bucket = "arn:aws:s3:::my-terraform-state-dr"
+        }
+      }
+    }
+  }
+}
+
+# DynamoDB Table for State Locking
+resource "aws_dynamodb_table" "terraform_state_locks" {
+  name         = "terraform-state-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+  
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+  
+  server_side_encryption {
+    enabled = true
+  }
+  
+  point_in_time_recovery {
+    enabled = true
+  }
+  
+  ttl {
+    attribute_name = "TTL"
+    enabled        = true
+  }
+  
+  global_secondary_index {
+    name            = "LockExpirationIndex"
+    hash_key        = "LockID"
+    projection_type = "ALL"
+    write_capacity  = 5
+    read_capacity   = 5
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+## HCL Examples
+
+### Backend Configuration Types
+
+```hcl
+# Full configuration (inline)
+terraform {
+  backend "gcs" {
+    bucket = "my-bucket"
+    prefix = "prod"
+  }
+}
+
+# Partial configuration (values at runtime)
+terraform {
+  backend "gcs" {
+    # bucket and prefix specified at init
+  }
+}
+```
+
+### Backend with Custom Configuration
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket                  = "my-terraform-state"
+    prefix                  = "prod"
+    encryption_key          = "projects/my-project/locations/global/keyRings/my-keyring/cryptoKeys/my-key"
+    
+    # State file path will be: gs://my-terraform-state/prod/default.tfstate
+  }
+}
+```
+
+### Multiple Backend Configurations
+
+```hcl
+# In different environment directories
+# environments/dev/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = "dev"
+  }
+}
+
+# environments/prod/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = "prod"
+  }
+}
+```
+
+## CLI Examples
+
+### Backend Initialization
+
+```bash
+# Initialize with default backend
+terraform init
+
+# Initialize with partial backend config
+terraform init \
+  -backend-config="bucket=my-bucket" \
+  -backend-config="prefix=prod"
+
+# Reconfigure backend
+terraform init -reconfigure
+
+# Force backend reconfiguration
+terraform init -force-copy
+
+# Upgrade backend (when upgrading Terraform)
+terraform init -upgrade
+
+# Migrate state between backends
+terraform init -migrate-state
+```
+
+### Backend Operations
+
+```bash
+# Pull state
+terraform state pull > state.tfstate
+
+# Push state
+terraform state push state.tfstate
+
+# Check state lock
+terraform state pull | jq '.metadata'
+
+# Force unlock (emergency)
+terraform force-unlock <lock-id>
+```
+
+### Backend State Management
+
+```bash
+# List GCS bucket contents
+gsutil ls gs://my-terraform-state/
+
+# List specific prefix
+gsutil ls gs://my-terraform-state/prod/
+
+# View state file versions
+gsutil ls -a gs://my-terraform-state/prod/
+
+# Copy specific version
+gsutil cp gs://my-terraform-state/prod/default.2024-01-15T10:00:00.0~1 /tmp/state.tfstate
+
+# Restore state version
+terraform state push /tmp/state.tfstate
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform init` | Initialize backend |
+| `terraform init -reconfigure` | Reconfigure backend |
+| `terraform init -migrate-state` | Migrate state |
+| `terraform state pull` | Pull remote state |
+| `terraform state push` | Push state to remote |
+| `terraform force-unlock` | Force unlock state |
+
+## Best Practices
+
+### 1. Always Use Remote Backend for Teams
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = var.environment
+  }
+}
+```
+
+### 2. Enable State Encryption
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    # GCS always encrypts, optionally with CMEK
+    encryption_key = google_kms_key.terraform_state_key.id
+  }
+}
+```
+
+### 3. Enable State Versioning
+
+```bash
+# GCS bucket versioning
+gsutil versioning set on gs://my-terraform-state
+
+# S3 bucket versioning
+aws s3api put-bucket-versioning \
+  --bucket my-terraform-state \
+  --versioning-configuration Status=Enabled
+```
+
+### 4. Separate State Per Environment
+
+```hcl
+# environments/prod/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = "prod"  # Separate prefix per environment
+  }
+}
+```
+
+### 5. Restrict Backend Access
+
+```hcl
+# IAM for state bucket
+resource "google_storage_bucket_iam_member" "tf_state" {
+  bucket = google_storage_bucket.terraform_state.name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.terraform_service_account}"
+}
+```
+
+### 6. Protect Against Accidental Deletion
+
+```hcl
+# Bucket with deletion protection
+resource "google_storage_bucket" "terraform_state" {
+  name = "my-terraform-state"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# KMS key with deletion protection
+resource "google_kms_key" "terraform_state_key" {
+  name = "tf-state-key"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+```
+
+## Monitoring / State Management
+
+### State Change Audit
+
+```bash
+# Cloud Storage audit logs
+gcloud logging read \
+  'resource.type="gcs_bucket" AND resource.labels.bucket_name="my-terraform-state"' \
+  --project=my-project \
+  --format=json
+
+# CloudTrail for S3 (AWS)
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue=my-terraform-state
+```
+
+### State Metrics
+
+```bash
+# State file size
+gsutil du -s gs://my-terraform-state/prod/
+
+# State file count
+gsutil ls gs://my-terraform-state/prod/*.tfstate | wc -l
+
+# State versions
+gsutil ls -a gs://my-terraform-state/prod/ | grep -c default
+```
+
+### State Backup Automation
+
+```hcl
+# Cloud Function for state backup
+resource "google_cloud_scheduler_job" "state_backup" {
+  name        = "terraform-state-backup"
+  schedule    = "0 */6 * * *"  # Every 6 hours
+  time_zone   = "UTC"
+  region      = var.region
+  
+  http_target {
+    uri         = "https://${var.region}-${var.project_id}.cloudfunctions.net/backup-terraform-state"
+    http_method = "POST"
+  }
+}
+```
+
+## Security
+
+### State Encryption
+
+```hcl
+# GCS backend with CMEK
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    encryption_key = google_kms_key.terraform_state_key.id
+  }
+}
+
+# S3 backend with SSE-KMS
+terraform {
+  backend "s3" {
+    bucket     = "my-terraform-state"
+    encrypt    = true
+    kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/xxxx"
+  }
+}
+```
+
+### State Access Control
+
+```hcl
+# Principle of least privilege for state access
+resource "google_project_iam_member" "terraform_state_dev" {
+  project = var.project_id
+  role    = "roles/storage.objectViewer"  # Read-only for developers
+  
+  member = "serviceAccount:dev-ci@project.iam.gserviceaccount.com"
+}
+
+resource "google_project_iam_member" "terraform_state_prod" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"  # Full access for prod CI
+  
+  member = "serviceAccount:prod-ci@project.iam.gserviceaccount.com"
+}
+```
+
+### Audit Logging
+
+```hcl
+# Enable Cloud Audit Logs
+resource "google_project_service" "logging" {
+  project = var.project_id
+  service = "logging.googleapis.com"
+}
+
+# Cloud Storage bucket with access logging
+resource "google_storage_bucket" "terraform_state" {
+  logging {
+    log_bucket        = google_storage_bucket.state_logs.name
+    log_object_prefix = "state-access"
+  }
+}
+```
+
+## Cost Optimization
+
+### State Storage Costs
+
+```bash
+# GCS storage costs (approximate)
+# Standard: $0.020/GB/month
+# Nearline: $0.010/GB/month
+# State files are typically small (<10MB)
+
+# Minimize costs with lifecycle rules
+lifecycle_rule {
+  condition { age = 90 }
+  action { type = "SetStorageClass"; storage_class = "NEARLINE" }
+}
+
+lifecycle_rule {
+  condition { age = 365 }
+  action { type = "Delete" }
+}
+```
+
+### State File Size Optimization
+
+```bash
+# Keep state files small
+# Use modules to organize resources
+# Avoid monolithic state files
+
+# Check state size
+gsutil du -sh gs://my-terraform-state/prod/
+```
+
+## Troubleshooting
+
+### State Lock Timeout
+
+```bash
+# Error: Error acquiring the state lock
+# Solution: Wait for lock or force unlock
+terraform apply  # Wait for lock
+
+# Check lock info
+gsutil cat gs://my-terraform-state/prod/.terraform.lock.info
+
+# Force unlock (emergency only)
+terraform force-unlock <lock-id>
+
+# Or manually remove lock file
+gsutil rm gs://my-terraform-state/prod/.terraform.lock.info
+```
+
+### Backend Configuration Error
+
+```bash
+# Error: Backend configuration changed
+# Solution: Reinitialize
+terraform init -reconfigure
+
+# Or migrate state
+terraform init -migrate-state
+```
+
+### State File Corruption
+
+```bash
+# Restore from version
+gsutil cp gs://my-terraform-state/prod/default.2024-01-15T10:00:00.0~1 /tmp/state.tfstate
+
+# Verify state
+terraform state pull
+
+# Push restored state
+terraform state push /tmp/state.tfstate
+```
+
+### Permission Denied
+
+```bash
+# Error: Access denied to state bucket
+# Solution: Check IAM permissions
+gcloud projects get-iam-policy my-project
+
+# Grant permissions
+gcloud projects add-iam-policy-binding my-project \
+  --member="serviceAccount:terraform@project.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+```
+
+## Interview Questions
+
+### Q1: What is a Terraform backend?
+**A:** Backend defines where Terraform stores state and how operations are performed. It can be local (file system) or remote (GCS, S3, etcd).
+
+### Q2: Why use remote backend over local?
+**A:** Remote backends enable team collaboration, state locking, state encryption, versioning for rollback, and consistent CI/CD execution.
+
+### Q3: How does state locking work in GCS?
+**A:** Terraform creates a `.terraform.lock.info` file when acquiring lock. Lock is held if file exists and is younger than timeout. GCS doesn't natively support locking.
+
+### Q4: What is partial backend configuration?
+**A:** Specifying only some backend options in configuration, with remaining options provided at runtime via `-backend-config` flags.
+
+### Q5: How do you migrate between backends?
+**A:** Use `terraform init -migrate-state` to migrate local state to remote backend, or between remote backends.
+
+### Q6: What encryption options exist for state?
+**A:** GCS with Google-managed or CMEK encryption. S3 with SSE-S3 or SSE-KMS. State always encrypted in transit.
+
+### Q7: How do you recover from corrupted state?
+**A:** Use state versioning to restore previous version: copy from GCS version, then `terraform state push`.
+
+### Q8: What is state file versioning?
+**A:** Keeping historical versions of state files. Enabled via GCS or S3 bucket versioning. Essential for disaster recovery.
+
+## Cheat Sheet
+
+### Backend Configuration
+```hcl
+terraform {
+  backend "gcs" {
+    bucket         = "my-state-bucket"
+    prefix         = "env/prod"
+    encryption_key = "kms-key-id"  # Optional CMEK
+  }
+}
+```
+
+### S3 Backend
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "my-state-bucket"
+    key            = "prod/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "terraform-state-locks"
+  }
+}
+```
+
+### Initialization Commands
+```bash
+terraform init                    # Initialize
+terraform init -reconfigure       # Reconfigure
+terraform init -migrate-state     # Migrate
+terraform init -force-copy        # Force copy
+```
+
+### State Commands
+```bash
+terraform state pull              # Pull state
+terraform state push              # Push state
+terraform force-unlock <lock-id>  # Force unlock
+```
+
+## Related Topics
+
+- [State](./state.mdx) - State management
+- [Remote State](./remote-state.mdx) - Cross-environment state
+- [Workspaces](./workspaces.mdx) - Workspace management
+- [Variables](./variables.mdx) - Variable handling
+- [Security](./secrets.mdx) - Secrets management

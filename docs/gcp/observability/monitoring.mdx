@@ -1,0 +1,702 @@
+# Cloud Monitoring
+
+## Overview
+
+Google Cloud Monitoring provides visibility into the performance, uptime, and health of your GCP infrastructure and applications. It offers metrics, dashboards, alerts, and alerting policies with integrations across all GCP services. The free tier includes 60 metrics and 6 dashboards.
+
+## When To Use
+
+- Infrastructure monitoring and alerting
+- Application performance monitoring
+- Service level objective (SLO) tracking
+- Custom metrics collection
+- Incident management
+- Resource utilization analysis
+
+## When NOT To Use
+
+- Log aggregation (use Cloud Logging)
+- Distributed tracing (use Cloud Trace)
+- Real-time streaming analytics
+- Deep application profiling
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Cloud Monitoring                           │
+├─────────────────────────────────────────────────────────────┤
+│  Components:                                                │
+│  ├── Metrics        (time-series data)                     │
+│  ├── Dashboards     (visualization)                        │
+│  ├── Alerting       (incident creation)                    │
+│  ├── Groups         (resource grouping)                    │
+│  └── SLOs           (service level objectives)             │
+├─────────────────────────────────────────────────────────────┤
+│  Uptime Checks:                                            │
+│  ├── HTTP/HTTPS    (web endpoint monitoring)              │
+│  ├── TCP           (port availability)                     │
+│  └── Cloud Run     (container monitoring)                  │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  ├── 60 metrics free                                       │
+│  ├── $0.01/metric after free tier                         │
+│  └── Alerting channels extra                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Metric
+Time-series data point with resource type, metric type, and value.
+
+### Resource
+GCP resource emitting metrics (VM, container, service, etc.).
+
+### Monitoring Query Language (MQL)
+SQL-like language for metrics manipulation.
+
+### Alerting Policy
+Defines conditions that trigger notifications.
+
+### Notification Channel
+Email, SMS, PagerDuty, Slack, webhook destinations.
+
+### Uptime Check
+Synthetic request testing from global locations.
+
+## Real Production Example
+
+**Comprehensive Monitoring Setup**
+
+```hcl
+# Terraform configuration for Cloud Monitoring
+
+# Create notification channel (email)
+resource "google_monitoring_notification_channel" "email" {
+  display_name = "Email Alert Channel"
+  type         = "email"
+  
+  labels = {
+    email_address = "alerts@company.com"
+  }
+}
+
+# Create notification channel (Slack)
+resource "google_monitoring_notification_channel" "slack" {
+  display_name = "Slack Alerts"
+  type         = "slack"
+  
+  labels = {
+    channel_name = "#alerts"
+  }
+  
+  sensitive_labels {
+    auth_token = var.slack_token  # Stored as secret
+  }
+}
+
+# Create uptime check for web application
+resource "google_monitoring_uptime_check_config" "web" {
+  display_name = "Web Application Uptime"
+  
+  monitored_resource {
+    type = "uptime_url"
+    labels = {
+      host = "myapp.example.com"
+    }
+  }
+  
+  http_check {
+    path         = "/health"
+    port         = 443
+    use_ssl      = true
+    validate_ssl = true
+  }
+  
+  period     = "60s"
+  timeout    = "10s"
+  
+  checker_region = "USA"
+  
+  monitored_resources {
+    type = "uptime_url"
+    labels = {
+      host = "myapp.example.com"
+    }
+  }
+}
+
+# Uptime check for API
+resource "google_monitoring_uptime_check_config" "api" {
+  display_name = "API Uptime"
+  
+  monitored_resource {
+    type = "uptime_url"
+    labels = {
+      host = "api.myapp.example.com"
+    }
+  }
+  
+  http_check {
+    path         = "/v1/health"
+    port         = 443
+    use_ssl      = true
+    headers = {
+      "Authorization" = "Bearer ${var.api_key}"
+    }
+  }
+  
+  period  = "60s"
+  timeout = "10s"
+  
+  content_matchers {
+    content = "\"status\":\"healthy\""
+  }
+}
+
+# Alerting policy for CPU utilization
+resource "google_monitoring_alert_policy" "high_cpu" {
+  display_name = "High CPU Alert"
+  
+  conditions {
+    display_name = "CPU > 80%"
+    
+    condition_threshold {
+      filter          = "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.8
+      
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_MEAN"
+      }
+    }
+  }
+  
+  combiner = "OR"
+  
+  conditions {
+    display_name = "GKE Container CPU > 80%"
+    
+    condition_threshold {
+      filter          = "resource.type=\"k8s_container\" AND metric.type=\"kubernetes.io/container/cpu/core_usage_time\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.8
+    }
+  }
+  
+  notification_channels = [
+    google_monitoring_notification_channel.email.name,
+    google_monitoring_notification_channel.slack.name
+  ]
+  
+  documentation {
+    content = "CPU utilization is above 80% for 5 minutes. Investigate high CPU usage and consider scaling."
+    mime_type = "text/markdown"
+  }
+}
+
+# Alerting policy for high error rate
+resource "google_monitoring_alert_policy" "high_error_rate" {
+  display_name = "High Error Rate"
+  
+  conditions {
+    display_name = "HTTP 5xx Error Rate > 1%"
+    
+    condition_threshold {
+      filter          = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_count\""
+      duration        = "60s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.01
+      
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_RATE"
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields    = ["resource.labels.service_name"]
+      }
+    }
+  }
+  
+  notification_channels = [
+    google_monitoring_notification_channel.email.name
+  ]
+}
+
+# Alerting policy for latency
+resource "google_monitoring_alert_policy" "high_latency" {
+  display_name = "High Latency P99 > 500ms"
+  
+  conditions {
+    display_name = "P99 Latency"
+    
+    condition_threshold {
+      filter          = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_latencies\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 500000000  # 500ms in nanoseconds
+      
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_PERCENTILE_99"
+      }
+    }
+  }
+  
+  notification_channels = [
+    google_monitoring_notification_channel.slack.name
+  ]
+}
+
+# Dashboard for Cloud Run
+resource "google_monitoring_dashboard" "cloud_run" {
+  dashboard_json = jsonencode({
+    displayName = "Cloud Run Dashboard"
+    
+    mosaicLayout = {
+      columns = 12
+      
+      tiles = [
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Request Count"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_count\""
+                  }
+                }
+              }]
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Latency P99"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/request_latencies\""
+                  }
+                }
+              }]
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "Container Instance Count"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/container/instance_count\""
+                  }
+                }
+              }]
+            }
+          }
+        },
+        {
+          width  = 6
+          height = 4
+          widget = {
+            title = "CPU Utilization"
+            xyChart = {
+              dataSets = [{
+                timeSeriesQuery = {
+                  timeSeriesFilter = {
+                    filter = "resource.type=\"cloud_run_revision\" AND metric.type=\"run.googleapis.com/container/cpu_utilizations\""
+                  }
+                }
+              }]
+            }
+          }
+        }
+      ]
+    }
+  })
+}
+
+# Service Level Objective
+resource "google_monitoring_slo" "availability_slo" {
+  name        = "availability-slo"
+  service     = "my-cloud-run-service"
+  
+  sli {
+    request_based = {
+      good_total_ratio = {
+        threshold_days = 30
+      }
+    }
+  }
+  
+  goal                = 0.99
+  calendar_period     = "MONTH"
+  
+  notification_channels = [
+    google_monitoring_notification_channel.email.name
+  ]
+}
+
+# Custom metric
+resource "google_metric_descriptor" "custom_requests" {
+  type        = "custom.googleapis.com/request_count"
+  metric_kind = "GAUGE"
+  value_type  = "INT64"
+  unit        = "1"
+  description = "Custom request count metric"
+  
+  labels {
+    key         = "environment"
+    value_type  = "STRING"
+    description = "Environment name"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# List metrics
+gcloud monitoring metrics list
+
+# Create alerting policy
+gcloud monitoring policies create \
+  --display-name="CPU Alert" \
+  --condition-display-name="CPU > 70%" \
+  --condition-filter='resource.type="gce_instance" AND metric.type="compute.googleapis.com/instance/cpu/utilization"' \
+  --condition-threshold-value=0.7 \
+  --notification-channels=CHANNEL_ID
+
+# List alerting policies
+gcloud monitoring policies list
+
+# Describe policy
+gcloud monitoring policies describe POLICY_ID
+
+# Create uptime check
+gcloud monitoring uptime-check-configs create \
+  --display-name="Web Uptime" \
+  --http-check-path="/health" \
+  --monitored-resource-type=uptime_url \
+  --monitored-resource-labels=host=myapp.example.com
+
+# List uptime checks
+gcloud monitoring uptime-check-configs list
+
+# Create notification channel
+gcloud monitoring channels create \
+  --display-name="Email" \
+  --type=email \
+  --channel-labels=email_address=alerts@example.com
+
+# List channels
+gcloud monitoring channels list
+
+# Query metrics
+gcloud monitoring metrics read \
+  "compute.googleapis.com/instance/cpu/utilization" \
+  --filter='resource.instance_id="instance-id"'
+
+# Create dashboard from JSON
+gcloud monitoring dashboards create --config-from-file=dashboard.json
+
+# List dashboards
+gcloud monitoring dashboards list
+
+# Create SLO
+gcloud monitoring slos create \
+  --service=my-service \
+  --goal=0.99 \
+  --latency-target=500ms
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Notification channel
+resource "google_monitoring_notification_channel" "email" {
+  display_name = "Email Alerts"
+  type         = "email"
+  
+  labels = {
+    email_address = "alerts@example.com"
+  }
+}
+
+# Alerting policy
+resource "google_monitoring_alert_policy" "alert" {
+  display_name = "High CPU"
+  
+  conditions {
+    display_name = "CPU > 70%"
+    
+    condition_threshold {
+      filter          = "resource.type=\"gce_instance\" AND metric.type=\"compute.googleapis.com/instance/cpu/utilization\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.7
+    }
+  }
+  
+  notification_channels = [google_monitoring_notification_channel.email.name]
+}
+
+# Dashboard
+resource "google_monitoring_dashboard" "dashboard" {
+  dashboard_json = jsonencode({
+    displayName = "My Dashboard"
+    mosaicLayout = {
+      columns = 12
+      tiles = [{
+        width = 12
+        widget = {
+          title = "Metrics"
+          xyChart = {}
+        }
+      }]
+    }
+  })
+}
+```
+
+## Common Commands
+
+```bash
+# Metrics
+gcloud monitoring metrics list
+gcloud monitoring metrics read METRIC [--filter=FILTER]
+
+# Policies
+gcloud monitoring policies create [flags]
+gcloud monitoring policies list
+gcloud monitoring policies describe POLICY
+gcloud monitoring policies update POLICY
+
+# Uptime checks
+gcloud monitoring uptime-check-configs create [flags]
+gcloud monitoring uptime-check-configs list
+
+# Notification channels
+gcloud monitoring channels create [flags]
+gcloud monitoring channels list
+
+# Dashboards
+gcloud monitoring dashboards create --config-from-file=FILE
+gcloud monitoring dashboards list
+
+# SLOs
+gcloud monitoring slos create [flags]
+gcloud monitoring slos list
+```
+
+## Monitoring
+
+### Key Metrics by Service
+
+**Compute Engine**
+- CPU utilization
+- Disk I/O
+- Network throughput
+- Instance uptime
+
+**Cloud Run**
+- Request count
+- Request latencies
+- Container instance count
+- CPU/memory utilization
+
+**GKE**
+- Node CPU/memory
+- Pod resource usage
+- Deployment status
+- HPA metrics
+
+**Load Balancer**
+- Request count by backend
+- Backend latency
+- Backend error rate
+- 5xx errors
+
+### Custom Metrics
+
+```bash
+# Create custom metric via API or SDK
+# Python example:
+from google.cloud import monitoring_v3
+
+client = monitoring_v3.MetricServiceClient()
+project_name = f"projects/{project_id}"
+
+descriptor = monitoring_v3.MetricDescriptor()
+descriptor.type = f"custom.googleapis.com/my_metric"
+descriptor.metric_kind = monitoring_v3.MetricDescriptor.MetricKind.GAUGE
+descriptor.value_type = monitoring_v3.MetricDescriptor.ValueType.INT64
+
+descriptor = client.create_metric_descriptor(name=project_name, metric_descriptor=descriptor)
+```
+
+## Security
+
+### IAM Permissions
+```bash
+# Monitoring viewer
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:analyst@company.com \
+  --role=roles/monitoring.viewer
+
+# Monitoring editor
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:sre@company.com \
+  --role=roles/monitoring.editor
+
+# Alert notification channel access
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:alerts@project.iam.gserviceaccount.com \
+  --role=roles/monitoring.notificationChannelViewer
+```
+
+### Data Access
+- Metrics data retained for 6 weeks (default)
+- Log-based metrics retained with logs
+- Audit logs retained for 400 days
+
+## Cost Optimization
+
+### Pricing
+| Resource | Price |
+|----------|-------|
+| Metrics (first 60) | Free |
+| Additional metrics | $0.01/metric/month |
+| Alerting policies | $0.10/policy/month |
+| Uptime checks | $3/check/month |
+
+### Optimization Tips
+```bash
+# Reduce metric retention (via Cloud Logging)
+# Use MQL to aggregate data before alerting
+# Disable unused metrics
+# Use metric alignment to reduce data points
+```
+
+## Troubleshooting
+
+### Alert Not Firing
+```bash
+# Check policy status
+gcloud monitoring policies describe POLICY_ID --format="yaml(enabledInAlertable)"
+
+# Verify notification channel
+gcloud monitoring channels describe CHANNEL_ID
+
+# Test condition with dry run
+gcloud monitoring metrics read METRIC --filter='FILTER' --duration=3600s
+```
+
+### Missing Metrics
+```bash
+# Check if metric exists
+gcloud monitoring metrics list | grep metric-name
+
+# Check resource type
+gcloud monitoring metrics list --filter='resource.type=gce_instance'
+```
+
+## Interview Questions
+
+**Q: How do you create an alerting policy with multiple conditions?**
+A: Define multiple `conditions` blocks in the policy. Use `combiner = "OR"` or `combiner = "AND"` to determine if any or all conditions trigger the alert.
+
+**Q: What is the difference between notification channels and alerting channels?**
+A: In Terraform, `notification_channel` is the Terraform resource. Alerting policies reference notification channel IDs. Create channels separately, then reference their names in alerting policies.
+
+**Q: How does MQL differ from basic metric filtering?**
+A: MQL (Monitoring Query Language) provides SQL-like capabilities for metrics: aggregations, transformations, joins, and calculations. Basic filtering only selects based on resource and metric labels.
+
+**Q: What is a Service Level Objective (SLO)?**
+A: SLO defines a target for service reliability (e.g., 99.9% availability). Cloud Monitoring SLOs track burn rate and create alerts when SLO is at risk of being violated.
+
+**Q: How do uptime checks work?**
+A: Uptime checks periodically send synthetic requests from Google's global network to your endpoint. They test availability, response time, and content matching. Results determine uptime percentage.
+
+## Cheat Sheet
+
+```bash
+# Metrics
+gcloud monitoring metrics list
+gcloud monitoring metrics read METRIC [--filter=FILTER]
+
+# Policies
+gcloud monitoring policies create \
+  --display-name="NAME" \
+  --condition-filter='FILTER' \
+  --condition-threshold-value=VALUE \
+  --notification-channels=CHANNEL_ID
+
+# Uptime checks
+gcloud monitoring uptime-check-configs create \
+  --display-name="NAME" \
+  --http-check-path=/health
+
+# Dashboards
+gcloud monitoring dashboards create --config-from-file=FILE
+
+# Channels
+gcloud monitoring channels create \
+  --display-name="NAME" --type=TYPE --channel-labels=KEY=VALUE
+```
+
+## Labs
+
+### Lab 1: Alerting Setup
+Configure comprehensive alerting.
+1. Create notification channels
+2. Create CPU alert policy
+3. Create error rate alert
+4. Create latency alert
+5. Test alert notifications
+
+### Lab 2: Custom Dashboard
+Build monitoring dashboard.
+1. Create dashboard JSON
+2. Add request metrics
+3. Add latency charts
+4. Add resource utilization
+5. Configure time range
+
+### Lab 3: SLO Tracking
+Implement SLO monitoring.
+1. Define SLO for availability
+2. Configure latency SLO
+3. Set up SLO alerts
+4. Monitor SLO burn rate
+5. Create SLO reports
+
+## Related Services
+
+- **Cloud Logging**: Log aggregation and analysis
+- **Cloud Trace**: Distributed tracing
+- **Cloud Profiler**: Performance profiling
+- **Error Reporting**: Error aggregation
+- **Incident Response**: On-call management

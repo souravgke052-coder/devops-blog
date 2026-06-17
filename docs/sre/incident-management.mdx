@@ -1,0 +1,705 @@
+---
+sidebar_position: 8
+---
+
+# Incident Management
+
+## Overview
+
+Incident management is the discipline of detecting, responding to, and resolving production issues that impact users or business operations. Unlike reactive firefighting, systematic incident management follows defined processes, clear roles, and structured communication — reducing mean time to detection (MTTD) and mean time to resolution (MTTR).
+
+Effective incident management is not about eliminating incidents — that's unrealistic. It's about responding to incidents more efficiently, communicating better during crises, and learning from failures to prevent recurrence. The goal is to minimize user impact while maintaining operational excellence.
+
+SRE teams typically own the incident management process: defining severity levels, maintaining on-call rotations, writing runbooks, conducting postmortems, and continuously improving the response process based on lessons learned.
+
+## When To Use
+
+- **Production outages** — Any service unavailable or significantly degraded
+- **User-impacting issues** — Errors, slow responses, data integrity problems
+- **Potential incidents** — Alerts that indicate developing problems
+- **Security events** — Suspected breaches, unusual access patterns
+- **Planned major changes** — Large migrations with rollback plans
+
+## When NOT To Use
+
+- **Minor issues with no user impact** — Handle during business hours
+- **Feature requests** — Not an incident, use standard workflows
+- **Known issues under monitoring** — Already being tracked
+- **Testing/staging problems** — Not production incidents
+
+## Core Concepts
+
+### Incident Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     INCIDENT LIFECYCLE                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  DETECTION → TRIAGE → MITIGATION → RESOLUTION → REVIEW      │
+│       │           │          │            │           │      │
+│       ▼           ▼          ▼            ▼           ▼      │
+│   Alert fires,  Assess     Reduce      Fix root   Blameless │
+│   user reports  severity   impact      cause      learning   │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Severity Levels
+
+```yaml
+severity_levels:
+  SEV1:
+    name: "Critical"
+    response_time: "5 minutes"
+    description: |
+      Complete service outage or severe user impact affecting all users.
+      Revenue loss occurring. No workaround available.
+    examples:
+      - "Site returns 5xx for all requests"
+      - "Payment processing completely down"
+      - "Database unreachable"
+      - "All users unable to log in"
+    actions:
+      - "Page SRE on-call immediately"
+      - "Create incident bridge/slack channel"
+      - "Assign Incident Commander"
+      - "Begin customer communication"
+      
+  SEV2:
+    name: "High"
+    response_time: "15 minutes"
+    description: |
+      Major feature unavailable or significant degradation.
+      Large subset of users affected. Partial workaround available.
+    examples:
+      - "Checkout fails for >50% of users"
+      - "API errors above 5%"
+      - "Latency p99 exceeds 10 seconds"
+      - "Search functionality broken"
+    actions:
+      - "Notify SRE on-call via SMS/Slack"
+      - "Create incident channel"
+      - "Start investigation"
+      - "Update status page if duration > 15 min"
+      
+  SEV3:
+    name: "Medium"
+    response_time: "1 hour"
+    description: |
+      Degraded performance or minor feature issues.
+      Limited user impact. Workaround exists.
+    examples:
+      - "Non-critical service errors elevated"
+      - "Latency degradation but functional"
+      - "One region affected"
+      - "Intermittent timeouts"
+    actions:
+      - "Notify team via Slack"
+      - "Investigate during business hours"
+      - "Update monitoring"
+      
+  SEV4:
+    name: "Low"
+    response_time: "4 hours"
+    description: |
+      Minor issues not currently impacting users.
+      No immediate urgency.
+    examples:
+      - "Disk usage approaching threshold"
+      - "Certificate expiring in 30 days"
+      - "Minor metric anomalies"
+    actions:
+      - "Create ticket"
+      - "Investigate during business hours"
+```
+
+### Incident Roles
+
+| Role | Responsibility | When Needed |
+|------|----------------|-------------|
+| **Incident Commander (IC)** | Overall coordination, decision making | SEV1/SEV2 |
+| **Technical Lead** | Root cause analysis, fix implementation | SEV1/SEV2 |
+| **Communications Lead** | Status updates, customer communication | SEV1/SEV2 |
+| **Scribe** | Document timeline, actions taken | SEV1 |
+| **Subject Matter Experts** | Specific domain knowledge | As needed |
+
+## Real Production Example
+
+### Incident Response Runbook
+
+```markdown
+# Incident Response Runbook: API Service Outage
+
+## Initial Response Checklist
+- [ ] Join incident bridge: https://zoom.us/j/INCIDENT-BRIDGE
+- [ ] Create incident Slack channel: #incident-YYYY-MM-DD
+- [ ] Announce incident in #engineering and #alerts
+- [ ] Note incident start time: ___________
+
+## Severity Assessment
+**Current Severity: _______**
+
+Check all that apply:
+- [ ] 100% of requests failing → SEV1
+- [ ] >50% of requests failing → SEV2
+- [ ] Latency >10s → SEV2
+- [ ] Single region affected → SEV3
+
+## Investigation Steps
+
+### 1. Check Infrastructure
+```bash
+# Check pod status
+kubectl get pods -n production | grep api
+
+# Check node health
+kubectl get nodes
+
+# Check resource usage
+kubectl top nodes
+kubectl top pods -n production
+
+# Check events
+kubectl get events -n production --sort-by='.lastTimestamp'
+```
+
+### 2. Check Application Logs
+```bash
+# Tail recent logs
+kubectl logs -n production -l app=api --tail=100 -f
+
+# Search for errors
+kubectl logs -n production -l app=api --since=15m | grep -i error
+
+# Check previous successful logs for comparison
+kubectl logs -n production -l app=api --since=1h | grep -i "started"
+```
+
+### 3. Check Metrics
+```bash
+# API availability
+promtool query instant http://localhost:9090 \
+  'sum(rate(http_requests_total{job="api",status!~"5.."}[5m])) / sum(rate(http_requests_total{job="api"}[5m]))'
+
+# API latency
+promtool query instant http://localhost:9090 \
+  'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le))'
+
+# Database connections
+promtool query instant http://localhost:9090 \
+  'sum(pg_stat_activity_count) / sum(pg_stat_activity_max)'
+```
+
+## Mitigation Options
+
+### Option A: Rollback Deployment
+```bash
+# Check recent deployments
+kubectl rollout history deployment/api -n production
+
+# Rollback to previous version
+kubectl rollout undo deployment/api -n production
+
+# Verify rollback
+kubectl get pods -n production -l app=api
+curl -s https://api.example.com/healthz
+```
+
+### Option B: Scale Up
+```bash
+# Check current replicas
+kubectl get deployment api -n production -o jsonpath='{.spec.replicas}'
+
+# Scale up
+kubectl scale deployment api --replicas=10 -n production
+
+# Verify
+kubectl get pods -n production -l app=api
+```
+
+### Option C: Restart Pods
+```bash
+# Restart all API pods
+kubectl rollout restart deployment/api -n production
+
+# Or delete specific pods ( Deployment will recreate)
+kubectl delete pod -n production -l app=api --grace-period=30
+```
+
+### Option D: Database Connection Pool Reset
+```bash
+# Connect to database
+psql -h db.internal -U postgres -d app
+
+# Check connection counts
+SELECT count(*) FROM pg_stat_activity WHERE datname='app';
+
+# Kill idle connections if needed
+SELECT pg_terminate_backend(pid) 
+FROM pg_stat_activity 
+WHERE datname = 'app' AND state = 'idle';
+```
+
+## Communication Template
+
+### Internal (Slack)
+```
+🔴 INCIDENT: API Service Degradation
+Severity: SEV2
+Start Time: 14:32 UTC
+Status: Investigating
+
+Current Impact:
+- Error rate: 8.5% (target: <1%)
+- Latency p99: 12.3s (target: <500ms)
+
+Actions Taken:
+- [14:35] Investigating pod logs
+- [14:38] Checking database connections
+
+Next Steps:
+- Continue investigating database pool
+- Preparing rollback if needed
+
+IC: @sre-oncall
+Bridge: https://zoom.us/j/INCIDENT-12345
+```
+
+### Customer Status Page
+```
+## Current Status: Partial Service Disruption
+
+**Investigating** - We are investigating reports of elevated error rates 
+affecting the checkout flow. Our team is actively working to resolve this 
+issue. We will provide an update within 30 minutes.
+
+**Started:** 14:32 UTC
+**Affected Services:** Checkout, Payment Processing
+```
+
+## Metrics / Formulas / Frameworks
+
+### Incident Metrics
+
+```python
+def calculate_incident_metrics(incidents):
+    """
+    Calculate key incident management metrics.
+    """
+    mtta_list = [i.mean_time_to_acknowledge for i in incidents]
+    mttd_list = [i.mean_time_to_detect for i in incidents]
+    mttr_list = [i.mean_time_to_resolve for i in incidents]
+    
+    return {
+        'mean_time_to_acknowledge': mean(mtta_list),
+        'mean_time_to_detect': mean(mttd_list),
+        'mean_time_to_resolve': mean(mttr_list),
+        'total_incidents': len(incidents),
+        'mtbf': calculate_mtbf(incidents),  # Mean Time Between Failures
+        'availability_lost': sum(i.duration_minutes for i in incidents)
+    }
+
+def calculate_mtbf(incidents, observation_period_days):
+    """
+    Calculate Mean Time Between Failures.
+    
+    MTBF = (Observation Period - Downtime) / Number of Failures
+    """
+    total_downtime = sum(i.duration_minutes for i in incidents)
+    observation_minutes = observation_period_days * 24 * 60
+    
+    if len(incidents) == 0:
+        return float('inf')
+        
+    return (observation_minutes - total_downtime) / len(incidents)
+```
+
+### Severity Distribution Analysis
+
+```python
+def severity_distribution(incidents):
+    """
+    Analyze incident severity distribution.
+    """
+    distribution = {}
+    for incident in incidents:
+        sev = incident.severity
+        distribution[sev] = distribution.get(sev, 0) + 1
+        
+    total = len(incidents)
+    return {
+        sev: {
+            'count': count,
+            'percentage': (count / total * 100) if total > 0 else 0
+        }
+        for sev, count in distribution.items()
+    }
+```
+
+## Common Tools and Commands
+
+### Incident Response Commands
+
+```bash
+# === Kubernetes Commands ===
+kubectl get pods -n production | grep -v Running
+kubectl describe pod <pod-name> -n production
+kubectl logs <pod-name> -n production --previous  # Previous container logs
+kubectl top pod -n production  # Resource usage
+kubectl get events -n production --sort-by='.lastTimestamp'
+
+# === Deployment Rollback ===
+kubectl rollout history deployment/api -n production
+kubectl rollout undo deployment/api -n production
+kubectl rollout undo deployment/api --to-revision=N -n production
+
+# === Database Commands ===
+psql -h $DB_HOST -U postgres -d app
+SELECT * FROM pg_stat_activity WHERE state != 'idle';
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='app';
+
+# === Prometheus/Debugging ===
+promtool query instant http://localhost:9090 'up{job="api"}'
+promtool query instant http://localhost:9090 'rate(http_requests_total[5m])'
+curl -v https://api.example.com/healthz
+curl -v https://api.example.com/metrics
+
+# === On-Call Tools ===
+# Page via PagerDuty
+pd-cli incidents create --title "API Down" --service api --urgency high
+
+# Check on-call schedule
+pd-cli schedules show production-oncall
+```
+
+### On-Call Scripts
+
+```bash
+#!/bin/bash
+# oncall-check.sh - Pre-shift on-call readiness check
+
+echo "=== On-Call Readiness Check ==="
+
+# 1. Check PagerDuty access
+echo "1. Checking PagerDuty access..."
+curl -s https://events.pagerduty.com/v2/enqueue \
+  -H 'Content-Type: application/json' \
+  -d '{"routing_key":"test","event_action":"trigger","payload":{"summary":"test"}}' \
+  | jq . || echo "PagerDuty check failed"
+
+# 2. Check Slack access
+echo "2. Checking Slack access..."
+curl -s -H "Authorization: Bearer $SLACK_TOKEN" \
+  https://slack.com/api/auth.test | jq .
+
+# 3. Check monitoring access
+echo "3. Checking Prometheus access..."
+curl -s localhost:9090/-/healthy | grep -q "Prometheus" && echo "OK" || echo "FAILED"
+
+# 4. Check kubectl access
+echo "4. Checking Kubernetes access..."
+kubectl cluster-info && echo "OK" || echo "FAILED"
+
+# 5. Check runbook access
+echo "5. Checking runbook access..."
+curl -s -o /dev/null -w "%{http_code}" https://runbooks.example.com && echo " OK" || echo " FAILED"
+
+echo "=== Check Complete ==="
+```
+
+## Monitoring / Alerting Examples
+
+### Incident Detection Alerts
+
+```yaml
+# Automatic incident detection alerts
+groups:
+  - name: incident-detection
+    rules:
+      # High error rate - potential SEV2
+      - alert: HighErrorRatePotentialIncident
+        expr: |
+          (
+            sum(rate(http_requests_total{job="api",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="api"}[5m]))
+          ) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          potential_incident: "true"
+        annotations:
+          summary: "High error rate - potential SEV2"
+          description: |
+            Error rate {{ $value | humanizePercentage }} exceeds 5%.
+            Investigate for potential SEV2 incident.
+            Auto-page if sustained > 10 minutes.
+
+      # Complete outage - SEV1
+      - alert: APIServiceOutage
+        expr: |
+          sum(rate(http_requests_total{job="api"}[5m])) == 0
+          and
+          sum(rate(http_requests_total{job="api"}[5m] offset 1h)) > 0
+        for: 2m
+        labels:
+          severity: critical
+          sev: "1"
+        annotations:
+          summary: "API appears to be down"
+          description: |
+            No traffic in 5 minutes after normal traffic.
+            Probable SEV1 - page on-call immediately.
+
+      # Latency spike - potential SEV2
+      - alert: APILatencySpike
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="api"}[5m])) by (le)
+          ) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p99 latency exceeds 10 seconds"
+          description: |
+            Severe latency detected - potential SEV2.
+            p99: {{ $value | humanizeDuration }}
+```
+
+## Security
+
+### Security Incident Response
+
+```yaml
+# Security-specific incident procedures
+security_incident_response:
+  # Suspicious access pattern
+  procedure:
+    - name: "Isolate affected systems"
+      command: "kubectl label namespace production istio-injection=enabled"
+      
+    - name: "Preserve evidence"
+      command: "kubectl cp production/pod-name:/var/logs /tmp/evidence/"
+      
+    - name: "Notify security team"
+      contact: "security-oncall@example.com"
+      
+  # Data breach suspected
+  procedure:
+    - name: "Do NOT delete logs or data"
+      note: "Preserve evidence for forensics"
+      
+    - name: "Isolate database"
+      command: "kubectl scale deployment api --replicas=0"
+      
+    - name: "Legal notification"
+      contact: "legal@example.com"
+```
+
+### Incident Communication Security
+
+```markdown
+Security reminders during incidents:
+- Don't share customer PII in incident channels
+- Use encrypted communication for sensitive details
+- Verify identities before sharing credentials
+- Document everything (may be needed for forensics)
+```
+
+## Cost Optimization
+
+### Incident Cost Analysis
+
+```python
+def calculate_incident_cost(incident):
+    """
+    Calculate the cost of an incident.
+    """
+    direct_costs = {
+        'engineering_time': incident.engineer_hours * 150,  # $150/hr loaded cost
+        'infrastructure': incident.duration_minutes / 60 * incident.infra_cost_per_hour,
+        'customer_credits': incident.credit_amount
+    }
+    
+    indirect_costs = {
+        'customer_churn_risk': estimate_churn_risk(incident),
+        'team_productivity': incident.duration_minutes / 60 * len(incident.responders) * 150,
+        'reputational': estimate_reputational_impact(incident)
+    }
+    
+    return {
+        'direct': sum(direct_costs.values()),
+        'indirect': sum(indirect_costs.values()),
+        'total': sum(direct_costs.values()) + sum(indirect_costs.values())
+    }
+```
+
+### Cost Reduction Strategies
+
+```yaml
+incident_cost_reduction:
+  reduce_mtta:
+    - "Improve alert quality to reduce time to acknowledge"
+    - "Clear escalation paths defined"
+    
+  reduce_mttr:
+    - "Invest in runbooks"
+    - "Regular incident response drills"
+    - "Reduce deployment risk (canary, feature flags)"
+    
+  reduce_incident_frequency:
+    - "Error budget policies to catch issues early"
+    - "SLO-based alerting before user impact"
+    - "Blameless postmortems to prevent recurrence"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Incident Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| No clear IC | Chaotic response | Assign IC immediately |
+| Poor communication | Confusion, delays | Regular updates, clear channels |
+| Skipping postmortem | Recurrence | Blameless culture, action items |
+| Long resolution time | More user impact | Pre-defined runbooks, practiced responses |
+| Over-communication | Noise | One channel, structured updates |
+
+### Incident Anti-Patterns
+
+```yaml
+anti_patterns:
+  - name: "Hero mode"
+    description: "One person tries to fix everything alone"
+    fix: "Delegate, communicate, use all available resources"
+    
+  - name: "Silence"
+    description: "No updates because 'nothing to report yet'"
+    fix: "Update at least every 15 minutes, even if 'still investigating'"
+    
+  - name: "Fixation"
+    description: "Pursuing one theory despite evidence otherwise"
+    fix: "Timebox investigations, broaden scope if not finding root cause"
+    
+  - name: "No rollback"
+    description: "Trying to fix in production instead of rolling back"
+    fix: "Rollback first, investigate second, always have rollback plan"
+```
+
+## Interview Questions
+
+### Q1: Describe your incident response process.
+
+**A**: I follow a structured process:
+
+1. **Detect**: Alert fires or user reports → validate it's real
+2. **Assess**: Determine severity, declare incident if needed
+3. **Respond**: 
+   - Assign Incident Commander (for SEV1/2)
+   - Create communication channel
+   - Begin investigation with runbook
+4. **Mitigate**: Stop bleeding (rollback, scale, restart)
+5. **Resolve**: Fix root cause
+6. **Review**: Postmortem within 48 hours
+
+Key principles:
+- Communicate early and often
+- Delegate (don't hero-mode)
+- Mitigate before root cause (user impact first)
+- Document in real-time
+
+### Q2: How do you decide when to escalate?
+
+**A**: Escalation triggers:
+
+**Time-based**:
+- Not making progress in 15 minutes
+- Unresolved after 30 minutes
+- Duration exceeds severity threshold
+
+**Impact-based**:
+- User impact increasing
+- Scope expanding
+- Additional services affected
+
+**Capability-based**:
+- Need specific expertise not available
+- Infrastructure access limited
+- Customer/legal escalation needed
+
+Escalation is not failure — it's appropriate resource allocation.
+
+### Q3: How do you handle a severe incident with unclear root cause?
+
+**A**: Strategy for complex incidents:
+
+1. **Stop the bleeding first** — Can you mitigate without knowing cause? (rollback, scale, failover)
+2. **Broaden investigation** — Check obvious: recent deployments, traffic changes, dependency status
+3. **Use all data sources** — Metrics, logs, traces, events — what changed?
+4. **Timebox investigations** — Don't spend 2 hours on one theory
+5. **Bring in fresh eyes** — Another engineer may see what you're missing
+6. **Consider known issues** — Is this a repeat of something seen before?
+
+The goal is to restore service, then investigate root cause. If you can mitigate without knowing why, do that first.
+
+### Q4: What's the difference between mitigation and resolution?
+
+**A**:
+
+- **Mitigation**: Reduces impact but doesn't fix root cause. Example: rolling back a bad deployment stops the bleeding but doesn't fix the bug.
+- **Resolution**: Fixes the root cause. Example: deploying a proper fix allows you to roll forward again.
+
+During an incident, mitigation takes priority. Get users back to a good state first, then fix properly.
+
+### Q5: How do you prevent communication overload during an incident?
+
+**A**:
+
+1. **Use one communication channel** — Single Slack channel or bridge, not scattered messages
+2. **Structure updates** — Template: "Status: [Investigating/Mitigating/Resolved], Impact: [X users], Next Update: [Time]"
+3. **Designate a comms lead** — Someone focused on communication, not fixing
+4. **Update on schedule** — Every 15-30 minutes, even if "still working on it"
+5. **Separate internal/external** — Technical details internal, customer-facing is separate
+
+## Cheat Sheet
+
+### Incident Severity Quick Reference
+
+| Severity | Response | Examples | Actions |
+|----------|----------|----------|---------|
+| SEV1 | 5 min | Site down, all 5xx | Page IC, full response |
+| SEV2 | 15 min | Major feature down | SMS on-call, investigate |
+| SEV3 | 1 hour | Degraded perf | Slack team, business hours |
+| SEV4 | 4 hours | Minor issue | Ticket, next sprint |
+
+### Incident Timeline Template
+
+```
+[TIMESTAMP] - Incident declared: [SEVERITY]
+[TIMESTAMP] - Investigation started
+[TIMESTAMP] - Possible cause identified: [DESCRIPTION]
+[TIMESTAMP] - Mitigation applied: [WHAT WAS DONE]
+[TIMESTAMP] - Mitigation verified: [HOW CONFIRMED]
+[TIMESTAMP] - Root cause confirmed: [DESCRIPTION]
+[TIMESTAMP] - Fix deployed: [VERSION/COMMIT]
+[TIMESTAMP] - Resolution confirmed: [METRICS SHOWING HEALTH]
+[TIMESTAMP] - Incident resolved
+```
+
+### Key Metrics
+
+```
+MTTD - Mean Time To Detect
+MTTA - Mean Time To Acknowledge  
+MTTR - Mean Time To Resolve
+MTBF - Mean Time Between Failures
+```
+
+## Related Topics
+
+- [Monitoring](./monitoring.mdx) — Detecting incidents
+- [Alerting](./alerting.mdx) — Alert-driven detection
+- [Postmortem](./postmortem.mdx) — Learning from incidents
+- [Reliability](./reliability.mdx) — Preventing incidents

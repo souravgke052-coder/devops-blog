@@ -1,0 +1,681 @@
+# DNS (Domain Name System)
+
+## Overview
+
+DNS is the internet's phone book—it translates human-readable names like `api.example.com` into IP addresses like `10.0.0.5`. Despite its critical role, DNS is often an afterthought until it breaks, at which point every service on your network fails simultaneously. Understanding DNS resolution chains, record types, caching behavior, and troubleshooting techniques is essential for any production environment.
+
+Modern DNS in production is complex: stub resolvers on clients, recursive resolvers (either local or provided by ISP/cloud), authoritative servers for domains, and increasingly, DNS-over-HTTPS (DoH) and DNS-over-TLS (DoT) for privacy. Kubernetes adds another layer with in-cluster DNS (CoreDNS), headless services, and externalName services. Cloud environments add Route53, Private DNS zones, and VPC DNS resolver. This page covers DNS from a DevOps perspective—understanding how to configure, secure, and debug it.
+
+## When To Use
+
+- **Service discovery**: Kubernetes, microservices, service meshes rely on DNS for service-to-service communication
+- **Debugging connectivity**: "Service can't reach database" often starts with "what does DNS say?"
+- **Load balancer integration**: A records point to load balancer IPs, weighted records enable blue-green deployments
+- **Zero-downtime deployments**: DNS TTL management enables traffic shifting between old and new infrastructure
+- **Multi-region routing**: Latency-based routing, geo-routing, and failover via DNS records
+
+## When NOT To Use
+
+- **Real-time service discovery**: For sub-second service updates, DNS TTLs introduce latency; use service mesh with xDS
+- **Single source of truth for health**: DNS doesn't know if your service is healthy; use load balancer health checks
+- **Sensitive configuration**: DNS records are publicly queryable (except Private DNS); don't put secrets in DNS
+
+## Core Concepts
+
+### DNS Resolution Chain
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Client Stub Resolver                     │
+│   libc: getaddrinfo() → /etc/nsswitch.conf → /etc/resolv.conf   │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ Query (UDP 53, or DoH/DoT)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Recursive Resolver (Caching)                │
+│         1.1.1.1 (Cloudflare), 8.8.8.8 (Google), corporate DNS   │
+│                     Checks cache, queries upstream                                       │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ If cache miss, query root
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                            Root Server                           │
+│  (13 logical root servers, a-m.root-servers.net, distributed globally) │
+│  Returns: TLD nameservers for .com zone                         │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        TLD Nameserver (.com)                     │
+│  Verisign manages .com, returns authoritative servers for example.com │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               Authoritative Nameserver (example.com)             │
+│  ns1.example.com, ns2.example.com (Route 53, Cloudflare, BIND)  │
+│  Returns: A record for api.example.com → 10.0.0.5               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### DNS Record Types
+
+| Type | Purpose | Example |
+|------|---------|---------|
+| A | IPv4 address | `api.example.com → 10.0.0.5` |
+| AAAA | IPv6 address | `api.example.com → 2600::1` |
+| CNAME | Canonical name (alias) | `www.example.com → example.com` |
+| MX | Mail exchange | `example.com → 10 mail.example.com` |
+| TXT | Text records (verification, SPF, DKIM) | `example.com → "v=spf1 include:_spf.example.com ~all"` |
+| NS | Nameserver | `example.com → ns1.example.com` |
+| SOA | Start of authority | Primary NS, serial, refresh, retry, expire |
+| PTR | Reverse DNS (IP to name) | `5.0.0.10.in-addr.arpa → api.example.com` |
+| SRV | Service location | `_http._tcp.example.com → 10 5 80 api.example.com` |
+| CAA | Certificate authority authorization | `example.com → 0 issue "letsencrypt.org"` |
+
+```bash
+# Common dig queries
+dig @8.8.8.8 example.com A +short                    # A record
+dig @1.1.1.1 example.com AAAA +short                 # AAAA record
+dig @8.8.8.8 example.com MX +short                   # MX records
+dig @8.8.8.8 _sip._tcp.example.com SRV +short        # SRV record
+dig @8.8.8.8 -x 10.0.0.5 +short                      # Reverse DNS (PTR)
+dig @8.8.8.8 example.com TXT +short                  # TXT records
+```
+
+### DNS Caching
+
+DNS responses are cached at multiple levels:
+1. **Browser cache**: Chrome caches DNS for 60 seconds (configurable)
+2. **OS cache**: systemd-resolved, Windows DNS cache
+3. **Stub resolver**: May cache negative responses
+4. **Recursive resolver**: Caches according to TTL, often overrides with lower values
+5. **Resolving recursive resolvers**: 1.1.1.1, 8.8.8.8 cache aggressively
+
+```bash
+# Check TTL on a record
+dig @8.8.8.8 api.example.com A
+# ;; ANSWER SECTION:
+# api.example.com.       300     IN      A       10.0.0.5
+# TTL = 300 seconds (5 minutes)
+
+# +cd flag (checking disable) bypasses client cache
+# +noedns disables EDNS extensions
+# +trace shows full resolution chain
+dig @8.8.8.8 example.com +trace
+```
+
+### DNS over UDP vs TCP
+
+**UDP (port 53)**: Primary protocol for queries. Faster, less overhead. Truncation (TC bit) occurs when response > 512 bytes.
+
+**TCP (port 53)**: Used for zone transfers (AXFR), large responses (>512 bytes), and when UDP fails.
+
+```bash
+# TCP zone transfer
+dig @ns1.example.com example.com AXFR +tcp
+
+# Force TCP query
+dig @8.8.8.8 large-record.example.com +tcp
+
+# When response is truncated, dig automatically retries over TCP
+dig @8.8.8.8 large-zone.example.com +short
+# Shows "truncated" and auto-fallback
+```
+
+### CoreDNS (Kubernetes DNS)
+
+CoreDNS replaces kube-dns in Kubernetes, providing DNS for services:
+
+```yaml
+# CoreDNS ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        # Forward cluster external queries to upstream
+        forward . 8.8.8.8 8.8.4.4 {
+            max_concurrent 1000
+        }
+        
+        # Kubernetes plugin for cluster DNS
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+            pods verified
+            endpoint_pod_names
+            fallthrough in-addr.arpa ip6.arpa
+        }
+        
+        # Caching
+        cache 30
+        
+        # Loop detection
+        loop
+        
+        # Load balancing (round robin)
+        loadbalance
+    }
+```
+
+**Kubernetes DNS resolution**:
+
+| Service Type | DNS Name | Resolves To |
+|--------------|----------|-------------|
+| Regular Service | `mysvc.default.svc.cluster.local` | ClusterIP |
+| Headless Service | `mysvc.default.svc.cluster.local` | Pod IPs (A records) |
+| ExternalName | `mysvc.default.svc.cluster.local` | External CNAME |
+
+```bash
+# From a pod, resolve service
+kubectl exec -it testpod -- nslookup nginx.default.svc.cluster.local
+# Server:    10.96.0.10
+# Address:   10.96.0.10#53
+# Name:      nginx.default.svc.cluster.local
+# Address:   10.96.0.20
+
+# Check CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns -c coredns
+```
+
+## Real Production Example
+
+### AWS Route 53 Configuration
+
+```bash
+# Create hosted zone
+aws route53 create-hosted-zone \
+  --name example.com \
+  --caller-reference $(date +%s)
+
+# Get hosted zone ID
+ZONE_ID=$(aws route53 list-hosted-zones-by-name \
+  --dns-name example.com \
+  --query 'HostedZones[0].Id' --output text)
+
+# Create A record (simple)
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.example.com",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "10.0.0.5"}]
+      }
+    }]
+  }'
+
+# Create weighted record (blue-green deployment, 10% to new)
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.example.com",
+        "Type": "A",
+        "SetIdentifier": "v1",
+        "Weight": 90,
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "10.0.0.5"}]
+      }
+    }]
+  }'
+
+# Create latency-based record (multi-region)
+aws route53 change-resource-record-sets \
+  --hosted-zone-id $ZONE_ID \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.example.com",
+        "Type": "A",
+        "SetIdentifier": "us-west-2",
+        "Region": "us-west-2",
+        "LatencyBasedRef": {},
+        "TTL": 60,
+        "ResourceRecords": [{"Value": "10.1.0.5"}]
+      }
+    }]
+  }'
+
+# Create failover record with health check
+aws route53 create-health-check \
+  --caller-reference $(date +%s) \
+  --health-check-config '{
+    "Type": "HTTPS",
+    "FullyQualifiedDomainName": "api.example.com",
+    "Port": 443,
+    "RequestInterval": 10,
+    "Threshold": 3,
+    "EnableSNI": true
+  }'
+```
+
+### BIND Configuration
+
+```bash
+# /etc/named.conf for authoritative server
+options {
+    listen-on port 53 { any; };
+    recursion no;  // Authoritative only, no recursion
+    allow-query { 10.0.0.0/8; };
+    
+    // Logging
+    query-log yes;
+    category queries { query_log; };
+};
+
+zone "example.com" {
+    type master;
+    file "/etc/bind/zones/example.com.db";
+    // Notify slave servers
+    also-notify { 10.0.0.2; };
+};
+
+// Zone file /etc/bind/zones/example.com.db
+$TTL 3600
+@       IN      SOA     ns1.example.com. admin.example.com. (
+                        2024061601 ; Serial (YYYYMMDDNN)
+                        3600       ; Refresh 1 hour
+                        1800       ; Retry 30 minutes
+                        604800     ; Expire 1 week
+                        86400 )    ; Minimum TTL 1 day
+
+@       IN      NS      ns1.example.com.
+@       IN      NS      ns2.example.com.
+
+@       IN      A       10.0.0.10
+www     IN      A       10.0.0.10
+api     IN      A       10.0.0.20
+@       IN      MX      10 mail.example.com.
+```
+
+## CLI Examples
+
+```bash
+# Basic DNS queries
+dig @8.8.8.8 example.com A +short
+dig @1.1.1.1 example.com AAAA +short
+dig @8.8.8.8 example.com MX
+dig @8.8.8.8 _sip._tcp.example.com SRV
+
+# DNS tracing (full resolution path)
+dig @8.8.8.8 api.example.com +trace
+
+# Reverse DNS
+dig @8.8.8.8 -x 10.0.0.5 +short
+host 10.0.0.5
+
+# Check DNSSEC
+dig @8.8.8.8 example.com DNSKEY +short
+dig @8.8.8.8 example.com +adflag  # AD flag = authenticated data
+
+# Check with specific resolver (bypassing local)
+dig @8.8.8.8 @9.9.9.9 example.com A
+
+# TTL on records
+dig +nocmd +noall +answer +ttlid api.example.com A
+
+# EDNS client subnet
+dig @8.8.8.8 example.com A +subnet=10.0.0.0/24
+
+# DNS zone transfer (AXFR)
+dig @ns1.example.com example.com AXFR +tcp
+
+# Using drill (alternative to dig)
+drill -TD example.com A
+drill -x 10.0.0.5
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `dig` | DNS query | `dig @8.8.8.8 example.com A` |
+| `nslookup` | Interactive DNS | `nslookup example.com` |
+| `host` | Simple DNS lookup | `host -a example.com` |
+| `drill` | DNS query (dig alternative) | `drill -TD example.com` |
+| `nsupdate` | Dynamic DNS updates | `nsupdate -l` (nsupdate -k key) |
+| `rndc` | BIND control | `rndc reload example.com` |
+| `delv` | DNSSEC validation | `delv +vtrace example.com` |
+| `kdig` | Advanced dig (with TLS) | `kdig -d -t TLS example.com` |
+| `whois` | Domain registration | `whois example.com` |
+
+## Monitoring
+
+### Key DNS Metrics
+
+```bash
+# Query latency (from client perspective)
+dig @8.8.8.8 api.example.com | grep "Query time"
+# ;; Query time: 12 msec
+
+# Measure resolution time for multiple domains
+for domain in google.com github.com api.example.com; do
+    echo -n "$domain: "
+    dig +stats @8.8.8.8 $domain A | grep "Query time" | awk '{print $4}'
+done
+
+# /proc/net/snmp UDP stats for DNS
+cat /proc/net/snmp | grep -i udp
+# Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors
+# Udp: 1234567    1234     0       2345678     0            0
+# High NoPorts = receiving queries for unhandled domains
+```
+
+### Prometheus DNS Monitoring
+
+```promql
+# CoreDNS metrics (when using prometheus plugin)
+# coredns_dns_requests_total{server, zone, type, proto}
+# coredns_dns_request_duration_seconds{server, zone, type}
+# coredns_cache_hits_total{server, cache_type}
+# coredns_cache_misses_total{server}
+
+# Monitor cache hit ratio
+sum(rate(coredns_cache_hits_total[5m])) by (server) /
+sum(rate(coredns_dns_requests_total[5m])) by (server)
+
+# Query latency p99
+histogram_quantile(0.99,
+  sum(rate(coredns_dns_request_duration_seconds_bucket[5m])) by (le))
+
+# Requests by type
+sum(rate(coredns_dns_requests_total[5m])) by (type)
+```
+
+### Alerting Thresholds
+
+| Metric | Warning | Critical |
+|--------|---------|----------|
+| DNS query latency | >100ms | >500ms |
+| DNS failure rate | >0.1% | >1% |
+| Cache hit ratio | &lt;80% | &lt;60% |
+| NXDOMAIN rate | >5% | >20% |
+
+## Security
+
+### DNS Security Extensions (DNSSEC)
+
+DNSSEC provides authentication of DNS data. Zones are signed with ZSK (Zone Signing Key) and KSK (Key Signing Key).
+
+```bash
+# Check DNSSEC validation
+dig @8.8.8.8 +short dnskey example.com
+# Returns DNSKEY records (public keys)
+# KSK typically has flag 257 (Secure Entry Point)
+# ZSK typically has flag 256
+
+# Validate chain of trust
+delv +vtrace example.com A
+# Shows: "validating" messages for each step
+
+# For .com zone, you need DS record at parent (.com) for chain of trust
+dig @8.8.8.8 example.com DS +short
+
+# Enable DNSSEC validation in systemd-resolved
+# /etc/systemd/resolved.conf
+[Resolve]
+DNSSEC=allow-downgrade
+DNSSEC=true
+```
+
+### DNS over TLS (DoT) and DNS over HTTPS (DoH)
+
+Privacy-focused DNS resolution:
+
+```bash
+# DoT (port 853)
+# Cloudflare: 1.1.1.1
+# Google: 8.8.8.8
+
+# Test with openssl
+echo -n | openssl s_client -connect 1.1.1.1:853 -servername 1.1.1.1
+# Look for "Certificate chain" and "SSL handshake has read"
+
+# DoH (HTTPS port 443)
+# Cloudflare: https://cloudflare-dns.com/dns-query
+# Google: https://dns.google/dns.google
+
+# curl DoH query
+curl -H 'accept: application/dns-json' \
+  'https://cloudflare-dns.com/dns-query?name=example.com&type=A'
+
+# systemd-resolved DoH configuration
+# /etc/systemd/resolved.conf
+[Resolve]
+DNSOverTLS=opportunistic
+DNS=1.1.1.1#cloudflare-dns.com
+```
+
+### DNS Firewall Rules
+
+```bash
+# Allow only specific DNS servers
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p udp -d 10.0.0.0/8 --dport 53 -j ACCEPT  # Internal DNS
+iptables -A OUTPUT -p udp --dport 53 -j DROP
+
+# Rate limit DNS queries
+iptables -A INPUT -p udp --dport 53 \
+  -m hashlimit --hashlimit-above 50/s --hashlimit-burst 100 \
+  --hashlimit-mode srcip --hashlimit-name dns_rate \
+  -j DROP
+
+# Prevent DNS tunneling (large DNS TXT responses)
+iptables -A INPUT -p udp --dport 53 \
+  -m string --algo bm --hex-string '|00 00 10|' \
+  -j LOG --log-prefix "DNS-TUNNEL: "
+```
+
+### DNS-based Authentication
+
+```bash
+# SPF (Sender Policy Framework) - TXT record
+# v=spf1 include:_spf.example.com ~all
+dig +short TXT example.com | grep spf
+
+# DKIM (DomainKeys Identified Mail) - TXT record
+# Selector._domainkey.example.com TXT v=DKIM1;k=rsa;t=s;p=...
+selector._domainkey.example.com TXT
+
+# DMARC - TXT record at _dmarc.example.com
+_dmarc.example.com TXT "v=DMARC1;p=quarantine;sp=quarantine;rua=mailto:dmarc@example.com"
+
+# CAA (Certificate Authority Authorization) - restricts which CAs can issue certs
+# example.com CAA 0 issue "letsencrypt.org"
+dig +short CAA example.com
+```
+
+## Cost Optimization
+
+### DNS Costs
+
+**Public DNS resolvers**: Free for public resolution (1.1.1.1, 8.8.8.8, 9.9.9.9). They fund operations via other services.
+
+**Authoritative DNS**: Route 53 is $0.50/hosted zone/month + $0.40/million queries (first 1B). Cloudflare DNS is free (proxies for you). Custom BIND requires server infra.
+
+**Private DNS**: Route 53 Private DNS is $0.50/hosted zone/month + $0.75/million queries. Cheaper than managing BIND in VPC.
+
+```bash
+# Route 53 cost calculation
+# Hosted zones: $0.50/month each
+# Queries (first 1B): $0.40/million = $0.40/1000000
+# Queries (next 9B): $0.20/million
+# Queries (10B+): $0.10/million
+
+# For 100 million queries/month:
+# Zone: $0.50
+# Queries: 100 * $0.40 = $40.00
+# Total: $40.50/month
+
+# Compare to managed BIND (t3.medium + EBS):
+# EC2: $33.16/month
+# EBS: $10/month
+# Total: ~$43/month + operational overhead
+
+# Private DNS cost comparison
+# Route 53 Private DNS: $0.50/zone + $0.75/million
+# Custom BIND in VPC: $0.02/GB for inter-AZ traffic + instance cost
+```
+
+### Optimization Strategies
+
+1. **Use low TTL for dynamic records**: 60-300 seconds enables fast failover
+2. **Use high TTL for static records**: 3600-86400 seconds reduces query volume
+3. **Cache aggressively**: Longer TTL on authoritative, shorter at resolvers
+4. **Private DNS**: Use VPC endpoints to avoid NAT Gateway costs for DNS resolution
+
+## Troubleshooting
+
+### DNS Debugging Flow
+
+```bash
+# 1. Check local resolution
+getent hosts api.example.com
+# Or: getent ahosts api.example.com
+
+# 2. Check /etc/resolv.conf
+cat /etc/resolv.conf
+# nameserver 10.0.0.2
+# nameserver 8.8.8.8
+# search default.svc.cluster.local svc.cluster.local cluster.local
+
+# 3. Test upstream resolver directly
+dig @8.8.8.8 api.example.com A +short
+# If this fails but internet works, issue is local resolver
+
+# 4. Check DNS service status (systemd-resolved)
+systemd-resolve --status
+resolvectl status
+
+# 5. Check systemd-resolved cache
+ systemd-resolve --statistics
+
+# 6. Flush DNS cache (if needed)
+systemd-resolve --flush-caches
+# Or for nscd: nscd -i hosts
+# Or for dnsmasq: killall -HUP dnsmasq
+```
+
+### Common DNS Issues Table
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `server can't find xxx` | NXDOMAIN | Check record exists, check domain registration |
+| `connection timed out` | Firewall blocking UDP 53 | Allow UDP 53 outbound |
+| Intermittent resolution | High TTL, cache miss | Lower TTL, more upstream resolvers |
+| Different results on servers | Propagation delay | Wait TTL, or use DNS failover |
+| Works on some servers | Local resolver issue | Check /etc/resolv.conf, restart resolver |
+| Long resolution time | Slow upstream resolver | Switch to faster resolver (1.1.1.1, 8.8.8.8) |
+
+### Kubernetes DNS Debugging
+
+```bash
+# Check CoreDNS pods running
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+
+# Check CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=100
+
+# Check resolv.conf in pod
+kubectl exec -it nginx-abc123 -- cat /etc/resolv.conf
+# nameserver 10.96.0.10
+# search default.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5
+
+# ndots:5 means queries with < 5 dots search local namespace first
+# Set ndots:1 to always use FQDN
+
+# Test DNS from within cluster
+kubectl run dnsutils --image=tutum/dnsutils --restart=Never -it --rm -- \
+  nslookup kubernetes.default
+
+# Check for DNS policy issues
+kubectl get pod nginx -o jsonpath='{.spec.dnsPolicy}'
+# Default: ClusterFirst
+# For host networking: Default
+# Custom: ClusterFirstWithHostNet
+```
+
+## Interview Questions
+
+**Q1: Walk through the DNS resolution process for `api.example.com`.**
+
+A: (1) Client stub resolver checks local cache, then queries configured recursive resolver (from /etc/resolv.conf). (2) Recursive resolver checks its cache; on miss, queries root server. (3) Root server returns .com TLD nameservers. (4) Resolver queries .com TLD server, returns ns1.example.com. (5) Resolver queries ns1.example.com, returns A record for api.example.com. (6) Recursive resolver caches result per TTL, returns to client. (7) Client caches locally (OS, browser). Each record has TTL telling resolvers how long to cache. The entire process typically takes 10-100ms.
+
+**Q2: What's the difference between a CNAME and an A record? When would you use each?**
+
+A: A record maps a name directly to an IPv4 address. CNAME creates an alias from one name to another canonical name. CNAME evaluation adds a DNS lookup (follow the alias to the final A record). Use A records for top-level domains (apex, like example.com) where CNAME is not allowed by DNS spec. Use CNAME for subdomains pointing to another service (www → example.com, cdn → cdn.example.com). CNAMEs cannot coexist with other record types at the same name. In Kubernetes, services get ClusterIP; headless services have no ClusterIP and return pod IPs directly.
+
+**Q3: What is a headless service in Kubernetes, and when would you use it?**
+
+A: A headless service has `clusterIP: None`. CoreDNS creates individual A records for each pod IP rather than a single ClusterIP. Used for: (1) StatefulSets where clients need to connect to specific pods (pod hostname), (2) service discovery where you want pod IPs rather than load-balanced ClusterIP, (3) custom client-side load balancing, (4) running your own load balancer. Clients can do DNS lookup and get all pod IPs, then pick one (random, round-robin, or based on health).
+
+**Q4: How does DNS failover work, and what are its limitations?**
+
+A: DNS failover uses health checks + record updates. Route 53, Cloudflare, and others monitor endpoint health and update DNS records (change TTL, switch to backup IP). Works for geographic distribution, data center failover. Limitations: (1) DNS TTLs cause stale lookups—clients may use old IPs during outage, (2) resolvers between you and users may ignore TTLs (aggressive caching), (3) some clients cache DNS indefinitely, (4) BGP/OSPF rerouting is faster than DNS TTL expiration, (5) some mobile clients hold DNS aggressively. Best practice: keep failover TTL low (60 seconds) for critical services, accept some period of degraded performance during failover.
+
+**Q5: What is DNSSEC, and why does it matter?**
+
+A: DNSSEC adds cryptographic signatures to DNS records, allowing resolvers to verify authenticity. Zones are signed with ZSKs; KSKs sign the ZSK. DS records at parent zones establish chain of trust. Matters because without DNSSEC, DNS responses can be spoofed (DNS cache poisoning), redirecting traffic to malicious servers. Common attack: Kaminsky attack—attacker guesses transaction ID + source port, injects fake DNS response. DNSSEC prevents this by verifying signatures. However, DNSSEC adds complexity and has had deployment issues (expired keys, DS record propagation delays). Most large providers (Google, Cloudflare) validate DNSSEC. Full deployment requires all parties in chain to be signed.
+
+## Cheat Sheet
+
+### Common DNS Record Types
+
+| Type | Format | TTL | Notes |
+|------|--------|-----|-------|
+| A | `host IN A ip` | Variable | IPv4 only |
+| AAAA | `host IN AAAA ipv6` | Variable | IPv6 |
+| CNAME | `alias IN CNAME canonical` | Variable | Can't coexist with other records |
+| MX | `domain IN MX pref host` | Variable | pref = priority (lower = higher) |
+| TXT | `host IN TXT "text"` | Variable | SPF, DKIM, verification |
+| NS | `domain IN NS nameserver` | Variable | Delegate zone |
+| SOA | `@ IN SOA ns email serial` | Variable | Zone metadata |
+| PTR | `rev IP.in-addr.arpa IN PTR name` | Variable | Reverse DNS |
+| SRV | `_service._proto.name IN SRV wt port target` | Variable | Service discovery |
+
+### Common Ports
+
+| Port | Protocol | Use |
+|------|----------|-----|
+| 53 | UDP/TCP | DNS queries/responses |
+| 853 | TCP | DNS over TLS (DoT) |
+| 443 | TCP | DNS over HTTPS (DoH) |
+| 953 | TCP | BIND rndc control |
+| 953 | TCP | nsupdate with TSIG |
+
+### Kubernetes DNS Naming
+
+| Resource | DNS Name | Resolves To |
+|----------|----------|-------------|
+| Service | `svc.ns.svc.cluster.local` | ClusterIP |
+| Headless Service | `svc.ns.svc.cluster.local` | Pod IPs (A records) |
+| ExternalName | `svc.ns.svc.cluster.local` | External CNAME |
+| Pod | `pod-ip.ns.pod.cluster.local` | Pod IP |
+
+### TTL Best Practices
+
+| Record Type | TTL | Use Case |
+|-------------|-----|----------|
+| A/AAAA | 300-3600 | Regular services, load balancers |
+| A/AAAA | 60-300 | Failover, blue-green deployment |
+| A/AAAA | 86400 | Static content, CDNs |
+| MX | 3600 | Mail servers (lower = faster changes) |
+| CNAME | 300-3600 | Aliases, should match target |
+
+## Related Topics
+
+- [TCP/IP Model](./tcp-ip) — Network layer fundamentals
+- [Load Balancing](./load-balancing) — DNS-based load balancing
+- [VPC](./vpc) — Private DNS in cloud networks
+- [Observability](./observability) — DNS monitoring
+- [Debugging](./debugging) — DNS packet capture

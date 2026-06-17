@@ -1,0 +1,529 @@
+# TLS (Transport Layer Security)
+
+## Overview
+
+TLS 1.3 is the latest version of the cryptographic protocol that secures internet communications. Unlike TLS 1.2, which evolved over 10+ years accumulating complexity, TLS 1.3 was redesigned from the ground up with security and performance as primary goals. It removes obsolete features (static RSA key exchange, CBC ciphers), reduces handshake latency to 1 RTT (or 0-RTT with resumption), and integrates key exchange more tightly with authentication.
+
+Understanding TLS 1.3 matters for production systems: it's now the recommended minimum for secure communication, it's faster than TLS 1.2 (critical for mobile), and its simpler design reduces attack surface. Yet TLS 1.2 remains prevalent—understanding both versions and how to migrate is essential.
+
+## When To Use
+
+- **All new deployments**: TLS 1.3 is the standard
+- **Performance-critical APIs**: 1-RTT vs 2-RTT handshake matters for latency
+- **Service mesh/mTLS**: Istio, Linkerd use TLS for service-to-service auth
+- **Certificate management**: Understanding TLS helps manage cert lifecycle
+
+## When NOT To Use
+
+- **Legacy systems requiring TLS 1.0/1.1**: May need to maintain TLS 1.2 with fallback
+- **Regulatory compliance**: Some compliance frameworks mandate specific versions
+- **Performance-critical low-level**: Raw sockets may be faster (but no encryption)
+
+## Core Concepts
+
+### TLS 1.3 vs TLS 1.2 Key Differences
+
+| Feature | TLS 1.2 | TLS 1.3 |
+|---------|---------|---------|
+| Handshake RTT | 2 RTT | 1 RTT (0-RTT with PSK) |
+| Key exchange | RSA or DHE/ECDHE | DHE only (forward secret) |
+| Cipher modes | CBC, GCM, RC4 | GCM, ChaCha20 only |
+| Key derivation | SHA-256/384 | HKDF with SHA-256/384 |
+| Certificate format | Any (mostly RSA) | Any (mostly ECDSA) |
+| Renegotiation | Supported (insecure) | Removed |
+| Compression | Supported (CRIME attack) | Removed |
+| Static RSA | Supported | Removed |
+
+### TLS 1.3 Handshake Deep Dive
+
+```bash
+# Full TLS 1.3 handshake with tcpdump
+tcpdump -i eth0 -nn 'port 443' -w /tmp/tls13.pcap &
+
+# Make request
+curl -k https://api.example.com &
+
+# Analyze in Wireshark or parse:
+tcpdump -r /tmp/tls13.pcap -v
+
+# TLS 1.3 handshake packets:
+# 1. ClientHello (TLS 1.3, key_share extension with X25519 public key)
+# 2. ServerHello (TLS 1.3, key_share extension with server X25519 public key)
+# 3. EncryptedExtensions (server extensions, including ALPN)
+# 4. Certificate (server certificate chain)
+# 5. CertificateVerify (signature of handshake transcript)
+# 6. Finished (HMAC of handshake hash)
+# 7. Application Data (encrypted with derived keys)
+```
+
+### Key Exchange: ECDHE (Elliptic Curve Diffie-Hellman Ephemeral)
+
+TLS 1.3 only allows DHE-based key exchange, ensuring forward secrecy. ECDHE uses elliptic curves for performance.
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ ECDHE Key Exchange                                             │
+├────────────────────────────────────────────────────────────────┤
+│ Client generates:                                              │
+│   - Private key: random 32 bytes (for X25519)                  │
+│   - Public key: scalar_mult(G, private_key)                    │
+│                                                                │
+│ ClientHello: key_share extension contains public key          │
+│                                                                │
+│ Server generates:                                              │
+│   - Private key: random 32 bytes                               │
+│   - Public key: scalar_mult(G, private_key)                    │
+│                                                                │
+│ ServerHello: key_share extension contains server public key   │
+│                                                                │
+│ Shared secret: scalar_mult(client_public, server_private)     │
+│                = scalar_mult(server_public, client_private)   │
+│                = point on curve (same for both!)              │
+│                                                                │
+│ HKDF-Expand-Label: derive session keys from shared secret     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 0-RTT Resumption (Early Data)
+
+TLS 1.3 allows sending data immediately in the first flight using Pre-Shared Keys (PSK) from previous sessions.
+
+```bash
+# 0-RTT works when:
+# 1. Client has PSK from previous session (session ticket)
+# 2. Server accepts early data (configured in application)
+
+# Warning: 0-RTT is vulnerable to replay attacks
+# Only idempotent requests should use early data
+# Most applications disable 0-RTT or limit to GET requests
+
+# In nginx (disable 0-RTT):
+ssl_early_data off;  # or don't configure ssl_early_data at all
+
+# Check if 0-RTT was used:
+# In access log: $ssl_early_data
+# If 1: 0-RTT was used
+```
+
+### Certificate Types in TLS 1.3
+
+TLS 1.3 supports RSA and ECDSA certificates, but ECDSA is preferred:
+
+- **ECDSA P-256**: Fast verification, good security, recommended
+- **ECDSA P-384**: Higher security, slightly slower
+- **RSA 2048**: Legacy compatibility, slower, larger certs
+- **Ed25519**: Modern, fast, not widely supported by CAs yet
+
+```bash
+# Generate ECDSA key and CSR
+openssl ecparam -name prime256v1 -genkey | openssl ec -aes256 -out ec_private.key
+openssl req -new -key ec_private.key -out ec.csr -sha256
+
+# Check certificate type
+openssl x509 -in cert.pem -noout -text | grep "Public Key"
+# Public Key Algorithm: id-ecPublicKey
+# NIST CURVE: prime256v1 (P-256)
+```
+
+### Cipher Suites
+
+TLS 1.3 defines only 5 cipher suites:
+
+| Cipher Suite | Symmetric | KDF | PRF/HMAC |
+|--------------|-----------|-----|----------|
+| TLS_AES_256_GCM_SHA384 | AES-256-GCM | HKDF-SHA-384 | HMAC-SHA-384 |
+| TLS_CHACHA20_POLY1305_SHA256 | ChaCha20-Poly1305 | HKDF-SHA-256 | HMAC-SHA-256 |
+| TLS_AES_128_GCM_SHA256 | AES-128-GCM | HKDF-SHA-256 | HMAC-SHA-256 |
+| TLS_AES_128_CCM_SHA256 | AES-128-CCM | HKDF-SHA-256 | HMAC-SHA-256 |
+| TLS_AES_128_CCM_8_SHA256 | AES-128-CCM-8 | HKDF-SHA-256 | HMAC-SHA-256 |
+
+TLS 1.2 cipher suites are different (include key exchange method). TLS 1.3 separates key exchange from cipher, negotiated via extension.
+
+### PSK (Pre-Shared Key) Resumption
+
+```bash
+# Session tickets enable resumption
+# Server sends session ticket in NewSessionTicket message
+# Client stores ticket and uses in ClientHello (pre_shared_key extension)
+
+# In nginx:
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:50m;  # Tickets stored in shared memory
+
+# Performance impact of session resumption:
+# Without resumption: 1 RTT + certificate verify + key derivation
+# With resumption (TLS 1.2): 1 RTT (no cert verify)
+# With resumption (TLS 1.3): 0 RTT if early data allowed
+
+# Check session resumption in tcpdump:
+# Session ID or session ticket in ClientHello
+# Resumption indicated by pre_shared_key extension
+```
+
+## Real Production Example
+
+### Kubernetes Service Mesh mTLS with Istio
+
+Istio uses mutual TLS (mTLS) for service-to-service communication, providing automatic certificate rotation and identity verification.
+
+```yaml
+# Enable STRICT mTLS mode for namespace
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT  # All traffic must be mTLS
+---
+# Or per-workload
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: api-server
+  mtls:
+    mode: PERMISSIVE  # Allow both mTLS and plaintext for migration
+```
+
+```yaml
+# DestinationRule for TLS settings
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: api-server
+spec:
+  host: api-server.production.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL  # Use Istio's certs and keys
+      # Or explicitly:
+      # clientCertificate: /etc/certs/cert-chain.pem
+      # privateKey: /etc/certs/key.pem
+      # caCertificates: /etc/certs/root-cert.pem
+```
+
+### NGINX with TLS 1.3
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+
+    # Certificates
+    ssl_certificate /etc/ssl/certs/api.example.com.fullchain.pem;
+    ssl_certificate_key /etc/ssl/private/api.example.com.key;
+    
+    # TLS 1.3 only (for modern API)
+    ssl_protocols TLSv1.3;
+    
+    # Session resumption (tickets for TLS 1.3 PSK)
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    
+    # OCSP stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 1.1.1.1 valid=300s;
+    
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+}
+```
+
+## CLI Examples
+
+```bash
+# Check TLS 1.3 support
+openssl s_client -connect api.example.com:443 -tls1_3 2>&1 | grep -E "Protocol|Cipher"
+
+# Force TLS 1.3
+echo | openssl s_client -connect api.example.com:443 -tls1_3 -servername api.example.com
+
+# Test PSK resumption
+openssl s_client -connect api.example.com:443 -sess_out /tmp/session.pem
+openssl s_client -connect api.example.com:443 -sess_in /tmp/session.pem
+
+# Generate new ECDSA key
+openssl ecparam -name X25519 -genkey -noout -out x25519-key.pem
+openssl ec -in x25519-key.pem -text -noout
+
+# Check certificate signature
+openssl x509 -in cert.pem -noout -text | grep -E "Signature Algorithm|Public Key"
+# TLS 1.3 servers should use ECDSA (id-ecPublicKey) or RSA
+
+# Measure handshake timing
+curl -w "@curl-format.txt" -o /dev/null -s https://api.example.com
+# time_appconnect: SSL/TLS handshake time
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `openssl s_client` | TLS client | `s_client -tls1_3 -connect host:443` |
+| `openssl s_server` | TLS server | `s_server -accept 8443 -cert cert.pem -key key.pem` |
+| `openssl x509` | Certificate ops | `x509 -in cert.pem -text -noout` |
+| `openssl ecparam` | EC operations | `ecparam -name prime256v1 -genkey` |
+| `openssl req` | CSR operations | `req -new -key key.pem -out.csr` |
+| `openssl pkcs12` | PKCS#12 import/export | `pkcs12 -export -in cert.pem -inkey key.pem` |
+| `certbot` | ACME client | `certbot certonly --standalone` |
+
+## Monitoring
+
+### TLS Metrics
+
+```bash
+# TLS handshake timing (from curl)
+cat > curl-format.txt << 'EOF'
+    time_namelookup: %{time_namelookup}
+    time_connect: %{time_connect}
+    time_appconnect: %{time_appconnect}
+    time_pretransfer: %{time_pretransfer}
+    time_starttransfer: %{time_starttransfer}
+    time_total: %{time_total}
+EOF
+
+# time_appconnect includes full TLS handshake time
+
+# Check negotiated TLS version (nginx)
+# In nginx access log: $ssl_protocol
+log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                '$status $body_bytes_sent "$http_referer" '
+                '"$http_user_agent" "ssl_protocol=$ssl_protocol ssl_cipher=$ssl_cipher"';
+
+# Prometheus nginx-exporter:
+# nginx_ssl_protocol_total{protocol="TLSv1.3"}
+# nginx_ssl_session_reuses_total
+```
+
+### Prometheus Queries
+
+```promql
+# TLS version distribution
+sum(rate(nginx_ssl_protocol_total[5m])) by (protocol)
+
+# TLS handshake duration
+histogram_quantile(0.99,
+  sum(rate(nginx_ssl_handshake_duration_seconds_bucket[5m])) by (le))
+
+# Session resumption rate
+nginx_ssl_session_reuses_total / (nginx_ssl_session_reuses_total + rate(nginx_ssl_handshake_total[5m]))
+```
+
+## Security
+
+### TLS 1.3 Security Improvements
+
+1. **No static RSA**: Forward secrecy is required
+2. **No CBC ciphers**: Prevents BEAST and Lucky13 attacks
+3. **No renegotiation**: CVE-2009-3555 (renegotiation crash)
+4. **No compression**: Prevents CRIME attack
+5. **Encrypted handshake**: More handshake is encrypted
+6. **HKDF**: Better key derivation function
+
+### Security Configuration
+
+```bash
+# Strong TLS 1.3 configuration (nginx)
+ssl_protocols TLSv1.3;
+ssl_ciphers TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+ssl_prefer_server_ciphers off;
+
+# Additional security headers
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+add_header X-Frame-Options DENY always;
+add_header X-Content-Type-Options nosniff always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# Disable TLS 1.3 0-RTT if concerned about replay
+# (default is off, only enable if you understand the risks)
+# ssl_early_data off;
+```
+
+### 0-RTT Replay Attack Mitigation
+
+```bash
+# 0-RTT is vulnerable because early data is sent before handshake completes
+# Attacker can replay the same first flight
+
+# Mitigation:
+# 1. Don't use 0-RTT for non-idempotent requests
+# 2. Check anti-replay mechanisms (nginx: one-time tickets)
+# 3. Set small early_data window (max-age)
+
+# In nginx:
+ssl_early_data off;  # Disable 0-RTT entirely
+
+# Or limit 0-RTT to 1 second
+# This doesn't prevent replay but limits exposure
+```
+
+## Cost Optimization
+
+### TLS Performance
+
+TLS 1.3 is faster than TLS 1.2:
+- 1 RTT vs 2 RTT for full handshake
+- 0 RTT for session resumption
+- Faster key exchange with X25519
+
+```bash
+# ECDSA is faster than RSA for TLS
+# ECDSA P-256 sign: ~50μs
+# RSA 2048 sign: ~300μs (6x slower)
+
+# ECDSA P-256 verify: ~100μs
+# RSA 2048 verify: ~15μs (RSA faster for verify, but not by enough)
+
+# For high-volume servers:
+# Use ECDSA certificates
+# Enable session resumption
+# Consider TLS 1.3 only (simpler, faster negotiation)
+```
+
+### Session Resumption for Cost Reduction
+
+```bash
+# Session tickets reduce:
+# - CPU (no full key exchange)
+# - Latency (0-RTT)
+# - Network (fewer round trips)
+
+# Configure session resumption:
+ssl_session_timeout 1d;      # How long tickets are valid
+ssl_session_cache shared:SSL:50m;  # Shared memory across workers
+
+# With TLS 1.3 PSK, session resumption is more efficient
+# Server maintains PSK state (not session ID)
+```
+
+## Troubleshooting
+
+### TLS Connection Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `ssl_cipher` returns TLS_AES_... | TLS 1.3 cipher | Normal, TLS 1.3 uses different cipher format |
+| Handshake timeout | Firewall, protocol mismatch | Check TLS versions, firewall rules |
+| `certificate verify failed` | Untrusted CA | Add CA to trust store |
+| `sslv3 alert handshake failure` | No common cipher | Check cipher suites |
+| `wrong version number` | Non-TLS server | Check if port expecting TLS |
+
+### TLS Debugging
+
+```bash
+# Full TLS debug output
+openssl s_client -connect api.example.com:443 -debug -state
+
+# Check all available TLS versions
+for ver in tls1 tls1_1 tls1_2 tls1_3; do
+    echo -n "$ver: "
+    echo | openssl s_client -connect api.example.com:443 -$ver 2>&1 | \
+        grep -E "Protocol|Cipher|error" | head -1
+done
+
+# Check certificate chain
+openssl s_client -connect api.example.com:443 -showcerts 2>/dev/null | \
+    awk '/-----BEGIN/,/-----END/{cert=cert $0 "\n"} /-----END/{print cert; cert=""}'
+
+# Verify certificate chain
+openssl s_client -connect api.example.com:443 -CAfile /etc/ssl/certs/ca-certificates.crt
+
+# Check OCSP stapling
+openssl s_client -connect api.example.com:443 -status 2>&1 | grep -A 5 "OCSP Response"
+```
+
+## Interview Questions
+
+**Q1: What are the key security improvements in TLS 1.3?**
+
+A: TLS 1.3 removes several insecure features: (1) Static RSA key exchange—no forward secrecy with RSA, so TLS 1.3 mandates DHE/ECDHE; (2) CBC cipher modes—no BEAST or Lucky13 attacks; (3) TLS compression—no CRIME attack; (4) Renegotiation—no CVE-2009-3555; (5) MD5 in certificates—no weak hash algorithms. Additionally, more of the handshake is encrypted (ServerConfig, certificates), and the handshake itself is faster (1-RTT vs 2-RTT). The HKDF key derivation is stronger, using HMAC-based extract-and-expand rather than ad-hoc constructions. All cipher suites provide forward secrecy and use AEAD (authenticated encryption).
+
+**Q2: Explain 0-RTT in TLS 1.3. What are the security implications?**
+
+A: 0-RTT allows clients to send application data immediately in the first flight, before the TLS handshake completes. It uses Pre-Shared Keys (PSK) from previous sessions. The client sends `pre_shared_key` extension with the ticket and early data encrypted with keys derived from the PSK. Security implications: (1) Replay attacks—because the first flight is sent before the server's response, an attacker can capture and replay it. Mitigations: one-time tickets, limiting early data to idempotent requests, `max_early_data_size` limits. (2) No server authentication in first flight—the server identity isn't verified until Finished message. (3) Forward secrecy not fully preserved—if PSK is compromised, early data can be decrypted (but not the full session). Most applications disable 0-RTT or restrict it to GET requests.
+
+**Q3: How does forward secrecy work in TLS, and why is it important?**
+
+A: Forward secrecy (FS) means compromising long-term keys doesn't expose past sessions. With RSA key exchange (TLS 1.2, pre-TLS 1.3), the premaster secret is encrypted with the server's RSA public key. If an attacker records traffic and later obtains the server's private key, they can decrypt the premaster secret and all session keys. With ephemeral Diffie-Hellman (DHE/ECDHE), each session uses fresh DH key pairs. The premaster secret is derived from client and server ephemeral keys, both of which are discarded after handshake. Compromise of the server's private key doesn't help—the ephemeral keys are gone. TLS 1.3 mandates DHE-based key exchange, ensuring FS. For ECDHE with P-256, each handshake uses a new key pair—compromising the long-term key doesn't expose past sessions.
+
+**Q4: What is the difference between HKDF and the TLS 1.2 PRF?**
+
+A: TLS 1.2 uses a custom PRF (Pseudo-Random Function) based on HMAC with both MD5 and SHA-256 (called TLS PRF). It's defined as: PRF(secret, label, seed) = P_hash(P_hash(secret, label+seed)) where P_hash is HMAC iterated. TLS 1.3 uses HKDF (HMAC-based Key Derivation Function) defined in RFC 5869, which is a standard, well-analyzed KDF. HKDF consists of: Extract (extract pseudo-random key from input key material) and Expand (expand to desired length using HMAC with a info context). TLS 1.3 uses HKDF-Extract and HKDF-Expand-Label for deriving keys. The advantage: HKDF is a standard construction, has proven security properties, and separates the concerns of extracting entropy from expanding into specific contexts.
+
+**Q5: How would you migrate from TLS 1.2 to TLS 1.3 in production?**
+
+A: Migration strategy: (1) Update software—ensure OpenSSL 1.1.1+ or BoringSSL, servers and clients must support TLS 1.3; (2) Add TLS 1.3 alongside TLS 1.2—`ssl_protocols TLSv1.2 TLSv1.3`; (3) Test—use `openssl s_client -tls1_3` to verify connections work; (4) Update security policies—most clients support TLS 1.3, but some legacy systems need TLS 1.2 fallback; (5) Remove legacy once verified—`ssl_protocols TLSv1.3` only; (6) Monitor—watch for TLS version metrics in logs, check for TLS 1.2 failures. DNS-based canary deployments work: enable TLS 1.3 for a subset of users, monitor errors, gradually increase. Consider 0-RTT implications—disable if your application sends non-idempotent requests in early data.
+
+## Cheat Sheet
+
+### TLS 1.3 Cipher Suites
+
+```
+TLS_AES_256_GCM_SHA384       - Recommended, fastest on most hardware
+TLS_CHACHA20_POLY1305_SHA256 - Better on mobile/low-power devices
+TLS_AES_128_GCM_SHA256       - Good performance, smaller MAC
+TLS_AES_128_CCM_SHA256       - For constrained devices
+TLS_AES_128_CCM_8_SHA256     - For very constrained devices
+```
+
+### OpenSSL TLS 1.3 Commands
+
+```bash
+# Test TLS 1.3 connection
+openssl s_client -connect host:443 -tls1_3
+
+# Check TLS 1.3 features
+openssl s_client -connect host:443 -tls1_3 -early_data @- <<< "GET / HTTP/1.1"
+
+# Generate keys
+openssl ecparam -name X25519 -genkey          # X25519 key
+openssl ecparam -name prime256v1 -genkey      # P-256 key
+
+# Check certificate compatibility with TLS 1.3
+openssl x509 -in cert.pem -noout -text | grep "Public Key"
+# Should show id-ecPublicKey for TLS 1.3 compatibility
+```
+
+### NGINX TLS 1.3 Configuration
+
+```nginx
+ssl_protocols TLSv1.3;              # TLS 1.3 only (or TLSv1.2 TLSv1.3)
+ssl_ciphers TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+ssl_prefer_server_ciphers off;
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:50m;
+ssl_early_data off;                 # Disable 0-RTT unless needed
+```
+
+### TLS Handshake Timing (1-RTT vs 2-RTT)
+
+```
+TLS 1.2 Full Handshake:
+RTT 1: ClientHello → ServerHello + Certificate + ServerHelloDone
+RTT 2: ClientKeyExchange + ChangeCipherSpec + Finished → Application Data
+
+TLS 1.3 Full Handshake:
+RTT 1: ClientHello (key_share) → ServerHello + Certificate + Finished
+       → Application Data
+
+TLS 1.3 0-RTT (Session Resumption):
+ClientHello (pre_shared_key + early_data) → Application Data (immediate)
+ServerHello (pre_shared_key) + Finished → Application Data
+```
+
+## Related Topics
+
+- [HTTPS](./https) — HTTPS implementation
+- [HTTP](./http) — HTTP protocol
+- [Load Balancing](./load-balancing) — TLS termination
+- [VPN](./vpn) — WireGuard uses similar crypto
+- [SSL](./ssl) — SSL/TLS migration

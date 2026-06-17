@@ -1,0 +1,683 @@
+---
+title: "Kubernetes Services"
+description: "Complete guide to Kubernetes Services - load balancing, service discovery, and network routing"
+sidebar_position: 6
+---
+
+# Kubernetes Services
+
+## Overview
+
+A **Service** is a Kubernetes resource that provides stable network identity and load balancing for a set of Pods. Services abstract away the ephemeral nature of Pods by providing a single DNS name and IP address that remains stable even as Pods are created, destroyed, or moved across the cluster. This enables reliable network communication and is fundamental to microservices architecture.
+
+## When To Use
+
+- **Providing stable endpoints** for accessing applications
+- **Load balancing traffic** across multiple Pod replicas
+- **Enabling service discovery** using DNS names
+- **Exposing applications** internally or externally
+- **Decoupling consumers** from specific Pod instances
+- **Managing traffic routing** for blue-green or canary deployments
+
+## When NOT To Use
+
+- **For headless services** where you need direct Pod DNS - use Headless Service
+- **For external databases or APIs** - use ExternalName or Ingress
+- **When you need fine-grained traffic control** - use a service mesh like Istio
+- **For stateful applications** requiring sticky sessions - use session affinity
+
+## Core Concepts
+
+### Service Types
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Service Types                                     │
+├──────────────┬──────────────────────────────────────────────────────┤
+│              │                                                      │
+│  ClusterIP   │  ┌──────────────────────────────────────────────┐   │
+│  (internal)  │  │ Service: 10.0.0.100:80                        │   │
+│              │  │   │                                            │   │
+│              │  │   ▼                                            │   │
+│              │  │  Pod:80  Pod:80  Pod:80                       │   │
+│              │  └──────────────────────────────────────────────┘   │
+│              │                                                      │
+├──────────────┼──────────────────────────────────────────────────────┤
+│              │                                                      │
+│  NodePort    │  ┌──────────────────────────────────────────────┐   │
+│  (node ip)   │  │ Node:30080 → Service:80 → Pods:80            │   │
+│              │  └──────────────────────────────────────────────┘   │
+│              │                                                      │
+├──────────────┼──────────────────────────────────────────────────────┤
+│              │                                                      │
+│ LoadBalancer │  ┌──────────────────────────────────────────────┐   │
+│  (cloud)     │  │ Cloud LB → Node:30080 → Service:80 → Pods   │   │
+│              │  └──────────────────────────────────────────────┘   │
+│              │                                                      │
+├──────────────┼──────────────────────────────────────────────────────┤
+│              │                                                      │
+│  ExternalName│  ┌──────────────────────────────────────────────┐   │
+│  (CNAME)     │  │ Service: mydb.svc → mydb.external.com (CNAME)│   │
+│              │  └──────────────────────────────────────────────┘   │
+│              │                                                      │
+└──────────────┴──────────────────────────────────────────────────────┘
+```
+
+### Service Selector and Endpoints
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Service (selector: app=api)                                        │
+│                                                                      │
+│  spec:                                                               │
+│    selector:                                                         │
+│      app: api                                                        │
+│    ports:                                                            │
+│      - port: 80                                                      │
+│        targetPort: 8080                                              │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Watches Pods with app=api
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Endpoints (auto-created)                                            │
+│                                                                      │
+│  subsets:                                                            │
+│  - addresses:                                                        │
+│    - ip: 10.4.1.5   (Pod: api-abc123)                               │
+│    - ip: 10.4.2.8   (Pod: api-def456)                               │
+│    - ip: 10.4.1.12  (Pod: api-ghi789)                               │
+│    ports:                                                            │
+│      - port: 8080                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### kube-proxy Implementation
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      kube-proxy Modes                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  iptables mode (default):                                           │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ - Netfilter rules for each Service                          │   │
+│  │ - Probability-based load balancing                          │   │
+│  │ - O(n) rules for n Services                                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  IPVS mode (recommended for large clusters):                        │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ - Linux Virtual Server load balancer                        │   │
+│  │ - O(1) lookup regardless of Service count                   │   │
+│  │ - Multiple load balancing algorithms                        │   │
+│  │ - rr, lc, wrr, lc, sh, sed, nq                              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Service Discovery
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Service Discovery Flow                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Pod needs to reach: http://api-service                              │
+│                                                                      │
+│  1. DNS Query: api-service.production.svc.cluster.local             │
+│  2. CoreDNS responds: 10.0.0.100 (ClusterIP)                        │
+│  3. Pod connects to: 10.0.0.100:80                                  │
+│  4. kube-proxy redirects to actual Pod IP                            │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ CoreDNS: api-service.production.svc.cluster.local → 10.0.0.100│ │
+│  │ kube-proxy: 10.0.0.100:80 → 10.4.1.5:8080 (Pod)            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production API Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  labels:
+    app: api-service
+    tier: backend
+  annotations:
+    # GKE: Enable Cloud Armor
+    networking.gke.io/load-balancer-type: "Standard"
+    cloud.google.com/backend-config: '{"default": "api-backend-config"}'
+spec:
+  # Service type
+  type: ClusterIP
+  
+  # Pod selector
+  selector:
+    app: api-service
+    version: v2.3.1
+  
+  # Service ports
+  ports:
+  # HTTP port
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+  # gRPC port
+  - name: grpc
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  
+  # Session affinity
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+
+---
+# BackendConfig for Cloud Load Balancer
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: api-backend-config
+  namespace: production
+spec:
+  healthCheck:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /healthz/ready
+    port: 8080
+  connectionDraining:
+    drainingTimeoutSec: 60
+  sessionAffinity:
+    affinityType: "CLIENT_IP"
+    affinityDurationSeconds: 10800
+```
+
+### Multi-Port Service with Named Ports
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: multiport-service
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: myapp
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: https
+    protocol: TCP
+  - name: grpc
+    port: 9090
+    targetPort: grpc
+    protocol: TCP
+
+---
+# Pod with named ports
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp-pod
+spec:
+  containers:
+  - name: app
+    image: myapp:v1
+    ports:
+    - name: http
+      containerPort: 8080
+    - name: https
+      containerPort: 8443
+    - name: grpc
+      containerPort: 9090
+```
+
+### Headless Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: statefulset-headless
+  namespace: production
+spec:
+  # Headless: clusterIP: None
+  clusterIP: None
+  
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+
+# DNS resolution:
+# statefulset-headless.production.svc.cluster.local
+#   → mysql-0.statefulset-headless.production.svc.cluster.local (10.4.1.5)
+#   → mysql-1.statefulset-headless.production.svc.cluster.local (10.4.2.8)
+```
+
+### ExternalName Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-database
+  namespace: production
+spec:
+  type: ExternalName
+  externalName: db.example.com
+  # DNS: external-database.production.svc.cluster.local → db.example.com
+
+---
+# Alternative: External IP for external services
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-api
+  namespace: production
+spec:
+  type: ClusterIP
+  ports:
+  - port: 443
+    targetPort: 8443
+  # No selector - manually create endpoints
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-api
+  namespace: production
+subsets:
+- addresses:
+  - ip: 203.0.113.10
+  ports:
+  - port: 8443
+    name: https
+```
+
+## YAML Examples
+
+### NodePort Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-nodeport
+  namespace: production
+spec:
+  type: NodePort
+  selector:
+    app: api-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    nodePort: 30080  # Optional: specific port
+    protocol: TCP
+```
+
+### LoadBalancer Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-lb
+  namespace: production
+  annotations:
+    # GKE: Specify load balancer IP
+    networking.gke.io/load-balancer-ip: "203.0.113.50"
+    # AWS: Enable proxy protocol
+    service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-service
+  ports:
+  - port: 443
+    targetPort: 8443
+    protocol: TCP
+  # For external traffic policy
+  externalTrafficPolicy: Local  # Preserves client IP
+  healthCheckNodePort: 30000
+```
+
+### Internal LoadBalancer (GKE)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-internal
+  namespace: production
+  annotations:
+    # GCP: Internal load balancer
+    networking.gke.io/load-balancer-type: "Internal"
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-service
+  ports:
+  - port: 80
+    targetPort: 8080
+  # Only route to nodes with matching pods
+  externalTrafficPolicy: Local
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create service
+kubectl apply -f service.yaml
+kubectl expose deployment api-service --port=80 --target-port=8080
+
+# List services
+kubectl get services
+kubectl get svc
+kubectl get svc -o wide
+kubectl get svc -l app=api
+
+# Describe service
+kubectl describe service api-service
+
+# Get service YAML
+kubectl get service api-service -o yaml
+
+# Delete service
+kubectl delete service api-service
+
+# Scale deployment (service stays the same)
+kubectl scale deployment api-service --replicas=10
+```
+
+### Service Discovery
+
+```bash
+# Get service cluster IP
+kubectl get service api-service -o jsonpath='{.spec.clusterIP}'
+
+# Get all endpoints
+kubectl get endpoints
+kubectl get endpoints api-service
+
+# Describe endpoints (shows pod IPs)
+kubectl describe endpoints api-service
+
+# DNS lookup from a pod
+kubectl exec -it nginx -- nslookup api-service
+kubectl exec -it nginx -- nslookup api-service.production
+kubectl exec -it nginx -- cat /etc/resolv.conf
+```
+
+### Port Forwarding
+
+```bash
+# Forward local port to service
+kubectl port-forward svc/api-service 8080:80
+
+# Forward to specific endpoint
+kubectl port-forward svc/api-service 8080:80 --address 0.0.0.0
+
+# Multiple port forwards
+kubectl port-forward svc/api-service 8080:80 9090:9090
+```
+
+### Debugging
+
+```bash
+# Check service endpoints exist
+kubectl get endpoints api-service
+
+# Check service selector matches pods
+kubectl get pods -l app=api-service
+
+# Test service connectivity
+kubectl run test --rm -it --image=busybox -- wget -qO- http://api-service
+
+# Check events related to service
+kubectl get events --field-selector involvedObject.name=api-service
+```
+
+## Common Commands
+
+```bash
+# Create service from deployment
+kubectl expose deployment nginx --port=80 --type=ClusterIP
+
+# Update service
+kubectl apply -f service.yaml
+
+# Edit service
+kubectl edit service api-service
+
+# Patch service
+kubectl patch service api-service -p '{"spec":{"sessionAffinity":"ClientIP"}}'
+
+# Label service
+kubectl label service api-service team=platform --overwrite
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description |
+|--------|-------------|
+| service_endpoint_ready_endpoints | Ready endpoints count |
+| service_endpoint_not_ready_endpoints | Not ready endpoints count |
+| service_load_balancer_ingress | LB ingress IPs |
+
+### Prometheus Queries
+
+```promql
+# Services with no ready endpoints
+count(endpoints_ready) by (service, namespace) == 0
+
+# Endpoint count by service
+sum(kube_endpoint_addresses_ready) by (service, namespace)
+```
+
+## Security
+
+### NetworkPolicy for Service
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    - namespaceSelector:
+        matchLabels:
+          name: production
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+```
+
+### RBAC for Service Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: service-reader
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Service has no endpoints | Selector doesn't match pods | Fix pod labels or selector |
+| External traffic not working | NodePort/LoadBalancer misconfigured | Check firewall rules |
+| DNS resolution failing | CoreDNS issues | Check CoreDNS pods |
+| High latency | Too many hops or connection limits | Optimize service configuration |
+
+### Diagnostic Commands
+
+```bash
+# Check service and endpoints
+kubectl get service api-service
+kubectl get endpoints api-service
+
+# Check selector matches
+kubectl get pods -l app=api-service
+
+# Describe service for issues
+kubectl describe service api-service
+
+# Check events
+kubectl get events --field-selector involvedObject.name=api-service
+
+# Test from within cluster
+kubectl run curl --rm -it --image=curlimages/curl -- sh
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a Kubernetes Service?**
+A: A Service is an abstraction that provides a stable network identity and load balancing for a set of Pods. It provides a single DNS name and IP that remains stable as Pods are created and destroyed.
+
+**Q: What are the different Service types?**
+A: ClusterIP (internal only), NodePort (via node IP and port), LoadBalancer (cloud LB integration), and ExternalName (CNAME alias).
+
+**Q: How does a Service know which Pods to route to?**
+A: Services use a label selector to identify Pods. The Kubernetes control plane creates and updates Endpoints objects that list the IP addresses of matching Pods.
+
+### Intermediate Questions
+
+**Q: What is the difference between ClusterIP and Headless Service?**
+A: ClusterIP assigns a virtual IP for the service, and DNS returns that IP. Headless services have clusterIP: None, and DNS returns individual Pod IPs directly.
+
+**Q: How do you preserve client source IP in a Service?**
+A: Set externalTrafficPolicy: Local on the Service. This routes traffic only to pods on the receiving node, avoiding NAT and preserving the client IP.
+
+**Q: How does kube-proxy load balance traffic?**
+A: In iptables mode, kube-proxy creates netfilter rules with probability-based distribution. In IPVS mode, it uses the Linux Virtual Server for O(1) load balancing with multiple algorithms.
+
+## Cheat Sheet
+
+### Service YAML Template
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  # Type: ClusterIP, NodePort, LoadBalancer, ExternalName
+  type: ClusterIP
+  
+  # Selector (which pods to route to)
+  selector:
+    app: my-app
+  
+  # Ports
+  ports:
+  - name: http
+    port: 80        # Service port
+    targetPort: 8080 # Pod port
+    protocol: TCP
+  
+  # Session affinity
+  sessionAffinity: None  # or ClientIP
+```
+
+### Service Types Comparison
+
+| Type | Access | Use Case |
+|------|--------|----------|
+| ClusterIP | Internal cluster only | Internal microservices |
+| NodePort | NodeIP:NodePort | Development, simple exposure |
+| LoadBalancer | Cloud LB | Production external access |
+| ExternalName | CNAME | External service alias |
+
+### Essential Commands
+
+```bash
+# Create
+kubectl expose deployment myapp --port=80
+
+# Get
+kubectl get svc
+kubectl get svc my-service
+
+# Endpoints
+kubectl get endpoints my-service
+
+# Describe
+kubectl describe svc my-service
+
+# Delete
+kubectl delete svc my-service
+```
+
+## Related Topics
+
+- [Ingress](./ingress) - HTTP/HTTPS routing
+- [Networking](./networking) - Cluster networking
+- [Deployments](./deployments) - Managing pods behind services
+- [NetworkPolicy](./security) - Service security

@@ -1,0 +1,281 @@
+---
+sidebar_position: 3
+description: Linux as the foundation of production infrastructure — distributions, kernel, and ecosystem for DevOps engineers.
+---
+
+# Linux Overview
+
+## Overview
+
+Linux is the operating system running the majority of production infrastructure — from web servers and databases to Kubernetes nodes and CI/CD runners. Understanding Linux at depth is non-negotiable for DevOps engineers because every tool, container, and cloud service ultimately runs on it. The kernel is just the starting point; production expertise requires understanding systemd, networking, storage, security hardening, and performance tuning.
+
+Linux distributions fall into two main families: Debian-based (Ubuntu, Debian) and Red Hat-based (RHEL, CentOS, Fedora). Each has distinct package management (apt vs dnf/yum), init systems, and filesystem layouts. Alpine Linux dominates container base images due to its minimal footprint. In cloud environments, Ubuntu LTS and RHEL are the most common production choices, with RHEL preferred in enterprise due to its extended support cycles and certification ecosystem.
+
+The kernel is a monolith with modular components — you load and unload functionality at runtime via kernel modules. Understanding the kernel's role in system calls, process scheduling, memory management, and hardware interaction provides the foundation for debugging production issues like OOM kills, CPU throttling, and I/O bottlenecks.
+
+## When To Use
+
+- Selecting an OS for new production infrastructure
+- Troubleshooting kernel-level issues (module loading, sysctl tuning)
+- Evaluating distribution trade-offs for specific workloads
+- Understanding container host requirements
+- Planning OS patching and upgrade strategies
+
+## When NOT To Use
+
+- Running workloads that require Windows-specific software
+- When the cloud provider or platform mandates a specific OS
+- Embedding systems with real-time requirements that need a dedicated RTOS
+- Edge cases where a minimal unikernel is more appropriate
+
+## Core Concepts
+
+### Distribution Families
+
+| Family | Distributions | Package Manager | Init System |
+|--------|--------------|-----------------|-------------|
+| Debian | Ubuntu, Debian | apt | systemd |
+| Red Hat | RHEL, CentOS, Fedora | dnf/yum | systemd |
+| SUSE | SLES, openSUSE | zypper | systemd |
+| Alpine | Alpine Linux | apk | OpenRC |
+
+### Kernel Modules
+
+Kernel modules extend kernel functionality without rebooting:
+
+```bash
+# List loaded modules
+lsmod
+
+# Show module info
+modinfo nf_tables
+
+# Load a module
+sudo modprobe overlay
+
+# Unload a module (must not be in use)
+sudo modprobe -r bridge
+```
+
+### System Calls
+
+Applications interact with the kernel via system calls. Monitoring syscalls reveals application behavior:
+
+```bash
+# Trace syscalls for a process
+strace -p <PID> -f
+
+# Trace specific syscalls
+strace -e trace=open,read,write -p <PID>
+
+# Count syscalls
+strace -c -p <PID>
+```
+
+### Sysctl Parameters
+
+Tune kernel behavior at runtime:
+
+```bash
+# View current value
+sysctl net.ipv4.tcp_fin_timeout
+
+# Set value (runtime only)
+sudo sysctl -w net.ipv4.tcp_fin_timeout=30
+
+# Set value (permanent)
+echo "net.ipv4.tcp_fin_timeout=30" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+## Real Production Example
+
+Deploying a mixed workload web server on Ubuntu 22.04 LTS:
+
+```bash
+# Install with rational defaults — no GUI, minimal packages
+sudo apt update && sudo apt install -y \
+    curl \
+    wget \
+    ca-certificates \
+    jq \
+    htop \
+    iotop \
+    strace \
+    tcpdump \
+    linux-tools-generic \
+    unattended-upgrades
+
+# Enable automatic security updates
+sudo apt install -y unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades
+
+# Configure kernel parameters for network-heavy workload
+cat <<EOF | sudo tee /etc/sysctl.d/99-network-tuning.conf
+# Network buffer sizes
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# Connection tracking
+net.netfilter.nf_conntrack_max = 1048576
+net.nf_conntrack_max = 1048576
+
+# File descriptors
+fs.file-max = 2097152
+
+# Swappiness — keep swap minimal for database hosts
+vm.swappiness = 10
+EOF
+
+sudo sysctl -p /etc/sysctl.d/99-network-tuning.conf
+
+# Limit kernel messages
+echo "kernel.printk = 3 4 1 3" | sudo tee -a /etc/sysctl.d/99-kernel.conf
+```
+
+## CLI Examples
+
+```bash
+# Check OS version
+cat /etc/os-release
+
+# Check kernel version
+uname -r
+uname -a
+
+# Check system architecture
+uname -m
+
+# List CPU information
+lscpu
+
+# List PCI devices
+lspci
+
+# List USB devices
+lsusb
+
+# Check system uptime and load
+uptime
+
+# Check last boot time
+who -b
+
+# List running services
+systemctl list-units --type=service --state=running
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `uname -r` | Kernel version | Check running kernel |
+| `lsb_release -a` | Distribution info | Full OS details |
+| `hostnamectl` | System identification | Set hostname |
+| `timedatectl` | Time/date config | Check timezone |
+| `localectl` | Locale settings | Configure locale |
+| `modprobe` | Load kernel module | `modprobe nf_conntrack` |
+| `sysctl -a` | All kernel params | View tunable parameters |
+| `dmesg` | Kernel ring buffer | Boot messages, hardware issues |
+
+## Monitoring
+
+```bash
+# Kernel messages (real-time)
+dmesg -w
+
+# Filter by severity
+dmesg -T -f kern,err
+
+# Check module parameters
+cat /proc/cmdline  # Boot parameters
+modinfo -p <module>  # Available parameters
+
+# Systemd journal for kernel
+journalctl -k -b
+
+# CPU architecture details
+lscpu
+```
+
+## Security
+
+- **Kernel hardening**: Enable kernel lockdown mode (IMA/EVM on SELinux systems)
+- **Module loading restrictions**: Set `kernel.modules_disabled=1` to prevent module loading after boot
+- **Sysctl hardening**: Disable ICMP redirects, enable IP forwarding only when needed
+- **Updates**: Subscribe to distribution security feeds; automate patch management
+- **UEFI Secure Boot**: Ensures only signed kernels and modules load
+
+## Troubleshooting
+
+**Kernel module fails to load:**
+```
+modprobe: ERROR: could not insert 'vfio': Invalid argument
+```
+Fix: Check module dependencies with `modprobe -D <module>`, verify kernel version compatibility, check dmesg for hardware errors.
+
+**High syscall rate:**
+```bash
+# Identify offending process
+strace -c -p <PID>
+# Shows breakdown of syscalls by frequency and time
+```
+
+**System panic on boot:**
+- Disable quiet boot to see where it hangs
+- Check /proc/cmdline for problematic parameters
+- Boot to recovery mode and review logs
+
+## Interview Questions
+
+1. **What happens from the moment you press the power button until you get a login prompt?**
+
+The BIOS/UEFI performs POST, locates boot device, reads the MBR/GPT. The bootloader (GRUB2) loads the kernel and initial ramdisk (initramfs). The kernel initializes hardware, starts systemd (or init). systemd reads its configuration, activates basic.target, brings up local filesystems, starts necessary services, and finally reaches graphical.target or multi-user.target for the login prompt.
+
+2. **What's the difference between a kernel module and a user-space module?**
+
+Kernel modules (loadable kernel modules or LKM) run in kernel space with direct hardware access and full privileges. They can crash the kernel if buggy. User-space modules (like iptables extensions, BPF programs in some modes) run outside the kernel, are safer, but have higher syscall overhead. NFtables extensions run in kernel for speed but iptables xt_* modules run partly in user space.
+
+3. **How would you debug a service that fails to start after a kernel update?**
+
+Check if the new kernel version has known issues, verify module signatures match (Secure Boot context), ensure initramfs was regenerated, check for renamed symbols in dmesg, try booting with previous kernel via GRUB menu, verify service dependencies are actually available (udev may not have created device nodes yet).
+
+4. **What's the difference between sysctl, /proc/sys, and modprobe?**
+
+sysctl reads/writes to /proc/sys virtual filesystem which exposes kernel parameters. sysctl is the interface; /proc/sys is the mechanism. modprobe loads kernel modules (.ko files) which extend kernel capabilities. Sysctl configures already-loaded kernel behavior, modprobe adds new code paths.
+
+5. **How does the kernel handle out-of-memory conditions?**
+
+The kernel's OOM killer (oom_score_adj controls weighting) evaluates processes by memory usage, CPU time, and runtime. It selects and kills the "most guilty" process when physical memory and swap are exhausted. It's aggressive — can kill critical services if memory is misconfigured. vm.zone_reclaim_mode, vm.min_free_kbytes, and cgroup memory limits influence behavior.
+
+## Cheat Sheet
+
+```
+# Kernel info
+uname -r                           # Running kernel version
+cat /proc/cmdline                  # Boot parameters
+
+# Modules
+lsmod                              # Loaded modules
+modprobe <module>                  # Load module
+modinfo <module>                   # Module details
+
+# Tuning
+sysctl -a                          # All parameters
+sysctl -w param=value              # Set temporarily
+echo "param=value" >> /etc/sysctl.conf  # Permanent
+
+# Logs
+dmesg                              # Kernel messages
+journalctl -k                      # Kernel journal entries
+```
+
+## Related Topics
+
+- [Filesystem](./filesystem) — Understanding /proc, /sys, /dev
+- [Systemd](./systemd) — Service management and targets
+- [Memory](./memory) — VM, swap, OOM killer
+- [Networking](./networking) — Network stack tuning
+- [Security](./security) — Kernel hardening

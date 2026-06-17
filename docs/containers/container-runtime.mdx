@@ -1,0 +1,863 @@
+---
+title: "Container Runtime"
+description: "Deep dive into container runtimes - OCI, containerd, runc, CRI, and runtime security"
+sidebar_position: 5
+---
+
+# Container Runtime
+
+## Overview
+
+The container runtime is the software responsible for running containers. It sits at the lowest level of the container stack, handling the actual creation and management of containers using OS-level virtualization features like Linux namespaces and cgroups.
+
+**Container Runtime Stack:**
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         High-Level Runtime                           │
+│                    (containerd, CRI-O, Docker)                       │
+│                                                                      │
+│  Responsibilities: Image management, container lifecycle, logging    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                │ CRI (Container Runtime Interface)
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                          Low-Level Runtime                           │
+│                           (runc, crun, kata-runtime)                 │
+│                                                                      │
+│  Responsibilities: Creating containers, namespace isolation,         │
+│                   resource limits, process isolation                 │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Operating System                              │
+│                   (Linux kernel namespaces, cgroups)                 │
+│                                                                      │
+│  Responsibilities: Resource isolation, process isolation,            │
+│                   capability management                              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## When To Use
+
+- **Kubernetes administration** understanding how pods run
+- **Debugging container issues** requiring runtime-level inspection
+- **Custom container orchestrators** needing CRI integration
+- **Security hardening** requiring runtime policy configuration
+- **Performance optimization** understanding container overhead
+- **Runtime comparisons** choosing the right runtime for your use case
+
+## When NOT To Use
+
+- **Application development** (use Docker/Buildah/Podman instead)
+- **Simple container running** (use containerd directly or Docker)
+- **Learning basic container concepts** (start with Docker)
+
+## Core Concepts
+
+### Container Runtime Evolution
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Container Runtime History                          │
+│                                                                      │
+│  2013: Docker introduced with libcontainer (lxc-based initially)     │
+│  2015: Docker donated containerd to CNCF                              │
+│  2016: OCI (Open Container Initiative) established                    │
+│  2017: containerd became standalone, runc extracted                   │
+│  2018: Docker removed from Kubernetes (dockershim deprecation)        │
+│  2020: containerd v1.4, CRI-O mature                                  │
+│  2022: dockershim removed in Kubernetes 1.24                          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### OCI (Open Container Initiative) Specifications
+
+| Specification | Description |
+|--------------|-------------|
+| **runtime-spec** | Defines container configuration, execution environment, and lifecycle |
+| **image-spec** | Defines image format, manifest, layer storage, and index |
+| **distribution-spec** | Defines registry API for distributing images |
+
+### Low-Level Runtime (runc)
+
+`runc` is the reference implementation of the OCI runtime-spec. It creates and runs containers based on the OCI configuration.
+
+**runc workflow:**
+
+```bash
+# 1. Create a container bundle (rootfs + config.json)
+# 2. Create spec from default template
+runc spec
+
+# 3. Modify config.json (root, capabilities, etc.)
+# 4. Create and start container
+runc run mycontainer
+
+# 5. Or create without starting
+runc create mycontainer
+runc start mycontainer
+
+# 6. Pause/Resume (using cgroups freezer)
+runc pause mycontainer
+runc resume mycontainer
+
+# 7. Kill process in container
+runc kill mycontainer SIGTERM
+
+# 8. Delete container state
+runc delete mycontainer
+```
+
+**runc config.json example:**
+
+```json
+{
+  "ociVersion": "1.0.2",
+  "process": {
+    "terminal": false,
+    "user": {
+      "uid": 0,
+      "gid": 0
+    },
+    "args": [
+      "/bin/sh"
+    ],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "TERM=xterm"
+    ],
+    "cwd": "/"
+  },
+  "root": {
+    "path": "rootfs",
+    "readonly": true
+  },
+  "hostname": "mycontainer",
+  "mounts": [
+    {
+      "destination": "/proc",
+      "type": "proc",
+      "source": "proc"
+    },
+    {
+      "destination": "/dev",
+      "type": "tmpfs",
+      "source": "tmpfs"
+    }
+  ],
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "network" },
+      { "type": "ipc" },
+      { "type": "uts" },
+      { "type": "mount" }
+    ],
+    "cgroups": {
+      "path": "/user.slice/mycontainer",
+      "resources": {
+        "memory": {
+          "limit": 268435456,
+          "reservation": 134217728
+        },
+        "cpu": {
+          "quota": 100000,
+          "period": 100000
+        }
+      }
+    },
+    "rootfsPropagation": "rprivate",
+    "maskedPaths": [
+      "/proc/kcore",
+      "/proc/latency_stats",
+      "/proc/timer_stats",
+      "/proc/sched_debug"
+    ],
+    "readonlyPaths": [
+      "/proc/asyc",
+      "/proc/kpageflags"
+    ]
+  }
+}
+```
+
+### High-Level Runtime (containerd)
+
+`containerd` is a container runtime that manages the complete container lifecycle: image transfer, storage, container execution, supervision, and low-level storage.
+
+**containerd architecture:**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         containerd                                    │
+│                                                                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────┐ │
+│  │  Metadata   │  │  Content    │  │          Snapshots          │ │
+│  │   Store     │  │   Store     │  │                             │ │
+│  │  (boltdb)   │  │ (content)   │  │   (mount, overlay, devmapper)│ │
+│  └─────────────┘  └─────────────┘  └─────────────────────────────┘ │
+│                                                                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────────┐ │
+│  │  Tasks      │  │  Containers │  │           Images            │ │
+│  │             │  │             │  │                             │ │
+│  │ (processes) │  │(container   │  │ (pull, unpack, gc)          │ │
+│  │             │  │ metadata)   │  │                             │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────────────┘ │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                      Runtime                                 │   │
+│  │                (runc, kata, gVisor)                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**containerd CLI (ctr):**
+
+```bash
+# Image management
+ctr images pull docker.io/library/nginx:alpine
+ctr images list
+ctr images tag nginx:alpine myregistry.io/mynginx:latest
+ctr images push myregistry.io/mynginx:latest
+ctr images remove nginx:alpine
+
+# Container management
+ctr containers create myregistry.io/myapp:latest myapp
+ctr containers list
+ctr containers start myapp
+ctr containers pause myapp
+ctr containers resume myapp
+ctr containers stop myapp
+ctr containers delete myapp
+
+# Task management
+ctr tasks start myapp
+ctr tasks pause myapp
+ctr tasks resume myapp
+ctr tasks kill myapp
+ctr tasks delete myapp
+
+# Snapshots
+ctr snapshots list
+ctr snapshots mount <snapshot> <target>
+```
+
+### CRI (Container Runtime Interface)
+
+CRI is a plugin interface that allows Kubernetes to use container runtimes. It defines API for creating, starting, stopping, and deleting containers.
+
+**CRI-O** is a Kubernetes-specific container runtime that implements CRI:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Kubernetes                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │ kubelet
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      CRI (Container Runtime Interface)                │
+│                                                                      │
+│  RPC API: RuntimeService, ImageService                               │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    CRI-O / containerd                                 │
+│                                                                      │
+│  CRI-O: CRI implementation for Kubernetes (OCI-based)                │
+│  containerd: General purpose high-level runtime with CRI support     │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    OCI Runtime (runc)                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Runtime Comparison
+
+| Feature | Docker | containerd | CRI-O | runc |
+|---------|--------|------------|-------|------|
+| **Type** | High-level | High-level | High-level | Low-level |
+| **Scope** | Full platform | Container runtime | Kubernetes CRI | Container execution |
+| **OCI Compliant** | Yes | Yes | Yes | Yes |
+| **Image Management** | Built-in | Built-in | Via containerd | None |
+| **K8s Compatible** | Via dockershim | Native | Native | No (needs higher level) |
+| **Logging** | Built-in | Via ctr | Via CRI | None |
+| **Network Management** | libnetwork | CNI plugins | CNI plugins | None |
+| **Default in K8s** | Deprecated | Yes (default) | Alternative | N/A |
+
+## Real Production Example
+
+### Switching Container Runtimes in Kubernetes
+
+**Check current runtime:**
+
+```bash
+kubectl get nodes -o wide
+# Look at RUNTIME
+
+# Detailed info
+kubectl describe node <node-name> | grep -i container
+```
+
+**Configure containerd as runtime (containerd config):**
+
+```toml
+# /etc/containerd/config.toml
+
+version = 2
+
+# Root directory for containerd state
+root = "/var/lib/containerd"
+
+# Runtime options
+[plugins."io.containerd.grpc.v1.cri"]
+  # Sandbox image
+  sandbox_image = "registry.k8s.io/pause:3.9"
+  
+  # Containerd CRI plugin config
+  [plugins."io.containerd.grpc.v1.cri".containerd]
+    default_runtime_name = "runc"
+    
+    # Runtime classes
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+        runtime_type = "io.containerd.runc.v2"
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+          # Enable systemd cgroup driver
+          SystemdCgroup = true
+          
+      # Kata containers runtime
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+        runtime_type = "io.containerd.kata.v2"
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
+          ConfigPath = "/etc/kata-containers/config.toml"
+
+# CNI configuration
+[plugins."io.containerd.cri.v1.images".registry]
+  config_path = "/etc/containerd/certs.d"
+
+# Logging
+[logging]
+  level = "info"
+  [logging.logging_format]
+    pattern = "%L-%l"
+```
+
+**Configure systemd cgroup driver:**
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = true
+```
+
+**For runc directly:**
+
+```bash
+# Create runtime class for gVisor
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+```
+
+### Runtime Configuration Examples
+
+**Docker runtime configuration (daemon.json):**
+
+```json
+{
+  "runtimes": {
+    "runc": {},
+    "kata": {
+      "path": "/usr/bin/kata-runtime"
+    },
+    "gvisor": {
+      "path": "/usr/bin/runsc"
+    }
+  },
+  "default-runtime": "runc",
+  "default-cgroupns-mode": "private",
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 64000,
+      "Soft": 64000
+    }
+  },
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  }
+}
+```
+
+## CLI Examples
+
+### containerd CLI (ctr)
+
+```bash
+# Images
+ctr images pull docker.io/library/alpine:latest
+ctr images list
+ctr images tag myapp:latest myregistry.io/myapp:v1
+ctr images push myregistry.io/myapp:v1
+ctr images remove myapp:latest
+ctr images mount myapp:latest /mnt
+
+# Containers
+ctr containers create docker.io/library/nginx:alpine --null-bundle nginx
+ctr containers list
+ctr containers info nginx
+ctr containers delete nginx
+
+# Tasks (processes)
+ctr tasks create nginx
+ctr tasks start nginx
+ctr tasks pause nginx
+ctr tasks resume nginx
+ctr tasks kill nginx
+ctr tasks list
+
+# Snapshots
+ctr snapshots list
+ctr snapshots prepare myapp-snap /layers/layer1
+ctr snapshots mount myapp-snap /mnt
+ctr snapshots commit myapp-snap myapp:v1
+```
+
+### containerd-shim
+
+```bash
+# containerd-shim is used by containerd to manage container processes
+# Not typically invoked directly, but useful for debugging
+
+# List shim processes
+ps aux | grep containerd-shim
+
+# Connect to running shim
+containerd-shim-runc-v2 -id <container-id> -address /run/containerd/containerd.sock
+```
+
+### CRI-O CLI (crictl)
+
+```bash
+# Images
+crictl pull docker.io/library/nginx:alpine
+crictl images
+crictl rmi nginx:alpine
+
+# Containers
+crictl run pod.json container.json
+crictl ps
+crictl exec <container-id> ls
+crictl logs <container-id>
+crictl stop <container-id>
+crictl rm <container-id>
+
+# Pods
+crictl pods
+crictl runp pod.json
+crictl stopp <pod-id>
+crictl rmp <pod-id>
+
+# Info
+crictl info
+crictl version
+crictl stats <container-id>
+```
+
+### runc Commands
+
+```bash
+# Create spec
+runc spec
+
+# Run container
+runc run mycontainer
+
+# Create without running
+runc create mycontainer
+
+# Start (after create)
+runc start mycontainer
+
+# List containers
+runc list
+
+# Pause (cgroup freezer)
+runc pause mycontainer
+runc resume mycontainer
+
+# Kill process
+runc kill mycontainer SIGTERM
+
+# Delete container
+runc delete mycontainer
+
+# State
+runc state mycontainer
+
+# Events
+runc events mycontainer
+
+# Delete forcefully
+runc delete -f mycontainer
+```
+
+## Dockerfile / Compose Examples
+
+### Containerd in Docker Compose
+
+```yaml
+version: "3.9"
+
+# Note: Docker uses containerd internally
+# This is for understanding the runtime integration
+
+services:
+  app:
+    image: myapp:latest
+    runtime: runc  # Specify runtime (when using Docker directly)
+    # For Kubernetes, runtime class is defined differently
+```
+
+### Kubernetes RuntimeClass
+
+```yaml
+# runtime-class.yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+handler: kata
+overhead:
+  podFixed:
+    memory: "64Mi"
+    cpu: "250m"
+
+---
+# pod-using-kata.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp-katacontainer
+spec:
+  runtimeClassName: kata
+  containers:
+    - name: myapp
+      image: myapp:latest
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `runc run` | Create and start container |
+| `runc create` | Create container |
+| `runc start` | Start container |
+| `runc pause` | Pause container |
+| `runc resume` | Resume container |
+| `runc kill` | Send signal to container |
+| `runc delete` | Delete container |
+| `runc list` | List containers |
+| `runc state` | Show container state |
+| `ctr images pull` | Pull image |
+| `ctr images list` | List images |
+| `ctr containers create` | Create container |
+| `ctr tasks start` | Start task |
+| `crictl pull` | Pull image (CRI) |
+| `crictl run` | Run container (CRI) |
+
+## Monitoring
+
+### Runtime Metrics
+
+```bash
+# containerd metrics endpoint
+curl http://localhost:9323/metrics
+
+# Or via CRI
+crictl stats
+```
+
+### Runtime Events
+
+```bash
+# runc events
+runc events mycontainer
+
+# containerd events
+ctr events
+```
+
+### Debugging Runtime Issues
+
+```bash
+# Check containerd service
+systemctl status containerd
+
+# View containerd logs
+journalctl -u containerd -f
+
+# Check cgroup status
+cat /sys/fs/cgroup/cpu,cpuacct/system.slice/containerd.service/cpu.cfs_quota_us
+cat /sys/fs/cgroup/cpu,cpuacct/system.slice/containerd.service/cpu.cfs_period_us
+```
+
+## Security
+
+### Linux Capabilities
+
+Containers run with a subset of Linux capabilities. Best practice is to drop all and add only what's needed:
+
+```json
+{
+  "linux": {
+    "capabilities": {
+      "bounding": ["CAP_NET_BIND_SERVICE"],
+      "permitted": ["CAP_NET_BIND_SERVICE"],
+      "effective": ["CAP_NET_BIND_SERVICE"],
+      "inheritable": ["CAP_NET_BIND_SERVICE"],
+      "ambient": ["CAP_NET_BIND_SERVICE"]
+    }
+  }
+}
+```
+
+### Seccomp (Secure Computing Mode)
+
+Seccomp limits the syscalls a container can make:
+
+```json
+{
+  "linux": {
+    "seccomp": {
+      "defaultAction": "SCMP_ACT_ERRNO",
+      "architectures": ["SCMP_ARCH_X86_64"],
+      "syscalls": [
+        {
+          "names": ["read", "write", "exit", "futex"],
+          "action": "SCMP_ACT_ALLOW"
+        }
+      ]
+    }
+  }
+}
+```
+
+### AppArmor Profile
+
+```bash
+# Load AppArmor profile
+apparmor_parser -r -W /etc/apparmor.d/docker-myapp
+
+# Run with profile
+docker run --security-opt apparmor=docker-myapp myapp
+```
+
+### Dropped Capabilities (runc)
+
+```bash
+# Run container with minimal capabilities
+docker run --cap-drop=ALL \
+           --cap-add=NET_BIND_SERVICE \
+           --security-opt=no-new-privileges \
+           myapp
+```
+
+### Rootless Containers
+
+Rootless mode allows running containers without root privileges:
+
+```bash
+# Install rootless containerd
+containerd-rootless-setuptool.sh install
+
+# Verify rootless mode
+containerd-rootless-tool.sh specs
+```
+
+## Cost Optimization
+
+### Runtime Overhead
+
+| Runtime | Memory Overhead | Startup Time | Use Case |
+|---------|-----------------|--------------|----------|
+| runc | ~2MB | ~100ms | Default, most workloads |
+| Kata | ~20-50MB | ~1-2s | Strong isolation |
+| gVisor | ~10-15MB | ~200ms | User-space kernel |
+
+### Resource Limits Configuration
+
+```json
+{
+  "linux": {
+    "cgroups": {
+      "path": "/user.slice/container-web.service",
+      "resources": {
+        "memory": {
+          "limit": 536870912,
+          "reservation": 134217728
+        },
+        "cpu": {
+          "quota": 100000,
+          "period": 100000,
+          "shares": 1024
+        },
+        "pids": {
+          "limit": 1024
+        },
+        "blockIO": {
+          "weight": 10000
+        }
+      }
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+### Common Runtime Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Container starts but exits immediately | Main process fails | Check logs, verify CMD/ENTRYPOINT |
+| OOM kills | Memory limit exceeded | Increase limit, optimize application |
+| Permission denied | Missing capabilities | Add required capabilities |
+| Network not working | Namespace isolation | Check network namespace config |
+| cgroup v2 issues | System uses cgroup v2 | Ensure runtime supports cgroup v2 |
+
+### Debugging Commands
+
+```bash
+# Check container state
+runc state mycontainer
+
+# View container processes
+cat /proc/<pid>/status | grep -E "^(Name|Pid|NSPid)"
+
+# Check cgroup limits
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+
+# Monitor system calls (strace)
+strace -p <pid>
+
+# Check namespaces
+ls -la /proc/<pid>/ns/
+
+# Verify seccomp status
+cat /proc/<pid>/status | grep Seccomp
+```
+
+## Interview Questions
+
+### Q1: What is the difference between high-level and low-level container runtimes?
+**A:** Low-level runtimes (runc) directly interact with the kernel to create containers using namespaces and cgroups. High-level runtimes (containerd, CRI-O) manage the full container lifecycle including image handling, storage, networking, and delegate actual container execution to a low-level runtime.
+
+### Q2: What is OCI and what specifications does it define?
+**A:** OCI (Open Container Initiative) is a vendor-neutral standards body. It defines three specifications: runtime-spec for container execution and configuration, image-spec for container image format, and distribution-spec for image distribution APIs.
+
+### Q3: Why did Kubernetes remove dockershim?
+**A:** Docker uses containerd internally, but Kubernetes had to maintain a separate integration layer called dockershim. Removing it simplified the codebase, reduced maintenance burden, and allowed containerd to be used directly as a CRI-compatible runtime.
+
+### Q4: What is the difference between containerd and CRI-O?
+**A:** containerd is a general-purpose high-level runtime developed by Docker and donated to CNCF. CRI-O is a Kubernetes-specific implementation that only implements CRI (no built-in CLI), designed to be minimal and Kubernetes-focused.
+
+### Q5: How do containers achieve isolation?
+**A:** Containers use Linux namespaces (pid, network, mount, ipc, uts, user) for isolation. Each namespace provides a distinct view of system resources. cgroups limit resource usage (CPU, memory, I/O). Combined, they provide process isolation and resource limits.
+
+### Q6: What are Linux capabilities?
+**A:** Linux capabilities split root privileges into discrete units (CAP_NET_BIND_SERVICE, CAP_DAC_READ_SEARCH, etc.). Containers run with a subset to limit what privileged operations they can perform. Best practice is to drop all and add only required capabilities.
+
+### Q7: What is runc?
+**A:** runc is the reference implementation of the OCI runtime-spec. It's a low-level container runtime that creates and runs containers according to OCI configuration. It's used by containerd and CRI-O for actual container execution.
+
+### Q8: How does cgroup v2 differ from cgroup v1?
+**A:** cgroup v2 provides a unified hierarchy (all controllers under one tree) vs cgroup v1's per-controller hierarchies. cgroup v2 has better resource management, improved delegation to containers, and resolves issues with nested containers.
+
+### Q9: What is gVisor and when would you use it?
+**A:** gVisor is a user-space kernel that intercepts system calls, providing stronger isolation than namespaces alone. It's useful for multi-tenant environments or untrusted workloads, at the cost of higher overhead and limited device access.
+
+### Q10: What security features do container runtimes provide?
+**A:** Runtimes provide: Linux namespaces for isolation, cgroups for resource limits, capabilities for privilege management, seccomp profiles to filter syscalls, AppArmor/SELinux for mandatory access control, no-new-privileges flag, and read-only rootfs options.
+
+## Cheat Sheet
+
+### Runtime Components
+
+```
+Container Runtime Stack:
+├── High-Level Runtime (containerd, CRI-O)
+│   ├── Image management
+│   ├── Container lifecycle
+│   └── gRPC/CRI API
+└── Low-Level Runtime (runc)
+    ├── OCI spec parsing
+    ├── Namespace creation
+    └── cgroup management
+```
+
+### Key Commands
+
+```bash
+# runc
+runc run <container>
+runc list
+runc state <container>
+
+# containerd (ctr)
+ctr images pull <image>
+ctr containers create <image> <name>
+ctr tasks start <container>
+
+# CRI (crictl)
+crictl pull <image>
+crictl run <pod> <container>
+crictl ps
+```
+
+### OCI Runtime Spec Keys
+
+```json
+{
+  "ociVersion": "1.0.2",
+  "root": { "path": "rootfs", "readonly": true },
+  "process": { "args": [], "cwd": "/" },
+  "hostname": "container",
+  "mounts": [],
+  "linux": {
+    "namespaces": [],
+    "cgroups": { "path": "", "resources": {} },
+    "maskedPaths": [],
+    "readonlyPaths": []
+  }
+}
+```
+
+### Capability Examples
+
+```bash
+# Drop all, add minimal
+docker run --cap-drop=ALL --cap-add=NET_BIND_SERVICE myapp
+
+# Common capabilities needed:
+# NET_BIND_SERVICE - bind to privileged ports
+# SYS_CHROOT - chroot
+# DAC_READ_SEARCH - read files normally restricted
+```
+
+## Related Topics
+
+- [Container Overview](./overview.mdx) - Container fundamentals
+- [Docker](./docker.mdx) - Docker CLI reference
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Image Security](./image-security.mdx) - Vulnerability scanning
+- [Registry](./registry.mdx) - Image registries
+- [Troubleshooting](./troubleshooting.mdx) - Debugging containers

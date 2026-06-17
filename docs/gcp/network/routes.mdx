@@ -1,0 +1,550 @@
+# Routes
+
+## Overview
+
+Routes define how packets leaving a VM instance should be directed. GCP automatically creates system routes for each subnet that handle traffic within the VPC. Custom routes allow you to define traffic patterns that deviate from the default behavior, such as directing traffic through a NAT gateway, VPN tunnel, or load balancer.
+
+Every route has a priority that determines which route is used when multiple routes match the same destination. The routing table is evaluated in priority order (lower number = higher priority), with the first matching route winning. If no route matches, traffic is dropped (except for the implied return route for established connections).
+
+Understanding routes is essential for advanced networking scenarios like VPN connections, custom NAT setups, and traffic steering through network appliances. Most basic architectures rely on system routes alone, but production environments often need custom routes for hybrid connectivity and security appliances.
+
+## When To Use
+
+- **VPN connectivity**: Route traffic through Cloud VPN to on-premises networks
+- **Cloud NAT**: Route outbound traffic through NAT gateway for instances without external IPs
+- **Traffic steering**: Direct traffic through firewall appliances or proxy servers
+- **Default route modification**: Override the default internet gateway route
+- **Multi-network instances**: Route traffic from one interface through specific routes
+- **Peering traffic**: Route traffic through VPC Network Peering
+
+## When NOT To Use
+
+- **Basic internal routing**: System routes handle this automatically
+- **Load balancer traffic**: Load balancers handle their own routing
+- **Single instance with no special routing**: No custom routes needed
+- **Cross-region routing control**: Use Premium Tier network instead
+
+## Architecture
+
+**Route Structure:**
+```
+Route: my-custom-route
+├── Network: prod-vpc
+├── Priority: 100
+├── Destination: 172.16.0.0/12
+├── Next Hop: IP (10.0.1.1)
+├── Description: Route to on-premises via VPN
+└── Tags: [] (applies to all instances)
+```
+
+**Route Types:**
+
+| Type | Description | Next Hop |
+|------|-------------|----------|
+| Subnet route | Auto-created for each subnet | Local subnet |
+| Default route | Auto-created for internet access | Default internet gateway |
+| Static route | User-created | IP, gateway, VPN tunnel |
+| Dynamic route | BGP-learned | Cloud Router |
+
+**System-Generated Routes:**
+```
+# Subnet routes (automatic)
+10.0.1.0/24 → local (within subnet)
+10.0.2.0/24 → local
+
+# Default route
+0.0.0.0/0 → default internet gateway
+```
+
+**Route Priority:**
+- Lower number = Higher priority
+- Range: 0-65535
+- System routes use priority 100 (subnet) and 200 (default)
+- Custom routes: 100-65535 (below system priority)
+
+## Core Concepts
+
+### Viewing Routes
+
+```bash
+# List all routes
+gcloud compute routes list
+
+# List routes for specific network
+gcloud compute routes list --filter="network:prod-vpc"
+
+# Describe specific route
+gcloud compute routes describe my-route
+
+# Check system routes
+gcloud compute routes list --filter="name~^default"
+
+# Check routes for specific instance
+gcloud compute routes list --filter="instanceTags:web-server"
+```
+
+### Creating Custom Routes
+
+```bash
+# Create route to specific destination via IP address
+gcloud compute routes create route-to-vpn \
+    --network=prod-vpc \
+    --destination-range=172.16.0.0/12 \
+    --next-hop-address=10.0.1.1 \
+    --priority=100 \
+    --description="Route to on-premises via VPN"
+
+# Create route via VPN tunnel
+gcloud compute routes create route-through-vpn \
+    --network=prod-vpc \
+    --destination-range=10.100.0.0/16 \
+    --next-hop-vpn-tunnel=vpn-tunnel-name \
+    --priority=100
+
+# Create route with instance tags
+gcloud compute routes create route-for-web-tier \
+    --network=prod-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-gateway=default-internet-gateway \
+    --instance-tags=web-server \
+    --priority=1000
+
+# Create route without tags (applies to all instances)
+gcloud compute routes create route-all-traffic \
+    --network=prod-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-gateway=default-internet-gateway \
+    --priority=1000
+
+# Create route to private Google Access via default internet gateway
+gcloud compute routes create route-to-googleapis \
+    --network=prod-vpc \
+    --destination-range=199.36.153.8/30 \
+    --next-hop-gateway=default-internet-gateway \
+    --priority=100
+```
+
+### Route with Tags (Policy Routing)
+
+```bash
+# Create route that only applies to instances with specific tags
+gcloud compute routes create internal-only-route \
+    --network=prod-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-gateway=default-internet-gateway \
+    --instance-tags=bypass-proxy \
+    --priority=900
+
+# Create route for specific network tier
+gcloud compute routes create dmz-route \
+    --network=prod-vpc \
+    --destination-range=10.0.2.0/24 \
+    --next-hop-address=10.0.1.254 \
+    --instance-tags=dmz-tier \
+    --priority=100
+```
+
+### Deleting and Updating Routes
+
+```bash
+# Delete route
+gcloud compute routes delete my-route
+
+# Update route priority
+gcloud compute routes update my-route --priority=500
+
+# Update next hop
+gcloud compute routes update my-route --next-hop-address=10.0.2.1
+```
+
+### Default Route Behavior
+
+```bash
+# Default route is auto-created but can be removed
+# WARNING: This removes internet access for instances without other routes
+
+# Remove default route (use with caution)
+gcloud compute routes delete default-route-to-internet --network=prod-vpc
+
+# Recreate with different next hop
+gcloud compute routes create custom-default-route \
+    --network=prod-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-gateway=default-internet-gateway \
+    --priority=200
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Custom routes per VPC | 200 |
+| System routes | Unlimited (auto-created) |
+| Route destination ranges | /0 to /32 |
+| Routes per instance | ~50 (limited by network interface count) |
+
+### Key Gotchas
+
+- **Routes apply to ALL instances in the VPC** unless tagged; use instance tags to scope
+- **Default route is auto-created** at priority 200—remove or modify if needed
+- **Route priority lower number wins**—system routes have priority 100 and 200
+- **Routes are unidirectional**—return traffic follows separate path
+- **VPN tunnels require routes** on both GCP and on-premises sides
+- **Removing default route breaks internet access** for instances without alternative routes
+- **Custom routes can't override subnet routes**—subnet routes always take precedence for local traffic
+
+## Real Production Example
+
+Production routing configuration:
+
+```bash
+# 1. List existing routes
+gcloud compute routes list --filter="network:prod-vpc"
+
+# 2. Create route for on-premises network via VPN
+gcloud compute routes create route-to-onprem \
+    --network=prod-vpc \
+    --destination-range=10.100.0.0/16 \
+    --next-hop-vpn-tunnel=onprem-vpn \
+    --priority=100 \
+    --description="Route to on-premises via VPN"
+
+# 3. Create route for DMZ subnet to use specific gateway
+gcloud compute routes create route-dmz-egress \
+    --network=prod-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-address=10.0.1.254 \
+    --instance-tags=dmz-servers \
+    --priority=1000 \
+    --description="DMZ servers route through firewall"
+
+# 4. Create route for database subnet (no direct internet)
+# This subnet has no default route - relies on Cloud NAT for outbound
+
+# 5. Create route for Google APIs access (Private Google Access)
+# Note: This is handled by Private Google Access, not custom routes
+
+# 6. Create route for VPC Network Peering
+gcloud compute routes create route-to-shared-vpc \
+    --network=prod-vpc \
+    --destination-range=10.10.0.0/16 \
+    --next-hop-network=peering-name \
+    --priority=100
+
+# 7. Override default route for instances needing proxy
+gcloud compute routes create proxy-default-route \
+    --network=prod-vpc \
+    --destination-range=0.0.0.0/0 \
+    --next-hop-address=10.0.1.100 \
+    --instance-tags=requires-proxy \
+    --priority=500
+
+# 8. Create route for egress through Cloud NAT
+# Note: Cloud NAT automatically creates routes for its configured subnet
+# No manual route needed when using Cloud NAT
+```
+
+```hcl
+# Terraform: Custom routes
+resource "google_compute_network" "prod_vpc" {
+  name = "prod-vpc"
+}
+
+# Default route (auto-created, but shown for reference)
+resource "google_compute_route" "default_route" {
+  name             = "default-route"
+  network          = google_compute_network.prod_vpc.name
+  dest_range       = "0.0.0.0/0"
+  next_hop_gateway = "global/gateways/default-internet-gateway"
+  priority         = 200
+}
+
+# Route to on-premises via VPN tunnel
+resource "google_compute_route" "onprem_route" {
+  name                  = "onprem-route"
+  network               = google_compute_network.prod_vpc.name
+  dest_range            = "10.100.0.0/16"
+  next_hop_vpn_tunnel   = google_compute_vpn_tunnel.onprem.id
+  priority              = 100
+  description           = "Route to on-premises network"
+}
+
+# Route for specific instance tags
+resource "google_compute_route" "dmz_route" {
+  name             = "dmz-route"
+  network          = google_compute_network.prod_vpc.name
+  dest_range       = "0.0.0.0/0"
+  next_hop_address = "10.0.1.254"  # Firewall appliance IP
+  priority         = 500
+  instance_tags    = ["dmz-servers"]
+  description      = "DMZ servers route through firewall"
+}
+
+# Route through VPC peering
+resource "google_compute_route" "peering_route" {
+  name                  = "peering-route"
+  network               = google_compute_network.prod_vpc.name
+  dest_range            = "10.10.0.0/16"
+  next_hop_network      = google_compute_network_peerings.prod_peering.id
+  priority              = 100
+  description           = "Route to shared VPC"
+}
+```
+
+## CLI Examples
+
+```bash
+# List routes
+gcloud compute routes list
+
+# List routes in specific network
+gcloud compute routes list --filter="network:my-vpc"
+
+# List routes for specific instance tags
+gcloud compute routes list --filter="instanceTags:web-server"
+
+# Describe route
+gcloud compute routes describe my-route
+
+# Create route
+gcloud compute routes create my-route \
+    --network=my-vpc \
+    --destination-range=DEST \
+    --next-hop-address=IP \
+    --priority=100
+
+# Create route via VPN
+gcloud compute routes create my-route \
+    --network=my-vpc \
+    --destination-range=DEST \
+    --next-hop-vpn-tunnel=TUNNEL
+
+# Create route with instance tags
+gcloud compute routes create my-route \
+    --network=my-vpc \
+    --destination-range=DEST \
+    --next-hop-gateway=default-internet-gateway \
+    --instance-tags=web-server
+
+# Delete route
+gcloud compute routes delete my-route
+```
+
+## Terraform Example
+
+```hcl
+# Custom routes configuration
+resource "google_compute_network" "main" {
+  name = "main-vpc"
+}
+
+# Route to on-premises via VPN
+resource "google_compute_route" "on_prem" {
+  name                = "on-prem-route"
+  network             = google_compute_network.main.name
+  dest_range          = "10.100.0.0/16"
+  next_hop_vpn_tunnel = google_compute_vpn_tunnel.tunnel.self_link
+  priority            = 100
+}
+
+# Route for instances with specific tags
+resource "google_compute_route" "tagged_route" {
+  name             = "tagged-instances-route"
+  network          = google_compute_network.main.name
+  dest_range       = "0.0.0.0/0"
+  next_hop_address = "10.0.1.1"  # Next hop IP
+  priority         = 500
+  instance_tags    = ["proxy-required"]
+}
+
+# Route to shared VPC via peering
+resource "google_compute_route" "peering" {
+  name             = "peering-route"
+  network          = google_compute_network.main.name
+  dest_range       = "10.10.0.0/16"
+  next_hop_network = google_compute_network_peering.main_peering.id
+  priority         = 100
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List routes | `gcloud compute routes list` |
+| Describe route | `gcloud compute routes describe NAME` |
+| Create route | `gcloud compute routes create NAME --network=NET --destination-range=RANGE [FLAGS]` |
+| Update route | `gcloud compute routes update NAME [FLAGS]` |
+| Delete route | `gcloud compute routes delete NAME` |
+
+## Monitoring
+
+**Route Monitoring:**
+
+Routes are primarily for configuration management. Monitoring involves:
+- Verifying routes exist and are active
+- Checking VPN tunnel status (which affects route availability)
+- Monitoring VPN tunnel metrics
+
+```bash
+# Check route next hop status
+gcloud compute routes describe my-route
+
+# Check VPN tunnel status
+gcloud compute vpn-tunnels describe my-tunnel --region=us-central1
+
+# Monitor VPN tunnel metrics
+gcloud monitoring metrics list --filter="metric.type:starts_with('vpn.googleapis.com')"
+```
+
+**VPN Tunnel Monitoring:**
+```bash
+# Tunnel status
+gcloud compute vpn-tunnels list --region=us-central1
+
+# Tunnel details with peer IP
+gcloud compute vpn-tunnels describe my-tunnel --region=us-central1
+```
+
+## Security
+
+**Route Security Best Practices:**
+
+1. **Restrict default route access**—not all instances need internet access
+2. **Use Cloud NAT** instead of giving instances external IPs
+3. **Remove default routes** from sensitive subnets that shouldn't have internet access
+4. **Monitor route changes**—alert on unexpected route modifications
+
+```bash
+# Remove default route from subnet (for isolated subnet)
+# WARNING: Instances won't have internet access
+gcloud compute routes delete default-route-to-internet \
+    --network=prod-vpc \
+    --filter="nextHopGateway:default-internet-gateway"
+
+# Instead, use Cloud NAT for outbound
+# See cloud-nat.md for NAT configuration
+```
+
+## Cost Optimization
+
+**Route Costs:**
+- Routes themselves are free
+- VPN tunnels have per-tunnel hourly costs
+- Cloud NAT has per-gateway hourly costs plus processing fees
+- Egress traffic costs apply regardless of routing
+
+**Optimization:**
+- Minimize number of custom routes
+- Use VPN for hybrid connectivity (cheaper than Interconnect for low-volume)
+- Remove unused routes
+- Use VPC Network Peering instead of routes through VPN for GCP-to-GCP
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Traffic not routing correctly**
+   ```bash
+   # Check if route exists
+   gcloud compute routes list --filter="network:my-vpc AND destRange:DEST"
+   
+   # Check route priority
+   # Lower number = higher priority
+   # System routes have priority 100 and 200
+   
+   # Verify next hop is reachable
+   # For IP next hop: ping the next hop address
+   # For VPN: check tunnel status
+   ```
+
+2. **VPN route not working**
+   ```bash
+   # Check tunnel status
+   gcloud compute vpn-tunnels describe my-tunnel --region=us-central1
+   
+   # Check if tunnel is UP
+   # Look at vpn_gateway_interface for interface status
+   
+   # Verify BGP session
+   gcloud compute routers describe my-router --region=us-central1
+   
+   # Check Cloud Router status
+   gcloud compute routers get-status my-router --region=us-central1
+   ```
+
+3. **Instance can't reach internet**
+   ```bash
+   # Check if default route exists
+   gcloud compute routes list \
+       --filter="network:my-vpc AND destRange:0.0.0.0/0 AND nextHopGateway:default-internet-gateway"
+   
+   # If using Cloud NAT, verify NAT is configured on subnet
+   gcloud compute networks subnets describe my-subnet --region=us-central1 | grep natIpRanges
+   
+   # Check if instance has external IP (not needed with NAT but for debugging)
+   gcloud compute instances describe instance --zone=us-central1-a | grep networkInterfaces
+   ```
+
+4. **Route priority conflict**
+   ```bash
+   # Find conflicting routes
+   gcloud compute routes list \
+       --filter="network:my-vpc AND destRange:172.16.0.0/12"
+   
+   # Adjust priority (lower number wins)
+   gcloud compute routes update lower-priority-route --priority=50
+   ```
+
+## Interview Questions
+
+1. **How does GCP route traffic? Explain the routing table evaluation order.**
+
+2. **What's the difference between system routes and custom routes?**
+
+3. **How do instance tags affect route matching?**
+
+4. **What happens when you remove the default route from a VPC?**
+
+5. **How do routes work with VPC Network Peering vs VPN?**
+
+## Cheat Sheet
+
+```
+# Route Commands
+gcloud compute routes list                          # List all routes
+gcloud compute routes describe NAME                 # Describe route
+gcloud compute routes create NAME [FLAGS]           # Create route
+gcloud compute routes update NAME --priority=N      # Update route
+gcloud compute routes delete NAME                   # Delete route
+
+# Key Flags
+--network=NETWORK               # VPC network
+--destination-range=RANGE       # Destination CIDR
+--next-hop-address=IP           # Next hop IP
+--next-hop-gateway=GW           # Next hop gateway
+--next-hop-vpn-tunnel=TUNNEL    # Next hop VPN tunnel
+--next-hop-network=PEERING      # Next hop peer network
+--priority=NUMBER               # Route priority (lower wins)
+--instance-tags=TAGS            # Apply to instances with these tags
+
+# System Route Priorities
+100  = Subnet routes
+200  = Default route
+```
+
+## Labs
+
+1. **Route Basics**: List default routes, understand system vs custom routes
+2. **Custom Routes**: Create custom routes for specific traffic patterns
+3. **VPN Routing**: Set up routes for VPN tunnel to on-premises
+4. **Route Priority**: Test route priority with multiple matching routes
+5. **Cloud NAT with Routes**: Configure NAT and verify routing behavior
+
+## Related Services
+
+- [VPC](./vpc)
+- [Subnets](./subnets)
+- [Firewall Rules](./firewall)
+- [Cloud NAT](./cloud-nat)
+- [Interconnect](./interconnect)

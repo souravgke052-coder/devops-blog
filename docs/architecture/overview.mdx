@@ -1,0 +1,324 @@
+# Architecture Overview
+
+sidebar_position: 1
+
+## Overview
+
+The DevOps Blog platform is built on a modern, cloud-native architecture designed for scalability, resilience, and developer productivity. This documentation covers the architectural decisions, patterns, and implementations that power our infrastructure on Google Cloud Platform (GCP).
+
+Our architecture follows the principle of "paved road" - providing opinionated defaults while maintaining flexibility for edge cases. We leverage managed services wherever possible to reduce operational overhead while maintaining enterprise-grade reliability.
+
+## When To Use
+
+- Building new microservices that need to integrate with the platform
+- Designing event-driven workflows that span multiple services
+- Planning multi-region deployments for global availability
+- Implementing disaster recovery strategies for critical systems
+- Evaluating cost optimization opportunities
+- Designing security controls for sensitive workloads
+
+## When NOT To Use
+
+- Simple static websites that don't need the full platform complexity
+- Prototypes or experiments that need rapid iteration
+- Workloads that fit better in a single-region deployment
+- Cases where managed services add unnecessary cost
+
+## Core Concepts
+
+### Cloud-Native Design
+We embrace cloud-native principles:
+- **Immutability**: Infrastructure as code, no manual changes
+- **Declarative**: Define desired state, let the platform reconcile
+- **Observable**: Structured logging, metrics, and tracing
+- **Resilient**: Design for failure, implement retries and circuit breakers
+
+### Service Categories
+Our platform distinguishes between:
+- **Stateless Services**: Cloud Run services, Cloud Functions
+- **Stateful Services**: Cloud SQL, Memorystore, Cloud Spanner
+- **Event-Driven**: Pub/Sub, Eventarc, Cloud Tasks
+- **Data Pipeline**: Dataflow, BigQuery
+
+### Resource Hierarchy
+```
+Organization
+└── Folder: devops-platform
+    └── Project: devops-blog-prod
+        └── Services: [multiple Cloud Run services]
+        └── Data: [Cloud SQL, Memorystore, GCS]
+        └── Network: [VPC, Firewall rules]
+```
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           GCP Global Layer                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Cloud CDN                    Cloud Armor                    Cloud DNS   │
+└──────────┬──────────────────────────┬─────────────────────────┬─────────┘
+           │                          │                         │
+           ▼                          ▼                         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         GCP Regional: us-central1                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  Next.js    │  │  Auth API   │  │ Content API │  │ Analytics   │    │
+│  │  Frontend   │  │  (Cloud Run)│  │ (Cloud Run) │  │ (Cloud Run) │    │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘    │
+│         │                │                │                │            │
+│         └────────────────┴────────────────┴────────────────┘            │
+│                                │                                        │
+│                                ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                      Internal Load Balancer                      │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                │                                        │
+│         ┌──────────────────────┼──────────────────────┐                 │
+│         ▼                      ▼                      ▼                 │
+│  ┌─────────────┐  ┌─────────────────────┐  ┌─────────────────────┐    │
+│  │ Cloud SQL   │  │    Cloud Memorystore   │  │    Cloud Storage     │    │
+│  │ (PostgreSQL)│  │    (Redis Cluster)    │  │    (GCS Buckets)      │    │
+│  └─────────────┘  └─────────────────────┘  └─────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Event Processing Layer                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  Pub/Sub    │  │  Eventarc   │  │  Cloud      │  │  Cloud      │    │
+│  │  Topics     │──│  Triggers   │──│  Functions  │  │  Scheduler  │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Content Delivery Pipeline
+Our content delivery pipeline processes 10,000+ articles daily:
+
+1. **Ingestion**: MDX files pushed to GitHub trigger Cloud Build
+2. **Processing**: Cloud Build runs Next.js build, uploads to GCS
+3. **Distribution**: Cloud CDN caches content at edge locations globally
+4. **Invalidation**: Cache invalidation via Cloud Run API on deployment
+
+```hcl
+# Cloud Run Service - Content API
+resource "google_cloud_run_v2_service" "content_api" {
+  name     = "content-api"
+  location = var.region
+
+  template {
+    service_account = google_service_account.content_api.email
+
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 100
+    }
+
+    containers {
+      image = "gcr.io/${var.project_id}/content-api:${var.image_tag}"
+      resources {
+        limits = {
+          cpu    = "2"
+          memory = "1Gi"
+        }
+      }
+      ports {
+        container_port = 8080
+      }
+      env {
+        name  = "DATABASE_URL"
+        value = google_sql_database_instance.main.connection_name
+      }
+    }
+  }
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### Patterns We Use
+| Pattern | Description | When Applied |
+|---------|-------------|--------------|
+| Sidecar | Helper containers for logging, auth | All Cloud Run deployments |
+| Circuit Breaker | Prevent cascade failures | External API calls |
+| Strangler Fig | Incremental migration | Legacy system modernization |
+| Event Sourcing | Audit trail for state changes | Financial transactions |
+| CQRS | Separate read/write models | Analytics queries |
+
+### Anti-patterns We Avoid
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| Distributed Monolith | Tight coupling across services | Clear service boundaries |
+| Chatty IO | Too many small requests | Batching, GraphQL |
+| Shared Database | Coupling, scaling limits | Per-service databases |
+| Synchronous Everywhere | Cascading failures | Async event-driven |
+| Hard-coded Config | Environment coupling | Secret Manager, ConfigMaps |
+
+## Monitoring
+
+### Observability Stack
+- **Metrics**: Cloud Monitoring, Prometheus format
+- **Logs**: Cloud Logging, structured JSON
+- **Traces**: Cloud Trace, OpenTelemetry
+- **Alerts**: Alerting policies, PagerDuty integration
+
+### Key Dashboards
+```yaml
+# monitoring-dashboard.json
+{
+  "displayName": "DevOps Blog Platform Overview",
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "width": 4,
+        "height": 3,
+        "widget": {
+          "title": "Request Rate",
+          "xyChart": {
+            "dataSets": [{
+              "timeSeriesQuery": {
+                "prometheusQuery": "rate(http_requests_total[5m])"
+              }
+            }]
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+### SLIs and SLOs
+| Service | SLI | SLO |
+|---------|-----|-----|
+| Content API | Latency p99 < 500ms | 99.9% availability |
+| Auth Service | Latency p99 < 200ms | 99.95% availability |
+| CDN | Cache hit ratio > 95% | 99.99% availability |
+
+## Security
+
+### Defense in Depth
+1. **Network Layer**: VPC, Firewall rules, Private Service Connect
+2. **Identity Layer**: Workload Identity Federation, service accounts
+3. **Data Layer**: CMEK, Secret Manager, VPC SC
+4. **Application Layer**: WAF, Cloud Armor, OAUTH2
+
+### IAM Boundary Model
+```
+Organization Policy
+└── Folder: Restrict external IP creation
+└── Project: devops-blog-prod
+    └── Service Account: cloud-run-auth
+        └── Roles: run.invoker, sql.client
+        └── Conditions: resource.location == "us-central1"
+```
+
+## Cost Optimization
+
+### FinOps Practices
+- **Tagging Strategy**: environment, team, service, cost-center
+- **Rightsizing**: Weekly recommendations via Recommender API
+- **Committed Use**: 1-year commitments for baseline workloads
+- **Spot Instances**: Dataflow workers, batch processing
+
+### Cost Allocation
+```hcl
+resource "google_project_service" "billing" {
+  service = "billingbudgets.googleapis.com"
+}
+
+resource "google_billing_budget" "main" {
+  budget_filter {
+    projects = ["projects/${var.project_id}"]
+    labels {
+      key   = "environment"
+      value = ["production"]
+    }
+  }
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "50000"
+    }
+  }
+  threshold_rules {
+    threshold_percent = 0.5
+  }
+}
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| High latency p99 | Cold starts | Min instances > 0 |
+| 503 errors | Overloaded | Scale out, circuit break |
+| Connection timeouts | Firewall issues | Check VPC rules |
+| Memory OOM | Memory limit too low | Increase memory limit |
+
+### Debug Commands
+```bash
+# View Cloud Run logs
+gcloud run services logs read content-api --region us-central1 --limit 50
+
+# Check service status
+gcloud run services describe content-api --region us-central1
+
+# View metrics
+gcloud monitoring metrics list --filter "resource.type=cloud_run_revision"
+```
+
+## Interview Questions
+
+### Q1: How would you design for 10x traffic increase?
+**Answer**: Implement horizontal scaling with managed instance groups, add Cloud CDN for static content, implement caching at multiple layers (CDN, application, database), use read replicas for database scaling, and implement rate limiting to protect backend services.
+
+### Q2: Explain the trade-offs between microservices and monolith
+**Answer**: Microservices offer independent scaling, technology flexibility, and team autonomy but add complexity in distributed systems, network latency, and data consistency. Monoliths are simpler to develop, test, and deploy but create coupling and limit scaling options.
+
+### Q3: How do you handle schema migrations in a distributed system?
+**Answer**: Use expand-contract pattern: add new column as nullable, deploy new code, backfill data, make column non-nullable. For zero-downtime, use online DDL features and avoid exclusive locks.
+
+### Q4: What is your approach to secrets management?
+**Answer**: Store secrets in Secret Manager, access via Workload Identity, rotate automatically, audit access via Cloud Audit Logs, never expose in logs or environment variables in code.
+
+### Q5: How would you implement a disaster recovery plan?
+**Answer**: Define RTO/RPO targets, implement automated backups to GCS, use cross-region replication, test failover regularly, document runbooks, and automate recovery procedures with Terraform.
+
+## Cheat Sheet
+
+```bash
+# Deploy to Cloud Run
+gcloud run deploy content-api \
+  --image gcr.io/project/content-api:v1 \
+  --region us-central1 \
+  --min-instances 1 \
+  --max-instances 100
+
+# Set secrets
+echo -n "secret-value" | gcloud secrets create db-password --data-file=-
+
+# View costs
+gcloud billing budgets list --project=project-id
+
+# Check IAM
+gcloud projects get-iam-policy project-id --format=json
+```
+
+## Related Topics
+
+- [Design Patterns](./design-patterns.mdx) - Common architectural patterns
+- [Microservices](./microservices.mdx) - Service design and communication
+- [Serverless](./serverless.mdx) - Cloud Run and Functions
+- [Event-Driven](./event-driven.mdx) - Pub/Sub and Eventarc
+- [Multi-Region](./multi-region.mdx) - Global deployment strategies
+- [Disaster Recovery](./disaster-recovery.mdx) - DR planning and execution
+- [Cost Architecture](./cost-architecture.mdx) - FinOps and optimization
+- [Security Architecture](./security-architecture.mdx) - Security controls

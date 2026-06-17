@@ -1,0 +1,1127 @@
+# Security Architecture
+
+sidebar_position: 9
+
+## Overview
+
+Security architecture for the DevOps Blog platform implements defense-in-depth principles using GCP's native security services. This document covers zero trust networking, identity and access management, data protection, compliance, and security monitoring.
+
+## When To Use
+
+- Designing network security for services
+- Implementing identity and access controls
+- Planning data protection and encryption
+- Setting up security monitoring and alerting
+- Meeting compliance requirements (SOC2, HIPAA, PCI-DSS)
+
+## When NOT to Use
+
+- Security is not optional - all architectures must consider security
+- Skipping security for speed undermines the platform
+- Security should be built-in, not bolted-on
+
+## Core Concepts
+
+### Zero Trust Principles
+
+1. **Never Trust, Always Verify**: Every request is authenticated and authorized
+2. **Least Privilege Access**: Grant minimum permissions required
+3. **Assume Breach**: Design for containment and detection
+4. **Verify Explicitly**: Use all available data points for decisions
+
+### Defense in Depth Layers
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           Security Layers                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Layer 1: User/Identity                                                  │
+│  ├─ Identity Platform (Google Workspace)                                 │
+│  ├─ MFA Enforcement                                                      │
+│  └─ OAuth2/OIDC Single Sign-On                                          │
+│                                                                           │
+│  Layer 2: Network                                                        │
+│  ├─ VPC with private subnets                                             │
+│  ├─ Firewall rules (deny-all default)                                    │
+│  ├─ Cloud Armor (WAF/DDoS protection)                                    │
+│  └─ Private Service Connect / VPC Service Controls                       │
+│                                                                           │
+│  Layer 3: Service Mesh / Service-to-Service                              │
+│  ├─ mTLS for service communication                                       │
+│  ├─ Service identity via Workload Identity                               │
+│  └─ API Gateway with authentication                                       │
+│                                                                           │
+│  Layer 4: Application                                                     │
+│  ├─ Input validation                                                     │
+│  ├─ Output encoding                                                      │
+│  ├─ Secrets management (Secret Manager)                                  │
+│  └─ Security headers                                                     │
+│                                                                           │
+│  Layer 5: Data                                                           │
+│  ├─ Encryption at rest (CMEK)                                            │
+│  ├─ Encryption in transit (TLS 1.2+)                                     │
+│  ├─ Data loss prevention (DLP)                                           │
+│  └─ Tokenization for sensitive data                                      │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture Diagram (text description)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Security Architecture                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     External Traffic                               │   │
+│  │                                                                    │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │   │
+│  │  │   Users     │──│ Cloud Armor │──│ Cloud DNS   │               │   │
+│  │  │             │  │  (WAF/DDoS) │  │ (Geo-filter)│               │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     API Gateway Layer                              │   │
+│  │                                                                    │   │
+│  │  ┌──────────────────────────────────────────────────────────┐    │   │
+│  │  │  Apigee / Cloud API Gateway                               │    │   │
+│  │  │  ├─ OAuth2 / JWT validation                               │    │   │
+│  │  │  ├─ Rate limiting                                         │    │   │
+│  │  │  ├─ API key management                                    │    │   │
+│  │  │  └─ Request/response transformation                       │    │   │
+│  │  └──────────────────────────────────────────────────────────┘    │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     Private Network (VPC)                         │   │
+│  │                                                                    │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │   │
+│  │  │   Cloud Run  │──│  Cloud SQL   │──│ Memorystore  │            │   │
+│  │  │   Services   │  │  (Private IP)│  │   (VPC)      │            │   │
+│  │  │              │  │              │  │              │            │   │
+│  │  │  mTLS        │  │  CMEK        │  │  TLS         │            │   │
+│  │  │  Auth        │  │  Audit Logs  │  │  Auth        │            │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘            │   │
+│  │                          │                                        │   │
+│  │                          │                                        │   │
+│  │  ┌──────────────────────┴──────────────────────┐                 │   │
+│  │  │           VPC Service Controls                   │                 │   │
+│  │  │  └─ Perimeter security                              │                 │   │
+│  │  │  └─ Data exfiltration prevention                    │                 │   │
+│  │  │  └─ API access via private endpoints                │                 │   │
+│  │  └─────────────────────────────────────────────┘                 │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                              │                                           │
+│                              ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │                     Identity & Access                             │   │
+│  │                                                                    │   │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │   │
+│  │  │ Workload    │  │ Secret      │  │ Cloud IAM   │               │   │
+│  │  │ Identity    │──│ Manager     │──│ (Least Priv)│               │   │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘               │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Zero Trust Service-to-Service Authentication
+
+```typescript
+// Service mesh authentication using Workload Identity
+// Cloud Run service with secure service communication
+
+import { GoogleAuth } from 'google-auth-library';
+import express from 'express';
+
+const app = express();
+
+// Middleware for service-to-service authentication
+const serviceAuth = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing authorization token' });
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    // Verify JWT token
+    const decoded = await verifyServiceToken(token);
+
+    // Add service identity to request context
+    req.serviceIdentity = {
+      serviceAccount: decoded.service_account,
+      audience: decoded.aud,
+      issuer: decoded.iss
+    };
+
+    // Log for audit
+    console.log(JSON.stringify({
+      event: 'service_auth_success',
+      caller: decoded.service_account,
+      resource: req.path,
+      timestamp: new Date().toISOString()
+    }));
+
+    next();
+  } catch (error) {
+    console.log(JSON.stringify({
+      event: 'service_auth_failure',
+      error: (error as Error).message,
+      timestamp: new Date().toISOString()
+    }));
+    return res.status(403).json({ error: 'Invalid token' });
+  }
+};
+
+// Verify service account JWT
+async function verifyServiceToken(token: string): Promise<JWTPayload> {
+  const auth = new GoogleAuth();
+
+  // Verify token using Google's public keys
+  const ticket = await auth.verifyIdToken({
+    idToken: token,
+    audience: process.env.SERVICE_AUDIENCE
+  });
+
+  const payload = ticket.getPayload();
+
+  if (!payload) {
+    throw new Error('Invalid token payload');
+  }
+
+  // Verify issuer is Google
+  if (!['https://accounts.google.com', 'https://cloud.google.com/'].includes(payload.iss)) {
+    throw new Error('Invalid token issuer');
+  }
+
+  return payload as JWTPayload;
+}
+
+// Example: Calling another service with authentication
+async function callDownstreamService(serviceUrl: string, data: any): Promise<any> {
+  const auth = new GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/cloud-platform']
+  });
+
+  const client = await auth.getClient();
+
+  // Get access token for service account
+  const tokenResponse = await client.getAccessToken();
+
+  const response = await fetch(serviceUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${tokenResponse.token}`
+    },
+    body: JSON.stringify(data)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Downstream service error: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+// API endpoints with service authentication
+app.get('/api/internal/metrics', serviceAuth, async (req, res) => {
+  const metrics = await getMetrics();
+  res.json(metrics);
+});
+
+app.post('/api/internal/sync', serviceAuth, async (req, res) => {
+  const result = await callDownstreamService(
+    'https://sync-service.example.com/api/sync',
+    req.body
+  );
+  res.json(result);
+});
+
+// Health endpoint (no auth for load balancer)
+app.get('/healthz', (req, res) => {
+  res.json({ status: 'healthy' });
+});
+```
+
+### Secret Management Implementation
+
+```typescript
+// Secret Manager integration for secure secret storage
+import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
+
+const secretClient = new SecretManagerServiceClient();
+
+interface SecretConfig {
+  secretId: string;
+  version?: string;
+  addToEnv?: boolean;
+}
+
+// Cache secrets in memory (per-instance)
+const secretCache = new Map<string, { value: string; expires: number }>();
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getSecret(config: SecretConfig): Promise<string> {
+  const { secretId, version = 'latest', addToEnv = false } = config;
+
+  // Check cache first
+  const cached = secretCache.get(secretId);
+  if (cached && cached.expires > Date.now()) {
+    return cached.value;
+  }
+
+  // Fetch from Secret Manager
+  const [accessResponse] = await secretClient.accessSecretVersion({
+    name: `projects/${process.env.PROJECT_ID}/secrets/${secretId}/versions/${version}`
+  });
+
+  const secretValue = accessResponse.payload?.data?.toString();
+
+  if (!secretValue) {
+    throw new Error(`Failed to access secret: ${secretId}`);
+  }
+
+  // Cache the secret
+  secretCache.set(secretId, {
+    value: secretValue,
+    expires: Date.now() + CACHE_TTL_MS
+  });
+
+  // Optionally add to process.env
+  if (addToEnv) {
+    process.env[secretId] = secretValue;
+  }
+
+  return secretValue;
+}
+
+// Rotating secret handler
+async function rotateSecret(secretId: string, newValue: string): Promise<void> {
+  // Add new version
+  const [addedVersion] = await secretClient.addSecretVersion({
+    parent: `projects/${process.env.PROJECT_ID}/secrets/${secretId}`,
+    payload: {
+      data: Buffer.from(newValue)
+    }
+  });
+
+  const versionId = addedVersion.name?.split('/').pop();
+
+  // Update service to use new version (requires service restart in Cloud Run)
+  console.log(`Secret ${secretId} rotated to version ${versionId}`);
+
+  // Clear cache to force reload
+  secretCache.delete(secretId);
+}
+
+// Initialize secrets on startup
+exportasync function initializeSecrets(): Promise<void> {
+  const requiredSecrets = [
+    { secretId: 'database-url', addToEnv: true },
+    { secretId: 'api-key', addToEnv: false },
+    { secretId: 'jwt-secret', addToEnv: true }
+  ];
+
+  await Promise.all(
+    requiredSecrets.map(secret => getSecret(secret))
+  );
+
+  console.log('All secrets initialized successfully');
+}
+```
+
+### Security Headers and Input Validation
+
+```typescript
+// Security middleware for all Cloud Run services
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { body, validationResult } from 'express-validator';
+
+// Helmet for security headers
+app.use(helmet());
+
+// Content Security Policy
+app.use((req, res, next) => {
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self'; " +
+    "object-src 'none'; " +
+    "frame-ancestors 'none'; " +
+    "base-uri 'self'; " +
+    "form-action 'self';"
+  );
+  next();
+});
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+app.use('/api/', limiter);
+
+// Stricter rate limit for authentication endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5, // Only 5 attempts per 15 minutes
+  message: { error: 'Too many authentication attempts' }
+});
+
+app.use('/api/auth/', authLimiter);
+
+// Input validation
+exportconst validateCreateArticle = [
+  body('title')
+    .trim()
+    .isLength({ min: 1, max: 200 })
+    .withMessage('Title must be 1-200 characters'),
+
+  body('content')
+    .trim()
+    .isLength({ min: 1, max: 50000 })
+    .withMessage('Content must be 1-50000 characters'),
+
+  body('tags')
+    .isArray({ max: 10 })
+    .withMessage('Maximum 10 tags allowed'),
+
+  body('tags.*')
+    .isString()
+    .trim()
+    .isLength({ min: 1, max: 50 })
+    .withMessage('Each tag must be 1-50 characters'),
+
+  (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    next();
+  }
+];
+
+app.post('/api/articles', validateCreateArticle, async (req, res) => {
+  // Request is validated
+});
+```
+
+### Terraform Security Configuration
+
+```hcl
+# Terraform - Security-First Infrastructure
+
+variable "project_id" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+# VPC with private subnets
+resource "google_compute_network" "secure_vpc" {
+  name                    = "secure-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "GLOBAL"
+}
+
+resource "google_compute_subnetwork" "private_subnet" {
+  name          = "private-subnet"
+  network       = google_compute_network.secure_vpc.id
+  ip_cidr_range = "10.0.0.0/24"
+  region        = "us-central1"
+
+  private_ip_google_access = true
+
+  # Enable Private Google Access for internal services
+  # and VPC Flow Logs for network monitoring
+  log_config {
+    flow_sampling = 0.5
+    metadata      = "INCLUDE_ALL_METADATA"
+    aggregation_interval = "INTERVAL_10_MIN"
+  }
+}
+
+# Firewall rules - deny-all default
+resource "google_compute_firewall" "deny_all" {
+  name    = "deny-all-ingress"
+  network = google_compute_network.secure_vpc.name
+
+  direction = "INGRESS"
+  priority  = 65534
+  source_ranges = ["0.0.0.0/0"]
+
+  # No allow rules = deny all
+  # Explicitly deny to make intent clear
+  deny {}
+
+  description = "Default deny all ingress"
+}
+
+# Allow internal traffic
+resource "google_compute_firewall" "allow_internal" {
+  name    = "allow-internal"
+  network = google_compute_network.secure_vpc.name
+
+  direction = "INGRESS"
+  priority  = 1000
+  source_ranges = ["10.0.0.0/8"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+
+  target_tags = ["internal"]
+}
+
+# Allow health checks from GCP
+resource "google_compute_firewall" "allow_health_checks" {
+  name    = "allow-health-checks"
+  network = google_compute_network.secure_vpc.name
+
+  direction = "INGRESS"
+  priority  = 100
+
+  source_ranges = [
+    "130.211.0.0/22",
+    "35.191.0.0/16"
+  ]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080", "443"]
+  }
+
+  target_tags = ["cloud-run", "load-balancer"]
+}
+
+# VPC Service Controls
+resource "google_access_context_manager_service_perimeter" "secure_perimeter" {
+  perimeter_title = "secure-perimeter-${var.environment}"
+  description      = "Service perimeter for ${var.environment}"
+
+  status {
+    # Resources inside the perimeter
+    resources = [
+      "projects/${var.project_id}"
+    ]
+
+    # Access levels (IP ranges, etc.)
+    access_levels = [
+      google_access_context_manager_access_level.office_only.name
+    ]
+
+    # Restricted services
+    restricted_services = [
+      "bigquery.googleapis.com",
+      "storage.googleapis.com",
+      "cloudsql.googleapis.com"
+    ]
+
+    # Enforce environment restriction
+    ingress_policies {
+      ingress_from {
+        sources {
+          access_levels = [google_access_context_manager_access_level.office_only.name]
+        }
+        resources = ["projects/${var.project_id}"]
+        operation {
+          sources {
+            resource = "projects/${var.project_id}"
+          }
+          services = ["bigquery.googleapis.com", "storage.googleapis.com"]
+        }
+      }
+    }
+
+    egress_policies {
+      egress_from {
+        identity_type = "ANY_IDENTITY"
+      }
+      egress_to {
+        resources = ["*"]
+        operation {
+          services = ["storage.googleapis.com"]
+          # Prevent exfiltration of BigQuery data to unauthorized buckets
+          condition {
+            destination_constraint {
+              storage {
+                name = "*"
+                in = false
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Access level - office IP range only
+resource "google_access_context_manager_access_level" "office_only" {
+  name        = "access-level-office-only"
+  title       = "Office Only Access"
+  description = "Allow access only from office IP ranges"
+
+  basic {
+    conditions {
+      ip_subnetworks = [
+        "203.0.113.0/24"  # Example office IP
+      ]
+    }
+  }
+}
+
+# Cloud Armor WAF Policy
+resource "google_cloud_armor_security_policy" "waf_policy" {
+  name        = "waf-policy-${var.environment}"
+  description = "Web Application Firewall policy"
+
+  # Enable adaptive protection
+  adaptive_protection_config {
+    layer_7_ddos_defense_config {
+      enable = true
+      rule_visibility = "STANDARD"
+    }
+  }
+
+  # Preconfigured WAF rules
+  rule {
+    action   = "allow"
+    priority = 1000
+    match {
+      expr {
+        expression = "true"
+      }
+    }
+    description = "Default allow rule"
+  }
+
+  # SQL injection protection
+  rule {
+    action   = "deny(403)"
+    priority = 100
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('sqli-v33-stable')"
+      }
+    }
+    description = "Block SQL injection attempts"
+  }
+
+  # XSS protection
+  rule {
+    action   = "deny(403)"
+    priority = 200
+    match {
+      expr {
+        expression = "evaluatePreconfiguredExpr('xss-v33-stable')"
+      }
+    }
+    description = "Block XSS attempts"
+  }
+
+  # Rate limiting
+  rule {
+    action   = "throttle"
+    priority = 500
+    match {
+      expr {
+        expression = "true"
+      }
+    }
+    rate_limit_options {
+      conform_action = "allow"
+      exceed_action  = "deny(429)"
+      rate_limit_threshold {
+        count        = 1000
+        interval_sec = 60
+      }
+    }
+    description = "Rate limit to 1000 req/min"
+  }
+}
+
+# Cloud Run with security best practices
+resource "google_cloud_run_v2_service" "secure_service" {
+  name     = "secure-api"
+  location = "us-central1"
+
+  template {
+    service_account = google_service_account.secure_service.email
+
+    containers {
+      image = "gcr.io/${var.project_id}/secure-api:latest"
+
+      # Security context
+      security_context {
+        run_as_non_root           = true
+        run_as_user               = 1000
+        allow_privilege_escalation = false
+        capabilities {
+          drop = ["ALL"]
+        }
+      }
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+      }
+
+      ports {
+        container_port = 8080
+      }
+
+      # Environment variables from Secret Manager
+      env {
+        name = "DATABASE_URL"
+        value_from {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.database_url.secret_id
+            version = "latest"
+          }
+        }
+      }
+    }
+
+    # Network configuration
+    vpc_access {
+      connector = google_vpc_access_connector.connector.id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
+
+    scaling {
+      min_instance_count = 1
+      max_instance_count = 10
+    }
+
+    # No public ingress
+    ingress = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  }
+
+  # Disable public access
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+}
+
+# IAM - Least privilege
+resource "google_service_account" "secure_service" {
+  account_id   = "secure-service-sa"
+  display_name = "Secure Service Account"
+}
+
+resource "google_project_iam_member" "secure_service_roles" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.secure_service.email}"
+
+  condition {
+    title      = "production-only"
+    expression = "resource.location.endsWith('us-central1')"
+  }
+}
+
+# Secrets with automatic rotation
+resource "google_secret_manager_secret" "database_url" {
+  secret_id = "database-url-${var.environment}"
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+  }
+}
+
+resource "google_secret_manager_secret_version" "database_url" {
+  secret = google_secret_manager_secret.database_url.id
+  data   = var.database_url
+}
+
+# Customer-Managed Encryption Key
+resource "google_kms_key_ring" "secure_keyring" {
+  name     = "secure-keyring"
+  location = "global"
+}
+
+resource "google_kms_crypto_key" "database_key" {
+  name            = "database-encryption-key"
+  key_ring        = google_kms_key_ring.secure_keyring.id
+  purpose         = "ENCRYPT_DECRYPT"
+
+  rotation_period = "8640000s"  # 100 days
+
+  version_template {
+    algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
+    protection_level = "hsm"  # Hardware security module
+  }
+
+  lifecycle {
+    prevent_destroy = true  # Cannot be deleted
+  }
+}
+
+# Cloud SQL with encryption
+resource "google_sql_database_instance" "secure_postgres" {
+  name             = "secure-postgres"
+  database_version = "POSTGRES_15"
+  region           = "us-central1"
+
+  deletion_protection = true
+
+  encryption_config {
+    kms_key_name = google_kms_crypto_key.database_key.id
+  }
+
+  settings {
+    tier              = "db-n1-standard-2"
+    availability_type = "REGIONAL"
+    disk_autoresize   = true
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = google_compute_network.secure_vpc.id
+      require_ssl     = true
+    }
+
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "02:00"
+      point_in_time_recovery_enabled = true
+    }
+
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+      record_application_tags = true
+      record_client_address   = false  # PII protection
+    }
+  }
+}
+
+# VPC Access Connector for serverless
+resource "google_vpc_access_connector" "connector" {
+  name          = "secure-connector"
+  region        = "us-central1"
+  network       = google_compute_network.secure_vpc.name
+  ip_cidr_range = "10.8.0.0/28"
+  min_instances = 2
+  max_instances = 10
+
+  # Enable flow logs for network security monitoring
+  min_ip_version = "IPV4"
+}
+
+# Binary Authorization for container security
+resource "google_binary_authorization_policy" "default" {
+  default_admission_rule {
+    enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+    evaluation_mode  = "REQUIRE_ATTESTATION"
+    require_attestations_by {
+      attestation_authorities = [
+        google_binary_authorization_attestor.secure_build.name
+      ]
+    }
+  }
+}
+
+resource "google_binary_authorization_attestor" "secure_build" {
+  name        = "secure-build-attestor"
+  description = "Attestor for validated builds"
+
+  attestation_authority_note {
+    note_reference = google_logging_project_bucket_config.secure_notes.note_id
+
+    public_keys {
+      ascii_armored_pgp_key = var.pgp_public_key
+    }
+  }
+}
+
+# Cloud Audit Logs
+resource "google_logging_project_bucket_config" "secure_logs" {
+  name            = "secure-audit-logs"
+  description     = "Immutable audit logs bucket"
+  location        = "us-central1"
+  retention_days  = 365  # 1 year retention for compliance
+
+  # Immutable - logs cannot be deleted
+  lifecycle_state = "ACTIVE"
+}
+
+# Enable Cloud Armor on load balancer
+resource "google_compute_backend_service" "secure_backend" {
+  name        = "secure-backend"
+  port_name   = "http"
+  protocol    = "HTTPS"
+  health_checks = [google_compute_health_check.secure_health.id]
+
+  security_policy = google_cloud_armor_security_policy.waf_policy.id
+
+  backend {
+    group = google_compute_region_network_endpoint_group.secure_neg.id
+  }
+}
+```
+
+## Common Patterns / Anti-patterns
+
+### Security Patterns
+
+| Pattern | Description | Implementation |
+|---------|-------------|----------------|
+| Defense in Depth | Multiple security layers | Network + IAM + App + Data |
+| Zero Trust | Never trust, always verify | mTLS, JWT validation |
+| Least Privilege | Minimum required permissions | Granular IAM roles |
+| Secrets Rotation | Automated credential rotation | Secret Manager + Cloud Run restart |
+| Immutable Infrastructure | No changes to running instances | Terraform + container images |
+
+### Anti-patterns
+
+| Anti-pattern | Problem | Solution |
+|-------------|---------|----------|
+| Overly permissive IAM | Lateral movement risk | Granular roles, conditions |
+| Hardcoded secrets | Secret exposure | Secret Manager |
+| Public cloud resources | Attack surface | Private networking |
+| Disabled audit logs | No forensics capability | Cloud Audit Logs |
+| No network segmentation | Lateral movement | VPC, firewall rules |
+
+## Monitoring
+
+### Security Monitoring Dashboard
+
+```yaml
+# Security Monitoring Dashboard
+dashboard:
+  displayName: "Security Operations Dashboard"
+
+  widgets:
+    - title: "Failed Authentication Attempts"
+      xyChart:
+        dataSets:
+          - timeSeriesQuery: |
+              fetch cloud_run_revision
+              | metric 'logging.googleapis.com/user/auth_failure'
+              | group_by 5m, [value_failure_count: sum(value.failure_count)]
+
+    - title: "Suspicious Network Traffic"
+      timeseries:
+        metrics:
+          - resource.type="gce_subnetwork"
+            metric.type="compute.googleapis.com/subnetwork/network/sent_bytes"
+          - resource.type="gce_subnetwork"
+            metric.type="compute.googleapis.com/subnetwork/network/received_bytes"
+
+    - title: "IAM Policy Changes"
+      alertChart:
+        metrics:
+          - resource.type="project"
+            metric.type="cloudsql.googleapis.com/kubernetes/audit"
+
+    - title: "WAF Blocks"
+      scorecard:
+        metrics:
+          - resource.type="compute_backend_service"
+            metric.type="compute.googleapis.com/security_policy/rules/match_count"
+            filter: 'metric.labels.action="deny"'
+```
+
+### SIEM Integration
+
+```typescript
+// Cloud Logging export to SIEM
+exportconst exportSecurityLogs = async (event: CloudFunctionsEvent<any>) => {
+  const logEntry = JSON.parse(
+    Buffer.from(event.data.message.data, 'base64').toString()
+  );
+
+  // Parse and enrich security events
+  const securityEvent = {
+    timestamp: logEntry.timestamp,
+    severity: logEntry.severity,
+    service: logEntry.resource?.labels?.service,
+    event: parseSecurityEvent(logEntry),
+    metadata: {
+      environment: process.env.ENVIRONMENT,
+      version: process.env.VERSION
+    }
+  };
+
+  // Send to SIEM (Splunk, Chronicle, etc.)
+  await sendToSIEM(securityEvent);
+};
+
+function parseSecurityEvent(logEntry: any): ParsedEvent | null {
+  const textPayload = logEntry.textPayload || '';
+  const jsonPayload = logEntry.jsonPayload || {};
+
+  if (textPayload.includes('authentication failure') || jsonPayload.code === 'AUTH_FAILURE') {
+    return {
+      type: 'AUTH_FAILURE',
+      source: jsonPayload.caller_ip,
+      user: jsonPayload.user
+    };
+  }
+
+  if (textPayload.includes('SQL injection') || textPayload.includes('XSS')) {
+    return {
+      type: 'ATTACK_DETECTED',
+      attackType: textPayload.includes('SQL') ? 'SQL_INJECTION' : 'XSS',
+      source: jsonPayload.caller_ip
+    };
+  }
+
+  return null;
+}
+```
+
+## Security Hardening Checklist
+
+### Infrastructure
+- [ ] VPC with private subnets
+- [ ] Firewall deny-all default
+- [ ] No public IPs on compute resources
+- [ ] VPC Flow Logs enabled
+- [ ] Private Google Access enabled
+
+### Compute
+- [ ] Cloud Run with no public ingress
+- [ ] Security context configured
+- [ ] Min instances for production
+- [ ] No privileged containers
+- [ ] Read-only root filesystem
+
+### Data
+- [ ] Encryption at rest (CMEK)
+- [ ] Encryption in transit (TLS 1.2+)
+- [ ] Secrets in Secret Manager
+- [ ] No PII in logs
+- [ ] Data loss prevention configured
+
+### Identity
+- [ ] Workload Identity for service accounts
+- [ ] Least privilege IAM
+- [ ] No service account keys
+- [ ] MFA enabled for all users
+- [ ] API keys rotated
+
+### Monitoring
+- [ ] Cloud Audit Logs enabled
+- [ ] Security alerts configured
+- [ ] SIEM integration
+- [ ] Log retention policy
+- [ ] Regular security reviews
+
+## Troubleshooting
+
+### Common Security Issues
+
+| Symptom | Likely Cause | Resolution |
+|---------|--------------|------------|
+| 403 Forbidden | Missing IAM permission | Check service account roles |
+| Authentication failures | Expired/incorrect JWT | Verify token validation |
+| Secrets unavailable | Missing Secret Manager access | Check IAM for secret accessor |
+| WAF blocking legitimate traffic | Overly strict rules | Adjust WAF rules, add exceptions |
+| Connection refused | Firewall blocking | Check firewall rules |
+
+### Security Debug Commands
+
+```bash
+# Check IAM policy for a service
+gcloud projects get-iam-policy ${PROJECT_ID} \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:service-account-name"
+
+# Check firewall rules
+gcloud compute firewall-rules list --filter="network:secure-vpc"
+
+# Verify Secret Manager access
+gcloud secrets get-iam-policy database-url
+
+# Check Cloud Armor policy
+gcloud compute security-policies describe waf-policy-production
+
+# View audit logs for security events
+gcloud logging read 'resource.type="cloud_run_revision" AND severity>=WARNING' --limit 50
+
+# Test VPC connectivity
+gcloud compute ssh vm-name --zone=us-central1-a -- "curl -s http://10.0.0.5:8080/healthz"
+```
+
+## Interview Questions
+
+### Q1: Explain zero trust and how you implement it on GCP.
+**Answer**: Zero trust means never trusting and always verifying regardless of network location. On GCP, we implement it through: Workload Identity for service-to-service auth, mTLS for internal communication, VPC Service Controls for data exfiltration prevention, Cloud Armor for API protection, and continuous authentication/authorization checks without relying on network location.
+
+### Q2: How do you handle secrets management at scale?
+**Answer**: Use Secret Manager with versioned secrets and automatic rotation. Environment variables reference secrets at runtime, never store secrets in code or config files. Implement secret scanning in CI/CD to catch accidental commits. Use Workload Identity to avoid service account keys entirely.
+
+### Q3: What is your approach to incident response?
+**Answer**: 1) Detection: Cloud Armor, audit logs, SIEM integration. 2) Containment: Isolate affected services, revoke credentials, block IPs. 3) Investigation: Analyze logs, trace attack path. 4) Eradication: Remove malware, patch vulnerabilities. 5) Recovery: Restore from clean backups. 6) Post-incident: Document, implement preventive measures.
+
+### Q4: How do you ensure compliance with security standards?
+**Answer**: Implement security controls mapped to compliance frameworks (SOC2, PCI-DSS). Use binary authorization to ensure only approved container images deploy. Enable comprehensive audit logging with immutable storage. Conduct regular security reviews and penetration testing. Document controls and maintain evidence for audits.
+
+### Q5: What are the most critical security considerations for serverless?
+**Answer**: Serverless introduces unique challenges: 1) Function permissions - apply least privilege. 2) Secret management - use Secret Manager. 3) Cold starts - don't skip security headers for speed. 4) Concurrency - understand and limit to prevent runaway costs/attacks. 5) Vendor lock-in security - understand shared responsibility model.
+
+## Cheat Sheet
+
+```bash
+# Check if service has public IP
+gcloud compute instances describe instance-name --zone=zone --format="get(networkInterfaces[0].accessConfigs[0].natIP)"
+
+# View service account permissions
+gcloud iam service-accounts get-iam-policy service-account-email
+
+# Check VPC Service Controls
+gcloud access-context-manager perimeters list
+
+# Review Cloud Armor policy
+gcloud compute security-policies describe waf-policy --format=json
+
+# Enable logging for a service
+gcloud logging write test-log "test message" --severity=INFO
+
+# Check for public buckets
+gcloud storage buckets list --filter="storageClass:STANDARD" --format="table(bucket,storageClass)"
+
+# Test network connectivity from Cloud Run
+gcloud run services exec <service> --container=container -- sh -c "curl -s http://10.0.0.5:8080"
+
+# Verify encryption status
+gcloud sql instances describe instance-name --format="get(settings.storageEncryption)"
+```
+
+## Related Topics
+
+- [Overview](./overview.mdx) - Platform architecture introduction
+- [Microservices](./microservices.mdx) - Service security patterns
+- [Serverless](./serverless.mdx) - Cloud Run security
+- [Event-Driven](./event-driven.mdx) - Event security
+- [Multi-Region](./multi-region.mdx) - Global security considerations
+- [Disaster Recovery](./disaster-recovery.mdx) - Security in DR

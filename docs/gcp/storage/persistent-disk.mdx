@@ -1,0 +1,636 @@
+# Persistent Disk
+
+## Overview
+
+Google Cloud Persistent Disk provides durable, high-performance block storage for VM instances. It offers network-attached storage with automatic encryption at rest and supports both HDD and SSD options. Persistent Disk persists data independently from VM lifecycle and can be snapshotted for backups and migration.
+
+## When To Use
+
+- Primary storage for VM-based workloads (databases, apps, logs)
+- State persistence for containers running on GKE
+- Boot disks for VM instances
+- Need for consistent, low-latency I/O
+- Data requiring durability guarantees
+- Scenarios needing disk snapshots and backups
+
+## When NOT To Use
+
+- File share requirements between multiple VMs (use Filestore)
+- Object storage needs (use Cloud Storage)
+- In-memory caching (use Memorystore)
+- Serverless workloads (no persistent disk attachment)
+- Temporary scratch space (use local SSDs)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Persistent Disk                           │
+├─────────────────────────────────────────────────────────────┤
+│  Disk Types:                                                │
+│  ├── pd-standard     (HDD, $0.00006/GB/hour)               │
+│  ├── pd-balanced     (SSD, $0.0001/GB/hour)                │
+│  ├── pd-ssd          (Performance SSD, $0.00017/GB/hour)   │
+│  └── pd-extreme      (Provisioned IOPS, $0.0002/GB/hour)   │
+├─────────────────────────────────────────────────────────────┤
+│  Regional PD:                                               │
+│  ├── Replicated across zones for HA                        │
+│  ├── Synchronous replication                               │
+│  └── Automatic failover                                    │
+├─────────────────────────────────────────────────────────────┤
+│  Snapshots:                                                 │
+│  ├── Incremental backups                                   │
+│  ├── Stored in Cloud Storage                               │
+│  └── Cross-regional replication                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Disk Types
+
+| Type | Use Case | Max IOPS | Max Throughput |
+|------|----------|----------|----------------|
+| pd-standard | Cold storage, sequential R/W | 1,500/3,000 | 180 MB/s |
+| pd-balanced | General purpose, cost-effective | 6,000/12,000 | 240 MB/s |
+| pd-ssd | High-performance databases | 60,000/100,000 | 480 MB/s |
+| pd-extreme | Ultra-high performance | 120,000/400,000 | 2,000 MB/s |
+
+### Regional vs Zonal Disks
+- **Zonal (default)**: Attached to VM in same zone, lower latency
+- **Regional**: Replicated across two zones for HA, higher latency, 2x cost
+
+### Disk Performance
+- IOPS scales with disk size (except pd-extreme)
+- Throughput scales with disk size
+- Provisioned IOPS (pd-extreme) allows independent performance settings
+
+### Encryption
+- Default: Google-managed encryption
+- CMEK: Customer-managed via Cloud KMS
+- PIE: Customer-supplied encryption (deprecated)
+
+### Attach Modes
+- **Read/write (default)**: Exclusive access, can attach to one VM
+- **Read-only**: Can attach to multiple VMs simultaneously
+
+### Resize vs Extend
+- Resize: Increase disk size (online, no reboot for Linux)
+- Extend: Filesystem/filesystem resizing after resize
+
+## Real Production Example
+
+**PostgreSQL Database on GKE with Persistent Disks**
+
+```hcl
+# Terraform configuration for production PostgreSQL storage
+
+# Create Persistent Disk for PostgreSQL data
+resource "google_compute_disk" "postgres_data" {
+  name  = "postgres-data-disk-${var.environment}"
+  type  = "pd-ssd"
+  zone  = var.zone
+  size  = 500
+  
+  physical_block_size_bytes = 4096
+  
+  encryption_settings {
+    kms_key_self_link = google_kms_crypto_key.pg_disk_key.id
+  }
+  
+  labels = {
+    environment = var.environment
+    component   = "database"
+    team        = "platform"
+  }
+}
+
+# Create Persistent Disk for PostgreSQL logs (separate for performance)
+resource "google_compute_disk" "postgres_logs" {
+  name  = "postgres-logs-disk-${var.environment}"
+  type  = "pd-balanced"
+  zone  = var.zone
+  size  = 100
+  
+  labels = {
+    environment = var.environment
+    component   = "database-logs"
+  }
+}
+
+# Regional Persistent Disk for high availability
+resource "google_compute_disk" "postgres_ha_data" {
+  name  = "postgres-ha-data-${var.environment}"
+  type  = "pd-ssd"
+  zone  = element(split("-", var.region), 0)
+  size  = 500
+  
+  replica_zones = [
+    "${var.region}-a",
+    "${var.region}-b",
+  ]
+  
+  labels = {
+    environment = var.environment
+    ha          = "enabled"
+  }
+}
+
+# Disk snapshot for point-in-time recovery
+resource "google_compute_snapshot" "postgres_daily_backup" {
+  name        = "postgres-backup-${formatdate("YYYY-MM-DD", timestamp())}"
+  source_disk = google_compute_disk.postgres_data.name
+  zone        = var.zone
+  
+  snapshot_encryption_key {
+    kms_key_self_link = google_kms_crypto_key.snapshot_key.id
+  }
+  
+  labels = {
+    environment = var.environment
+    backup_type = "daily"
+  }
+}
+
+# Scheduled snapshot via Cloud Scheduler
+resource "google_cloud_scheduler_job" "postgres_snapshot" {
+  name        = "postgres-daily-snapshot"
+  schedule    = "0 2 * * *"  # 2 AM daily
+  time_zone   = "UTC"
+  region      = var.region
+  
+  http_target {
+    http_method = "POST"
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project}/zones/${var.zone}/disks/${google_compute_disk.postgres_data.name}/createSnapshot"
+    headers = {
+      "Content-Type" = "application/json"
+    }
+    oauth_token {
+      service_account_email = google_service_account.snapshot_sa.email
+    }
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create a new persistent disk
+gcloud compute disks create my-disk \
+  --size=500GB \
+  --type=pd-ssd \
+  --zone=us-central1-a
+
+# Create disk from image
+gcloud compute disks create my-boot-disk \
+  --image-family=debian-12 \
+  --image-project=debian-cloud \
+  --zone=us-central1-a
+
+# Create disk with custom encryption
+gcloud compute disks create my-encrypted-disk \
+  --size=100GB \
+  --type=pd-ssd \
+  --zone=us-central1-a \
+  --kms-key=projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
+
+# Resize an existing disk (no reboot needed for Linux)
+gcloud compute disks resize my-disk \
+  --size=1TB \
+  --zone=us-central1-a
+
+# Create snapshot
+gcloud compute disks snapshot my-disk \
+  --snapshot-name=my-daily-snapshot \
+  --zone=us-central1-a
+
+# Create disk from snapshot
+gcloud compute disks create my-restored-disk \
+  --source-snapshot=projects/my-project/global/snapshots/my-daily-snapshot \
+  --zone=us-central1-a
+
+# Attach disk to instance
+gcloud compute instances attach-disk my-instance \
+  --disk=my-disk \
+  --zone=us-central1-a
+
+# Attach disk read-only (for sharing data)
+gcloud compute instances attach-disk my-instance \
+  --disk=my-shared-data \
+  --mode=ro \
+  --zone=us-central1-a
+
+# Detach disk
+gcloud compute instances detach-disk my-instance \
+  --disk=my-disk \
+  --zone=us-central1-a
+
+# List disks
+gcloud compute disks list --filter="zone:us-central1-a"
+
+# Describe disk details
+gcloud compute disks describe my-disk --zone=us-central1-a
+
+# Move disk to different zone
+gcloud compute disks move my-disk \
+  --destination-zone=us-east1-b \
+  --source-zone=us-central1-a
+
+# Regional disk creation
+gcloud compute disks create my-regional-disk \
+  --region=us-central1 \
+  --replica-zones=us-central1-a,us-central1-b \
+  --size=500GB \
+  --type=pd-ssd
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Standard zonal SSD disk
+resource "google_compute_disk" "default" {
+  name  = "app-disk-${var.environment}"
+  type  = "pd-ssd"
+  zone  = var.zone
+  size  = 100
+  
+  labels = {
+    environment = var.environment
+  }
+}
+
+# Regional disk for high availability
+resource "google_compute_disk" "regional" {
+  name  = "ha-disk-${var.environment}"
+  type  = "pd-ssd"
+  size  = 200
+  
+  replica_zones = [
+    "${var.region}-a",
+    "${var.region}-b",
+  ]
+  
+  labels = {
+    environment = var.environment
+    ha          = "true"
+  }
+}
+
+# Disk with customer-managed encryption
+resource "google_compute_disk" "encrypted" {
+  name  = "encrypted-disk-${var.environment}"
+  type  = "pd-ssd"
+  zone  = var.zone
+  size  = 100
+  
+  disk_encryption_key {
+    kms_key_self_link = google_kms_crypto_key.my_key.id
+  }
+}
+
+# Attach disk to instance
+resource "google_compute_instance" "vm_instance" {
+  name         = "app-vm-${var.environment}"
+  machine_type = "n2-standard-4"
+  zone         = var.zone
+  
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+      size  = 50
+      type  = "pd-ssd"
+    }
+  }
+  
+  attached_disk {
+    source      = google_compute_disk.default.id
+    device_name = "app-data"
+  }
+  
+  network_interface {
+    network = google_compute_network.default.id
+  }
+}
+
+# Snapshot resource
+resource "google_compute_snapshot" "disk_snapshot" {
+  name        = "snapshot-${var.environment}"
+  source_disk = google_compute_disk.default.id
+  zone        = var.zone
+  
+  labels = {
+    environment = var.environment
+  }
+}
+```
+
+## Common Commands
+
+```bash
+# Create operations
+gcloud compute disks create NAME --size=SIZE --type=TYPE --zone=ZONE
+gcloud compute disks snapshot NAME --snapshot-name=SNAP --zone=ZONE
+
+# Attach/Detach
+gcloud compute instances attach-disk INSTANCE --disk=DISK --zone=ZONE
+gcloud compute instances detach-disk INSTANCE --disk=DISK --zone=ZONE
+
+# Resize
+gcloud compute disks resize NAME --size=SIZE --zone=ZONE
+
+# Move/Copy
+gcloud compute disks move NAME --destination-zone=ZONE --source-zone=ZONE
+gcloud compute disks copy NAME --destination-zone=ZONE --source-zone=ZONE
+
+# Query
+gcloud compute disks list [--filter="zone:ZONE"]
+gcloud compute disks describe NAME --zone=ZONE
+```
+
+## Monitoring
+
+### Key Metrics
+- **Disk write/read latency**: Average time for I/O operations
+- **Disk throughput**: MB/s read/written
+- **IOPS**: Operations per second
+- **Disk utilization**: Percentage of max throughput used
+- **Snapshot size**: Size of backup snapshots
+
+### Monitoring via Cloud Monitoring
+
+```bash
+# Create alert for disk full
+gcloud monitoring policies create \
+  --display-name="Disk Space Warning" \
+  --condition-display-name="Disk > 80%" \
+  --condition-filter='resource.type="gce_disk" AND metric.type="compute.googleapis.com/disk/disk_utilization"' \
+  --condition-threshold-value=0.8 \
+  --notification-channels=CHANNEL_ID
+
+# View disk I/O metrics
+gcloud monitoring metrics list | grep disk
+
+# Dashboard for Persistent Disk
+cat > pd-dashboard.json << 'EOF'
+{
+  "displayName": "Persistent Disk Dashboard",
+  "mosaicLayout": {
+    "columns": 2,
+    "tiles": [
+      {"width": 1, "height": 1, "widget": {"title": "Disk IOPS", "xyChart": {"dataSets": [{"timeSeriesQuery": "metric.type=compute.googleapis.com/disk/operations"}]}}},
+      {"width": 1, "height": 1, "widget": {"title": "Disk Latency", "xyChart": {"dataSets": [{"timeSeriesQuery": "metric.type=compute.googleapis.com/disk/read_latency"}]}}}
+    ]
+  }
+}
+EOF
+gcloud monitoring dashboards create --config-from-file=pd-dashboard.json
+```
+
+### Disk Performance Testing
+
+```bash
+# Install fio for benchmarking
+gcloud compute ssh instance --zone=ZONE -- "sudo apt-get install fio"
+
+# Run fio test for read IOPS
+gcloud compute ssh instance --zone=ZONE -- \
+  "sudo fio --name=randread --ioengine=libaio --iodepth=32 --rw=randread --bs=4k --size=1G --numjobs=4 --runtime=60 --group_reporting"
+
+# Run fio test for write throughput
+gcloud compute ssh instance --zone=ZONE -- \
+  "sudo fio --name=seqwrite --ioengine=libaio --iodepth=64 --rw=write --bs=1m --size=10G --numjobs=1 --runtime=60 --group_reporting"
+```
+
+## Security
+
+### Encryption at Rest
+```bash
+# Create disk with Google-managed encryption (default)
+gcloud compute disks create my-disk --zone=ZONE
+
+# Create disk with CMEK
+gcloud compute disks create my-encrypted-disk \
+  --zone=ZONE \
+  --kms-key=projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
+```
+
+### IAM Permissions
+```bash
+# Required roles for disk management
+# For creating disks: roles/compute.storageAdmin
+# For snapshot operations: roles/compute.storageAdmin
+
+# Service account for disk operations
+gcloud compute disks add-iam-policy-binding my-disk \
+  --zone=ZONE \
+  --member=serviceAccount:sa@project.iam.gserviceaccount.com \
+  --role=roles/compute.storageAdmin
+```
+
+### Best Practices
+```bash
+# Use separate service accounts for disk operations
+# Implement principle of least privilege
+# Enable VPC Service Controls for disk access
+# Use CMEK for sensitive workloads
+# Regular snapshots with encryption
+```
+
+## Cost Optimization
+
+### Disk Type Selection
+Choose the right disk type based on workload:
+- **pd-standard**: Dev/test, log storage, sequential workloads
+- **pd-balanced**: General workloads, moderate cost/performance
+- **pd-ssd**: Databases, critical applications
+- **pd-extreme**: Ultra-high performance, provisioned IOPS
+
+### Resize Strategically
+```bash
+# Monitor disk usage
+gcloud monitoring metrics read \
+  "compute.googleapis.com/disk/disk_utilization" \
+  --filter='resource.disk_id="my-disk"'
+
+# Resize only when needed (no downsizing)
+gcloud compute disks resize my-disk --size=new-size --zone=ZONE
+```
+
+### Snapshot Cost Management
+```bash
+# Delete old snapshots
+gcloud compute snapshots delete old-snapshot --quiet
+
+# Use snapshot schedules with retention
+gcloud compute resource-policies create-snapshot-schedule my-schedule \
+  --region=us-central1 \
+  --schedule=0 2 * * * \
+  --retention-days=30 \
+  --max-retention-days=90 \
+  --snapshot-locations=us-central1
+```
+
+### Regional vs Zonal Cost
+Regional disks cost 2x zonal disks but provide HA. Use for:
+- Production databases
+- Critical application data
+- State that cannot be easily reproduced
+
+## Troubleshooting
+
+### Disk Attachment Fails
+```bash
+# Check disk zone matches instance zone
+gcloud compute disks describe my-disk --zone=ZONE
+gcloud compute instances describe my-instance --zone=ZONE
+
+# Check disk is not already attached
+gcloud compute instances list-disks my-instance --zone=ZONE
+
+# Verify disk type compatibility
+gcloud compute disk-types list --zone=ZONE
+```
+
+### Disk Performance Issues
+```bash
+# Check disk stats
+gcloud compute ssh instance --zone=ZONE -- "iostat -x 1 5"
+
+# Check for I/O contention
+gcloud compute ssh instance --zone=ZONE -- "iotop"
+
+# Verify disk is not throttled
+gcloud compute ssh instance --zone=ZONE -- \
+  "cat /sys/block/sda/device/../../../queue/*/max_sectors_kb"
+```
+
+### Disk Full
+```bash
+# Check disk usage inside VM
+gcloud compute ssh instance --zone=ZONE -- "df -h"
+
+# Resize disk (increase only)
+gcloud compute disks resize my-disk --size=new-size --zone=ZONE
+
+# Resize filesystem after disk resize
+gcloud compute ssh instance --zone=ZONE -- \
+  "sudo resize2fs /dev/sdb1"
+```
+
+### Data Corruption
+```bash
+# Restore from snapshot
+gcloud compute disks create restored-disk \
+  --source-snapshot=my-backup \
+  --zone=ZONE
+
+# Attach restored disk
+gcloud compute instances attach-disk my-instance \
+  --disk=restored-disk \
+  --zone=ZONE
+```
+
+### Instance Startup Issues with Boot Disk
+```bash
+# Check boot disk exists
+gcloud compute disks describe instance-name --zone=ZONE
+
+# Create new boot disk from snapshot
+gcloud compute disks create new-boot-disk \
+  --source-snapshot=boot-backup \
+  --zone=ZONE
+
+# Attach as boot disk (requires instance stop)
+gcloud compute instances stop instance --zone=ZONE
+gcloud compute instances detach-disk instance --disk=old-boot-disk --zone=ZONE
+gcloud compute instances attach-disk instance --disk=new-boot-disk --boot --zone=ZONE
+gcloud compute instances start instance --zone=ZONE
+```
+
+## Interview Questions
+
+**Q: What's the difference between zonal and regional Persistent Disks?**
+A: Zonal disks exist in a single zone with lower latency and cost. Regional disks synchronously replicate data across two zones in the same region, providing high availability with automatic failover. Regional disks cost 2x but are essential for HA deployments.
+
+**Q: How does Persistent Disk performance scale?**
+A: For pd-standard, pd-balanced, and pd-ssd, IOPS and throughput scale linearly with disk size up to their maximums. Pd-extreme allows independent provisioning of IOPS separate from size, giving predictable performance.
+
+**Q: Can you shrink a Persistent Disk?**
+A: No, Persistent Disks can only be resized (increased), not shrunk. You must create a smaller disk, migrate data, then delete the old disk.
+
+**Q: How do Persistent Disk snapshots work?**
+A: Snapshots are incremental—they only store changes since the last snapshot. This makes them storage-efficient and fast to create. They support cross-regional copying for disaster recovery.
+
+**Q: What are the encryption options for Persistent Disk?**
+A: Three options: Google-managed keys (default, free), Customer-Managed Encryption Keys (CMEK) via Cloud KMS ($0.03/month per key), and Customer-Supplied Encryption Keys (deprecated).
+
+**Q: How do you migrate a Persistent Disk to a different zone?**
+A: Use `gcloud compute disks move` for quick relocation, or create a snapshot, then create a new disk in the target zone from that snapshot.
+
+**Q: What's the maximum Persistent Disk size?**
+A: 65,536 GB (64 TB) for all disk types. Note that some OS filesystems have their own limits (e.g., ext4 max is 1 EB but in practice much less).
+
+## Cheat Sheet
+
+```bash
+# Create
+gcloud compute disks create my-disk --size=500 --type=pd-ssd --zone=ZONE
+
+# Attach/Detach
+gcloud compute instances attach-disk INSTANCE --disk=DISK --zone=ZONE
+gcloud compute instances detach-disk INSTANCE --disk=DISK --zone=ZONE
+
+# Resize
+gcloud compute disks resize my-disk --size=1TB --zone=ZONE
+
+# Snapshot
+gcloud compute disks snapshot my-disk --snapshot-name=SNAP --zone=ZONE
+gcloud compute disks create new-disk --source-snapshot=SNAP --zone=ZONE
+
+# Regional disk
+gcloud compute disks create my-regional --region=US --replica-zones=US-A,US-B --type=pd-ssd --size=500
+```
+
+## Labs
+
+### Lab 1: High-Performance Database Storage
+Deploy PostgreSQL with optimal Persistent Disk configuration.
+1. Create pd-ssd disk with 1TB
+2. Configure disk with optimal partition alignment
+3. Mount with noatime and discard options
+4. Benchmark with fio showing >50k IOPS
+5. Create automated daily snapshots
+
+### Lab 2: Disaster Recovery Setup
+Implement regional Persistent Disk with automated failover.
+1. Create regional disk in primary zone pair
+2. Configure application to use regional disk
+3. Set up snapshot schedule to separate region
+4. Test failover by moving secondary zone
+5. Validate data integrity after failover
+
+### Lab 3: Disk Encryption with CMEK
+Implement customer-managed encryption for compliance.
+1. Create Cloud KMS key ring and crypto key
+2. Create Persistent Disk with CMEK
+3. Configure IAM permissions for key access
+4. Test key rotation and re-encryption
+5. Verify encryption in transit and at rest
+
+## Related Services
+
+- **Cloud Storage**: Object storage for backups
+- **Filestore**: NFS file shares for multi-instance access
+- **Local SSD**: Highest performance, ephemeral storage
+- **Cloud KMS**: Customer-managed encryption keys
+- **Compute Engine**: VM instances that use Persistent Disks
+- **GKE**: Kubernetes pods using Persistent Disks via PVCs

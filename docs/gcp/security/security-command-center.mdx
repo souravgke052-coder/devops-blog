@@ -1,0 +1,571 @@
+# Security Command Center
+
+## Overview
+
+Google Cloud Security Command Center (SCC) is a security posture management platform that provides threat detection, vulnerability identification, and security insights across GCP resources. It aggregates findings from various security scanners, integrates with SIEM tools, and supports compliance frameworks.
+
+## When To Use
+
+- Centralized security visibility
+- Threat detection and alerting
+- Compliance monitoring
+- Vulnerability management
+- Security posture tracking
+- Event-driven security automation
+
+## When NOT To Use
+
+- Real-time network security (use Cloud Armor, Firewall)
+- Identity management (use Cloud Identity)
+- Encryption management (use Cloud KMS)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              Security Command Center                         │
+├─────────────────────────────────────────────────────────────┤
+│  Tiers:                                                    │
+│  ├── Standard (free, basic findings)                      │
+│  └── Enterprise (advanced threat detection)                │
+├─────────────────────────────────────────────────────────────┤
+│  Sources:                                                  │
+│  ├── Built-in scanners (Security Health Analytics)        │
+│  ├── Event Threat Detection (Enterprise)                   │
+│  ├── Container/VM Threat Detection                        │
+│  └── Custom findings (API/Partner)                        │
+├─────────────────────────────────────────────────────────────┤
+│  Features:                                                 │
+│  ├── Security Health Analytics                           │
+│  ├── Event Threat Detection                               │
+│  ├── Container/VM Threat Detection                        │
+│  ├── Security Scores                                      │
+│  └── Asset Discovery                                      │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  ├── Standard: Free                                       │
+│  └── Enterprise: $15/org/month                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Finding
+Security issue identified by a scanner. Has severity, category, and resource.
+
+### Security Health Analytics
+Built-in checks for common security misconfigurations.
+
+### Event Threat Detection
+Detects threats in Cloud Logging (Enterprise tier).
+
+### Security Score
+Overall security posture score with category breakdowns.
+
+### Asset Inventory
+Discovery and tracking of GCP resources.
+
+### Threat
+Malicious activity detected in logs or network traffic.
+
+## Real Production Example
+
+**Security Command Center Configuration**
+
+```hcl
+# Terraform configuration for Security Command Center
+
+# Enable Security Command Center
+resource "google_project_service" "securitycenter" {
+  service = "securitycenter.googleapis.com"
+}
+
+# Create notification config for findings
+resource "google_scc_notification" "security_findings" {
+  org_id    = var.org_id
+  config_id = "security-findings-config"
+  
+  description = "Notify on new security findings"
+  
+  pubsub_message_template = <<-EOT
+    {
+      "finding": "${protojson.MarshalJSONOf(finding)}"
+    }
+  EOT
+  
+  streaming_config {
+    filter = "severity >= LOW"
+  }
+}
+
+# Create custom notification for high severity
+resource "google_scc_notification" "high_severity" {
+  org_id    = var.org_id
+  config_id = "high-severity-config"
+  
+  description = "Notify on high/critical findings"
+  
+  streaming_config {
+    filter = "severity >= HIGH"
+  }
+}
+
+# Security Health Analytics settings
+# Note: Most SAA settings are configured via API, not Terraform
+
+# Enable Security Health Analytics
+resource "google_securitycenter_source" "security_health" {
+  org_id   = var.org_id
+  display_name = "Security Health Analytics"
+  
+  description = "Built-in Security Health Analytics scanner"
+}
+
+# Custom security source for findings
+resource "google_securitycenter_source" "custom_scanner" {
+  org_id   = var.org_id
+  display_name = "Custom Security Scanner"
+  
+  description = "Findings from our custom security scanner"
+}
+
+# Security module configuration (Enterprise)
+# Note: Module settings typically done via API or console
+
+# IAM for Security Command Center
+resource "google_organization_iam_member" "security_admin" {
+  org_id = var.org_id
+  role   = "roles/securitycenter.admin"
+  member = "user:security-admin@company.com"
+}
+
+resource "google_organization_iam_member" "security_viewer" {
+  org_id = var.org_id
+  role   = "roles/securitycenter.viewer"
+  member = "user:analyst@company.com"
+}
+
+resource "google_organization_iam_member" "notification_viewer" {
+  org_id = var.org_id
+  role   = "roles/securitycenter.notificationConfigViewer"
+  member = "user:analyst@company.com"
+}
+
+# Create BigQuery dataset for findings export
+resource "google_bigquery_dataset" "security_findings" {
+  dataset_id    = "security_findings"
+  friendly_name = "Security Findings Export"
+  location      = "US"
+  
+  default_table_expiration_ms = 2592000000  # 30 days
+}
+
+# Export findings to BigQuery
+resource "google_scc_bigquery_export" "findings_export" {
+  org_id       = var.org_id
+  bigquery_dataset = google_bigquery_dataset.security_findings.id
+  description  = "Export all findings to BigQuery"
+  
+  filter = "severity >= LOW"
+}
+
+# Security Command Center API sink
+resource "google_logging_org_sink" "security_findings" {
+  org_id    = var.org_id
+  name      = "security-findings-sink"
+  destination = "pubsub.googleapis.com/${google_pubsub_topic.security.id}"
+  
+  filter = <<-EOT
+    resource.type="securitycenter" OR
+    resource.type="google.cloud.securitycenter.v1"
+  EOT
+  
+  unique_writer_identity = true
+}
+
+# Pub/Sub for real-time alerts
+resource "google_pubsub_topic" "security" {
+  name = "security-alerts"
+}
+
+# Cloud Functions for security automation
+resource "google_cloudfunctions2_function" "security_alerter" {
+  name     = "security-alerter"
+  location = "us-central1"
+  
+  build_config {
+    runtime     = "nodejs18"
+    entry_point = "alerter"
+    source {
+      storage_source {
+        bucket = google_storage_bucket.source.name
+        object = google_storage_bucket_object.source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count    = 3
+    min_instance_count    = 1
+    service_account_email = google_service_account.alerter.email
+    
+    environment_variables = {
+      SLACK_WEBHOOK = var.slack_webhook
+    }
+  }
+  
+  event_trigger {
+    trigger_policy {
+      event_type = "google.cloud.pubsub.topic.v1.messagePublished"
+      pubsub_topic = google_pubsub_topic.security.id
+    }
+  }
+}
+
+resource "google_service_account" "alerter" {
+  account_id = "security-alerter"
+}
+
+# Grant SCC permissions
+resource "google_pubsub_topic_iam_member" "alerter" {
+  topic  = google_pubsub_topic.security.name
+  role   = "roles/pubsub.subscriber"
+  member = "serviceAccount:${google_cloudfunctions2_function.security_alerter.service_config.service_account_email}"
+}
+```
+
+### Security Automation Function (Node.js)
+
+```javascript
+// alerter.js - Cloud Function for processing security findings
+exports.alerter = async (event, context) => {
+    const pubsubMessage = event.data;
+    const finding = JSON.parse(Buffer.from(pubsubMessage, 'base64').toString());
+    
+    const severity = finding.severity;
+    const resource = finding.resourceName;
+    const category = finding.category;
+    
+    console.log(`Processing finding: ${category} at ${resource} (${severity})`);
+    
+    if (severity === 'CRITICAL' || severity === 'HIGH') {
+        await sendAlert(finding);
+        
+        if (category.includes('MALWARE')) {
+            await isolateResource(finding);
+        }
+        
+        if (category.includes('PRIVILEGE')) {
+            await revokeAccess(finding);
+        }
+    }
+    
+    return { processed: true, finding: finding.category };
+};
+
+async function sendAlert(finding) {
+    const message = {
+        text: `Security Alert: ${finding.category}`,
+        attachments: [{
+            color: finding.severity === 'CRITICAL' ? 'danger' : 'warning',
+            fields: [
+                { title: 'Severity', value: finding.severity, short: true },
+                { title: 'Resource', value: finding.resourceName, short: false },
+                { title: 'Category', value: finding.category, short: true },
+                { title: 'Description', value: finding.description, short: false }
+            ]
+        }]
+    };
+    
+    await fetch(process.env.SLACK_WEBHOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(message)
+    });
+}
+
+async function isolateResource(finding) {
+    // Extract resource info
+    const resourceName = finding.resourceName;
+    
+    // If VM, isolate via firewall
+    if (resourceName.includes('instances')) {
+        console.log(`Isolating VM: ${resourceName}`);
+        // Implementation would:
+        // 1. Block all traffic to instance
+        // 2. Tag instance for security review
+        // 3. Create incident ticket
+    }
+}
+
+async function revokeAccess(finding) {
+    console.log(`Reviewing access for: ${finding.resourceName}`);
+    // Implementation would:
+    // 1. Identify affected service accounts
+    // 2. Disable potentially compromised accounts
+    // 3. Alert security team
+}
+```
+
+## CLI Examples
+
+```bash
+# Get organization ID
+gcloud organizations list
+
+# List security sources
+gcloud scc sources list --organization=ORG_ID
+
+# List findings
+gcloud scc findings list ORG_ID --filter="severity=HIGH"
+gcloud scc findings list ORG_ID --filter="category=MALWARE"
+
+# Get security score
+gcloud scc securityscores list --organization=ORG_ID
+
+# List assets
+gcloud scc assets list --organization=ORG_ID
+gcloud scc assets list --organization=ORG_ID --asset-type=google.compute.Instance
+
+# Get specific finding
+gcloud scc findings describe FINDING_ID --organization=ORG_ID --source=SOURCE_ID
+
+# Update finding status (mark as resolved)
+gcloud scc findings update FINDING_ID \
+  --organization=ORG_ID \
+  --source=SOURCE_ID \
+  --state=INACTIVE
+
+# Create custom finding
+gcloud scc findings create SOURCE_ID \
+  --organization=ORG_ID \
+  --category="CUSTOM_FINDING" \
+  --description="Custom security finding" \
+  --resource="//compute.googleapis.com/projects/my-project/zones/us-central1-a/instances/vm-1" \
+  --severity=HIGH
+
+# Enable Security Health Analytics
+gcloud scc sources update SOURCE_ID \
+  --organization=ORG_ID \
+  --enable=False  # Enable via console typically
+
+# Export findings
+gcloud scc bigquery-exports create ORG_ID \
+  --dataset=DATASET_ID \
+  --filter="severity >= LOW"
+
+# Set notification config
+gcloud scc notification-configs create ORG_ID \
+  --config-id=my-config \
+  --pubsub-topic=projects/my-project/topics/my-topic \
+  --filter="severity >= MEDIUM"
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Security Command Center IAM
+resource "google_organization_iam_member" "scc_admin" {
+  org_id = "123456789"
+  role   = "roles/securitycenter.admin"
+  member = "user:admin@company.com"
+}
+
+# Notification config
+resource "google_scc_notification" "notify" {
+  org_id    = "123456789"
+  config_id = "notify-config"
+  
+  description = "Security alerts"
+  
+  streaming_config {
+    filter = "severity >= HIGH"
+  }
+}
+
+# BigQuery export
+resource "google_scc_bigquery_export" "export" {
+  org_id       = "123456789"
+  bigquery_dataset = "projects/my-project/datasets/security"
+  description  = "Export findings"
+  filter       = "severity >= LOW"
+}
+```
+
+## Common Commands
+
+```bash
+# Findings
+gcloud scc findings list ORG [--filter=FILTER]
+gcloud scc findings describe ID --source=SOURCE --organization=ORG
+gcloud scc findings update ID --source=SOURCE --organization=ORG [--state=STATE]
+
+# Assets
+gcloud scc assets list ORG [--asset-type=TYPE]
+gcloud scc assets describe ORG ASSET_NAME
+
+# Security score
+gcloud scc securityscores list --organization=ORG
+
+# Sources
+gcloud scc sources list --organization=ORG
+
+# Notifications
+gcloud scc notification-configs create ORG --config-id=ID [flags]
+```
+
+## Monitoring
+
+### Key Metrics
+- Security score by category
+- Finding counts by severity
+- Asset inventory changes
+- MTTD (mean time to detect)
+
+### Cloud Monitoring
+```bash
+# Create security score alert
+gcloud monitoring policies create \
+  --display-name="Security Score Alert" \
+  --condition-display-name="Score < 80" \
+  --condition-filter='resource.type="securitycenter" AND metric.type="securitycenter.googleapis.com/security_score"' \
+  --condition-threshold-value=80 \
+  --notification-channels=CHANNEL_ID
+
+# Create high finding alert
+gcloud monitoring policies create \
+  --display-name="Critical Finding Alert" \
+  --condition-filter='resource.type="securitycenter" AND metric.type="securitycenter.googleapis.com/finding_count"' \
+  --condition-threshold-value=1 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### IAM Roles
+| Role | Description |
+|------|-------------|
+| securitycenter.admin | Full SCC access |
+| securitycenter.viewer | Read-only access |
+| securitycenter.findingsEditor | Edit findings |
+| securitycenter.notificationConfigEditor | Manage notifications |
+| securitycenter.sourcesEditor | Manage sources |
+
+### Data Access
+- Findings retained based on tier
+- Export to Cloud Storage/Pub/Sub for retention
+- Audit logs for compliance
+
+## Cost
+
+| Tier | Price |
+|------|-------|
+| Standard | Free |
+| Enterprise | $15/organization/month |
+| Additional modules | Variable |
+
+## Troubleshooting
+
+### Findings Not Appearing
+```bash
+# Check Security Health Analytics is enabled
+gcloud scc sources list --organization=ORG
+
+# Verify API is enabled
+gcloud services list --enabled | grep securitycenter
+
+# Check permissions
+gcloud organizations get-iam-policy ORG
+```
+
+### API Errors
+```bash
+# Verify organization access
+gcloud organizations describe ORG
+
+# Check API quota
+gcloud alpha scc quotas describe
+```
+
+## Interview Questions
+
+**Q: What is the difference between Standard and Enterprise SCC?**
+A: Standard provides Security Health Analytics, Asset Discovery, and basic findings. Enterprise adds Event Threat Detection (real-time log analysis), Container Threat Detection, VM Threat Detection, and custom security analytics with longer retention.
+
+**Q: How does Event Threat Detection work?**
+A: ETD continuously analyzes Cloud Logging entries for malicious activity patterns. It uses predefined detection rules and ML to identify threats. When a threat is detected, it creates a finding with MITRE ATT&CK mapping.
+
+**Q: What is a security finding?**
+A: A finding represents a security issue identified by a scanner. It includes: severity, category, resource affected, timestamp, and recommended remediation. Findings can be marked active/inactive.
+
+**Q: How do you automate response to findings?**
+A: Create notification configs pointing to Pub/Sub. Cloud Functions or other services subscribe to process findings and take automated actions (isolate resources, revoke access, create tickets).
+
+**Q: What is Security Health Analytics?**
+A: SHA scans for common security misconfigurations: open ports, public bucket access, SQL public IP, IAM policy issues, and more. It runs continuously and creates findings when issues are detected.
+
+## Cheat Sheet
+
+```bash
+# List findings
+gcloud scc findings list ORG --filter="severity=HIGH"
+
+# Get security score
+gcloud scc securityscores list --organization=ORG
+
+# List assets
+gcloud scc assets list ORG --asset-type=google.compute.Instance
+
+# Update finding
+gcloud scc findings update ID --source=SOURCE --organization=ORG --state=INACTIVE
+
+# Security Health Analytics checks:
+# - Public bucket access
+# - Open firewall ports
+# - SQL public IP
+# - IAM policy issues
+# - Disabled CIS checks
+```
+
+## Labs
+
+### Lab 1: Security Monitoring Setup
+Configure comprehensive security monitoring.
+1. Enable Security Command Center
+2. Configure notification to Pub/Sub
+3. Create Cloud Function for alerts
+4. Set up Cloud Monitoring dashboards
+5. Test finding creation
+
+### Lab 2: Compliance Monitoring
+Track compliance posture.
+1. Review Security Health Analytics findings
+2. Create security score alerts
+3. Implement remediation workflow
+4. Track compliance over time
+5. Generate compliance reports
+
+### Lab 3: Automated Response
+Build automated security response.
+1. Create finding notification
+2. Classify findings by category
+3. Implement automated isolation
+4. Set up Slack notifications
+5. Test with simulated findings
+
+## Related Services
+
+- **Cloud Armor**: WAF protection
+- **Cloud Monitoring**: Metrics and alerting
+- **Cloud Logging**: Log aggregation
+- **SIEM Integration**: External security tools
+- **Security Health Analytics**: Built-in security checks

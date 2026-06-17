@@ -1,0 +1,723 @@
+# Billing
+
+## Overview
+
+GCP Billing is the system for tracking and managing cloud spend across your organization. It provides financial controls, cost allocation, and budget alerts to prevent unexpected charges. Billing in GCP operates through Billing Accounts, which can be linked to projects to collect charges. Understanding billing architecture is essential for any production GCP deployment.
+
+GCP offers two types of billing accounts: **Self-Serve** (linked to a credit card or bank account) and **Invoiced** (billed monthly to a company). Invoiced accounts provide higher spending limits and are recommended for enterprise deployments. All billing account activity is logged and exportable to BigQuery or Cloud Storage for detailed cost analysis.
+
+Effective billing management involves setting up budgets and alerts, using labels for cost allocation, understanding commitment discounts, and regularly reviewing cost reports. Without proper billing controls, cloud costs can spiral out of control—I've seen production bills increase 10x due to a single misconfigured autoscaler.
+
+## When To Use
+
+- **Cost tracking and allocation**: Assign costs to teams, projects, or services using labels
+- **Budget enforcement**: Set alerts at percentage thresholds to prevent overspending
+- **Chargeback/showback**: Allocate costs to business units for accountability
+- **Commitment discounts**: Purchase committed-use discounts for predictable workloads
+- **Detailed cost analysis**: Export billing data to BigQuery for custom reports
+- **Multi-project billing**: Aggregate or separate billing across organizational units
+
+## When NOT To Use
+
+- **Real-time cost control**: Billing data has up to 24-hour delay; use budgets for alerts, not real-time blocking
+- **Per-second billing queries**: Export to BigQuery for detailed analysis; Console shows daily summaries
+- **Preventing all overspending**: Budget alerts notify but don't prevent resource creation
+
+## Architecture
+
+**Billing Hierarchy:**
+```
+Billing Account (Master)
+├── Linked Projects (one or many)
+│   ├── Project A
+│   └── Project B
+└── Budgets & Alerts
+```
+
+**Billing Account Types:**
+
+| Type | Features | Limits |
+|------|----------|--------|
+| Self-Serve | Credit card, monthly auto-pay | $1,000-$50,000 default |
+| Invoiced | Invoice monthly, wire transfer | Higher limits, credit check |
+| Subaccounts | Child accounts for departments | Hierarchical billing |
+
+**Billing Data Flow:**
+1. Resources generate usage
+2. Usage is measured and recorded (usually within minutes)
+3. Charges are calculated at end of billing cycle
+4. Itemized invoice generated
+5. Payment processed or invoice sent
+
+**Key Billing Concepts:**
+- **Billing Account**: Container for charges, linked to payment method
+- **Billing Export**: Daily detailed records exported to BigQuery/Cloud Storage
+- **Budget**: Spending limit with alert thresholds
+- **Credit**: Promotional credits, discounts applied
+- **Commitment**: Upfront payment for discounted rates
+
+## Core Concepts
+
+### Billing Accounts
+
+```bash
+# List billing accounts
+gcloud billing accounts list
+
+# Describe billing account
+gcloud billing accounts describe XXXXXX-XXXXXX-XXXXXX
+
+# Get billing account for project
+gcloud billing projects describe my-project --format="value(billingAccountName)"
+```
+
+### Linking Billing to Projects
+
+```bash
+# Link billing account to project
+gcloud billing projects link my-project \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# Unlink billing (requires Project Owner)
+gcloud billing projects unlink my-project
+
+# List projects linked to billing account
+gcloud billing accounts projects list --billing-account=XXXXXX-XXXXXX-XXXXXX
+```
+
+### Billing Export
+
+**To BigQuery:**
+```bash
+# Create billing export to BigQuery dataset
+gcloud billing export bigquery create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --dataset-name=billing_export \
+    --dataset-project=billing-project
+
+# Use existing dataset
+gcloud billing export bigquery create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --dataset-name=billing_export
+```
+
+**To Cloud Storage:**
+```bash
+# Export to Cloud Storage bucket
+gcloud billing export gcs create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --bucket=gs://my-billing-bucket
+```
+
+### Budgets and Alerts
+
+```bash
+# Create budget
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Monthly Budget" \
+    --amount=50000USD
+
+# Create budget with threshold alerts
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Monthly Budget" \
+    --amount=50000USD \
+    --threshold-rules=percent=0.5,percent=0.8,percent=0.95,percent=1.0
+
+# Create budget for specific projects
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Production Budget" \
+    --amount=100000USD \
+    --filter-projects=my-prod-project
+
+# Create budget for specific services
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Compute Budget" \
+    --amount=20000USD \
+    --filter-services=services/6F81B5F3-6B30-C9D8-B4B2-8BD79C0E0A9B
+```
+
+### Committed Use Discounts (CUDs)
+
+```bash
+# Purchase committed use discount
+gcloud commitment create \
+    --project=my-project \
+    --region=us-central1 \
+    --resources=vcpus=96 \
+    --resources=memory=624GB \
+    --plan=12-month
+
+# List commitments
+gcloud commitments list --project=my-project --region=us-central1
+
+# Delete commitment (early termination fee applies)
+gcloud commitments delete commitment-name --project=my-project --region=us-central1
+```
+
+### Quotas and Limits
+
+| Resource | Default Limit |
+|----------|---------------|
+| Billing accounts per organization | Unlimited |
+| Projects per billing account | Unlimited |
+| Budgets per billing account | 100 |
+| Credits per billing account | 50 |
+
+### Key Gotchas
+
+- **Billing data has ~24-hour delay**—don't use Console for real-time cost monitoring
+- **Budget alerts are notifications only**—they don't prevent resource creation
+- **Committed use discounts auto-apply**—no need to manually assign to instances
+- **Credit card limits may apply** to self-serve accounts—check with your provider
+- **Project without billing can't create billable resources**—always link billing before deploying
+- **Credits don't apply to all services**—some (like Cloud Storage) don't accept credits
+- **Spot/preemptible instance savings appear as credits**—not direct price reduction
+
+## Real Production Example
+
+Production billing setup:
+
+```bash
+# 1. Create BigQuery dataset for billing export
+bq mk --dataset --location=US billing_export
+
+# 2. Enable billing export to BigQuery
+gcloud billing export bigquery create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --dataset-name=billing_export \
+    --dataset-project=my-billing-project
+
+# 3. Create budgets with alerts
+# Total monthly budget
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Monthly Total Budget" \
+    --amount=200000USD \
+    --threshold-rules=percent=0.5,percent=0.8,percent=0.95,percent=1.0 \
+    --notification-rules=percent=0.5,percent=0.8,percent=0.95,percent=1.0
+
+# 4. Create budget for production projects only
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Production Budget" \
+    --amount=150000USD \
+    --threshold-rules=percent=0.8,percent=1.0 \
+    --filter-projects=my-prod-app
+
+# 5. Create budget for GKE
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="GKE Budget" \
+    --amount=30000USD \
+    --threshold-rules=percent=0.7,percent=0.9,percent=1.0 \
+    --filter-services=services/6F81B5F3-6B30-C9D8-B4B2-8BD79C0E0A9B
+
+# 6. List and manage budgets
+gcloud billing budgets list --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# 7. Update budget amount
+gcloud billing budgets update budget-id \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --amount=250000USD
+
+# 8. Delete budget
+gcloud billing budgets delete budget-id --billing-account=XXXXXX-XXXXXX-XXXXXX
+```
+
+```hcl
+# Terraform: Billing configuration
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google-beta"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Billing account data source
+data "google_billing_account" "main" {
+  billing_account = "XXXXXX-XXXXXX-XXXXXX"
+}
+
+# Budget for all projects
+resource "google_billing_budget" "monthly_budget" {
+  billing_account = data.google_billing_account.main.id
+  display_name    = "Monthly Budget"
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "200000"
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.5
+  }
+  threshold_rules {
+    threshold_percent = 0.8
+  }
+  threshold_rules {
+    threshold_percent = 0.95
+  }
+  threshold_rules {
+    threshold_percent = 1.0
+  }
+
+  notification_rules {
+    threshold_percent = 0.5
+    notification_channels = [google Monitoring notification_channel.email.id]
+  }
+  notification_rules {
+    threshold_percent = 1.0
+    notification_channels = [google_monitoring_notification_channel.email.id]
+  }
+}
+
+# Budget filtered by projects
+resource "google_billing_budget" "prod_budget" {
+  billing_account = data.google_billing_account.main.id
+  display_name    = "Production Budget"
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "150000"
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.8
+  }
+  threshold_rules {
+    threshold_percent = 1.0
+  }
+
+  filter {
+    projects = ["projects/my-prod-app"]
+  }
+}
+
+# Monitoring notification channel
+resource "google_monitoring_notification_channel" "email" {
+  display_name = "Billing Alerts"
+  type         = "email"
+
+  labels = {
+    email_address = "billing@company.com"
+  }
+}
+
+# Billing export to BigQuery
+resource "google_billing_budget" "budget" {
+  # ... budget config ...
+}
+
+# Note: Billing export is configured via gcloud or API
+# Terraform doesn't support billing export as a resource
+```
+
+## CLI Examples
+
+```bash
+# List billing accounts
+gcloud billing accounts list
+
+# Describe billing account
+gcloud billing accounts describe XXXXXX-XXXXXX-XXXXXX
+
+# Get billing account for project
+gcloud billing projects describe my-project
+
+# Link billing account
+gcloud billing projects link my-project --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# List budgets
+gcloud billing budgets list --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# Create budget
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Budget" \
+    --amount=10000USD
+
+# Update budget
+gcloud billing budgets update BUDGET_ID \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --amount=20000USD
+
+# Delete budget
+gcloud billing budgets delete BUDGET_ID --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# List projects under billing account
+gcloud billing accounts projects list --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# Enable billing export
+gcloud billing export bigquery create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --dataset-name=billing_export
+
+# View current spend (approximate)
+gcloud billing budgets list --billing-account=XXXXXX-XXXXXX-XXXXXX
+```
+
+## Terraform Example
+
+```hcl
+# Billing budget with email notifications
+data "google_billing_account" "current" {
+  billing_account = var.billing_account_id
+}
+
+resource "google_monitoring_notification_channel" "billing_alerts" {
+  display_name = "Billing Alert Email"
+  type         = "email"
+
+  labels = {
+    email_address = var.alert_email
+  }
+}
+
+resource "google_billing_budget" "main" {
+  billing_account = data.google_billing_account.current.id
+  display_name    = "Main Budget"
+  currency_code   = "USD"
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = var.budget_amount
+    }
+  }
+
+  threshold_rules {
+    threshold_percent = 0.5
+  }
+  threshold_rules {
+    threshold_percent = 0.8
+  }
+  threshold_rules {
+    threshold_percent = 1.0
+  }
+
+  notification_rules {
+    threshold_percent = 0.5
+    notification_channels = [google_monitoring_notification_channel.billing_alerts.name]
+  }
+  notification_rules {
+    threshold_percent = 1.0
+    notification_channels = [google_monitoring_notification_channel.billing_alerts.name]
+  }
+}
+
+# Budget for specific services
+resource "google_billing_budget" "compute_budget" {
+  billing_account = data.google_billing_account.current.id
+  display_name    = "Compute Budget"
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "50000"
+    }
+  }
+
+  filter {
+    services = ["services/6F81B5F3-6B30-C9D8-B4B2-8BD79C0E0A9B"]
+  }
+
+  threshold_rules {
+    threshold_percent = 0.8
+  }
+  threshold_rules {
+    threshold_percent = 1.0
+  }
+}
+
+# Budget for specific project
+resource "google_billing_budget" "prod_budget" {
+  billing_account = data.google_billing_account.current.id
+  display_name    = "Production Project Budget"
+
+  amount {
+    specified_amount {
+      currency_code = "USD"
+      units         = "100000"
+    }
+  }
+
+  filter {
+    projects = ["projects/my-production-app"]
+  }
+
+  threshold_rules {
+    threshold_percent = 0.8
+  }
+  threshold_rules {
+    threshold_percent = 1.0
+  }
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List billing accounts | `gcloud billing accounts list` |
+| Describe billing account | `gcloud billing accounts describe ACCOUNT` |
+| Get project billing | `gcloud billing projects describe PROJECT` |
+| Link billing to project | `gcloud billing projects link PROJECT --billing-account=ACCOUNT` |
+| Unlink billing | `gcloud billing projects unlink PROJECT` |
+| List budgets | `gcloud billing budgets list --billing-account=ACCOUNT` |
+| Create budget | `gcloud billing budgets create --billing-account=ACCOUNT [FLAGS]` |
+| Update budget | `gcloud billing budgets update BUDGET_ID [FLAGS]` |
+| Delete budget | `gcloud billing budgets delete BUDGET_ID` |
+| Create billing export | `gcloud billing export bigquery create --billing-account=ACCOUNT` |
+
+## Monitoring
+
+**Billing Metrics in Cloud Monitoring:**
+
+1. **Actual Spend vs Budget**: Track spend as percentage of budget
+2. **Forecast**: AI-based spending forecast
+3. **Cost by Service**: Breakdown of spend by GCP service
+4. **Cost by Project**: Per-project spending
+
+```bash
+# View budget status
+gcloud billing budgets list --billing-account=XXXXXX-XXXXXX-XXXXXX
+
+# Query BigQuery billing export for detailed analysis
+bq query --use_legacy_sql=false \
+    'SELECT service.description, SUM(cost) as total_cost
+     FROM billing_export.gcp_billing_export
+     WHERE _PARTITIONDATE = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+     GROUP BY service.description
+     ORDER BY total_cost DESC'
+```
+
+**Budget Alert Configuration:**
+```bash
+# Create budget with email alert
+gcloud billing budgets create \
+    --billing-account=XXXXXX-XXXXXX-XXXXXX \
+    --display-name="Alert Budget" \
+    --amount=50000USD \
+    --threshold-rules=percent=0.5,percent=0.8,percent=1.0
+```
+
+**Recommended Alerts:**
+- 50% of budget (warning)
+- 80% of budget (attention needed)
+- 100% of budget (critical, immediate action required)
+- 120% of budget (emergency overspend)
+
+## Security
+
+**Billing Security Best Practices:**
+
+1. **Restrict billing access** to finance team and necessary admins
+   ```bash
+   # Only billing account admins can modify billing
+   gcloud organizations add-iam-policy-binding 123456789012 \
+       --member="group:billing-admins@company.com" \
+       --role="roles/billing.admin"
+   ```
+
+2. **Use separate billing accounts for high-risk projects**
+   ```bash
+   # Create isolated billing for risky experiments
+   gcloud billing accounts create --display-name="Experiments"
+   gcloud billing projects link my-experiment --billing-account=YYYYYY-YYYYYY-YYYYYY
+   ```
+
+3. **Enable billing exports to Cloud Storage with versioning**
+   ```bash
+   gsutil versioning set on gs://my-billing-bucket
+   gsutil retention set 90D gs://my-billing-bucket
+   ```
+
+4. **Use labels for cost allocation** (not for security)
+   ```bash
+   gcloud projects update my-project --update-labels=team=platform,cost-center=CC123
+   ```
+
+5. **Monitor for unauthorized billing changes**
+   ```bash
+   # Alert on billing account IAM changes
+   gcloud logging read 'resource.type="billing_account" AND protoPayload.methodName="SetIAMPolicy"'
+   ```
+
+## Cost Optimization
+
+**Key Cost Drivers:**
+
+| Service | Cost Drivers | Typical Savings |
+|---------|--------------|-----------------|
+| Compute Engine | CPU, memory, sustained use | Committed use, right-sizing |
+| Cloud Storage | Storage, egress, operations | Lifecycle policies,压缩 |
+| GKE | Node count, storage | Autopilot, spot nodes |
+| BigQuery | Storage, queries | Partition, clustering |
+| Cloud SQL | Instance size, storage | Committed use, SSD tier |
+
+**Optimization Strategies:**
+
+1. **Purchase committed use discounts** for baseline workloads
+   ```bash
+   # 1-year commitment for 96 vCPUs, 624GB memory
+   gcloud compute commitments create prod-commitment \
+       --region=us-central1 \
+       --resources=vcpus=96,memory=624GB \
+       --plan=12-month
+   ```
+
+2. **Use labels for cost allocation and tracking**
+   ```bash
+   gcloud projects update my-project \
+       --update-labels=environment=prod,team=platform,cost-center=CC123
+   ```
+
+3. **Set budgets with alerts for all projects**
+   - Create org-level budget for total spend
+   - Create project-level budgets for granular tracking
+
+4. **Review cost analysis weekly**
+   ```sql
+   -- Weekly cost by project
+   SELECT
+     project.name,
+     SUM(cost) as total_cost
+   FROM billing_export.gcp_billing_export_v1
+   WHERE DATE(_PARTITIONTIME) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+   GROUP BY project.name
+   ORDER BY total_cost DESC
+   ```
+
+5. **Implement cleanup policies**
+   ```bash
+   # Schedule VMs to stop at night
+   gcloud scheduler jobs create http night-shutdown \
+       --schedule="0 20 * * *" \
+       --uri="https://compute.googleapis.com/compute/v1/projects/my-project/zones/us-central1-a/instances/instance-id/stop"
+   ```
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **Unexpected high charges**
+   ```bash
+   # Check which project/service is causing charges
+   bq query --use_legacy_sql=false \
+       'SELECT project.id, service.description, SUM(cost) as total
+        FROM billing_export.gcp_billing_export_v1
+        WHERE _PARTITIONDATE >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+        GROUP BY project.id, service.description
+        ORDER BY total DESC'
+   
+   # Check for orphaned resources
+   gcloud compute instances list --filter="status:RUNNING"
+   gcloud compute disks list --filter="status:READY" --uri
+   ```
+
+2. **Budget not triggering alerts**
+   ```bash
+   # Verify budget is active
+   gcloud billing budgets list --billing-account=XXXXXX-XXXXXX-XXXXXX
+   
+   # Check notification channel
+   gcloud monitoring channels list
+   
+   # Budget data has ~24h delay
+   ```
+
+3. **Can't link billing to project**
+   ```bash
+   # Check permissions (need Project Owner or Billing Account Administrator)
+   gcloud projects get-iam-policy my-project
+   
+   # Check billing account exists and is active
+   gcloud billing accounts describe XXXXXX-XXXXXX-XXXXXX
+   ```
+
+4. **Committed use discount not applying**
+   ```bash
+   # Check commitment status
+   gcloud commitments list --project=my-project --region=us-central1
+   
+   # Commitments apply to zonal resources in same region
+   # Verify resources are in correct zone
+   ```
+
+5. **Billing export not working**
+   ```bash
+   # Verify BigQuery dataset exists
+   bq ls --dataset=billing_export
+   
+   # Check export configuration
+   gcloud billing export bigquery list --billing-account=XXXXXX-XXXXXX-XXXXXX
+   
+   # Verify permissions on BigQuery dataset
+   bq show billing_export
+   ```
+
+## Interview Questions
+
+1. **How do GCP billing accounts work and how would you structure billing for a multi-team organization?**
+
+2. **Explain how budgets and alerts work in GCP. Can you prevent spending with budgets?**
+
+3. **What's the difference between committed use discounts and sustained use discounts?**
+
+4. **How would you investigate unexpected charges on a GCP bill?**
+
+5. **How does billing export to BigQuery work and what kind of analysis can you perform with it?**
+
+## Cheat Sheet
+
+```
+# Billing Accounts
+gcloud billing accounts list                           # List accounts
+gcloud billing accounts describe ACCOUNT              # Describe account
+gcloud billing projects describe PROJECT              # Get project's billing
+gcloud billing projects link PROJECT --billing-account=ACCOUNT
+gcloud billing projects unlink PROJECT
+
+# Budgets
+gcloud billing budgets list --billing-account=ACCOUNT
+gcloud billing budgets create --billing-account=ACCOUNT --display-name=NAME --amount=AMOUNT
+gcloud billing budgets update BUDGET --billing-account=ACCOUNT [FLAGS]
+gcloud billing budgets delete BUDGET --billing-account=ACCOUNT
+
+# Export
+gcloud billing export bigquery create --billing-account=ACCOUNT --dataset-name=NAME
+gcloud billing export gcs create --billing-account=ACCOUNT --bucket=BUCKET
+
+# Commitment
+gcloud compute commitments list --project=PROJECT --region=REGION
+gcloud compute commitments create --project=PROJECT --region=REGION --resources=vcpus=N,memory=SIZE --plan=12-month
+
+# Cost Analysis
+bq query --use_legacy_sql=false 'SELECT * FROM billing_export.gcp_billing_export_v1 WHERE...'
+```
+
+## Labs
+
+1. **Billing Setup**: Link billing to projects, explore the Billing Console
+2. **Budget Alerts**: Create budgets with different thresholds, test alert notifications
+3. **Cost Analysis**: Export billing to BigQuery, write queries for cost breakdown
+4. **Committed Use**: Analyze workloads for CUD eligibility, purchase commitments
+5. **Cost Optimization**: Identify cost drivers, implement optimization strategies
+
+## Related Services
+
+- [Organization Node](./organization)
+- [Projects](./projects)
+- [Compute Engine](../compute/compute-engine)
+- [Cloud Storage](../foundation/organization)
+- [GKE](../compute/gke)

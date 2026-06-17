@@ -1,0 +1,398 @@
+# Cloud Trace
+
+## Overview
+
+Google Cloud Trace is a distributed tracing system that collects latency data from applications and displays it in the Google Cloud Console. It helps identify performance bottlenecks by showing how requests flow through services. Cloud Trace supports OpenCensus, OpenTelemetry, and Zipkin instrumentation.
+
+## When To Use
+
+- Distributed application performance analysis
+- Latency troubleshooting
+- Service dependency mapping
+- Request flow visualization
+- Performance optimization
+
+## When NOT To Use
+
+- Real-time transaction monitoring
+- High-frequency sampling needs (use custom solutions)
+- Single monolithic application (use profiling instead)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Cloud Trace                              │
+├─────────────────────────────────────────────────────────────┤
+│  Components:                                                │
+│  ├── Trace API                                             │
+│  ├── Trace spans (request units)                           │
+│  ├── Trace list (related spans)                            │
+│  └── Performance insights                                  │
+├─────────────────────────────────────────────────────────────┤
+│  SDK Support:                                              │
+│  ├── OpenTelemetry (recommended)                          │
+│  ├── OpenCensus                                           │
+│  └── Zipkin                                               │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  ├── First 100K spans/month: Free                        │
+│  └── $0.001/spans after free tier                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Trace
+Complete end-to-end request path through services.
+
+### Span
+Individual operation within a trace (start/end time, metadata).
+
+### Parent Span
+Span that contains child spans (represents call hierarchy).
+
+### Latency Distribution
+P50, P90, P99 latency measurements per endpoint.
+
+## Real Production Example
+
+**OpenTelemetry Instrumentation**
+
+```hcl
+# Terraform configuration for Cloud Trace setup
+
+# Enable APIs
+resource "google_project_service" "cloudtrace" {
+  service = "cloudtrace.googleapis.com"
+}
+
+resource "google_project_service" "cloudtracev2" {
+  service = "cloudtrace.googleapis.com"
+}
+
+# Configure Trace sampling via environment
+# No Terraform resource needed - configured in application code
+```
+
+### Application Code (Python with OpenTelemetry)
+
+```python
+# requirements.txt
+# opentelemetry-api
+# opentelemetry-sdk
+# opentelemetry-exporter-cloud-trace
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+from opentelemetry.resources import Resource, SERVICE_NAME
+from opentelemetry.sdk.resources import ATTR_SERVICE_NAME
+
+# Initialize tracer
+resource = Resource(attributes={
+    ATTR_SERVICE_NAME: "my-service",
+    "service.version": "1.0.0",
+    "deployment.environment": "production"
+})
+
+provider = TracerProvider(resource=resource)
+processor = BatchSpanProcessor(CloudTraceSpanExporter())
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+# Get tracer
+tracer = trace.get_tracer(__name__)
+
+# Example: HTTP request with tracing
+import requests
+from opentelemetry import propagate
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+propagator = TraceContextTextMapPropagator()
+
+def traced_request(url, method='GET', **kwargs):
+    with tracer.start_as_current_span(f"http_{method.lower()}") as span:
+        span.set_attribute("http.url", url)
+        span.set_attribute("http.method", method)
+        
+        # Inject trace context into headers
+        headers = kwargs.get('headers', {})
+        propagator.inject(headers)
+        kwargs['headers'] = headers
+        
+        with tracer.start_as_current_span("external_call"):
+            try:
+                response = requests.request(method, url, **kwargs)
+                span.set_attribute("http.status_code", response.status_code)
+                return response
+            except Exception as e:
+                span.set_attribute("error", True)
+                span.record_exception(e)
+                raise
+
+# Example: Database query with tracing
+def traced_db_query(query, params=None):
+    with tracer.start_as_current_span("db_query") as span:
+        span.set_attribute("db.statement", query[:200])  # Truncate for safety
+        span.set_attribute("db.system", "postgresql")
+        
+        with tracer.start_as_current_span("execute"):
+            result = db.execute(query, params)
+        
+        span.set_attribute("db.rows_affected", result.rowcount)
+        return result
+
+# Example: Business logic span
+@tracer.start_as_current_span("process_order")
+def process_order(order_id):
+    span = trace.get_current_span()
+    span.set_attribute("order.id", order_id)
+    
+    # Validate
+    with tracer.start_as_current_span("validate_order"):
+        validate_order(order_id)
+    
+    # Reserve inventory
+    with tracer.start_as_current_span("reserve_inventory"):
+        reserve_inventory(order_id)
+    
+    # Process payment
+    with tracer.start_as_current_span("process_payment"):
+        process_payment(order_id)
+    
+    # Send notification
+    with tracer.start_as_current_span("send_notification"):
+        send_notification(order_id)
+```
+
+### Node.js with OpenTelemetry
+
+```javascript
+// tracing.js
+const { NodeSDK } = require('@opentelemetry/sdk-node');
+const { CloudTraceSpanExporter } = require('@google-cloud/opentelemetry-cloud-trace-exporter');
+const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http');
+const { ExpressInstrumentation } = require('@opentelemetry/instrumentation-express');
+const { PgInstrumentation } = require('@opentelemetry/instrumentation-pg');
+
+const sdk = new NodeSDK({
+  traceExporter: new CloudTraceSpanExporter(),
+  instrumentations: [
+    new HttpInstrumentation(),
+    new ExpressInstrumentation(),
+    new PgInstrumentation()
+  ],
+  resource: {
+    'service.name': 'my-service',
+    'service.version': '1.0.0',
+    'deployment.environment': process.env.NODE_ENV
+  }
+});
+
+sdk.start();
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  sdk.shutdown()
+    .then(() => console.log('Tracing shut down'))
+    .catch((error) => console.error('Error shutting down tracing', error));
+});
+```
+
+### Go with OpenCensus
+
+```go
+package main
+
+import (
+    "contrib.go.opencensus.io/exporter/stackdriver"
+    "go.opencensus.io/trace"
+)
+
+func initTracer() {
+    exporter, err := stackdriver.NewExporter(stackdriver.Options{
+        ProjectID: "my-project",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    trace.RegisterExporter(exporter)
+    trace.ApplyConfig(trace.Config{
+        DefaultSampler: trace.ProbabilitySampler(0.1), // 10% sampling
+    })
+}
+
+// In your handlers
+func handler(w http.ResponseWriter, r *http.Request) {
+    ctx, span := trace.StartSpan(r.Context(), "handler")
+    defer span.End()
+    
+    span.SetAttribute("http.method", r.Method)
+    span.SetAttribute("http.url", r.URL.String())
+    
+    // Process request
+    processRequest(ctx)
+}
+```
+
+## CLI Examples
+
+```bash
+# List recent traces
+gcloud alpha trace slices list --project=my-project
+
+# Get trace data
+gcloud alpha trace list --project=my-project --limit=100
+
+# Create trace report
+gcloud alpha trace report create \
+  --project=my-project \
+  --service=my-service
+
+# Configure sampling
+# Done in application code, not CLI
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Enable Cloud Trace API
+resource "google_project_service" "trace" {
+  service = "cloudtrace.googleapis.com"
+}
+
+# No specific Terraform resources for trace configuration
+# Configuration is done in application code
+```
+
+## Monitoring
+
+### Trace Metrics
+- Latency by endpoint (P50, P90, P99)
+- Request count by status
+- Error rate
+- Dependencies discovered
+
+### Cloud Monitoring
+```bash
+# Create trace-based alert
+gcloud monitoring policies create \
+  --display-name="High Latency Alert" \
+  --condition-display-name="P99 Latency > 1s" \
+  --condition-filter='resource.type="cloud_trace" AND metric.type="cloudtrace.googleapis.com/trace/trace_duration"' \
+  --condition-threshold-value=1000000000 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### IAM Permissions
+```bash
+# Trace viewer
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:developer@company.com \
+  --role=roles/cloudtrace.viewer
+
+# Trace agent
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/cloudtrace.agent
+```
+
+## Troubleshooting
+
+### Spans Not Appearing
+```bash
+# Check API is enabled
+gcloud services list --enabled | grep cloudtrace
+
+# Verify credentials in application
+# Application needs GOOGLE_APPLICATION_CREDENTIALS or Workload Identity
+
+# Check sampling rate
+# High-traffic apps may need higher sampling
+
+# Verify exporter configuration
+```
+
+### High Latency in Traces
+```bash
+# Look for slow spans in trace view
+# Check network spans for latency
+# Check database spans for slow queries
+# Review child span timing
+```
+
+## Interview Questions
+
+**Q: How does distributed tracing work?**
+A: Each service injects trace context (trace ID, span ID) into request headers. Downstream services extract this context and create child spans. All spans are sent to a collector (Cloud Trace) where they're assembled into complete traces.
+
+**Q: What is the difference between tracing and profiling?**
+A: Tracing captures request flow across services with timing information. Profiling captures CPU and memory usage at the function level within a single service. Use tracing for latency issues, profiling for resource utilization.
+
+**Q: How do you handle high-volume tracing?**
+A: Use sampling to reduce trace volume. Head-based sampling (at trace start) or tail-based sampling (after completion) are common approaches. Cloud Trace automatically samples at 100% for first 100K spans/month.
+
+**Q: What is trace context propagation?**
+A: Trace context includes trace ID and span ID that travels with requests across service boundaries. W3C Trace Context standard defines headers (`traceparent`, `tracestate`) for context propagation.
+
+## Cheat Sheet
+
+```bash
+# List traces
+gcloud alpha trace list --project=my-project
+
+# View specific trace
+gcloud alpha trace list --filter="trace_id:ID"
+
+# Application instrumentation
+# Python: opentelemetry-exporter-cloud-trace
+# Node.js: @google-cloud/opentelemetry-cloud-trace-exporter
+# Go: contrib.go.opencensus.io/exporter/stackdriver
+```
+
+## Labs
+
+### Lab 1: Application Instrumentation
+Add tracing to an application.
+1. Install OpenTelemetry SDK
+2. Configure Cloud Trace exporter
+3. Add custom spans
+4. Configure sampling
+5. Verify traces in Console
+
+### Lab 2: Performance Analysis
+Analyze trace data.
+1. Review latency distributions
+2. Identify slow operations
+3. Add child spans for detail
+4. Create performance insights
+5. Set up alerts
+
+### Lab 3: Multi-Service Tracing
+Trace across services.
+1. Configure propagation headers
+2. Instrument all services
+3. Verify trace continuity
+4. Review dependency graph
+5. Identify bottlenecks
+
+## Related Services
+
+- **Cloud Profiler**: CPU/memory profiling
+- **Cloud Monitoring**: Metrics and alerting
+- **Error Reporting**: Error aggregation
+- **OpenTelemetry**: Vendor-neutral instrumentation
+- **SRE**: Reliability engineering

@@ -1,0 +1,464 @@
+# Error Reporting
+
+## Overview
+
+Google Cloud Error Reporting automatically groups and counts errors from cloud services and application logs. It provides real-time error visibility, stack traces, and integrates with incident management. Error Reporting supports multiple languages and frameworks out of the box.
+
+## When To Use
+
+- Application error tracking
+- Production issue identification
+- Error trend analysis
+- Incident correlation
+- Stack trace analysis
+
+## When NOT To Use
+
+- Log aggregation (use Cloud Logging)
+- Performance monitoring (use Cloud Monitoring)
+- Distributed tracing (use Cloud Trace)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Error Reporting                             │
+├─────────────────────────────────────────────────────────────┤
+│  Features:                                                  │
+│  ├── Automatic error grouping                              │
+│  ├── Stack trace analysis                                  │
+│  ├── Error counts and trends                               │
+│  ├── First/last seen timestamps                            │
+│  └── Affected user counts                                  │
+├─────────────────────────────────────────────────────────────┤
+│  Data Sources:                                             │
+│  ├── Cloud Run                                             │
+│  ├── GKE                                                   │
+│  ├── Compute Engine                                        │
+│  ├── App Engine                                            │
+│  └── Custom (Error Reporting API)                         │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  └── First 1,000 error groups: Free                       │
+│  └── $0.20/error group after                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Error Group
+Collection of similar errors based on stack trace fingerprint.
+
+### Error Occurrence
+Individual error event with timestamp and details.
+
+### Exception
+Error with stack trace and location information.
+
+### Impact
+Count of affected users and error frequency.
+
+## Real Production Example
+
+**Error Reporting Integration**
+
+```hcl
+# Terraform - Error Reporting is automatic for many services
+# No specific Terraform resources needed
+
+# Enable API
+resource "google_project_service" "clouderrorreporting" {
+  service = "clouderrorreporting.googleapis.com"
+}
+
+# IAM for Error Reporting
+resource "google_project_iam_member" "error_viewer" {
+  project = var.project
+  role    = "roles/errorreporting.viewer"
+  member  = "user:developer@company.com"
+}
+
+resource "google_project_iam_member" "error_user" {
+  project = var.project
+  role    = "roles/errorreporting.user"
+  member  = "user:sre@company.com"
+}
+```
+
+### Application Integration
+
+#### Python (Flask)
+
+```python
+# pip install google-cloud-error-reporting
+# google-cloud-error-reporting-lib or use Google Cloud Logging handler
+
+import logging
+from google.cloud import logging as cloud_logging
+from google.cloud.logging_v2.handlers import CloudLoggingHandler
+from google.cloud.error_reporting import setup_logging
+
+# Configure error reporting
+setup_logging(level=logging.ERROR)
+
+# Or manually with Cloud Logging
+client = cloud_logging.Client()
+handler = CloudLoggingHandler(client)
+logging.root.addHandler(handler)
+logging.root.setLevel(logging.ERROR)
+
+# Log exceptions
+try:
+    risky_operation()
+except Exception as e:
+    logging.error(
+        f"Exception occurred: {str(e)}",
+        exc_info=True,  # Include stack trace
+        extra={
+            "context": {
+                "user_id": get_current_user_id(),
+                "request_id": get_request_id(),
+            }
+        }
+    )
+```
+
+#### Node.js (Express)
+
+```javascript
+// npm install @google-cloud/error-reporting
+
+const { ErrorReporting } = require('@google-cloud/error-reporting');
+
+// Initialize error reporting
+const errors = new ErrorReporting({
+    projectId: 'my-project',
+    serviceContext: {
+        service: 'my-service',
+        version: '1.0.0'
+    }
+});
+
+// Use as error handler middleware
+const express = require('express');
+const app = express();
+
+app.use(errors.express);
+
+app.get('/error', (req, res) => {
+    throw new Error('Intentional error for testing');
+});
+
+// Or manually report errors
+app.use((err, req, res, next) => {
+    errors.report(err, {
+        user: req.user?.id,
+        requestId: req.headers['x-request-id']
+    });
+    next(err);
+});
+```
+
+#### Java (Spring Boot)
+
+```java
+// Add dependency for Spring Boot integration
+// Or use Cloud Error Reporting Java SDK
+
+import com.google.cloud.errorreporting.v1beta1.ErrorGroupServiceClient;
+import com.google.cloud.errorreporting.v1beta1.ReportErrorsMethod.Request;
+import com.google.devtools.clouderrorreporting.v1beta1.ErrorContext;
+import com.google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent;
+
+// Spring Boot auto-configuration handles error reporting
+// For custom integration:
+
+@Service
+public class ErrorReporterService {
+    
+    public void reportError(Exception e, HttpRequest request) {
+        ErrorContext context = ErrorContext.newBuilder()
+            .setReportLocation(ErrorLocation.newBuilder()
+                .setFilePath(request.getRequestURI())
+                .setFunctionName(e.getStackTrace()[0].getMethodName())
+                .build())
+            .build();
+        
+        ReportedErrorEvent errorEvent = ReportedErrorEvent.newBuilder()
+            .setTimestamp(Timestamp.now())
+            .setMessage(e.toString())
+            .setContext(context)
+            .build();
+        
+        // Report to Error Reporting API
+    }
+}
+```
+
+#### Go
+
+```go
+package main
+
+import (
+    "contrib.go.opencensus.io/exporter/stackdriver"
+    "go.opencensus.io/trace"
+)
+
+// For error reporting with Cloud Logging and Error Reporting
+import (
+    "cloud.google.com/go/errorreporting"
+    "cloud.google.com/go/errorreporting/apiv1beta1"
+)
+
+// Initialize error reporting
+client, err := errorreporting.NewClient(ctx, "my-project",
+    errorreporting.Config{
+        ServiceName:    "my-service",
+        ServiceVersion: "1.0.0",
+    },
+)
+defer client.Close()
+
+// Report errors
+client.Report(errorreporting.Entry{
+    Error: err,
+    Context: map[string]string{
+        "user": "user-id",
+    },
+})
+```
+
+### Cloud Run Error Reporting
+
+```yaml
+# Cloud Run service with error reporting
+# Error reporting is automatic for Cloud Run
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: my-service
+spec:
+  template:
+    metadata:
+      annotations:
+        # Ensure Cloud Trace is enabled for error correlation
+        run.googleapis.com/launch-stage: GA
+    spec:
+      containers:
+        - image: gcr.io/my-project/my-service
+          env:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "my-project"
+```
+
+## CLI Examples
+
+```bash
+# View error groups
+gcloud alpha error-reporting groups list --project=my-project
+
+# View specific error group
+gcloud alpha error-reporting groups describe GROUP_ID --project=my-project
+
+# List errors
+gcloud alpha error-reporting events list --project=my-project
+
+# Delete error events (for testing)
+gcloud alpha error-reporting events delete EVENT_ID --project=my-project
+
+# Note: Most Error Reporting is automatic
+# Use Cloud Console for detailed view
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Enable API
+resource "google_project_service" "errorreporting" {
+  service = "clouderrorreporting.googleapis.com"
+}
+
+# IAM permissions
+resource "google_project_iam_member" "viewer" {
+  project = "my-project"
+  role    = "roles/errorreporting.viewer"
+  member  = "user:developer@company.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Most error reporting is automatic
+# CLI for manual intervention
+
+# List error groups
+gcloud alpha error-reporting groups list
+
+# View error events
+gcloud alpha error-reporting events list
+
+# Delete resolved errors
+gcloud alpha error-reporting events delete EVENT_ID
+```
+
+## Monitoring
+
+### Error Metrics
+- Error count by group
+- Error rate per service
+- New error groups
+- Resurfaced errors
+
+### Cloud Monitoring Integration
+```bash
+# Create error rate alert
+gcloud monitoring policies create \
+  --display-name="Error Rate Alert" \
+  --condition-display-name="Errors > 10/min" \
+  --condition-filter='resource.type="error_report" AND metric.type="clouderrorreporting.googleapis.com/error_count"' \
+  --condition-threshold-value=10 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### IAM Permissions
+```bash
+# Error reporting viewer
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:developer@company.com \
+  --role=roles/errorreporting.viewer
+
+# Error reporting user (can resolve errors)
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:sre@company.com \
+  --role=roles/errorreporting.user
+```
+
+### Data Handling
+- Stack traces may contain sensitive paths
+- User IDs can be included
+- Request data can be logged
+
+## Cost
+
+| Resource | Price |
+|----------|-------|
+| First 1,000 error groups/month | Free |
+| Additional error groups | $0.20/group |
+
+## Troubleshooting
+
+### Errors Not Appearing
+```bash
+# Check API enabled
+gcloud services list --enabled | grep clouderrorreporting
+
+# Verify logging is configured
+# Error Reporting reads from Cloud Logging
+
+# Check log format
+# Look for log entries with:
+# - "severity": "ERROR" or "CRITICAL"
+# - "logging.googleapis.com/logName" containing "errors"
+
+# Check service account has error reporting permissions
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/errorreporting.user
+```
+
+### Duplicate Error Groups
+```bash
+# Similar errors may be grouped differently
+# Check stack trace fingerprint
+# Verify error message format is consistent
+```
+
+### Stack Traces Not Showing
+```bash
+# Ensure exc_info=True (Python) or similar
+# Include stack trace in log entry
+# Check error message format
+```
+
+## Interview Questions
+
+**Q: How does Error Reporting group errors?**
+A: Error Reporting uses stack trace fingerprints to group similar errors. Functions and line numbers in the top of the stack trace determine the group. Similar errors from different users are grouped together.
+
+**Q: What is the difference between Error Reporting and Cloud Logging?**
+A: Cloud Logging stores all log entries. Error Reporting automatically extracts and analyzes errors, providing grouping, trends, and stack traces. Error Reporting reads from Cloud Logging logs with ERROR or CRITICAL severity.
+
+**Q: How do you integrate Error Reporting with custom applications?**
+A: Use language-specific Error Reporting libraries (Python, Node.js, Java, Go). Install SDK, configure service context, and call report() on exceptions. For custom logs, ensure ERROR-level logs are written to Cloud Logging.
+
+**Q: What triggers a new error group?**
+A: A new error group is created when an error's stack trace fingerprint doesn't match existing groups. The fingerprint is based on the error's type, message, and top of stack trace.
+
+**Q: How does Error Reporting handle sensitive data?**
+A: Stack traces may contain file paths and function names. User data should be minimized. Consider sanitizing error messages before logging to prevent exposing sensitive data.
+
+## Cheat Sheet
+
+```bash
+# Error Reporting is primarily automatic
+# Enable via language-specific SDKs
+
+# Python
+# pip install google-cloud-error-reporting
+# from google.cloud.error_reporting import setup_logging
+# setup_logging()
+
+# Node.js
+# npm install @google-cloud/error-reporting
+# const errors = new ErrorReporting({...});
+# errors.report(error);
+
+# View in Console
+# https://console.cloud.google.com/errors
+```
+
+## Labs
+
+### Lab 1: Error Tracking Setup
+Configure error tracking.
+1. Install Error Reporting SDK
+2. Configure service context
+3. Trigger test error
+4. Verify error appears in Console
+5. Set up notifications
+
+### Lab 2: Error Analysis
+Analyze and resolve errors.
+1. Review error groups
+2. Analyze stack traces
+3. Identify root cause
+4. Implement fix
+5. Mark error as resolved
+
+### Lab 3: Alerting Integration
+Set up error alerts.
+1. Create Cloud Monitoring alert
+2. Configure notification channel
+3. Set up error rate threshold
+4. Test alert firing
+5. Document runbook
+
+## Related Services
+
+- **Cloud Logging**: Log aggregation
+- **Cloud Monitoring**: Metrics and alerting
+- **Cloud Trace**: Request tracing
+- **Incident Response**: On-call management

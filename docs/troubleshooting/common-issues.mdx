@@ -1,0 +1,817 @@
+---
+sidebar_position: 9
+---
+
+# Common Issues Guide
+
+## Overview
+
+This guide covers the most frequently occurring production issues across DevOps infrastructure. These are the problems that appear repeatedly across different systems and technologies—memory leaks, disk exhaustion, network partitions, database connection exhaustion, and more.
+
+Understanding these common patterns prepares you to diagnose and resolve issues quickly when they occur.
+
+## When To Use
+
+- **Memory Leaks**: Application memory growing unbounded
+- **Disk Full**: Storage exhaustion, inode exhaustion
+- **OOM Kills**: Linux out-of-memory killer activating
+- **Network Partitions**: Split-brain, failover failures
+- **Database Issues**: Connection exhaustion, query timeouts
+- **Service Degradation**: Slow responses, timeouts
+
+## When NOT To Use
+
+- **Specific Technology Issues**: Use the relevant troubleshooting guide
+- **New, Unknown Issues**: These require systematic debugging
+- **Security Incidents**: Use security incident response
+- **Performance Optimization**: Different from troubleshooting
+
+## Core Concepts / Methodology
+
+### The "It Works, Until It Doesn't" Pattern
+
+Many common issues share a common characteristic: they work fine at small scale but fail at production scale:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              SCALING FAILURE PATTERN                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Load: ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  25%            │
+│  Status: Everything works fine                             │
+│                                                             │
+│  ─────────────────────────────────────────────────────────  │
+│                                                             │
+│  Load: ████████████████░░░░░░░░░░░░░░░░░░  60%             │
+│  Status: Occasional slow responses, still works            │
+│                                                             │
+│  ─────────────────────────────────────────────────────────  │
+│                                                             │
+│  Load: ██████████████████████████████░░  90%               │
+│  Status: TIME_WAIT connections, memory pressure            │
+│                                                             │
+│  ─────────────────────────────────────────────────────────  │
+│                                                             │
+│  Load: ███████████████████████████████████ 100%+            │
+│  Status: FAILURE - Out of memory, connections, disk        │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Resource Exhaustion Taxonomy
+
+| Resource | What Happens When Exhausted | Key Metrics to Watch |
+|----------|----------------------------|---------------------|
+| **Memory** | OOM killer, swapping, crashes | used/free, available |
+| **Disk Space** | Can't write, application failures | df -h |
+| **Inodes** | "No space left on device" even with free space | df -i |
+| **Connections** | "Too many connections" errors | ss -s |
+| **File Descriptors** | "Too many open files" | lsof \| wc -l |
+| **CPU** | Throttling, latency spikes | load, %cpu |
+| **Bandwidth** | Latency, timeouts | iftop, iptables counters |
+
+## Diagnostic Commands / Tools
+
+### Memory Analysis
+
+```bash
+# Overall memory status
+free -h
+
+# Output:
+#               total        used        free      shared  buff/cache   available
+# Mem:          31Gi        28Gi       1.2Gi       45Mi       1.8Gi        2.5Gi
+# Swap:         2.0Gi       1.5Gi       512Mi
+
+# Memory usage by process
+ps aux --sort=-%mem | head -15
+
+# Detailed process memory
+cat /proc/$(pgrep -f myapp)/status | grep -E "VmRSS|VmSize|VmPeak"
+
+# Check for OOM events
+dmesg -T | grep -i "out of memory\|killed process"
+
+# Sample OOM log:
+# [Mon Jun 16 10:32:15 2026] Out of memory: Killed process 1234 (java) total-vm:8292344kB, anon-rss:4096128kB, file-rss:0kB, shmem-rss:0kB
+
+# Check for swap usage (bad if high)
+vmstat 1 5
+# si/so columns show swap in/out
+```
+
+### Disk Analysis
+
+```bash
+# Disk space
+df -h
+
+# Inode usage (for "no space left" errors)
+df -i
+
+# Find largest files
+du -sh /* 2>/dev/null | sort -h | tail -10
+
+# Find files by age
+find /var -type f -mtime +30 -ls
+
+# Large log files
+find /var/log -type f -size +100M -ls
+
+# Disk I/O stats
+iostat -x 1 5
+
+# Check for disk I/O wait in CPU stats
+vmstat 1 5
+# %wa column = I/O wait time
+```
+
+### Connection Analysis
+
+```bash
+# Connection summary
+ss -s
+
+# Output:
+# Total: 1256 (kernel 1272)
+# TCP:   42 (estab 12, closed 2, orphaned 0, synrecv 0, timewait 0)
+
+# Connection states
+ss -tan | awk '{print $1}' | sort | uniq -c | sort -rn
+
+# Connections by port
+ss -tan | awk '{print $4}' | cut -d: -f2 | sort | uniq -c | sort -rn | head -10
+
+# Check TIME_WAIT accumulation
+ss -tan | awk '/TIME-WAIT/ {count++} END {print count}'
+
+# Check for socket buffer issues
+ss -tm
+```
+
+### File Descriptor Analysis
+
+```bash
+# Current usage
+lsof 2>/dev/null | wc -l
+
+# Per-process limits
+cat /proc/$(pgrep -f nginx)/limits | grep "Max open files"
+
+# System-wide limits
+cat /proc/sys/fs/file-nr
+# Output: 4096 0 65536
+# (allocated, unused, max)
+
+# Top file descriptor users
+lsof 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -10
+```
+
+## Real Production Scenarios
+
+### Scenario 1: Java Heap Memory Leak in Production
+
+**Symptom:**
+- Application memory usage grows steadily over days
+- Application becomes slower, then crashes
+- GC logs show frequent full GCs
+
+**Diagnostic Commands:**
+```bash
+# Check memory growth pattern
+watch -n 5 'ps aux | grep java | grep -v grep'
+
+# Enable GC logging
+# Add to JVM args:
+# -Xloggc:/var/log/gc.log -XX:+PrintGCDetails -XX:+PrintGCDateStamps
+
+# Sample GC log analysis:
+head -100 /var/log/gc.log
+# 2026-06-16T10:00:00.123+0000: 1234.567: [GC (Allocation Failure) 
+#  -> (DefNew), 0.1234567 secs]
+# 2026-06-16T10:00:30.234+0000: 1235.678: [Full GC (Allocation Failure) 
+#  -> (Heap Dump OutOfMemoryError), 2.3456789 secs]
+
+# Take heap dump for analysis
+jmap -dump:file=/tmp/heap.hprof,format=b <pid>
+
+# Analyze heap dump
+jhat /tmp/heap.hprof
+# Then open http://localhost:7000 in browser
+
+# Or use VisualVM
+jvisualvm
+
+# Common leak patterns in heap:
+# - ConcurrentHashMap entries never removed
+# - Listener lists growing
+# - Cache with no eviction
+# - ThreadLocal not cleared
+```
+
+**Root Cause:**
+A monitoring service was adding metrics to a `ConcurrentHashMap` but never removing old entries. As new metrics came in, the map grew indefinitely, causing heap exhaustion.
+
+**Fix:**
+```java
+// Before (leaking code):
+private ConcurrentHashMap<String, Metric> metrics = new ConcurrentHashMap<>();
+
+public void recordMetric(String key, Metric value) {
+    metrics.put(key, value);  // Never removed!
+}
+
+// After (fixed code):
+private ConcurrentHashMap<String, Metric> metrics = new ConcurrentHashMap<>();
+private static final int MAX_ENTRIES = 10000;
+
+public void recordMetric(String key, Metric value) {
+    if (metrics.size() >= MAX_ENTRIES) {
+        // Remove oldest or use LinkedHashMap with access order
+        String oldest = metrics.keys().nextElement();
+        metrics.remove(oldest);
+    }
+    metrics.put(key, value);
+}
+
+// Even better: use built-in cache with eviction
+private LoadingCache<String, Metric> metrics = Caffeine.newBuilder()
+    .maximumSize(10_000)
+    .expireAfterWrite(Duration.ofMinutes(30))
+    .build(key -> loadMetric(key));
+```
+
+**Prevention:**
+- Set appropriate heap size: `-Xmx` should be < container limit
+- Enable `-XX:+UseContainerSupport` for container-aware sizing
+- Monitor heap usage with alerting at 70% and 85%
+- Use weak references for caches where appropriate
+- Implement proper shutdown hooks to clear resources
+
+---
+
+### Scenario 2: Redis OOM Kill
+
+**Symptom:**
+- Redis instance restarting unexpectedly
+- Application errors: "MISCONF Redis is configured to save RDB snapshots"
+- Data loss between restarts
+
+**Diagnostic Commands:**
+```bash
+# Check Redis memory usage
+redis-cli info memory
+
+# Output:
+# used_memory: 2147483648
+# used_memory_human: 2.00G
+# maxmemory: 2147483648
+# maxmemory_policy: allkeys-lru
+
+# Current memory equals maxmemory! No room for new data.
+
+# Check key count
+redis-cli dbsize
+# 15000000  (15 million keys!)
+
+# Check memory by key size
+redis-cli --bigkeys
+
+# Sample output:
+# Scanning 15 million keys...
+# Total key length: 1234567890 bytes
+# Biggest   Sorted Set   12345 'cache:large:set:12345' (500000 bytes)
+
+# Check what keys are consuming memory
+redis-cli --scan --pattern '*' | head -1000 | \
+  redis-cli --pipe -c 2>/dev/null | \
+  redis-cli --bigkeys 2>/dev/null || true
+```
+
+**Root Cause:**
+Redis was configured with `maxmemory 2GB` but was storing 2GB of session data with `allkeys-lru` eviction policy. However, an overnight batch job was inserting millions of temporary keys that weren't being evicted before the main application needed memory.
+
+**Fix:**
+```bash
+# Temporarily increase memory
+redis-cli config set maxmemory 4gb
+redis-cli config set maxmemory-policy noeviction
+
+# Or restart with new config
+# redis.conf:
+maxmemory 4gb
+maxmemory-policy allkeys-lru
+maxmemory-samples 5
+
+# Apply without restart
+redis-cli CONFIG REWRITE
+```
+
+```python
+# Fix application side:
+# Use key expiration properly
+redis.setex("session:user123", 3600, json_data)  # 1 hour TTL
+
+# Scan and clean up large keys
+import redis
+r = redis.Redis(host='localhost', port=6379)
+for key in r.scan_iter(match='temp:*', count=1000):
+    r.delete(key)
+```
+
+**Prevention:**
+- Monitor Redis memory usage with alerting at 70% and 85%
+- Set `maxmemory-policy` appropriately (volatile-lru for caching)
+- Use `EXPIRE` on all cache keys
+- Set up key size monitoring for large keys
+- Implement TTL-based cleanup in application
+
+---
+
+### Scenario 3: Elasticsearch Split-Brain After Network Partition
+
+**Symptom:**
+- Two masters elected in cluster
+- Index replicas out of sync
+- Search results inconsistent between nodes
+
+**Diagnostic Commands:**
+```bash
+# Check cluster health
+curl -s http://localhost:9200/_cluster/health?pretty
+
+# Sample split-brain output:
+# {
+#   "cluster_name": "production",
+#   "status": "red",
+#   "number_of_nodes": 3,
+#   "number_of_data_nodes": 3,
+#   "active_primary_shards": 50,
+#   "relocating_shards": 0,
+#   "active_shards": 85,
+#   "unassigned_shards": 5
+# }
+
+# Check nodes
+curl -s http://localhost:9200/_cat/nodes?v
+
+# Check master nodes (should be 1, not 2!)
+curl -s http://localhost:9200/_cat/nodes?h=name,master
+
+# Sample output showing problem:
+# name       master
+# node-1     *
+# node-2     -
+# node-3     *  ← PROBLEM: Two masters!
+
+# Check discovery
+curl -s http://localhost:9200/_nodes/_local/clear_cache?pretty
+
+# Check recent cluster state changes
+curl -s http://localhost:9200/_cat/pending_tasks
+```
+
+**Root Cause:**
+A network partition separated the cluster into two groups of 1 and 2 nodes. The minimum master nodes was set to 2, but with a 1-node group, that node couldn't form a quorum so it couldn't elect a master. The 2-node group elected a new master and kept accepting writes. When the partition healed, both nodes believed they were master.
+
+**Fix:**
+```bash
+# Immediate: Reduce to single master
+# On the node that should NOT be master:
+curl -X PUT "http://localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d'
+{
+  "transient": {
+    "discovery.zen.minimum_master_nodes": 2,
+    "cluster.routing.allocation.enable": "none"
+  }
+}
+'
+
+# Check for unassigned shards
+curl -s http://localhost:9200/_cat/shards?h=index,shard,prirep,state,unassigned.reason
+
+# Reroute unassigned shards
+curl -X POST "http://localhost:9200/_cluster/reroute?retry_failed=true"
+
+# If data is inconsistent, may need to:
+# 1. Restore from snapshot
+# 2. Or accept data loss on one node
+curl -X POST "http://localhost:9200/_cache/clear"
+```
+
+**Prevention:**
+```yaml
+# elasticsearch.yml - Proper configuration:
+cluster.name: production
+node.master: true
+node.data: true
+
+# Set minimum_master_nodes to (total_nodes/2) + 1
+# For 3 nodes: minimum_master_nodes = 2
+discovery.zen.minimum_master_nodes: 2
+
+# Use dedicated master nodes (3 masters, separate from data)
+node.master: true  # on dedicated masters
+node.data: false   # on dedicated masters
+
+# Enable voting-only nodes for larger clusters
+node.voting_only: true  # for quorum calculations
+
+# Use the new cluster coordination API (7.x+):
+discovery.seed_providers: file
+cluster.initial_master_nodes: ["node-1", "node-2", "node-3"]
+```
+
+---
+
+### Scenario 4: PostgreSQL Connection Pool Exhaustion
+
+**Symptom:**
+- Application errors: "FATAL: remaining connection slots are reserved"
+- Database appears healthy but new connections fail
+- Restart fixes temporarily, then problem returns
+
+**Diagnostic Commands:**
+```bash
+# Connect to database
+psql -h localhost -U postgres
+
+# Check current connections
+postgres=# SELECT count(*) FROM pg_stat_activity;
+#  count
+# -------
+#   100
+
+# Check max connections
+postgres=# SHOW max_connections;
+#  max_connections
+# -----------------
+#  100
+
+# We're at 100/100!
+
+# Find what's using connections
+postgres=# SELECT pid, usename, application_name, state, query_start, query
+FROM pg_stat_activity
+ORDER BY query_start;
+
+# Output:
+#   pid  | usename  |    application_name     |  state  |         query_start         | query
+# -------+----------+------------------------+---------+----------------------------+-------
+#   1234 | app_user | myapp                  | idle    | 2026-06-15 10:00:00.123+00 | &lt;IDLE&gt;
+#   1235 | app_user | myapp                  | idle    | 2026-06-15 10:00:00.456+00 | &lt;IDLE&gt;
+# ... (many more idle connections)
+
+# Idle connections = connection leak!
+postgres=# SELECT count(*) FROM pg_stat_activity WHERE state = 'idle';
+#  count
+# -------
+#    85
+```
+
+**Root Cause:**
+The application was creating database connections but not properly closing them. The application server had been running for weeks, accumulating 85 leaked connections. When it hit the 100 connection limit, all new connection attempts failed.
+
+**Fix:**
+```sql
+-- Option 1: Kill idle connections (temporary fix)
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle'
+AND query_start < now() - interval '10 minutes';
+
+-- Option 2: Kill all connections from application
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE application_name = 'myapp';
+
+-- Option 3: Reload application (recommended)
+-- This properly closes and reopens connections
+```
+
+```java
+// Fix application code - use try-with-resources:
+try (Connection conn = dataSource.getConnection()) {
+    // Use connection
+    // Automatically closed at end of try block
+}
+
+// Or use connection pool properly:
+HikariConfig config = new HikariConfig();
+config.setMaximumPoolSize(20);      // Not too high
+config.setMinimumIdle(5);           // Keep some idle
+config.setConnectionTimeout(30000); // 30 second timeout
+config.setIdleTimeout(600000);      // 10 min idle timeout
+config.setMaxLifetime(1800000);     // 30 min max lifetime
+```
+
+**Prevention:**
+- Always use connection pooling (HikariCP, pgBouncer)
+- Set appropriate pool sizes (max 20-50 per application)
+- Set `connection_timeout`, `idle_timeout`, `max_lifetime`
+- Monitor connection count with alerting
+- Implement health checks that verify connection pool health
+- Add connection leak detection in application
+
+---
+
+### Scenario 5: Nginx 502 Bad Gateway After Upstream Timeout
+
+**Symptom:**
+- Users seeing 502 Bad Gateway errors
+- Only affects specific endpoints, others work
+- Errors occur intermittently, last 30-60 seconds
+
+**Diagnostic Commands:**
+```bash
+# Check Nginx error log
+tail -100 /var/log/nginx/error.log
+
+# Sample 502 error:
+# 2026/06/16 10:00:00 [error] 1234#1234: *5678 connect() failed (110: Connection timed out) while connecting to upstream, client: 10.0.1.5, server: api.example.com, request: "GET /api/slow-endpoint HTTP/1.1", upstream: "http://10.0.1.10:8080/api/slow-endpoint"
+
+# Check upstream status
+curl -v http://localhost:8080/health 2>&1 | head -20
+
+# Check if upstream is responding
+timeout 5 curl http://localhost:8080/api/endpoint
+# If this times out, upstream is slow
+
+# Check Nginx upstream configuration
+upstream backend {
+    server 10.0.1.10:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.1.11:8080 backup;
+}
+
+# Check what upstream Nginx thinks is healthy
+nginx -T | grep -A 20 "upstream backend"
+
+# Check kernel connection tracking
+sudo conntrack -L | grep 10.0.1.10 | wc -l
+```
+
+**Root Cause:**
+The upstream API had a slow database query that was taking 65 seconds to complete. Nginx had a `proxy_read_timeout` of 60 seconds, so it terminated the connection before the upstream could respond, returning 502 to the client.
+
+**Fix:**
+```nginx
+# Increase timeout in nginx.conf
+location /api/ {
+    proxy_pass http://backend;
+    proxy_connect_timeout 60s;
+    proxy_read_timeout 120s;      # Increased from 60s
+    proxy_send_timeout 60s;
+    
+    # Add buffering
+    proxy_buffering on;
+    proxy_buffer_size 4k;
+    proxy_buffers 8 4k;
+}
+
+# Or fix the upstream (better solution):
+# Optimize the slow query
+# Add response caching
+# Implement async processing for long operations
+```
+
+```nginx
+# For long-running requests, use different pattern:
+location /api/long-job {
+    proxy_pass http://backend;
+    proxy_read_timeout 300s;
+    
+    # Return 202 Accepted immediately
+    proxy_intercept_errors on;
+    error_page 202 = @poll_status;
+}
+
+location @poll_status {
+    # Return status endpoint
+    proxy_pass http://backend/status/$request_id;
+}
+```
+
+**Prevention:**
+- Set appropriate timeouts (but not too high)
+- Implement request timeouts at every layer
+- Monitor upstream response times
+- Use circuit breakers to fail fast
+- Implement async patterns for long operations
+- Add alerting on 5xx rates by endpoint
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Memory Leak Investigation
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: CONFIRM MEMORY LEAK                                 │
+├─────────────────────────────────────────────────────────────┤
+│ $ free -h  # Check if memory is actually growing            │
+│ $ top     # Check process RSS over time                     │
+│ $ watch 'ps aux | grep process'  # Watch memory growth      │
+│                                                              │
+│ If memory grows monotonically without bound → Likely leak  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: IDENTIFY THE PROCESS                                │
+├─────────────────────────────────────────────────────────────┤
+│ $ ps aux --sort=-%mem | head -20                           │
+│                                                              │
+│ Find which process is consuming memory                      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CAPTURE MEMORY STATE                                │
+├─────────────────────────────────────────────────────────────┤
+│ For Java: jmap -dump:file=heap.hprof <pid>                 │
+│ For Node: node --inspect + Chrome DevTools                 │
+│ For C/C++: valgrind --leak-check=full                      │
+│ For Go: pprof endpoint, go tool pprof                      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: ANALYZE AND FIX                                     │
+├─────────────────────────────────────────────────────────────┤
+│ - Find largest objects or data structures                  │
+│ - Look for unbounded growth (maps, lists)                  │
+│ - Check for missing cleanup/shutdown                       │
+│ - Implement size limits or TTL                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: Disk Full Emergency Response
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: IMMEDIATE TRIAGE                                    │
+├─────────────────────────────────────────────────────────────┤
+│ $ df -h              # Which partition is full?            │
+│ $ df -i              # Inode exhaustion?                   │
+│ $ du -sh /*          # What's consuming space?             │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: FREE UP SPACE (QUICK WINS)                         │
+├─────────────────────────────────────────────────────────────┤
+│ $ journalctl --vacuum-size=100M                             │
+│ $ docker system prune -af                                   │
+│ $ npm cache clean --force                                   │
+│ $ rm -rf /tmp/*                                             │
+│ $ find /var/log -type f -mtime +7 -delete                  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: IDENTIFY LARGE FILES                                │
+├─────────────────────────────────────────────────────────────┤
+│ $ find / -type f -size +1G -ls 2>/dev/null                │
+│ $ find / -type f -mtime -1 -ls 2>/dev/null | head -20     │
+│                                                              │
+│ Check for: core dumps, log files, temp files               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: PREVENT RECURRENCE                                  │
+├─────────────────────────────────────────────────────────────┤
+│ - Set up log rotation (logrotate)                          │
+│ - Configure Docker cleanup                                  │
+│ - Set disk space alerts at 80% and 90%                     │
+│ - Implement storage quotas                                  │
+│ - Use LVM for flexible resizing                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Out of memory` | Memory limit reached | Increase limit, fix leak, add swap |
+| `No space left on device` | Disk full | Free space, clean logs, add disk |
+| `Too many open files` | FD limit reached | Increase ulimit, fix file handle leak |
+| `Connection refused` | Service not listening | Check service status, port binding |
+| `Connection reset by peer` | Upstream closed connection | Check upstream health, timeouts |
+| `502 Bad Gateway` | Upstream timeout/failure | Increase timeout, fix upstream |
+| `504 Gateway Timeout` | Request too slow | Optimize query, increase timeout |
+| `503 Service Unavailable` | All backends failing | Check backend health, scale up |
+| `504 timeout` | Long-running request | Increase timeout, implement async |
+
+## Monitoring / Log Analysis
+
+### Key Metrics for Common Issues
+
+| Issue | Metric | Warning | Critical |
+|-------|--------|---------|----------|
+| Memory Leak | Memory growth rate | >10%/hour | >20%/hour |
+| Disk Full | Disk usage % | >80% | >90% |
+| Connection Exhaustion | Connection count | >70% of max | >90% of max |
+| OOM Risk | Memory available | &lt;20% | &lt;10% |
+| Slow Queries | Query duration | >1s | >10s |
+| Split-Brain | Master count | >1 | >1 |
+
+### Alerting Rules
+
+```yaml
+# Prometheus alerting rules example
+groups:
+- name: common_issues
+  rules:
+  - alert: HighMemoryUsage
+    expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage detected"
+
+  - alert: DiskSpaceLow
+    expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.1
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Disk space less than 10%"
+
+  - alert: TooManyConnections
+    expr: rate(postgresql_stat_activity_count[5m]) > (postgresql_settings_max_connections * 0.8)
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Connection pool near capacity"
+```
+
+## Interview Questions
+
+### Question 1: Memory Leak Detection
+
+**Q:** How do you detect and diagnose a memory leak in a production system?
+
+**A:**
+1. **Detection**: Monitor memory usage over time; monotonic growth is the key indicator
+2. **Baseline**: Establish what's "normal" - memory usage varies but shouldn't grow unbounded
+3. **Correlation**: Check if leak is related to traffic, time, or specific operations
+4. **Heap dumps**: Capture memory snapshots at different times, compare
+5. **Profiling**: Use memory profilers to find what's consuming memory
+6. **Common patterns**: Unbounded caches, listeners not removed, circular references
+
+### Question 2: Database Connection Issues
+
+**Q:** Your application is getting "too many connections" errors to PostgreSQL. Walk me through diagnosing and fixing this.
+
+**A:**
+1. **Confirm**: Check `pg_stat_activity` - is it really at max?
+2. **Identify**: Which applications/users are holding connections?
+3. **Categorize**: Are connections active or idle (leaked)?
+4. **Root cause**: 
+   - Too many app instances? → Reduce count
+   - Connection pool too large? → Reduce pool size
+   - Connections not closed? → Fix code (try-with-resources)
+   - Long-running queries holding connections? → Optimize queries
+5. **Fix**: Terminate leaked connections, fix code, adjust pool settings
+6. **Prevent**: Set connection timeouts, use pooling, monitor connection count
+
+### Question 3: Split-Brain
+
+**Q:** You're operating a distributed system and suspect split-brain. How do you confirm and recover?
+
+**A:**
+1. **Confirm split-brain**: Check for multiple masters/leaders
+2. **Assess data divergence**: Compare data between nodes
+3. **Immediate action**: Stop writes to prevent further divergence
+4. **Recovery options**:
+   - If one node is "correct", promote it, rebuild others
+   - If data diverged, determine which data to keep
+   - May need to accept data loss on some nodes
+5. **Prevent future**: 
+   - Set proper quorum sizes
+   - Use fencing to prevent zombie masters
+   - Implement proper network partitioning detection
+   - Test network partition scenarios
+
+## Cheat Sheet
+
+| Issue | Quick Check | Quick Fix |
+|-------|-------------|----------|
+| Memory leak | `ps aux --sort=-%mem` | Restart process, fix leak |
+| Disk full | `df -h` | `journalctl --vacuum-size=100M` |
+| OOM | `dmesg \| grep -i oom` | Increase memory or reduce usage |
+| Connection exhausted | `ss -s` | Kill idle, increase limit |
+| Slow query | `EXPLAIN ANALYZE` | Optimize query, add index |
+| 502 error | Check upstream logs | Increase timeout, fix upstream |
+| Split-brain | Check master count | Reduce to single master |
+| FD exhaustion | `lsof \| wc -l` | `ulimit -n`, fix leak |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [Linux Troubleshooting](./linux-troubleshooting) - System-level debugging
+- [Network Troubleshooting](./network-troubleshooting) - Network debugging
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - Container orchestration
+- [GCP Troubleshooting](./gcp-troubleshooting) - Cloud debugging

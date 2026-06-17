@@ -1,0 +1,814 @@
+---
+id: artifact-management
+title: Artifact Management
+description: Artifact Registry, semantic versioning, image signing, and SBOM generation
+sidebar_position: 6
+---
+
+# Artifact Management
+
+## Overview
+
+Artifact management is the practice of storing, versioning, and distributing software build outputs (container images, binaries, packages) through a centralized registry. Proper artifact management enables reproducible builds, rollback capabilities, compliance auditing, and secure distribution.
+
+## When To Use
+
+- Containerized applications
+- Multi-service architectures
+- Production deployments requiring audit trails
+- Compliance-regulated environments (SOC2, HIPAA, PCI)
+- Teams needing artifact immutability and provenance
+
+## When NOT To Use
+
+- Simple scripts without distribution needs
+- Throwaway experiments
+- Single developer projects without deployment automation
+
+## Core Concepts
+
+### Artifact Repository Types
+
+| Type | Examples | Use Case |
+|------|----------|----------|
+| **Container Registry** | GCR, ECR, GHCR, Artifactory | Docker/OCI images |
+| **Package Registry** | npm, PyPI, Maven Central | Language packages |
+| **Binary Repository** | Artifactory, Nexus | compiled binaries |
+| **Universal** | GitHub Packages | Multiple formats |
+
+### Versioning Strategies
+
+```
+Semantic Versioning (SemVer): MAJOR.MINOR.PATCH
+  MAJOR: Breaking changes
+  MINOR: New functionality (backward compatible)
+  PATCH: Bug fixes (backward compatible)
+
+Examples:
+  v1.0.0 - Initial release
+  v1.0.1 - Bug fix
+  v1.1.0 - New feature
+  v2.0.0 - Breaking changes
+```
+
+### Artifact Metadata
+
+| Field | Description |
+|-------|-------------|
+| **Digest** | SHA256 of artifact content (immutable identifier) |
+| **Tags** | Mutable aliases (e.g., `latest`, `v1.2.3`) |
+| **SBOM** | Software Bill of Materials (dependencies list) |
+| **Provenance** | Cryptographic proof of build origin |
+| **Labels** | Custom metadata for filtering |
+
+## Real Production Example
+
+### Multi-Registry Push Pipeline
+
+```yaml
+name: Build & Publish Artifacts
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY_GCP: gcr.io/myproject
+  REGISTRY_ECR: 123456789.dkr.ecr.us-east-1.amazonaws.com
+  REGISTRY_GITHUB: ghcr.io/myorg/myrepo
+  IMAGE_NAME: api-service
+
+jobs:
+  # ============================================
+  # BUILD ARTIFACTS
+  # ============================================
+  build:
+    name: Build & Tag
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      # Generate version tag
+      - name: Generate version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "tag" ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=sha-${{ github.sha }}
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GCP }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY_GITHUB }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.VERSION }}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Login to all registries
+      - name: Login to GCP
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GCP }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+      
+      - name: Login to GitHub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GITHUB }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Authenticate to ECR
+      - name: Login to ECR
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      
+      - name: Push to ECR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_ECR }}
+      
+      # Build with all registries
+      - name: Build and push (GCP)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+      
+      # Push to ECR (separate step for different tag format)
+      - name: Tag for ECR
+        run: |
+          # Extract GCP image tag and retag for ECR
+          docker tag ${{ env.REGISTRY_GCP }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
+            ${{ env.REGISTRY_ECR }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+      
+      - name: Push to ECR
+        run: |
+          docker push ${{ env.REGISTRY_ECR }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+      
+      # Sign images
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      
+      - name: Sign image (GCP)
+        run: |
+          cosign sign --yes ${{ env.REGISTRY_GCP }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+        env:
+          COSIGN_EXPERIMENTAL: 1
+          COSIGN_FULCIO_URL: https://v1.fulcio.sigstep.dev
+      
+      - name: Sign image (GitHub)
+        run: |
+          cosign sign --yes ${{ env.REGISTRY_GITHUB }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+        env:
+          COSIGN_EXPERIMENTAL: 1
+
+  # ============================================
+  # GENERATE SBOM
+  # ============================================
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+      
+      - name: Generate SBOM
+        run: |
+          syft ${{ needs.build.outputs.image-tag }} \
+            -o spdx-json=sbom.spdx.json \
+            -o cyclonedx-json=sbom.cdx.json
+      
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.spdx.json
+            sbom.cdx.json
+          retention-days: 365
+      
+      - name: Push SBOM to GCP
+        run: |
+          gsutil cp sbom.spdx.json \
+            gs://${{ vars.SBOM_BUCKET }}/${{ env.IMAGE_NAME }}/${{ github.sha }}/sbom.spdx.json
+
+  # ============================================
+  # VERIFY ARTIFACT
+  # ============================================
+  verify:
+    name: Verify Artifact
+    runs-on: ubuntu-latest
+    needs: [build, sbom]
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/myorg/myrepo" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.REGISTRY_GCP }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+        env:
+          COSIGN_FULCIO_URL: https://v1.fulcio.sigstep.dev
+      
+      - name: Verify SBOM
+        run: |
+          # Download and verify SBOM
+          gsutil cp \
+            gs://${{ vars.SBOM_BUCKET }}/${{ env.IMAGE_NAME }}/${{ github.sha }}/sbom.spdx.json .
+          
+          # Verify SBOM matches image
+          syft ${{ needs.build.outputs.image-tag }} -o spdx-json=verify.spdx.json
+          
+          # Compare (simple check - production should use attestation)
+          diff sbom.spdx.json verify.spdx.json || echo "SBOMs match"
+```
+
+### Artifact Registry Configuration (GCP)
+
+```yaml
+# Enable required APIs
+resource "null_resource" "enable_apis" {
+  provisioner "local-exec" {
+    command = <<-EOF
+      gcloud services enable \
+        artifactregistry.googleapis.com \
+        container.googleapis.com \
+        iamcredentials.googleapis.com
+    EOF
+  }
+}
+
+# Create Artifact Registry repository
+resource "google_artifact_registry_repository" "docker" {
+  location      = var.region
+  repository_id = "my-repo"
+  description   = "Docker repository for production artifacts"
+  format        = "DOCKER"
+  
+  docker_config {
+    verbose = true
+  }
+  
+  cleanup_policy_dry_run = false
+  
+  cleanup_policy {
+    id     = "cleanup_old_versions"
+    action = "DELETE"
+    
+    condition {
+      tag_state             = "TAGGED"
+      tag_version_age_days  = 30
+    }
+  }
+  
+  cleanup_policy {
+    id     = "keep_minimum_versions"
+    action = "KEEP_LATEST_N"
+    condition {
+      tag_state              = "TAGGED"
+      keep_latest_n          = 5
+      older_than_days        = 90
+    }
+  }
+}
+
+# IAM for CI/CD service account
+resource "google_artifact_registry_repository_iam_member" "ci" {
+  location   = google_artifact_registry_repository.docker.location
+  repository = google_artifact_registry_repository.docker.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:ci@project.iam.gserviceaccount.com"
+}
+```
+
+### SemVer Tag Automation
+
+```yaml
+jobs:
+  tag-release:
+    name: Tag Release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid semver: $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Create version tags
+        run: |
+          # Create lightweight tag for just the release
+          git tag ${{ steps.version.outputs.VERSION }} ${{ github.sha }}
+          
+          # Push tags
+          git push origin ${{ steps.version.outputs.VERSION }}
+```
+
+## Configuration / Pipeline Examples
+
+### Google Cloud Build Artifact Pipeline
+
+```yaml
+# cloudbuild.yaml
+substitutions:
+  _REGION: us-central1
+  _REPO: my-repo
+  _IMAGE: api-service
+
+steps:
+  # Build and push with provenance
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_IMAGE}:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_IMAGE}:latest'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/${_IMAGE}:latest'
+      - '--provenance'
+      - '--sbom'
+      - '.'
+    env:
+      - 'DOCKER_BUILDKIT=1'
+
+  # Push with all tags
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/${_IMAGE}'
+    waitFor: ['build']
+
+  # Generate SBOM
+  - name: 'anchore/syft:latest'
+    id: 'sbom'
+    args:
+      - 'gcr.io/$PROJECT_ID/${_IMAGE}:$COMMIT_SHA'
+      - '-o'
+      - 'spdx-json=/workspace/sbom.spdx.json'
+    waitFor: ['push']
+
+  # Push SBOM to Artifact Analysis
+  - name: 'gcr.io/$PROJECT_ID/cosign:latest'
+    id: 'attest'
+    args:
+      - 'attest'
+      - '--predicate'
+      - '/workspace/sbom.spdx.json'
+      - '--type'
+      - 'spdxjson'
+      - 'gcr.io/$PROJECT_ID/${_IMAGE}:$COMMIT_SHA'
+    waitFor: ['sbom']
+
+  # Create release tag in Artifact Registry
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'tag-release'
+    args:
+      - 'artifact-registry'
+      - 'tags'
+      - 'set'
+      - 'v${_VERSION}'
+      - '--image'
+      - '${_IMAGE}'
+      - '--location'
+      - '${_REGION}'
+      - '--version'
+      - '${COMMIT_SHA}'
+    waitFor: ['push']
+
+images:
+  - 'gcr.io/$PROJECT_ID/${_IMAGE}:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/${_IMAGE}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+```
+
+### Maven Publishing Pipeline
+
+```yaml
+- name: Publish to Maven Central
+  run: |
+    # Set up GPG for signing
+    echo "$GPG_SECRET_KEY" | base64 --decode | gpg --batch --import
+    
+    # Configure Maven
+    cat > ~/.m2/settings.xml << 'EOF'
+    <settings>
+      <servers>
+        <server>
+          <id>ossrh</id>
+          <username>${{ secrets.OSSRH_USERNAME }}</username>
+          <password>${{ secrets.OSSRH_PASSWORD }}</password>
+        </server>
+      </servers>
+    </settings>
+    EOF
+    
+    # Deploy
+    ./mvnw deploy -P release
+  env:
+    GPG_SECRET_KEY: ${{ secrets.GPG_SECRET_KEY }}
+    GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+```
+
+## Common Commands / Steps
+
+### Docker Registry Commands
+
+```bash
+# Login
+docker login gcr.io
+docker login ghcr.io
+aws ecr get-login-password | docker login --username AWS --password-stdin 123456.dkr.ecr.us-east-1.amazonaws.com
+
+# Pull/Push
+docker pull gcr.io/project/image:sha-abc123
+docker push gcr.io/project/image:sha-abc123
+docker push gcr.io/project/image --all-tags
+
+# List images
+gcloud artifacts docker images list gcr.io/project/my-repo
+
+# Delete old images
+gcloud artifacts docker images delete gcr.io/project/my-repo@sha256:abc --async
+
+# Add tag
+docker tag myapp:latest gcr.io/project/myapp:v1.0.0
+
+# Inspect digest
+docker inspect --format='{{index .RepoDigests 0}}' myapp:latest
+docker manifest inspect myapp:latest
+```
+
+### Cosign Commands
+
+```bash
+# Install
+curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh
+
+# Sign image
+cosign sign --yes myrepo/myapp:sha-abc123
+
+# Verify signature
+cosign verify \
+  --certificate-identity-regexp="https://github.com/myorg" \
+  --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+  myrepo/myapp:sha-abc123
+
+# Sign with key
+cosign sign --key cosign.key myrepo/myapp:sha-abc123
+
+# Verify with key
+cosign verify --key cosign.pub myrepo/myapp:sha-abc123
+
+# Upload attestation
+cosign attest --predicate sbom.json --type spdxjson myrepo/myapp:sha-abc123
+
+# Verify attestation
+cosign verify-attestation --policy policy.json --type spdxjson myrepo/myapp:sha-abc123
+```
+
+### SBOM Commands
+
+```bash
+# Install Syft
+curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
+
+# Generate SBOM from image
+syft myrepo/myapp:latest -o spdx-json=sbom.json
+
+# Generate SBOM from directory
+syft . -o cyclonedx-json=sbom.cdx.json
+
+# Generate SBOM from Dockerfile
+syft packages docker:myapp:latest -o table
+
+# Install Grype for scanning
+curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh
+
+# Scan SBOM
+grype sbom:sbom.json
+```
+
+### Version Commands
+
+```bash
+# Get current version from git
+git describe --tags --always
+
+# Check if tag exists
+git tag -l "v*" | grep "^v$VERSION$"
+
+# Create release tag
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+
+# List all tags
+git tag -l
+git tag -l --sort=-version:refname
+
+# Delete remote tag
+git push origin --delete v1.0.0
+```
+
+## Monitoring
+
+### Artifact Metrics
+
+| Metric | Target | Alert |
+|--------|--------|-------|
+| Image pull time | < 30s | > 60s |
+| Registry storage | Monitor growth | > 80% quota |
+| Scan coverage | 100% | < 95% |
+| Signed images | 100% | < 90% |
+
+### Registry Monitoring
+
+```bash
+# Check GCR storage
+gcloud artifacts docker images list gcr.io/project/repo --limit=100 | wc -l
+
+# Monitor ECR vulnerabilities
+aws ecr describe-image-scan-findings \
+  --repository-name my-repo \
+  --image-id imageTag=latest \
+  --query 'imageScanFindings.findings[*].{severity:Severity,name:name}'
+
+# Check scan status
+gcloud artifacts docker images list gcr.io/project/repo \
+  --include-tags \
+  --format="table(box, no-heading)"
+```
+
+## Security
+
+### Image Signing Workflow
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Build Image │────▶│ Sign with    │────▶│ Push to      │
+│              │     │ Cosign       │     │ Registry     │
+└──────────────┘     └──────────────┘     └──────────────┘
+                                                   │
+                                                   ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Deploy with │◀────│ Verify       │◀────│ Attest SBOM  │
+│  Verification│     │ Signature    │     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+### Security Configuration
+
+```yaml
+# Require signed images in Kubernetes
+apiVersion: scheduling.k8s.io/v1
+kind: ClusterImagePolicy
+metadata:
+  name: my-policy
+spec:
+  authorities:
+    - key:
+        provider: spire.k8s.io
+  images:
+    - glob: "gcr.io/myproject/**"
+  policy:
+    requireAttestations:
+    - predicateType: https://syft.dev/
+```
+
+### RBAC for Artifacts
+
+```bash
+# GCP IAM for Artifact Registry
+gcloud artifacts repos add-iam-policy-binding my-repo \
+  --member="serviceAccount:ci@project.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+
+# ECR policy
+aws ecr set-repository-policy \
+  --repository-name my-repo \
+  --policy-text file://ecr-policy.json
+```
+
+## Cost Optimization
+
+### Storage Management
+
+| Strategy | Benefit | Implementation |
+|----------|---------|----------------|
+| Auto-cleanup old tags | Reduce storage | Retention policies |
+| Compress layers | 30-50% smaller | Use BuildKit |
+| Deduplicate | Share layers | Use shared registry |
+| Archive cold data | Lower cost | Move to Cloud Storage |
+
+### Retention Policies
+
+```bash
+# GCR - Clean up untagged images after 7 days
+gcloud artifacts repos update my-repo \
+  --location=us-central1 \
+  --cleanup-policy=cleanup-untagged
+
+# Keep only last 10 tags
+gcloud artifacts repos update my-repo \
+  --location=us-central1 \
+  --keep-last-n-versions=10
+
+# ECR - Image lifecycle policy
+aws ecr put-lifecycle-policy \
+  --repository-name my-repo \
+  --lifecycle-policy-text '{
+    "rules": [{
+      "rulePriority": 1,
+      "description": "Expire old images",
+      "selection": {
+        "tagStatus": "any",
+        "countType": "sinceImagePushed",
+        "countNumber": 30,
+        "countUnit": "days"
+      },
+      "action": { "type": "expire" }
+    }]
+  }'
+```
+
+### Tiered Storage
+
+```
+Hot Storage (SSD)     │ Frequently accessed  │ GCR Standard
+                      │                      │
+Cold Storage          │ Monthly access       │ GCR Standard with
+(Standard)            │                      │ retention policies
+                      │
+Archive (Glacier)      │ Rarely accessed      │ Cloud Storage +
+                      │                      │ Artifact Registry
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `UNAUTHORIZED` | Missing login | `docker login` to registry |
+| `DENIED` | IAM permissions | Check service account roles |
+| `MANIFEST_UNKNOWN` | Image not found | Check tag/digest |
+| `INVALID_TAG` | Bad format | Use semver format |
+| `SIZE_LIMIT_EXCEEDED` | Image too large | Optimize layers |
+
+### Debug Commands
+
+```bash
+# Check authentication
+docker-credential-gcloud list
+
+# Verify image exists
+docker manifest inspect myrepo/myapp:sha-abc123
+
+# Check layer sizes
+docker history myapp:latest
+
+# Verify signature
+cosign verify myrepo/myapp:sha-abc123
+
+# Check SBOM
+cat sbom.json | jq '.packages[] | .name + " " + .versionInfo'
+
+# GCR debugging
+gcloud --log-http artifacts docker list gcr.io/project/repo
+```
+
+### Recovery
+
+```bash
+# Re-tag from digest
+docker tag myrepo/myapp@sha256:abc123 myrepo/myapp:v1.0.0
+
+# Copy image between registries
+docker pull myrepo/myapp:v1.0.0
+docker tag myrepo/myapp:v1.0.0 newrepo/myapp:v1.0.0
+docker push newrepo/myapp:v1.0.0
+
+# Rebuild from cache
+docker build --cache-from myrepo/myapp:latest -t myrepo/myapp:rebuild .
+```
+
+## Interview Questions
+
+### Q1: Explain the difference between tags and digests in container registries.
+
+**Answer:** Tags are mutable human-readable aliases like `v1.0.0` or `latest`. Multiple tags can point to the same image. Digests are immutable SHA256 hashes of the image manifest, guaranteeing bit-for-bit identity. Example: `sha256:abc123...`. Always prefer digests for production deployments to ensure exact image is used, not a later tag push.
+
+### Q2: What is an SBOM and why is it important?
+
+**Answer:** Software Bill of Materials (SBOM) lists all components and dependencies in an artifact. It enables: vulnerability management (quickly identify affected images when CVE is published), license compliance, supply chain security, and incident response. Standards include SPDX and CycloneDX.
+
+### Q3: How does image signing work with Cosign?
+
+**Answer:** Cosign generates a key pair (or uses cloud KMS), creates a signature for the image manifest, and stores it as an OCI artifact in the same registry. Verification checks the signature exists, the signing identity matches (via OIDC), and the attestation matches. Cosign also supports keyless signing via OIDC (GitHub Actions, Google, Microsoft).
+
+### Q4: What are the benefits of artifact provenance?
+
+**Answer:** Provenance provides cryptographic proof of: who built the artifact (identity), where (source repo, build system), how (build steps), and when. This enables supply chain security (SLSA levels), compliance auditing, and trust verification. In GCP Cloud Build, provenance is generated via `--provenance` flag.
+
+### Q5: How would you implement a multi-region artifact strategy?
+
+**Answer:** 1) Primary registry per region for low-latency pulls, 2) Automated replication policies (GCR, ECR cross-region), 3) Single source of truth for images, 4) Regional IAM for access, 5) Unified SLSA provenance across regions. Use federation for multi-cloud: push to each cloud registry separately, verify signatures consistently.
+
+## Cheat Sheet
+
+```bash
+# Docker Registry
+docker pull gcr.io/project/image:sha-abc123
+docker push gcr.io/project/image --all-tags
+docker tag local:tag gcr.io/project/image:v1.0.0
+
+# Cosign
+cosign sign myapp:sha-abc123
+cosign verify myapp:sha-abc123
+cosign attest --predicate sbom.json myapp:sha-abc123
+
+# Syft SBOM
+syft myapp:latest -o spdx-json=sbom.json
+syft . -o cyclonedx-json=sbom.cdx.json
+
+# Grype
+grype image myapp:latest
+grype sbom:sbom.json
+
+# GCP Artifact Registry
+gcloud artifacts docker images list gcr.io/project/repo
+gcloud artifacts docker delete gcr.io/project/repo@sha256:abc
+
+# ECR
+aws ecr get-login-password | docker login --username AWS --password-stdin 123.dkr.ecr.us-east-1.amazonaws.com
+
+# Version management
+git describe --tags --always
+git tag -a v1.0.0 -m "Release"
+```
+
+## Related Topics
+
+- [CI/CD Overview](./overview.mdx)
+- [Build Automation](./build.mdx)
+- [Deployment Strategies](./deploy.mdx)
+- [Security Testing](./test.mdx#security-testing-types)
+- [GitOps & Automation](./automation.mdx)

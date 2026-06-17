@@ -1,0 +1,913 @@
+---
+sidebar_position: 4
+title: "GCP Interview Questions"
+description: "Advanced Google Cloud Platform interview questions covering GKE, networking, data services, and infrastructure design"
+---
+
+# GCP Interview Questions
+
+## Overview
+
+Google Cloud Platform questions test your ability to design, implement, and operate cloud-native infrastructure on GCP. Senior engineers should understand GCP's unique offerings, how services integrate with each other, and when to use which service.
+
+These questions probe your knowledge of GCP networking models, container orchestration with GKE, data services, and the trade-offs between GCP's various managed services.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Explain GCP's VPC network model. What are the differences between auto-mode and custom-mode VPCs?**
+
+A: **GCP VPC fundamentals**:
+
+A GCP VPC is a global resource (spans all regions) but subnetworks (subnets) are regional. This is different from AWS where VPC is regional.
+
+**Auto-mode VPC**:
+- One subnet per region is automatically created
+- Subnet ranges follow a pattern: `10.0.0.0/8` regional blocks
+- `0.0.0.0/0` default route exists
+- Routes are automatically managed
+- Can't delete the default route (prevents full VPC isolation)
+
+**Custom-mode VPC**:
+- You define all subnet ranges and regions
+- Full control over IP addressing
+- Routes are managed by you (VPC routes)
+- No automatic routes (you manage everything)
+- Recommended for production
+
+**Key concepts**:
+```bash
+# Shared VPC (formerly org-level)
+gcloud compute shared-vpc enable <org-id>
+# Allows projects to share subnets from a host project
+
+# VPC Peering (simpler, less features)
+gcloud compute networks peerings create peer-name \
+  --network=network-a \
+  --peer-network=network-b
+
+# Cloud Router (for BGP/HA VPN)
+gcloud compute routers create my-router \
+  --network=my-vpc \
+  --region=us-central1
+```
+
+**Shared VPC vs Peering**:
+| Feature | Shared VPC | VPC Peering |
+|---------|-----------|-------------|
+| Route sharing | Yes, filter by subnet | No, all or nothing |
+| Network admin | Centralized | Distributed |
+| IAM control | Per-project | None |
+| Latency | Same | Same (global) |
+
+---
+
+**Q: How does GKE networking work? Explain pod networking, services, and ingress.**
+
+A: **GKE pod networking**:
+
+GKE uses **VPC-native** networking (alias IP ranges) by default:
+- Pods get IPs from a secondary range in your subnet
+- Pod IPs are routable within the VPC (no NAT needed)
+- Services get ClusterIP from a different range
+- Traffic between pods doesn't need NAT
+
+**Network architecture**:
+```
+Pod → veth → node's eth0 → (via GKE managed routes) → other node's eth0 → veth → Target Pod
+```
+
+**How traffic flows**:
+1. Pod sends packet to Service IP (ClusterIP)
+2. iptables/ipvs on node redirects to one of the service endpoints (pod IPs)
+3. If on different node, packet is routed via VPC
+4. kube-proxy handles load balancing within cluster
+
+**GKE service types**:
+
+| Type | Scope | Use Case |
+|------|-------|----------|
+| ClusterIP | Cluster-internal | Internal services |
+| NodePort | All nodes | Development, debugging |
+| LoadBalancer | Internet-facing | Production public LB |
+| ExternalName | DNS CNAME | External service alias |
+
+**Cloud Load Balancer integration**:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    networking.gke.io/load-balancer-type: "External"  # or "Internal"
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 8080
+  selector:
+    app: my-app
+```
+
+**GKE Ingress (Cloud Controller)**:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: "my-ip"
+    networking.gke.io/managed-certificates: "my-cert"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /*
+            pathType: Prefix
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+```
+
+The ingress controller creates:
+- A global HTTP(S) Load Balancer
+- Google-managed SSL certificate
+- Frontend configuration with HTTPS
+- Backend services pointing to node ports
+
+---
+
+**Q: Explain GCP's IAM model. How do you implement least privilege?**
+
+A: **GCP IAM fundamentals**:
+
+**Components**:
+- **Principal**: Who (user, service account, group)
+- **Role**: A collection of permissions
+- **Policy**: Binds principals to roles on resources
+
+**Role types**:
+1. **Primitive roles**: Owner, Editor, Viewer (broad, not recommended)
+2. **Predefined roles**: Granular, managed by Google (e.g., `roles/compute.instanceAdmin`)
+3. **Custom roles**: User-defined combinations of permissions
+
+**Policy binding**:
+```bash
+# Grant role to service account for specific project
+gcloud projects add-iam-policy-binding my-project \
+  --member="serviceAccount:my-sa@my-project.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# Grant at resource level (more granular)
+gcloud storage buckets add-iam-policy-binding gs://my-bucket \
+  --member="serviceAccount:my-sa@my-project.iam.gserviceaccount.com" \
+  --role="roles/storage.objectViewer"
+```
+
+**Principle of least privilege implementation**:
+
+1. **Use service accounts, not user credentials for workloads**
+```bash
+# Create service account with minimal permissions
+gcloud iam service-accounts create app-sa \
+  --display-name="Application SA"
+
+# Grant only what's needed for this specific workload
+gcloud projects add-iam-policy-binding my-project \
+  --member="serviceAccount:app-sa@my-project.iam.gserviceaccount.com" \
+  --role="roles/cloudsql.client"  # only what's needed
+```
+
+2. **Use condition-based IAM**
+```json
+{
+  "condition": {
+    "expression": "resource.name.startsWith('projects/my-project/buckets/prod-')",
+    "title": "Only production buckets"
+  }
+}
+```
+
+3. **Audit with Policy Analyzer**
+```bash
+# Find who has what roles
+gcloud beta asset search-all-iam-policies \
+  --scope=projects/my-project \
+  --query="policy:roles/storage.objectAdmin"
+```
+
+4. **Workload Identity Federation** (no keys to manage)
+```bash
+# Instead of downloading service account keys, use workload identity
+# In Terraform:
+resource "kubernetes_service_account" "app" {
+  metadata {
+    name = "app-sa"
+    namespace = "production"
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "app_binding" {
+  role {
+    kind = "ClusterRole"
+    name = "system:controller:node-controller"
+  }
+  subject {
+    kind = "ServiceAccount"
+    name = "app-sa"
+    namespace = "production"
+  }
+}
+```
+
+---
+
+**Q: What is the difference between Cloud Run, GKE, and GCE? When would you choose each?**
+
+A: **Service comparison**:
+
+| Feature | Cloud Run | GKE | GCE |
+|---------|-----------|-----|-----|
+| Management | Fully managed | You manage cluster | You manage everything |
+| Scaling | 0 to N, per request | HPA based on metrics | Manual or ASG |
+| Pricing | Pay per request | Pay for nodes | Pay for instances |
+| Networking | Serverless networking | Full VPC integration | Full VPC control |
+| Use case | HTTP services, event-driven | Complex microservices | VMs, batch |
+
+**Cloud Run**:
+- Best for: HTTP services, APIs, event-driven workloads
+- Scales to zero when idle (cost savings)
+- No node management
+- Built on Knative
+- Container images only
+
+**GKE**:
+- Best for: Complex microservices, stateful workloads, batch processing
+- Full Kubernetes API
+- Node pools for different workloads
+- Supports GPUs, preemptible nodes
+-Anthos for hybrid/multi-cloud
+
+**GCE**:
+- Best for: Persistent VMs, Windows workloads, legacy apps
+- Full control (you manage the OS)
+- Sole-tenant nodes for compliance
+- Live migration for maintenance
+
+**Selection matrix**:
+```
+                    │
+   Stateless? ──────┼───── Stateful?
+                    │
+        ┌───────────┼───────────┐
+        │           │           │
+        ▼           ▼           ▼
+   ┌─────────┐  ┌─────────┐  ┌─────────┐
+   │Cloud Run│  │   GKE   │  │   GKE   │
+   │(HTTP)   │  │(Docker) │  │(Stateful)│
+   └─────────┘  └─────────┘  └─────────┘
+```
+
+---
+
+**Q: Explain Cloud Pub/Sub architecture. How do you ensure message delivery?**
+
+A: **Pub/Sub fundamentals**:
+
+```
+Publisher ───┐
+Publisher ───┼──▶ Topic ──▶ Subscription ──▶ Subscriber
+Publisher ───┘     │
+                   │
+                   └─▶ (Dead Letter Topic if max retries exceeded)
+```
+
+**Delivery guarantees**:
+- **At-least-once delivery**: Messages may be delivered more than once (subscribers must handle duplicates via idempotency)
+- **Exactly-once** (in-order): Available with exactly-once delivery feature for subscriptions
+
+**Message ordering**:
+- Messages can have ordering keys
+- All messages with same key go to same region (not necessarily same subscriber)
+- Ordering isn't guaranteed across regions
+
+**Retry configuration**:
+```bash
+# Create subscription with retry policy
+gcloud pubsub subscriptions create my-sub \
+  --topic=my-topic \
+  --ack-deadline=60 \
+  --min-retry-delay=10s \
+  --max-retry-delay=600s \
+  --dead-letter-topic=my-dl-topic \
+  --max-delivery-attempts=5
+```
+
+**Consumer patterns**:
+
+```python
+# Python subscriber example
+from google.cloud import pubsub_v1
+
+subscriber = pubsub_v1.SubscriberClient()
+subscription_path = subscriber.subscription_path(project, subscription)
+
+def callback(message):
+    try:
+        process(message.data)
+        message.ack()
+    except Exception:
+        message.nack()  # Will retry based on retry policy
+
+subscriber.subscribe(subscription_path, callback=callback)
+```
+
+**At-least-once delivery handling**:
+```python
+# Idempotency key pattern
+def process_message(message):
+    # Check if already processed
+    idempotency_key = message.attributes.get('idempotency-key')
+    if redis.exists(f"processed:{idempotency_key}"):
+        message.ack()
+        return
+    
+    do_work(message.data)
+    redis.setex(f"processed:{idempotency_key}", ttl=86400, value="1")
+    message.ack()
+```
+
+---
+
+**Q: How does Cloud Armor work and when would you use it?**
+
+A: **Cloud Armor positioning**:
+```
+Internet → Cloud Armor → Global HTTP(S) LB → Backend Services → GKE/Cloud Run/etc.
+```
+
+**Cloud Armor features**:
+
+1. **DDoS protection**: Automatic for Global LBs, L7 protection
+2. **WAF (Web Application Firewall)**:
+   - Preconfigured rules (OWASP Top 10)
+   - Custom rules with CEL expressions
+   - Rate limiting
+   - IP allow/block lists
+   - Geo-based restrictions
+
+**Configuring Cloud Armor**:
+```bash
+# Create security policy
+gcloud compute security-policies create my-policy \
+  --description "WAF policy"
+
+# Add OWASP rules
+gcloud compute security-policies rules create 1000 \
+  --security-policy my-policy \
+  --expression "evaluatePreconfiguredExpr('sqli-v33-stable')" \
+  --action deny-403
+
+gcloud compute security-policies rules create 1001 \
+  --security-policy my-policy \
+  --expression "evaluatePreconfiguredExpr('xss-v33-stable')" \
+  --action deny-403
+
+# Rate limiting
+gcloud compute security-policies rules create 2000 \
+  --security-policy my-policy \
+  --expression "true" \
+  --action throttle \
+  --rate-limit-threshold-count 100 \
+  --rate-limit-threshold-interval-sec 60 \
+  --conform-action allow \
+  --exceed-action deny-429
+
+# Attach to backend service
+gcloud compute backend-services update my-backend \
+  --security-policy my-policy \
+  --global
+```
+
+**Custom rule examples**:
+```bash
+# Block specific IP
+gcloud compute security-policies rules create 1 \
+  --security-policy my-policy \
+  --src-ip-ranges "1.2.3.4/32" \
+  --action deny-403
+
+# Allow only specific countries
+gcloud compute security-policies rules create 2 \
+  --security-policy my-policy \
+  --expression "origin.region_code == 'US' || origin.region_code == 'CA'" \
+  --action allow
+
+# JSON payload inspection
+gcloud compute security-policies rules create 3 \
+  --security-policy my-policy \
+  --expression "request.headers['content-type'].contains('application/json')" \
+  --action allow
+```
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: How do you set up a private GKE cluster with no public endpoints?**
+
+A: **Private cluster setup**:
+```bash
+gcloud container clusters create my-private-cluster \
+  --private-cluster \
+  --master-ipv4-cidr=172.16.0.0/28 \
+  --enable-private-nodes \
+  --master-authorized-networks=10.0.0.0/8 \
+  --enable-ip-alias \
+  --services-ipv4-cidr=10.4.0.0/20 \
+  --cluster-ipv4-cidr=10.0.0.0/16 \
+  --region=us-central1
+```
+
+**Key flags**:
+- `--private-cluster`: Nodes have no public IPs, master has private endpoint
+- `--master-ipv4-cidr`: Control plane's internal IP range
+- `--enable-private-nodes`: Nodes only have internal IPs
+- `--master-authorized-networks`: IPs that can access the control plane
+
+**Accessing the control plane**:
+```bash
+# Option 1: Bastion host in the same VPC
+gcloud compute ssh bastion-host --zone=us-central1-a
+
+# Option 2: IAP (Identity-Aware Proxy) tunnel
+gcloud compute start-iap-tunnel my-node \
+  --zone=us-central1-a \
+  --local-host-port=localhost:8888
+
+# Then use kubectl proxy or direct connection
+```
+
+**kubectl configuration**:
+```bash
+# Get credentials (uses private endpoint by default for private clusters)
+gcloud container clusters get-credentials my-private-cluster \
+  --region=us-central1
+
+# If you need to use IAP tunnel
+gcloud alpha container clusters get-credentials my-cluster \
+  --region=us-central1 \
+  --internal-ip  # forces internal endpoint
+```
+
+**VPC firewall rules**:
+You need to allow traffic from the master's authorized networks to the nodes on port 10250 (kubelet API).
+
+---
+
+**Q: How do you configure Cloud SQL for high availability?**
+
+A: **HA configuration**:
+```bash
+# Create a HA Cloud SQL instance
+gcloud sql instances create my-ha-instance \
+  --database-version=POSTGRES_14 \
+  --tier=db-custom-2-8192 \
+  --region=us-central1 \
+  --availability-type=REGIONAL \
+  --storage-type=SSD \
+  --storage-size=100GB \
+  --storage-auto-increase \
+  --backup-start-time=02:00 \
+  --enable-bin-log \
+  --network=vpc-network
+```
+
+**Key HA settings**:
+- `--availability-type=REGIONAL`: Creates standby in different zone
+- `--enable-bin-log`: Required for HA with PostgreSQL/MySQL
+- `--network`: For Private IP (never expose to internet)
+
+**Read replicas**:
+```bash
+# Create read replica
+gcloud sql instances create my-replica \
+  --master-instance-name=my-ha-instance \
+  --region=us-central1 \
+  --tier=db-custom-2-8192 \
+  --replica-type=READ_REPLICA
+
+# For cross-region
+gcloud sql instances create my-cross-region-replica \
+  --master-instance-name=my-ha-instance \
+  --region=europe-west1 \
+  --tier=db-custom-2-8192
+```
+
+**Failover testing**:
+```bash
+# Initiate manual failover to test HA
+gcloud sql instances failover my-ha-instance
+```
+
+**Connection with HA awareness**:
+```python
+# Python: Use Cloud SQL Python Connector
+from google.cloud.sql.connector import Connector
+
+connector = Connector()
+def get_connection():
+    conn = connector.connect(
+        "my-project:us-central1:my-instance",
+        "pg8000",
+        user="user",
+        password="password",
+        db="db",
+        enable_iam_auth=True  # Use service account, not password
+    )
+    return conn
+
+# Connector handles refresh and automatic failover
+```
+
+---
+
+**Q: How would you migrate an on-premises PostgreSQL database to Cloud SQL with minimal downtime?**
+
+A: **Migration strategy using Cloud SQL Auth Proxy and DMS**:
+
+**Phase 1: Assessment**
+```bash
+# Check database version compatibility
+psql --version
+# Cloud SQL supports PostgreSQL 11-15
+
+# Check for unsupported features
+SELECT * FROM pg_extension;
+-- Check for: pg_partman, PostGIS, etc.
+```
+
+**Phase 2: Initial replication**
+```bash
+# Create Cloud SQL instance
+gcloud sql instances create prod-cloudsql \
+  --database-version=POSTGRES_14 \
+  --tier=db-n1-standard-4 \
+  --region=us-central1 \
+  --network=vpc-network
+
+# Enable PITR (Point-in-Time Recovery)
+gcloud sql instances patch prod-cloudsql \
+  --enable-bin-log
+```
+
+**Phase 3: Set up Database Migration Service**
+```bash
+# Create connection profile (on-prem)
+gcloud sql migration create-connection-profile prod-onprem \
+  --type=POSTGRES \
+  --postgresql-host=10.0.0.5 \
+  --postgresql-port=5432
+
+# Create migration job
+gcloud sql migration jobs create my-migration \
+  --source=prod-onprem \
+  --destination=prod-cloudsql \
+  --type=DUMP_AND_CARRY
+
+# Start continuous replication
+gcloud sql migration jobs start my-migration
+```
+
+**Phase 4: Cutover**
+```bash
+# Monitor replication lag
+gcloud sql migration jobs describe my-migration
+
+# When lag is acceptable:
+# 1. Stop writes on source
+# 2. Wait for replication to complete
+# 3. Verify data consistency
+gcloud sql migration jobs verify-connection-source my-migration
+
+# Promote standby
+gcloud sql instances promote-replica prod-cloudsql
+
+# Update application connection strings
+```
+
+**Alternative: Manual dump/restore (for smaller DBs)**
+```bash
+# On source
+pg_dump -Fc -j 4 -f dump.backup mydb
+
+# On Cloud SQL (via Cloud SQL Proxy)
+pg_restore -h /cloudsql/my-project:region:instance -U postgres -d mydb dump.backup
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: Design a multi-region deployment on GCP with active-active configuration.**
+
+A: **Architecture overview**:
+```
+                          ┌─────────────────────────┐
+                          │    Cloud DNS /       │
+                          │    Global HTTP LB     │
+                          └───────────┬───────────┘
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          │                           │                           │
+          ▼                           ▼                           ▼
+   ┌─────────────┐            ┌─────────────┐            ┌─────────────┐
+   │  us-central │            │ europe-west1│            │ asia-east1  │
+   │             │◀──────────▶│             │◀──────────▶│             │
+   │  GKE + SA   │  Replica   │  GKE + SA   │  Replica   │  GKE + SA   │
+   │  + Cloud SQL│            │  + Cloud SQL│            │  + Cloud SQL│
+   └──────┬──────┘            └──────┬──────┘            └──────┬──────┘
+          │                           │                           │
+          └───────────────────────────┴───────────────────────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │   Spanner / AlloyDB       │
+                    │   (Global Database)       │
+                    └───────────────────────────┘
+```
+
+**Traffic routing with Cloud Load Balancer**:
+```yaml
+# GKE Ingress with multi-region backend
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: global-ingress
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: "global-ip"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /*
+            pathType: Prefix
+            backend:
+              service:
+                name: my-service
+                port:
+                  number: 80
+```
+
+**GKE multi-cluster setup**:
+```bash
+# Enable multi-cluster services
+gcloud container clusters list --region=us-central1
+gcloud container clusters list --region=europe-west1
+
+# Register clusters to fleet
+gcloud container fleet memberships register us-central-cluster \
+  --gke-uri=https://container.googleapis.com/v1/projects/my-project/locations/us-central1/clusters/us-central-cluster \
+  --enable-workload-identity
+
+# Create multi-cluster service
+apiVersion: networking.k8s.io/v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    cloud.google.com/backend-config: '{"default": "my-backend"}'
+spec:
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+**Database choices**:
+| Requirement | Recommended Service |
+|-------------|-------------------|
+| Strong consistency, global writes | Cloud Spanner |
+| PostgreSQL-compatible, global | AlloyDB |
+| Regional only, cost optimization | Cloud SQL HA |
+| Caching layer | Memorystore (Redis) |
+
+**Disaster recovery**:
+```bash
+# Automated backup for Cloud SQL
+gcloud sql instances patch my-instance \
+  --backup-start-time=03:00 \
+  --enable-bin-log
+
+# Cross-region backup copy
+gcloud sql instances export sql-export \
+  gs://bucket/backups/instance-$(date +%Y%m%d).gz
+```
+
+---
+
+**Q: How do you design a cost-effective data pipeline on GCP?**
+
+A: **Pipeline architecture**:
+```
+Cloud Storage → Dataflow → BigQuery → Looker/BI
+     ↑              │
+     └──── Cloud Functions (on GCS trigger)
+```
+
+**Ingestion layer**:
+```python
+# Cloud Function triggered on file upload
+import functions_framework
+
+@functions_framework.cloud_event
+def process_file(cloud_event):
+    data = cloud_event.data
+    bucket = data['bucket']
+    filename = data['name']
+    
+    print(f"Processing {bucket}/{filename}")
+    # Trigger Dataflow job
+```
+
+**Dataflow (Apache Beam)**:
+```python
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+
+class DataflowOptions(PipelineOptions):
+    @classmethod
+    def _add_argparse_args(cls, parser):
+        parser.add_value_provider_argument('--input', type=str)
+        parser.add_value_provider_argument('--output', type=str)
+
+def run():
+    options = PipelineOptions(['--runner=DataflowRunner',
+                               '--project=my-project',
+                               '--region=us-central1',
+                               '--staging_location=gs://bucket/staging',
+                               '--temp_location=gs://bucket/temp'])
+    
+    with beam.Pipeline(options=options) as p:
+        (p
+         | 'Read' >> beam.io.ReadFromText('{input}*', skip_header_lines=1)
+         | 'Parse' >> beam.Map(parse_csv)
+         | 'Write' >> beam.io.WriteToBigQuery('{output}', 
+                                               schema='schema.json',
+                                               create_disposition='CREATE_IF_NEEDED',
+                                               write_disposition='WRITE_APPEND'))
+```
+
+**Cost optimization strategies**:
+
+| Strategy | Impact | Implementation |
+|---------|--------|----------------|
+| Flex Slots for BigQuery | 50-80% cost reduction | Reserved capacity vs flex slots |
+| Partitioned tables | Query cost reduction | Partition by date/timestamp |
+| Clustering | Query performance | Cluster by commonly-filtered columns |
+| Dataflow auto-scaling | Right-size resources | Set max workers, enable autoscaling |
+| Cloud Storage lifecycle | Reduce storage cost | Move to Coldline after 90 days |
+| Streaming vs batch | Match to use case | Batch if latency allows |
+
+**Storage tiering**:
+```bash
+# Set lifecycle policy
+gsutil lifecycle set lifecycle-config.json gs://my-bucket
+
+# lifecycle-config.json:
+# {"rule": [{"action": {"type": "SetStorageClass", "storageClass": "COLDLINE"},
+#           "condition": {"age": 90}}]}
+```
+
+---
+
+### Security Questions
+
+**Q: How do you implement secrets management in GCP without exposing sensitive data?**
+
+A: **Secret Manager for secrets**:
+```bash
+# Create secret
+gcloud secrets create my-api-key --replication-policy=automatic
+
+# Add secret value
+echo -n "my-secret-value" | gcloud secrets versions add my-api-key --data-file=-
+
+# Grant access to service account
+gcloud secrets add-iam-policy-binding my-api-key \
+  --member="serviceAccount:my-sa@my-project.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+**Using secrets in GKE**:
+```yaml
+# Option 1: Secret Manager CSI driver (recommended)
+apiVersion: secrets.csi.spife.io/v1alpha1
+kind: SecretProviderClass
+metadata:
+  name: my-secret
+spec:
+  provider: gcp
+  secretObjects:
+    - secretName: my-api-key
+      data:
+        - objectName: my-api-key
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  serviceAccountName: my-sa
+  volumes:
+    - name: secrets
+      csi:
+        driver: secrets-store.csi.store.googleapis.com
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: my-secret
+  containers:
+    - name: app
+      image: my-app
+      volumeMounts:
+        - name: secrets
+          mountPath: /secrets
+          readOnly: true
+```
+
+**Best practices**:
+1. **Never commit secrets to source control**
+2. **Rotate secrets regularly** — use Secret Manager's rotation feature with Cloud Functions
+3. **Use Workload Identity** — don't download service account keys
+4. **Audit secret access** — enable Cloud Audit Logs for Secret Manager
+
+---
+
+**Q: How do you implement VPC Service Controls to prevent data exfiltration?**
+
+A: **VPC Service Controls concepts**:
+
+VPC SC creates a security perimeter around GCP resources. Resources inside the perimeter can only be accessed by clients from within the perimeter.
+
+**Setup**:
+```bash
+# Create access perimeter
+gcloud access-context-manager perimeters create my-perimeter \
+  --title="My Security Perimeter" \
+  --resource-sensitivity=medium
+
+# Add resources to perimeter
+gcloud access-context-manager perimeters update my-perimeter \
+  --add-resource-selectors=projects/my-project
+
+# Restrict which services can be accessed from inside
+gcloud access-context-manager perimeters update my-perimeter \
+  --service-perimeters=bigquery.googleapis.com,storage.googleapis.com
+
+# Create access level (IP range or device policy)
+gcloud access-context-manager levels create office-ip-level \
+  --title="Office IPs" \
+  --combining-function=OR \
+  --basic-level-specs=ip-subnetworks=203.0.113.0/24
+
+# Allow access to perimeter from access level
+gcloud access-context-manager perimeters update my-perimeter \
+  --add-access-levels=office-ip-level
+```
+
+**Effect**:
+- Users from non-authorized IPs can't access BigQuery datasets in perimeter
+- Data can't be exported to buckets outside perimeter
+- Even if user has IAM permission, VPC SC can block access
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Confusing region and zone**: Regions are independent geographic areas; zones are within regions. Some services are regional (GKE), others are zonal (GCE instances).
+
+2. **Not understanding Shared VPC**: Many candidates don't understand the difference between Shared VPC and simple VPC peering.
+
+3. **Overusing IAM**: Thinking IAM is the only way to secure resources. Cloud Armor, VPC firewall rules, and VPC SC provide additional security layers.
+
+4. **Ignoring networking costs**: Egress between regions and to internet costs money. Designing for locality reduces costs.
+
+5. **Not using managed services**: Some candidates default to GCE when Cloud Run or managed services would be simpler and cheaper.
+
+## How to Structure Your Answers
+
+For **GCP-specific questions**: Start with the GCP service hierarchy (organization → folder → project), then explain the specific service architecture.
+
+For **migration questions**: Always address data validation and the cutover strategy.
+
+For **cost questions**: Discuss both direct costs (compute hours) and indirect (egress, operations overhead).
+
+## Related Topics
+
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [Networking Questions](./networking-questions.mdx)
+- [Architecture Questions](./architecture-questions.mdx)
+- [Terraform Questions](./terraform-questions.mdx)

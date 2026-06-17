@@ -1,0 +1,685 @@
+---
+sidebar_position: 1
+---
+
+# SRE Overview
+
+## Overview
+
+Site Reliability Engineering (SRE) is a discipline that applies software engineering principles to infrastructure and operations. Originated at Google in 2003, SRE bridges the gap between development and operations teams by treating infrastructure as software — something that can be automated, measured, and improved continuously.
+
+The core philosophy of SRE is that reliability is a product feature. Rather than treating outages as inevitable and operational work as separate from engineering, SRE embeds reliability into the software development lifecycle from day one.
+
+SRE teams are responsible for the availability, latency, performance, and efficiency of production services. They own incident response, change management, monitoring, and capacity planning — with an explicit goal of spending at least 50% of their time on engineering work rather than manual operations.
+
+## When To Use
+
+- **Building new production services** — SRE principles should inform architecture decisions from the start (redundancy, scalability, observability)
+- **Mature services with reliability issues** — Apply SRE practices to identify root causes and systematically improve reliability
+- **Defining service level agreements** — SRE provides the framework for setting meaningful SLAs, SLOs, and SLIs
+- **Reducing operational burden** — SRE's focus on automation and toil reduction helps teams scale without linearly growing headcount
+- **On-call improvement** — When pages are noisy, incidents take too long to resolve, or same issues recur
+- **Incident review and learning** — SRE postmortem culture emphasizes blameless analysis and systemic improvements
+
+## When NOT To Use
+
+- **Greenfield projects with no users** — Focus on building and validating the product first; SRE rigor matters when you have real traffic and reliability requirements
+- **Completely static infrastructure** — If infrastructure rarely changes and doesn't need to scale, traditional ops may suffice
+- **Prototype/MVP phase with explicit "move fast" mindset** — Accept that reliability tradeoffs are intentional during this phase
+- **Teams without bandwidth for engineering work** — SRE requires investment in automation and tooling; pure firefighting mode leaves no time for it
+
+## Core Concepts
+
+### The SRE Manifesto
+
+SRE's founding principle at Google: **"Ship the software. Run the software. Fix the software."** This means engineers who build a system are also responsible for operating it in production. This ownership model eliminates the "throw over the wall" dynamic between development and operations teams.
+
+### Error Budgets
+
+Error budgets are the central mechanism SRE uses to balance reliability and innovation. An error budget = `1 - SLO` — the amount of unreliability you're willing to accept in a given window. If your SLO is 99.9% availability, your error budget is 0.1% of downtime allowed per month.
+
+**Why error budgets work**: When reliability is at 100%, you have a full error budget to spend on new features. When you burn through the budget (reliability degrades), you stop feature development and focus on reliability. This creates a self-regulating mechanism that prevents both over-engineering and under-investing in reliability.
+
+### Toil
+
+Toil is manual, repetitive, automatable work that scales linearly with service growth. If your user base doubles and your on-call burden doubles, that's toil. SRE teams aim to keep toil below 50% of their time — the rest should be engineering: building automation, improving reliability, reducing complexity.
+
+**Examples of toil**:
+- Manually restarting failed services
+- Running the same deployment commands repeatedly
+- Manually updating configurations across multiple systems
+- Writing the same incident summary repeatedly
+- Manually verifying that a deployment succeeded
+
+**SLO-based toil elimination**: When something breaks repeatedly, SRE asks "why does this keep happening?" and fixes the root cause rather than manually mitigating symptoms each time.
+
+### Service Level Hierarchy
+
+```
+SLA (Service Level Agreement)
+├── Legal/contractual commitment to customers
+├── Financial penalties for breach
+└── Derived from business requirements
+
+SLO (Service Level Objective)
+├── Internal target we aim for
+├── Drives error budget policy
+└── Should be stricter than SLA
+
+SLI (Service Level Indicator)
+├── What we actually measure
+├── Basis for SLO calculations
+└── Must be measurable and unambiguous
+```
+
+### The SRE Toolkit
+
+| Concept | Purpose |
+|---------|---------|
+| **SLIs/SLOs/SLAs** | Quantify reliability targets |
+| **Error Budgets** | Balance reliability vs velocity |
+| **Toil Tracking** | Identify automation opportunities |
+| **Blameless Postmortems** | Learn from failures without blame |
+| **SLO Alerts** | Detect reliability degradation early |
+| **Change Management** | Reduce incident risk from deployments |
+| **Monitoring/Observability** | Understand system behavior |
+| **Capacity Planning** | Plan for growth |
+
+### Google SRE Book Principles
+
+The foundational SRE practices from Google's experience:
+
+1. **Embrace risk** — Not all failures matter equally; optimize for the failures that do
+2. **Strive for simplicity** — Complex systems fail in complex ways
+3. **Automate first** — Manual work doesn't scale and introduces errors
+4. **Measure what's important** — You can't improve what you can't measure
+5. **Learn from failures** — Blameless postmortems drive systemic improvement
+6. **Shared ownership** — Developers share operational responsibility for their services
+7. **Use the error budget** — Let the budget guide investment decisions
+
+## Real Production Example
+
+### Google-Scale SRE Practices
+
+At Google, SRE teams typically manage services with the following characteristics:
+
+- **Availability target**: 99.9% (8.76 hours downtime/year) for most services
+- **Error budget for 99.9% SLO**: 43.8 minutes/month for a 30-day window
+- **Monthly SLO burn rate alert**: Triggers when 50% of budget burns in 1 hour (fast burn) or 4 hours (slow burn)
+- **On-call response**: &lt;5 minutes for P1 incidents, &lt;30 minutes for P2
+
+### SRE in a Mid-Size Company
+
+A company with 50-engineer engineering team might structure SRE as:
+
+```
+SRE Team (4 engineers)
+├── Owns: Platform services, monitoring, incident response
+├── Shared ownership: Core infrastructure, CI/CD
+└── Advisory: Application reliability, deployment practices
+
+Application Teams (5 teams × ~8 engineers)
+├── Own: Application reliability for their domain
+├── Participate: On-call rotation for shared services
+└── Consume: Platform services and SRE-defined SLIs/SLOs
+```
+
+### SLO Configuration Example
+
+```yaml
+# Example SLO configuration for a payments service
+service_level_objectives:
+  - name: "API Availability"
+    sli: "successful_requests / total_requests"
+    target: 99.95%  # 21.9 minutes downtime/month
+    window: 30d
+    error_budget_policy:
+      burn_threshold: 50%  # Alert when 50% budget burned
+      burn_window: 1h
+      action: "Page on-call; halt non-critical deployments"
+
+  - name: "API Latency (p99)"
+    sli: "requests with latency < 200ms / total_requests"
+    target: 99%  # 7.3 hours of slow responses/month
+    window: 30d
+    alert_on: "p99 > 500ms for 5 minutes"
+
+  - name: "Data Pipeline Freshness"
+    sli: "records processed within SLA window"
+    target: 99.9%
+    window: 1d
+    alert_on: "processing lag > 1 hour"
+```
+
+## Metrics / Formulas / Frameworks
+
+### Error Budget Calculation
+
+```
+Monthly Error Budget (minutes) = (1 - SLO_target) × minutes_in_window
+
+For 99.9% SLO over 30 days:
+Error Budget = (1 - 0.999) × 43,200 minutes = 43.2 minutes
+```
+
+### Availability Percentages
+
+| Availability | Downtime/Year | Downtime/Month | Downtime/Week |
+|--------------|---------------|----------------|---------------|
+| 90% | 36.5 days | 3 days | 16.8 hours |
+| 99% | 3.65 days | 7.2 hours | 1.68 hours |
+| 99.5% | 1.83 days | 3.6 hours | 50.4 minutes |
+| 99.9% | 8.76 hours | 43.8 minutes | 10.1 minutes |
+| 99.95% | 4.38 hours | 21.9 minutes | 5.04 minutes |
+| 99.99% | 52.6 minutes | 4.38 minutes | 1.01 minutes |
+
+### Error Budget Burn Rate
+
+```
+Burn Rate = Actual Error Rate / Permitted Error Rate
+
+For 99.9% SLO (0.001 permitted error rate):
+- If actual error rate is 0.002 (0.2%), burn rate = 2.0
+- At burn rate 2.0, budget depletes 2× faster than normal
+- Budget exhaustion time = Error Budget / (Burn Rate × Baseline Error Rate)
+```
+
+### Toil Formula
+
+```
+Toil Percentage = (Time spent on toil / Total time) × 100
+
+SRE target: Toil < 50% of engineering time
+Warning threshold: Toil > 30% triggers investigation
+```
+
+### MTBF and MTTR
+
+```
+Availability = MTBF / (MTBF + MTTR)
+
+Example:
+- MTBF = 720 hours (30 days mean time between failures)
+- MTTR = 1 hour (average time to repair)
+- Availability = 720 / 721 = 99.86%
+```
+
+## Common Tools and Commands
+
+### Monitoring Stack
+
+```bash
+# Prometheus query examples
+# Request rate
+rate(http_requests_total{service="api"}[5m])
+
+# Error rate
+rate(http_requests_total{service="api", status=~"5.."}[5m])
+
+# Latency percentiles
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# Availability (requests that didn't error)
+sum(rate(http_requests_total{service="api",status!~"5.."}[5m])) 
+/ 
+sum(rate(http_requests_total{service="api"}[5m]))
+```
+
+### SLO Calculation
+
+```bash
+# Calculate SLO achievement from Prometheus
+# 30-day window availability
+sum(increase(http_requests_total{job="api"}[30d]) and 
+    http_requests_total{job="api"} > 0)
+/
+sum(increase(http_requests_total{job="api"}[30d]))
+
+# Error budget remaining
+# (1 - (total_errors / allowed_errors)) × 100
+```
+
+### Grafana Dashboard Panels
+
+```json
+{
+  "title": "SLO Dashboard",
+  "panels": [
+    {
+      "title": "Request Success Rate (SLI)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{status!~'5..'}[5m])) / sum(rate(http_requests_total[5m])) * 100"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {"value": 99, "color": "red"},
+              {"value": 99.9, "color": "yellow"},
+              {"value": 99.95, "color": "green"}
+            ]
+          },
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "title": "Error Budget Burn Rate",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "slo:burnrate:5m{job='api'} * 100"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### On-Call Tools
+
+| Tool | Purpose |
+|------|---------|
+| PagerDuty | Alert routing, on-call scheduling |
+| OpsGenie | Alert management, escalation |
+| Slack | Incident communication, war room |
+| Statuspage | Customer-facing status updates |
+| Grafana | Visualization, SLO dashboards |
+| Prometheus | Metrics collection, alerting rules |
+
+## Monitoring / Alerting Examples
+
+### SLO-Based Alerting
+
+```yaml
+# Prometheus alert rule for SLO error budget burn
+groups:
+  - name: slo-error-budget
+    interval: 30s
+    rules:
+      # Fast burn alert (50% budget in 1 hour)
+      - alert: SLOErrorBudgetFastBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{job="api"}[1h]))
+            )
+          ) / (1 - 0.999) > 50
+        for: 0m
+        labels:
+          severity: critical
+          slo: api-availability
+        annotations:
+          summary: "API SLO error budget burning fast"
+          description: "50% of error budget burned in 1 hour (burn rate: {{ $value }}x)"
+          runbook_url: "https://runbooks.example.com/slo-budget-fast-burn"
+
+      # Slow burn alert (50% budget in 4 hours)
+      - alert: SLOErrorBudgetSlowBurn
+        expr: |
+          (
+            1 - (
+              sum(rate(http_requests_total{job="api",status!~"5.."}[4h]))
+              /
+              sum(rate(http_requests_total{job="api"}[4h]))
+            )
+          ) / (1 - 0.999) > 50
+        for: 0m
+        labels:
+          severity: warning
+          slo: api-availability
+        annotations:
+          summary: "API SLO error budget burning slowly"
+          description: "50% of error budget burned in 4 hours"
+```
+
+### Golden Signals Alerting
+
+```yaml
+groups:
+  - name: golden-signals
+    rules:
+      # Latency - p99 > 1s
+      - alert: APIHighLatency
+        expr: |
+          histogram_quantile(0.99, 
+            rate(http_request_duration_seconds_bucket{job="api"}[5m])
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          signal: latency
+        annotations:
+          summary: "API p99 latency above 1 second"
+          description: "p99 latency is {{ $value | humanizeDuration }}"
+
+      # Traffic - sudden drop
+      - alert: APITrafficDrop
+        expr: |
+          rate(http_requests_total{job="api"}[5m]) < 0.5 * 
+          avg_over_time(rate(http_requests_total{job="api"}[5m])[1h])
+        for: 5m
+        labels:
+          severity: warning
+          signal: traffic
+        annotations:
+          summary: "API traffic dropped by more than 50%"
+
+      # Errors - 5xx rate > 1%
+      - alert: APIHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="api",status=~"5.."}[5m])) 
+          / 
+          sum(rate(http_requests_total{job="api"}[5m])) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          signal: errors
+        annotations:
+          summary: "API 5xx error rate above 1%"
+
+      # Saturation - CPU > 80%
+      - alert: APISaturation
+        expr: |
+          rate(process_cpu_seconds_total{job="api"}[5m]) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+          signal: saturation
+        annotations:
+          summary: "API service CPU above 80%"
+```
+
+## Security
+
+### SRE Security Responsibilities
+
+SRE teams handle operational security aspects:
+
+1. **Secret management** — Ensuring credentials aren't exposed in logs, configs, or code
+2. **Access control** — Managing production access, break-glass procedures
+3. **Security patching** — Rapid deployment of security patches (SRE owns the pipeline)
+4. **Incident response** — Handling security incidents with the same rigor as reliability incidents
+5. **Monitoring for threats** — Anomaly detection, brute force detection, unusual access patterns
+
+### Production Access Control
+
+```yaml
+# Example RBAC configuration for production access
+# GCP IAM
+bindings:
+  - role: roles/viewer
+    members:
+      - "group:all-engineers@company.com"
+
+  - role: roles/container.clusterViewer
+    members:
+      - "group:sre-team@company.com"
+
+  - role: roles/container.admin  # Limited to SRE
+    members:
+      - "group:sre-oncall@company.com"
+
+  # Break-glass access (time-limited, audited)
+  - role: roles/owner
+    members:
+      - "user:emergency-access@company.com"
+    condition:
+      title: "Emergency access - 24 hours max"
+      expression: "request.time < timestamp('2024-01-01T00:00:00Z')"
+```
+
+### Audit Logging
+
+```bash
+# GCP audit log query for privilege escalation
+gcloud logging read \
+  'resource.type="gce_instance" AND \
+   protoPayload.methodName="SetIamPolicy" AND \
+   protoPayload.authorizationInfo.granted=true' \
+  --project=production \
+  --format=json
+
+# Alert on failed SSH attempts
+gcloud logging read \
+  'resource.type="gce_instance" AND \
+   logName="projects/*/logs/secure" AND \
+   "Failed password"' \
+  --format=json
+```
+
+## Cost Optimization
+
+### SRE Cost Responsibilities
+
+SRE teams influence infrastructure costs through:
+
+1. **Right-sizing** — Matching capacity to actual demand (not peak + 2x)
+2. **Autoscaling** — Only paying for what you use
+3. **Resource efficiency** — Reducing waste from misconfigured resources
+4. **SLO optimization** — Spending engineering time where it matters most
+
+### Cost vs Reliability Balance
+
+```
+Cost Optimization Opportunities by SLO Level:
+
+99.9% SLO (43.8 min/month downtime):
+- Minimal overprovisioning needed
+- Standard HA architecture sufficient
+- Cost: ~$X
+
+99.99% SLO (4.38 min/month downtime):
+- Multi-AZ deployment required
+- Hot standby capacity
+- Additional monitoring and alerting
+- Cost: ~3-5X of 99.9%
+
+99.999% SLO (26 seconds/month downtime):
+- Active-active multi-region
+- Extensive redundancy
+- Very high operational overhead
+- Cost: ~10-20X of 99.9%
+```
+
+### Rightsizing Example
+
+```bash
+# Analyze actual CPU utilization vs provisioned
+# PromQL: actual CPU usage
+avg(rate(container_cpu_usage_seconds_total{container="api"}[5m])) 
+/ 
+avg(container_spec_cpu_quota{container="api"} / container_spec_cpu_period{container="api"})
+
+# If utilization < 30%, consider smaller instance
+# If utilization > 80%, consider larger instance or scaling
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common SRE Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| Setting SLOs too tight | Error budget burns quickly, constant firefighting | Align SLOs with user experience, not theoretical perfection |
+| No error budget policy | No clear trigger for reliability work | Define burn rate alerts and action thresholds |
+| Alerting on everything | Alert fatigue, ignored pages | Only alert on SLO-impacting events |
+| Manual incident response | Slow resolution, inconsistent outcomes | Document runbooks, automate detection |
+| Not tracking toil | Team burns out, no time for engineering | Regular toil reviews, automation backlog |
+| Skipping postmortems | Same incidents recur | Blameless culture, action item tracking |
+
+### SLO Troubleshooting
+
+**Symptom**: Error budget depleting faster than expected
+
+**Diagnosis steps**:
+```bash
+# 1. Check if it's a spike or sustained issue
+rate(http_requests_total{job="api",status=~"5.."}[5m])
+# vs
+rate(http_requests_total{job="api",status=~"5.."}[1h])
+
+# 2. Check which endpoints are failing
+sum by (endpoint) (rate(http_requests_total{job="api",status=~"5.."}[5m]))
+
+# 3. Check if specific region/instance is failing
+sum by (region, instance) (rate(http_requests_total{job="api",status=~"5.."}[5m]))
+
+# 4. Check for deployment correlation
+# Look at deployment timestamps in last 24 hours
+kubectl rollout history deployment/api -n production
+```
+
+### Incident Anti-Patterns
+
+```yaml
+Anti-patterns to avoid:
+
+1. "It's just a warning" - Pages that don't require action
+2. "I'll fix it in the morning" - Unaddressed production issues overnight
+3. "Let me check if it's real" - Unverified escalations
+4. "We've always done it this way" - Ritual alerting without purpose
+5. "Just restart it" - Symptom treatment without root cause analysis
+```
+
+## Interview Questions
+
+### Q1: What is the difference between SRE and DevOps?
+
+**A**: There's significant overlap, but key distinctions:
+
+- **DevOps** is a cultural/philosophical movement focused on breaking down silos between development and operations, improving collaboration, and automating the software delivery process.
+- **SRE** is a specific discipline that applies software engineering principles to operations. SRE was born at Google as a formal implementation of many DevOps principles.
+
+Both aim for faster delivery with high reliability. SRE provides specific practices (error budgets, SLOs, toil tracking) and measurable targets (50% engineering time, &lt;50% toil).
+
+### Q2: How do you decide what SLO to set for a new service?
+
+**A**: SLOs should be set based on:
+
+1. **User expectations**: What do users experience as "working"?
+2. **Business requirements**: What's the cost of downtime vs cost of preventing it?
+3. **Historical performance**: What has the service historically achieved?
+4. **Competitive benchmarks**: What do similar services offer?
+
+Process:
+- Measure current performance for 2-4 weeks (SLIs)
+- Set initial SLO slightly above current performance
+- Tighten SLO as reliability improves
+- Never set SLO tighter than what users can perceive as broken
+
+### Q3: What would you do if an SLO's error budget is depleting faster than expected?
+
+**A**:
+
+1. **Verify the data** — Check if metrics are accurate, not due to measurement issues
+2. **Identify the cause** — Is it a deployment, infrastructure issue, or traffic spike?
+3. **Mitigate immediately** — Rollback if deployment-related, scale if load-related
+4. **Communicate** — Alert stakeholders, update status page
+5. **Root cause analysis** — Find and fix the underlying issue
+6. **Prevent recurrence** — Add monitoring, fix systemic issues
+7. **Review SLO** — Is it realistic? Should it be adjusted?
+
+### Q4: How do you handle the tension between feature velocity and reliability?
+
+**A**: Error budgets provide a principled way to manage this tension:
+
+- When error budget is healthy: invest more in features
+- When error budget is depleting: pause features, invest in reliability
+- The budget creates a self-regulating mechanism
+
+Key practices:
+- Track error budget burn rate in real-time
+- Have clear policies: "When budget < 50%, no new deployments"
+- Automate reliability work so it doesn't compete with features
+- Focus engineering time on highest-impact improvements
+
+### Q5: What makes a good postmortem?
+
+**A**: A good postmortem:
+
+1. **Blameless** — Focus on systems and processes, not individuals
+2. **Accurate** — Timeline is verified, not guessed
+3. **Complete** — Covers detection, impact, mitigation, and root cause
+4. **Actionable** — Every problem has a specific fix or investigation
+5. **Tracked** — Action items have owners and deadlines
+6. **Followed up** — Verify actions actually prevented recurrence
+
+The goal is learning, not punishment. "What should we do better next time?" not "Who messed up?"
+
+## Cheat Sheet
+
+### SLO Decision Matrix
+
+| User Impact | Availability | Latency (p99) | Error Rate |
+|-------------|--------------|---------------|------------|
+| Critical | 99.99%+ | &lt;200ms | &lt;0.1% |
+| High | 99.9% | &lt;500ms | &lt;1% |
+| Medium | 99.5% | &lt;1s | &lt;5% |
+| Low | 99% | &lt;3s | &lt;10% |
+
+### Error Budget Quick Reference
+
+```
+SLO Target    | Monthly Budget | Daily Budget | Hourly Budget
+--------------+----------------+--------------+---------------
+99%          | 7.3 hours      | 14.4 minutes | 36 seconds
+99.9%        | 43.8 minutes   | 1.4 minutes  | 3.6 seconds
+99.95%       | 21.9 minutes   | 43.8 seconds | 1.8 seconds
+99.99%       | 4.4 minutes    | 8.6 seconds  | 0.4 seconds
+```
+
+### Key Formulas
+
+```bash
+# Error Budget (minutes)
+error_budget_minutes = (1 - SLO) × minutes_in_window
+
+# Availability
+availability = MTBF / (MTBF + MTTR)
+
+# Burn Rate
+burn_rate = actual_error_rate / permitted_error_rate
+
+# Toil Percentage
+toil_pct = (toil_hours / total_hours) × 100
+```
+
+### Alert Severity Levels
+
+| Severity | Response Time | Description | Example |
+|----------|---------------|-------------|---------|
+| P1/Critical | 5 minutes | Complete service outage | Site down, all requests failing |
+| P2/High | 15 minutes | Major feature broken | Payment processing down |
+| P3/Medium | 1 hour | Degraded performance | Slow responses, some errors |
+| P4/Low | 4 hours | Minor issue | One region degraded |
+
+### Golden Signals Checklist
+
+```
+[ ] Latency monitored (p50, p95, p99)
+[ ] Traffic/rate monitored (requests/second)
+[ ] Error rate monitored (4xx, 5xx)
+[ ] Saturation monitored (CPU, memory, disk, connections)
+[ ] SLO dashboards created
+[ ] Error budget burn rate tracked
+[ ] Alert routing configured correctly
+```
+
+## Related Topics
+
+- [SLI](./sli.mdx) — Service Level Indicators: how to measure
+- [SLO](./slo.mdx) — Service Level Objectives: setting targets
+- [SLA](./sla.mdx) — Service Level Agreements: contractual commitments
+- [Error Budget](./error-budget.mdx) — The error budget framework
+- [Monitoring](./monitoring.mdx) — Observability and metrics
+- [Alerting](./alerting.mdx) — Actionable alerting practices
+- [Incident Management](./incident-management.mdx) — Incident response
+- [Postmortem](./postmortem.mdx) — Blameless learning from failures
+- [Reliability](./reliability.mdx) — Building reliable systems
+- [Capacity Planning](./capacity-planning.mdx) — Planning for growth

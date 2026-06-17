@@ -1,0 +1,780 @@
+---
+title: "Kubernetes RBAC"
+description: "Complete guide to Kubernetes RBAC - Role-Based Access Control for secure cluster access management"
+sidebar_position: 16
+---
+
+# Kubernetes RBAC
+
+## Overview
+
+**RBAC (Role-Based Access Control)** is a Kubernetes mechanism for regulating access to cluster resources based on the roles and permissions assigned to users, groups, and service accounts. RBAC uses four key concepts: Subjects (who), Roles/ClusterRoles (what permissions), RoleBindings/ClusterRoleBindings (how they're connected), and Resources (what they affect).
+
+## When to Use
+
+- **Controlling access** to Kubernetes resources
+- **Implementing least privilege** for users and services
+- **Managing multi-tenant clusters** with namespace isolation
+- **API access control** for CI/CD pipelines
+- **Separation of duties** between teams
+- **Audit compliance** requirements
+
+## When NOT to Use
+
+- **Simple local clusters** with single user
+- **Testing environments** where quick access is needed
+- **When other auth methods** are more appropriate (OAuth, OIDC)
+
+## Core Concepts
+
+### RBAC Model
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           RBAC Architecture                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Subjects (WHO)                                                             │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                   │
+│  │    User       │  │    Group      │  │ServiceAccount │                   │
+│  │  (external)   │  │  (external)   │  │  (internal)   │                   │
+│  └───────────────┘  └───────────────┘  └───────────────┘                   │
+│                                                                              │
+│  Roles/ClusterRoles (WHAT)                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Permissions: get, list, watch, create, update, patch, delete       │   │
+│  │  Resources: pods, services, deployments, configmaps, secrets        │   │
+│  │  API Groups: "" (core), apps, batch, networking.k8s.io              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  RoleBindings/ClusterRoleBindings (HOW)                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Connects Subject → Role                                            │   │
+│  │  RoleBinding: Namespace-scoped                                      │   │
+│  │  ClusterRoleBinding: Cluster-wide                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Role vs ClusterRole
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Role vs ClusterRole                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Role (Namespace-scoped)                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  apiVersion: rbac.authorization.k8s.io/v1                           │   │
+│  │  kind: Role                                                          │   │
+│  │  metadata:                                                           │   │
+│  │    namespace: production                                            │   │
+│  │  rules:                                                              │   │
+│  │  - apiGroups: [""]                                                   │   │
+│  │    resources: ["pods"]                                               │   │
+│  │    verbs: ["get", "list"]                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│  → Grants access within a specific namespace                                │
+│                                                                              │
+│  ClusterRole (Cluster-scoped)                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  apiVersion: rbac.authorization.k8s.io/v1                           │   │
+│  │  kind: ClusterRole                                                   │   │
+│  │  rules:                                                              │   │
+│  │  - apiGroups: [""]                                                   │   │
+│  │    resources: ["nodes"]                                              │   │
+│  │    verbs: ["get", "list"]                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│  → Can grant access to:                                                     │
+│    - Cluster-scoped resources (nodes, PVs, namespaces)                     │
+│    - Namespaced resources across all namespaces                            │
+│    - Non-resource URLs (/api, /healthz)                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### RBAC Resolution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        RBAC Authorization Flow                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  User makes API request                                                      │
+│      │                                                                        │
+│      ▼                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  kube-apiserver receives request                                     │   │
+│  │  - Authenticates user identity (cert, token, OIDC)                  │   │
+│  │  - Extracts user, groups, and attributes                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│      │                                                                        │
+│      ▼                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  RBAC Authorization                                                   │   │
+│  │  1. Find RoleBindings in namespace (or ClusterRoleBindings)          │   │
+│  │  2. Check if user/group matches any subject                          │   │
+│  │  3. Check if Role/ClusterRole grants requested permission            │   │
+│  │  4. Allow or deny based on match                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Result: ALLOWED or DENIED                                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Aggregation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      ClusterRole Aggregation                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Built-in ClusterRole: view                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  aggregationRule:                                                   │   │
+│  │    clusterRoleSelectors:                                            │   │
+│  │    - matchLabels:                                                   │   │
+│  │        rbac.example.com/aggregate-to-view: "true"                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Custom ClusterRole with label:                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  metadata:                                                          │   │
+│  │    labels:                                                          │   │
+│  │      rbac.example.com/aggregate-to-view: "true"                     │   │
+│  │  rules:                                                             │   │
+│  │  - apiGroups: ["custom.example.com"]                                │   │
+│  │    resources: ["customresources"]                                   │   │
+│  │    verbs: ["get", "list"]                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Result: "view" ClusterRole automatically includes custom ClusterRole rules │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Real Production Example
+
+### Production RBAC Configuration
+
+```yaml
+# Developer Role - read-only access to production
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer-read
+  namespace: production
+rules:
+# Read all resources
+- apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch"]
+# Read logs
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+# Describe resources (for debugging)
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["describe"]
+# Get events
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get"]
+
+---
+# Developer RoleBinding - bind developers to read role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-read-binding
+  namespace: production
+subjects:
+# Users
+- kind: User
+  name: john.doe@example.com
+  apiGroup: rbac.authorization.k8s.io
+- kind: User
+  name: jane.smith@example.com
+  apiGroup: rbac.authorization.k8s.io
+# Groups
+- kind: Group
+  name: engineering
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: developer-read
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# CI/CD Service Account with deployment access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-pipeline
+  namespace: production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-pipeline
+  namespace: production
+rules:
+# Manage deployments
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+# Manage services
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Manage configmaps and secrets
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Manage jobs
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Read pods and logs
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+# Create pods/exec
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+# Events
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch", "create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-pipeline-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: ci-pipeline
+  namespace: production
+roleRef:
+  kind: Role
+  name: ci-pipeline
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Platform Admin ClusterRole - cluster-wide admin access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-admin
+rules:
+# Full access to all namespaced resources in all namespaces
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["*"]
+# Read cluster-scoped resources
+- apiGroups: [""]
+  resources: ["nodes", "namespaces", "persistentvolumes"]
+  verbs: ["get", "list", "watch"]
+# Manage cluster roles
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Access to non-resource URLs
+- nonResourceURLs: ["/api", "/apis", "/metrics", "/healthz", "/version"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-admin-binding
+subjects:
+- kind: Group
+  name: platform-team
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: platform-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Read-only ClusterRole for cluster monitoring
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-reader
+rules:
+# Read nodes
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+# Read namespaces
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+# Read persistent volumes
+- apiGroups: [""]
+  resources: ["persistentvolumes"]
+  verbs: ["get", "list", "watch"]
+# Read storage classes
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+# Read cluster roles and bindings
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings"]
+  verbs: ["get", "list", "watch"]
+# Read all resources (aggregated to this ClusterRole)
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch"]
+# Access to metrics endpoint
+- nonResourceURLs: ["/metrics", "/metrics/prometheus"]
+  verbs: ["get"]
+```
+
+### Monitoring Role (for Prometheus)
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+# Read pods for service discovery
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "nodes"]
+  verbs: ["get", "list", "watch"]
+# Read node metrics via kubelet
+- apiGroups: [""]
+  resources: ["nodes/metrics", "nodes/proxy"]
+  verbs: ["get"]
+# Read PVCs
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list"]
+# Read ingress
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+# Read HPA
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-binding
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: prometheus
+  apiGroup: rbac.authorization.k8s.io
+```
+
+## YAML Examples
+
+### Basic Role
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+```
+
+### Role with Multiple Permissions
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-manager
+  namespace: production
+rules:
+# Deployments
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ReplicaSets
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch"]
+# Services
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+# ConfigMaps
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+```
+
+### ClusterRole for Node Access
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/status"]
+  verbs: ["get", "list", "watch"]
+```
+
+## CLI Examples (kubectl)
+
+### Role Operations
+
+```bash
+# Create Role
+kubectl apply -f role.yaml
+
+# List Roles
+kubectl get roles
+kubectl get role -n production
+
+# Describe Role
+kubectl describe role pod-reader -n production
+
+# Get Role YAML
+kubectl get role pod-reader -n production -o yaml
+
+# Delete Role
+kubectl delete role pod-reader -n production
+```
+
+### RoleBinding Operations
+
+```bash
+# Create RoleBinding
+kubectl apply -f rolebinding.yaml
+
+# List RoleBindings
+kubectl get rolebindings
+kubectl get rolebinding -n production
+
+# Describe RoleBinding
+kubectl describe rolebinding developer-binding -n production
+
+# Delete RoleBinding
+kubectl delete rolebinding developer-binding -n production
+```
+
+### ClusterRole Operations
+
+```bash
+# List ClusterRoles
+kubectl get clusterroles
+kubectl get clusterrole
+
+# Get default ClusterRole details
+kubectl get clusterrole admin -o yaml
+kubectl get clusterrole view -o yaml
+
+# Describe ClusterRole
+kubectl describe clusterrole admin
+```
+
+### ClusterRoleBinding Operations
+
+```bash
+# Create ClusterRoleBinding
+kubectl apply -f clusterrolebinding.yaml
+
+# List ClusterRoleBindings
+kubectl get clusterrolebindings
+kubectl get clusterrolebinding
+
+# Delete ClusterRoleBinding
+kubectl delete clusterrolebinding admin-binding
+```
+
+### Checking Access
+
+```bash
+# Check if user can perform action
+kubectl auth can-i create pods
+kubectl auth can-i create pods --as=john.doe@example.com
+kubectl auth can-i create pods --as=john.doe@example.com -n production
+
+# Check specific resource
+kubectl auth can-i get pods --as=john.doe@example.com -n production
+kubectl auth can-i delete pods --as=john.doe@example.com -n production
+
+# Check all permissions for user
+kubectl auth can-i --list --as=john.doe@example.com
+
+# Check all permissions in namespace
+kubectl auth can-i --list --namespace=production
+```
+
+## Common Commands
+
+```bash
+# Create service account
+kubectl create serviceaccount my-sa -n production
+
+# Generate token for service account
+kubectl create token my-sa -n production
+
+# Create role for service account
+kubectl create role my-role --verb=get,list,watch --resource=pods -n production
+
+# Create rolebinding
+kubectl create rolebinding my-binding --role=my-role --serviceaccount=production:my-sa -n production
+
+# Create clusterrolebinding
+kubectl create clusterrolebinding my-cluster-binding --clusterrole=view --user=john@example.com
+```
+
+## Monitoring
+
+### RBAC Audit Logging
+
+```bash
+# Check for RBAC denial events
+kubectl get events --field-selector reason=FailedCreate,involvedObject.kind=Role
+
+# View authorization failures in logs
+# On API server: grep -i "authorization denied" /var/log/kube-apiserver.log
+```
+
+### Kubernetes Events
+
+```bash
+# Get events related to RBAC
+kubectl get events --field-selector reason=Forbidden
+kubectl get events --field-selector reason=Authorized
+```
+
+## Security
+
+### Security Best Practices
+
+```yaml
+# Principle of Least Privilege
+# Always grant minimum required permissions
+
+# Use ServiceAccounts for applications
+# Avoid using cluster-admin for applications
+
+# Regular audit of RBAC configurations
+kubectl get clusterrolebindings -o json | jq '.items[] | {name: .metadata.name, subjects: .subjects}'
+```
+
+### Pre-defined ClusterRoles
+
+| ClusterRole | Purpose |
+|-------------|---------|
+| admin | Full access to namespace |
+| edit | Read/write except RBAC |
+| view | Read-only access |
+| cluster-admin | Superuser (cluster-wide) |
+
+### RBAC Recommendations
+
+```bash
+# Check for overly permissive roles
+kubectl get clusterroles -o json | jq '.items[] | select(.rules[].resources | if type=="array" then . else [.] end | any == "*") | .metadata.name'
+
+# Avoid these patterns:
+# - resources: ["*"] with verbs: ["*"] unless necessary
+# - apiGroups: ["*"] with resources: ["*"]
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| 403 Forbidden | No RBAC permission | Add RoleBinding |
+| RoleBinding not working | Wrong namespace | Check subject namespace |
+| ServiceAccount can't access | Missing binding | Create RoleBinding |
+| Cluster-wide access needed | Namespace scope insufficient | Use ClusterRoleBinding |
+
+### Diagnostic Commands
+
+```bash
+# Check user permissions
+kubectl auth can-i --list --as=<user>
+
+# Check what roles are bound to user
+kubectl auth can-i --list --as=<user> -n <namespace>
+
+# Check subject bindings
+kubectl get rolebinding -n <namespace> -o wide
+
+# Check cluster role bindings
+kubectl get clusterrolebinding -o wide
+
+# Describe role for full details
+kubectl describe role <role-name> -n <namespace>
+
+# Check service account token
+kubectl get serviceaccount <sa-name> -n <namespace> -o yaml
+```
+
+### Authorization Debugging
+
+```bash
+# Enable audit logging for RBAC
+# In kube-apiserver:
+--audit-log-path=/var/log/kubernetes/audit.log
+--audit-policy-file=/etc/kubernetes/audit-policy.yaml
+
+# View audit logs
+kubectl logs -n kube-system kube-apiserver-control-plane | grep RBAC
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is Kubernetes RBAC?**
+A: Role-Based Access Control in Kubernetes regulates access to resources using Roles, ClusterRoles, RoleBindings, and ClusterRoleBindings. It controls who (Subjects) can perform what actions (Verbs) on which resources (Resources).
+
+**Q: What is the difference between Role and ClusterRole?**
+A: Role is namespace-scoped and grants access to namespaced resources. ClusterRole can grant access to both cluster-scoped resources and namespaced resources across all namespaces.
+
+**Q: What is a RoleBinding vs ClusterRoleBinding?**
+A: RoleBinding grants permissions defined in a Role or ClusterRole to a user/group within a specific namespace. ClusterRoleBinding grants permissions cluster-wide or to multiple namespaces.
+
+### Intermediate Questions
+
+**Q: What are the available RBAC verbs?**
+A: get, list, watch, create, update, patch, delete, deletecollection. Special: bind, escalate for roles.
+
+**Q: How do you grant access to all namespaces?**
+A: Use ClusterRoleBinding to bind a ClusterRole to subjects across the cluster, or bind to a Group that exists in all namespaces.
+
+**Q: What is the purpose of aggregation in ClusterRoles?**
+A: Aggregation allows custom ClusterRoles to automatically include rules from other ClusterRoles based on labels. This enables composition and reuse of permissions.
+
+### Advanced Questions
+
+**Q: How would you implement least privilege for a CI/CD pipeline?**
+A: Create a dedicated ServiceAccount, create a Role with minimal required permissions (only what's needed for deployment), and bind it to the ServiceAccount. Avoid cluster-admin.
+
+**Q: What is the difference between Role and ClusterRole for namespaced resources?**
+A: Both can reference namespaced resources. Role grants access within one namespace. ClusterRole grants access across ALL namespaces, which may be more permissive than intended.
+
+**Q: How do you audit RBAC configuration?**
+A: Review ClusterRoleBindings for cluster-admin usage, check for overly broad permissions (* on resources/verbs), monitor API server audit logs for authorization failures, and use tools like Polaris or KubeLinter.
+
+## Cheat Sheet
+
+### Role YAML Template
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: my-role
+  namespace: default
+rules:
+- apiGroups: [""]  # "" = core API group
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["*"]
+```
+
+### RoleBinding YAML Template
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: my-binding
+  namespace: default
+subjects:
+- kind: User
+  name: john@example.com
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: engineering
+  apiGroup: rbac.authorization.k8s.io
+- kind: ServiceAccount
+  name: my-sa
+  namespace: production
+roleRef:
+  kind: Role
+  name: my-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### ClusterRole YAML Template
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: my-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics", "/healthz"]
+  verbs: ["get"]
+```
+
+### Essential Commands
+
+```bash
+# Check permissions
+kubectl auth can-i create pods
+kubectl auth can-i get pods --as=user@example.com
+
+# List roles
+kubectl get roles
+kubectl get clusterroles
+
+# Describe role
+kubectl describe role my-role -n production
+
+# Create binding
+kubectl create rolebinding my-binding --role=my-role --user=john@example.com -n production
+```
+
+### API Groups
+
+| API Group | Resources |
+|-----------|-----------|
+| "" (core) | pods, services, configmaps, secrets |
+| apps | deployments, statefulsets, daemonsets |
+| batch | jobs, cronjobs |
+| networking.k8s.io | ingresses, networkpolicies |
+| rbac.authorization.k8s.io | roles, rolebindings |
+| autoscaling | horizontalpodautoscalers |
+
+## Related Topics
+
+- [Security](./security) - Pod and container security
+- [ServiceAccounts](./security) - Service account management
+- [Secrets](./secrets) - Token management
+- [Observability](./observability) - Audit logging

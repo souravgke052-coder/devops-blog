@@ -1,0 +1,573 @@
+# Cloud KMS
+
+## Overview
+
+Google Cloud Key Management Service (KMS) provides centralized key management and cryptographic operations. It enables encryption at rest for GCP services and custom applications. KMS supports symmetric and asymmetric keys with full lifecycle management, rotation, and hardware security module (HSM) protection.
+
+## When To Use
+
+- Encrypting data at rest in GCP services
+- Implementing envelope encryption
+- Managing encryption keys for applications
+- Digital signatures and asymmetric encryption
+- Compliance requirements (PCI-DSS, HIPAA)
+- Key rotation automation
+
+## When NOT To Use
+
+- Real-time encryption of high-frequency data (use AES directly in-app)
+- Storing passwords (use Secret Manager)
+- Non-sensitive configuration (use other services)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Cloud KMS                                 │
+├─────────────────────────────────────────────────────────────┤
+│  Hierarchy:                                                │
+│  ├── Location (global, regional)                          │
+│  ├── KeyRing (logical grouping)                           │
+│  └── CryptoKey (encryption key)                           │
+├─────────────────────────────────────────────────────────────┣
+│  Key Types:                                                │
+│  ├── Symmetric (AES-256-GCM)                             │
+│  ├── Asymmetric (RSA, EC)                                │
+│  └── HSM-backed (hardware security module)                │
+├─────────────────────────────────────────────────────────────┤
+│  Rotation:                                                │
+│  ├── Automatic (24h - 90d intervals)                     │
+│  └── Manual (via API)                                     │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  ├── Software key: $0.03/key/month                       │
+│  └── HSM key: $0.15/key/month                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Key Ring
+Container for related keys. Keys cannot be moved between key rings.
+
+### CryptoKey
+The actual encryption key with versioning support.
+
+### CryptoKeyVersion
+Individual version of a key, supporting rotation.
+
+### Key Rotation
+Automatic or manual process to generate new key versions.
+
+### Protection Level
+Software (default) or HSM (hardware security module).
+
+## Real Production Example
+
+**Encrypted Data Storage with KMS**
+
+```hcl
+# Terraform configuration for Cloud KMS
+
+# Create key ring
+resource "google_kms_key_ring" "default" {
+  name     = "default-keyring"
+  location = "us-central1"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Create key ring for production
+resource "google_kms_key_ring" "production" {
+  name     = "production-keyring"
+  location = "us-central1"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Symmetric encryption key
+resource "google_kms_crypto_key" "data_encryption" {
+  name     = "data-encryption-key"
+  key_ring = google_kms_key_ring.production.id
+  
+  protection_level = "HSM"
+  
+  purpose = "ENCRYPT_DECRYPT"
+  
+  rotation_period = "7776000s"  # 90 days
+  
+  version_template {
+    algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
+    protection_level = "HSM"
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Asymmetric key for signing
+resource "google_kms_crypto_key" "signing_key" {
+  name     = "signing-key"
+  key_ring = google_kms_key_ring.production.id
+  
+  protection_level = "HSM"
+  
+  purpose = "ASYMMETRIC_SIGN"
+  
+  version_template {
+    algorithm        = "EC_SIGN_P256_SHA256"
+    protection_level = "HSM"
+  }
+}
+
+# Asymmetric key for encryption
+resource "google_kms_crypto_key" "rsa_encryption" {
+  name     = "rsa-encryption-key"
+  key_ring = google_kms_key_ring.production.id
+  
+  protection_level = "HSM"
+  
+  purpose = "ASYMMETRIC_DECRYPT"
+  
+  version_template {
+    algorithm        = "RSA_DECRYPT_OAHS_4096_SHA256"
+    protection_level = "HSM"
+  }
+}
+
+# IAM for key access
+resource "google_kms_crypto_key_iam_member" "app_service" {
+  crypto_key_id = google_kms_crypto_key.data_encryption.id
+  role         = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member       = "serviceAccount:${google_service_account.app.email}"
+}
+
+resource "google_kms_crypto_key_iam_member" "signing_service" {
+  crypto_key_id = google_kms_crypto_key.signing_key.id
+  role         = "roles/cloudkms.cryptoSigner"
+  member       = "serviceAccount:${google_service_account.signing_service.email}"
+}
+
+# Service account for application
+resource "google_service_account" "app" {
+  account_id = "app-service"
+}
+
+resource "google_service_account" "signing_service" {
+  account_id = "signing-service"
+}
+
+# Cloud Storage with KMS encryption
+resource "google_storage_bucket" "encrypted_storage" {
+  name          = "encrypted-data-${var.project}"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  encryption {
+    default_kms_key_name = google_kms_crypto_key.data_encryption.id
+  }
+}
+
+# BigQuery with KMS encryption
+resource "google_bigquery_table" "encrypted_table" {
+  dataset_id = google_bigquery_dataset.encrypted.dataset_id
+  table_id   = "encrypted_data"
+  
+  deletion_protection   = true
+  use_legacy_sql       = false
+  
+  encryption_configuration {
+    kms_key_name = google_kms_crypto_key.data_encryption.id
+  }
+  
+  schema = <<-EOF
+    [
+      {"name": "id", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "data", "type": "STRING", "mode": "NULLABLE"}
+    ]
+  EOF
+}
+
+# BigQuery dataset for encrypted tables
+resource "google_bigquery_dataset" "encrypted" {
+  dataset_id    = "encrypted_data"
+  friendly_name = "Encrypted Data"
+  location      = "US"
+  
+  default_table_expiration_ms = null
+}
+
+# Firestore with customer-managed encryption
+# Note: Firestore uses Google-managed encryption by default
+# CMEK available in specific regions
+
+# Secret Manager with KMS (if needed for custom encryption)
+resource "google_secret_manager_secret" "encrypted_secret" {
+  name     = "encrypted-secret"
+  
+  replication {
+    auto {}
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Create key ring
+gcloud kms keyrings create my-keyring --location=us-central1
+
+# Create symmetric key
+gcloud kms keys create my-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --purpose=encrypt-decrypt \
+  --rotation-period=90d \
+  --protection-level=hsmm
+
+# Create asymmetric key
+gcloud kms keys create my-signing-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --purpose=asymmetric-sign \
+  --algorithm=ec-sign-p256-sha256
+
+# List key rings
+gcloud kms keyrings list --location=us-central1
+
+# List keys in key ring
+gcloud kms keys list --keyring=my-keyring --location=us-central1
+
+# Describe key
+gcloud kms keys describe my-key --keyring=my-keyring --location=us-central1
+
+# Get key version
+gcloud kms keys versions describe 1 --key=my-key --keyring=my-keyring --location=us-central1
+
+# Encrypt data
+echo -n "secret data" | gcloud kms encrypt \
+  --key=my-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --plaintext-file=- \
+  --ciphertext-file=encrypted.bin
+
+# Decrypt data
+gcloud kms decrypt \
+  --key=my-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --ciphertext-file=encrypted.bin \
+  --plaintext-file=-
+
+# Sign data (asymmetric)
+gcloud kms asymmetric-sign \
+  --key=my-signing-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --input-file=data.txt \
+  --signature-file=sig.bin
+
+# Verify signature
+gcloud kms asymmetric-verify \
+  --key=my-signing-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --signature-file=sig.bin \
+  --input-file=data.txt
+
+# Rotate key manually
+gcloud kms keys versions create 2 \
+  --key=my-key \
+  --keyring=my-keyring \
+  --location=us-central1
+
+# Disable key version
+gcloud kms keys versions disable 1 \
+  --key=my-key \
+  --keyring=my-keyring \
+  --location=us-central1
+
+# Destroy key version (permanent)
+gcloud kms keys versions destroy 1 \
+  --key=my-key \
+  --keyring=my-keyring \
+  --location=us-central1
+
+# Set IAM policy
+gcloud kms keys add-iam-policy-binding my-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --member=serviceAccount:sa@project.iam.gserviceaccount.com \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+
+# Get IAM policy
+gcloud kms keys get-iam-policy my-key \
+  --keyring=my-keyring \
+  --location=us-central1
+
+# Import key material
+gcloud kms keys create-import-job my-key-import \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --import-job-state=pending \
+  --protection-level=hsmm \
+  --algorithm=aes-256-gcm
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Key ring
+resource "google_kms_key_ring" "default" {
+  name     = "default-keyring"
+  location = "us-central1"
+}
+
+# Symmetric key with rotation
+resource "google_kms_crypto_key" "symmetric" {
+  name     = "symmetric-key"
+  key_ring = google_kms_key_ring.default.id
+  
+  rotation_period = "7776000s"  # 90 days
+  
+  version_template {
+    algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
+    protection_level = "HSM"
+  }
+}
+
+# Asymmetric key
+resource "google_kms_crypto_key" "asymmetric" {
+  name     = "asymmetric-key"
+  key_ring = google_kms_key_ring.default.id
+  
+  purpose = "ASYMMETRIC_SIGN"
+  
+  version_template {
+    algorithm        = "EC_SIGN_P256_SHA256"
+    protection_level = "HSM"
+  }
+}
+
+# IAM binding
+resource "google_kms_crypto_key_iam_member" "member" {
+  crypto_key_id = google_kms_crypto_key.symmetric.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:app@project.iam.gserviceaccount.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Key ring operations
+gcloud kms keyrings create NAME --location=LOC
+gcloud kms keyrings list --location=LOC
+
+# Key operations
+gcloud kms keys create NAME --keyring=RING --location=LOC --purpose=PURPOSE
+gcloud kms keys list --keyring=RING --location=LOC
+gcloud kms keys describe NAME --keyring=RING --location=LOC
+
+# Cryptographic operations
+gcloud kms encrypt --key=KEY --keyring=RING --location=LOC [flags]
+gcloud kms decrypt --key=KEY --keyring=RING --location=LOC [flags]
+gcloud kms asymmetric-sign --key=KEY --keyring=RING --location=LOC [flags]
+
+# Version management
+gcloud kms keys versions list --key=KEY --keyring=RING --location=LOC
+gcloud kms keys versions disable/enable/KEY --key=KEY --keyring=RING --location=LOC
+
+# IAM
+gcloud kms keys add-iam-policy-binding KEY --keyring=RING --location=LOC [flags]
+```
+
+## Monitoring
+
+### Key Metrics
+- Key version creation
+- Encryption operations
+- Key rotation events
+- Access denials
+
+### Cloud Monitoring
+```bash
+# Monitor key operations
+gcloud logging read "resource.type=kms_key" --limit=50
+
+# Create alert for key destruction
+gcloud monitoring policies create \
+  --display-name="Key Destruction Alert" \
+  --condition-filter='resource.type="kms_crypto_key" AND metric.type="cloudkms.googleapis.com/crypto_key/version/destroy_count"' \
+  --condition-threshold-value=0 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### Key Hierarchy
+```bash
+# Keys never leave KMS
+# Operations happen within HSM
+# Keys are never exposed in plaintext
+```
+
+### IAM Best Practices
+```bash
+# Principle of least privilege
+gcloud kms keyrings add-iam-policy-binding my-keyring \
+  --location=us-central1 \
+  --member=serviceAccount:admin@project.iam.gserviceaccount.com \
+  --role=roles/cloudkms.admin
+
+# Encrypt/Decrypt only
+gcloud kms keys add-iam-policy-binding my-key \
+  --keyring=my-keyring \
+  --location=us-central1 \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
+
+### Audit Logging
+```bash
+# Cloud Audit Logs records:
+# - Key creation/deletion
+# - Encryption/decryption operations
+# - IAM changes
+# - Key rotation
+```
+
+## Cost Optimization
+
+### Pricing
+| Key Type | Price/month |
+|----------|-------------|
+| Software | $0.03/key |
+| HSM | $0.15/key |
+
+### Optimization Tips
+```bash
+# Use software keys for less sensitive data
+# Use HSM keys for compliance requirements only
+# Implement key rotation (don't keep old versions)
+# Clean up destroyed key versions
+```
+
+## Troubleshooting
+
+### Permission Denied
+```bash
+# Check IAM policy
+gcloud kms keys get-iam-policy my-key --keyring=my-keyring --location=us-central1
+
+# Verify service account has correct role
+gcloud projects get-iam-policy my-project \
+  --filter="bindings.members:sa@project.iam.gserviceaccount.com"
+```
+
+### Key Version Issues
+```bash
+# List key versions
+gcloud kms keys versions list --key=my-key --keyring=my-keyring --location=us-central1
+
+# Check if key is enabled
+gcloud kms keys versions describe 1 --key=my-key --keyring=my-keyring --location=us-central1
+
+# Enable if disabled
+gcloud kms keys versions enable 1 --key=my-key --keyring=my-keyring --location=us-central1
+```
+
+## Interview Questions
+
+**Q: What is envelope encryption and how does KMS support it?**
+A: Envelope encryption encrypts data with a data encryption key (DEK), which is then encrypted with a key encryption key (KEK). KMS manages the KEK (master key). The encrypted DEK is stored with the data. This pattern allows efficient bulk encryption while centralizing key management.
+
+**Q: What is the difference between software and HSM protection levels?**
+A: Software keys use cryptographic operations in Google's secure data centers. HSM keys use tamper-resistant hardware security modules. HSM provides FIPS 140-2 Level 3 certification and is required for many compliance scenarios.
+
+**Q: How does automatic key rotation work?**
+A: Set `rotation_period` when creating the key. KMS automatically creates a new version at the specified interval. Old versions remain available for decryption. Primary version changes to newest version.
+
+**Q: What happens when you destroy a key version?**
+A: The key material is permanently deleted. Data encrypted with that version cannot be decrypted. This is irreversible - use caution when destroying versions.
+
+**Q: Can you import your own key material into KMS?**
+A: Yes, use import jobs to bring existing keys into KMS. This supports "bring your own key" (BYOK) scenarios while still using KMS for key management.
+
+## Cheat Sheet
+
+```bash
+# Create key ring
+gcloud kms keyrings create RING --location=REGION
+
+# Create key
+gcloud kms keys create KEY --keyring=RING --location=REGION --purpose=encrypt-decrypt
+
+# Encrypt
+echo -n DATA | gcloud kms encrypt --key=KEY --keyring=RING --location=REGION \
+  --plaintext-file=- --ciphertext-file=out.bin
+
+# Decrypt
+gcloud kms decrypt --key=KEY --keyring=RING --location=REGION \
+  --ciphertext-file=out.bin --plaintext-file=-
+
+# Sign (asymmetric)
+gcloud kms asymmetric-sign --key=SIGN_KEY --keyring=RING --location=REGION \
+  --input-file=data.txt --signature-file=sig.bin
+
+# IAM
+gcloud kms keys add-iam-policy-binding KEY --keyring=RING --location=REGION \
+  --member=sa@project.iam.gserviceaccount.com \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
+
+## Labs
+
+### Lab 1: Data Encryption
+Implement envelope encryption.
+1. Create KMS key
+2. Generate data encryption key
+3. Encrypt data with DEK
+4. Encrypt DEK with KMS key
+5. Store encrypted data and encrypted DEK
+
+### Lab 2: Key Rotation
+Configure automatic rotation.
+1. Create key with rotation period
+2. Verify rotation after period
+3. Monitor old version usage
+4. Clean up old versions
+5. Test decryption with new version
+
+### Lab 3: Compliance Encryption
+Implement compliance-grade encryption.
+1. Create HSM-backed key ring
+2. Create key with rotation
+3. Attach to Cloud Storage bucket
+4. Attach to BigQuery table
+5. Configure IAM with least privilege
+
+## Related Services
+
+- **Secret Manager**: Secrets storage (uses KMS internally)
+- **Cloud Storage**: Encryption at rest
+- **BigQuery**: Encryption at rest
+- **Cloud SQL**: CMEK support
+- **Artifact Registry**: Image encryption

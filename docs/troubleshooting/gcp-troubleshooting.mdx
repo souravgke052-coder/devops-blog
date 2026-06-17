@@ -1,0 +1,786 @@
+---
+sidebar_position: 5
+---
+
+# GCP Troubleshooting Guide
+
+## Overview
+
+Google Cloud Platform provides a rich set of debugging and diagnostic tools. This guide covers systematic approaches to troubleshooting GCP services—from Compute Engine to GKE, Cloud SQL to networking issues.
+
+Understanding GCP's tooling ecosystem and knowing how to navigate the console, CLI, and logs is essential for effective cloud debugging.
+
+## When To Use
+
+- **Compute Engine Issues**: Instance startup failures, SSH access, disk problems
+- **GKE Cluster Problems**: Node issues, pod scheduling, networking within clusters
+- **Cloud SQL Connectivity**: Connection pooling, failover, replication
+- **IAM/Authentication**: Permission denied, service account issues
+- **Networking**: VPC, firewall rules, load balancer, Cloud DNS
+- **Quotas and Limits**: Hitting service limits, quota exhaustion
+- **Cloud Logging**: Finding and analyzing logs across services
+
+## When NOT To Use
+
+- **Application Logic Bugs**: These require code-level debugging
+- **Multi-Cloud Issues**: May require provider-specific troubleshooting
+- **Billing Questions**: Use billing support, not debugging tools
+- **Hardware Failures**: GCP manages this, open support ticket
+
+## Core Concepts / Methodology
+
+### GCP Diagnostics Philosophy
+
+GCP follows a hierarchical debugging model:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              GCP TROUBLESHOOTING LAYERS                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              OPERATION LAYER                        │   │
+│  │   Cloud Logging, Cloud Monitoring, Error Reporting  │   │
+│  │   "What happened?"                                  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                         ↓                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              CONFIGURATION LAYER                    │   │
+│  │   IAM, Firewall Rules, Routes, VPC                  │   │
+│  │   "Is it configured correctly?"                     │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                         ↓                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              RESOURCE LAYER                         │   │
+│  │   Compute, GKE, Cloud SQL, Cloud Storage            │   │
+│  │   "Is the resource healthy?"                        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                         ↓                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              INFRASTRUCTURE LAYER                   │   │
+│  │   Physical hardware, network, GCP backbone          │   │
+│  │   (Managed by Google)                               │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### The gcloud CLI Debugging Mindset
+
+Always know what project and zone you're working with:
+
+```bash
+# Always check your context first
+gcloud config list
+
+# Output:
+# [component_manager]
+# disable_update_check = True
+# [compute]
+# region = us-central1
+# zone = us-central1-a
+# [core]
+# account = user@example.com
+# project = my-project-123456
+
+# Set context if needed
+gcloud config set project my-project-123456
+gcloud config set zone us-central1-a
+```
+
+## Diagnostic Commands / Tools
+
+### gcloud CLI Essential Commands
+
+```bash
+# List resources
+gcloud compute instances list
+gcloud container clusters list
+gcloud sql instances list
+
+# Get detailed info
+gcloud compute instances describe instance-1 --zone us-central1-a
+gcloud container clusters describe cluster-1 --zone us-central1-a
+
+# Operations (async operations)
+gcloud compute operations list --filter="zone:us-central1-a"
+gcloud operations list --project=my-project
+
+# Get logs
+gcloud logging read "resource.type=gce_instance" --limit=50
+gcloud logging read "resource.type=k8s_container" --limit=50
+```
+
+### Cloud Logging Queries
+
+Cloud Logging provides powerful log querying with Cloud Logging Query Language:
+
+```bash
+# Basic log read
+gcloud logging read "resource.type=gce_instance" --limit=100
+
+# Filter by severity
+gcloud logging read "severity>=ERROR" --limit=100
+
+# Filter by resource
+gcloud logging read 'resource.type="gce_instance" AND resource.labels.instance_id="1234567890"'
+
+# Filter by time range
+gcloud logging read 'timestamp>="2026-06-16T10:00:00Z"' --limit=100
+
+# Text search in log entries
+gcloud logging read 'textPayload:"OutOfMemoryError"'
+
+# Filter by specific fields
+gcloud logging read 'jsonPayload.message="Connection refused"'
+
+# Combine filters
+gcloud logging read 'resource.type="k8s_container" AND severity>=WARNING AND textPayload:"error"'
+
+# Write to bucket for analysis
+gcloud logging read 'severity>=ERROR' --format=json > /tmp/errors.json
+```
+
+### Compute Engine Debugging
+
+```bash
+# Serial port output (when SSH fails)
+gcloud compute instances get-serial-port-output instance-1 --zone us-central1-a
+
+# Instance serial port sample output:
+# [    0.000000] Linux version 5.10.0-xxxxxx (build@host) (gcc version 9.3.0)
+# [    0.500000] Command line: BOOT_IMAGE=/boot/vmlinuz
+# [    1.234567] cloud-init[1234]: Cloud-init v. 23.1 running
+
+# Reset instance (simulates power cycle)
+gcloud compute instances reset instance-1 --zone us-central1-a
+
+# Simulate host maintenance event
+gcloud compute instances simulate-maintenance-event instance-1 --zone us-central1-a
+
+# Check disk
+gcloud compute disks describe instance-1 --zone us-central1-a
+
+# Snapshot management
+gcloud compute snapshots list --filter="sourceDisk:instance-1"
+```
+
+### IAM Debugging
+
+```bash
+# Check service account permissions
+gcloud projects get-iam-policy my-project-123456
+
+# Test IAM permissions
+gcloud projects test-iam-permissions my-project-123456 \
+  --permissions=compute.instances.create,storage.buckets.list
+
+# Who am I?
+gcloud auth list
+gcloud config get-value account
+
+# Service account key inspection
+gcloud iam service-accounts keys list --iam-account=sa@my-project.iam.gserviceaccount.com
+
+# Policy linting
+gcloud beta iam policies lint-condition \
+  --condition-expression='resource.name == "projects/my-project-123456"'
+```
+
+### Quota Debugging
+
+```bash
+# List all quotas
+gcloud compute project-info describe --project my-project-123456
+
+# List quotas in specific region
+gcloud compute regions describe us-central1 --project my-project-123456 | grep -A 50 quotas
+
+# Output example:
+# quotas:
+# - limit: 8
+#   metric: CPU
+#   usage: 4
+# - limit: 2000
+#   metric: INSTANCES
+#   usage: 12
+
+# Request quota increase
+gcloud compute regions set-quota us-central1 --cpu=16 --instances=100
+
+# Check quota for specific resource type
+gcloud compute images list | wc -l  # Custom images count toward quota
+```
+
+### GKE Debugging (via gcloud)
+
+```bash
+# Cluster status
+gcloud container clusters describe cluster-1 --zone us-central1-a
+
+# Node pool details
+gcloud container node-pools describe default-pool \
+  --cluster=cluster-1 --zone us-central1-a
+
+# Cluster operations
+gcloud container operations list --cluster=cluster-1 --zone us-central1-a
+
+# Get credentials for kubectl
+gcloud container clusters get-credentials cluster-1 --zone us-central1-a
+
+# Workload status
+gcloud container workloads list --location=us-central1
+```
+
+## Real Production Scenarios
+
+### Scenario 1: gcloud CLI Authentication Token Expiration
+
+**Symptom:**
+- `gcloud` commands returning "Request had insufficient authentication scopes"
+- Previously working scripts now failing
+- kubectl can't authenticate to GKE
+
+**Diagnostic Commands:**
+```bash
+# Check current auth status
+gcloud auth list
+# Output:
+#       Credentialed Accounts
+# active  account
+#        user@example.com
+
+# Check token expiry
+gcloud auth print-identity-token  # Will fail if expired
+
+# Verify application default credentials
+gcloud auth application-default print-access-token
+
+# Check who the service account is running as
+curl -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/instance/service-accounts/
+```
+
+**Root Cause:**
+The gcloud access token had expired (tokens are valid for 1 hour by default). The application was using ADC (Application Default Credentials) which picks up the expired token from `gcloud auth application-default`.
+
+**Fix:**
+```bash
+# Re-authenticate gcloud
+gcloud auth login
+
+# Or for service accounts
+gcloud auth activate-service-account --key-file=/path/to/key.json
+
+# Update application default credentials
+gcloud auth application-default login
+
+# For workloads, use Workload Identity
+# Check current binding
+kubectl get serviceaccount -n kube-system
+# Verify annotation
+kubectl get serviceaccount default -n default -o yaml | grep iam.gke.io
+
+# Create new workload identity binding
+gcloud iam service-accounts add-iam-policy-binding \
+  --role="roles/container.node.ServiceAccount" \
+  --member="serviceAccount:my-project.svc.id.goog[default/default]" \
+  sa@my-project.iam.gserviceaccount.com
+```
+
+**Prevention:**
+- Use Workload Identity for GKE workloads instead of key files
+- Set up token refresh in long-running jobs
+- Monitor token expiry with alerting
+- Use service account impersonation for short-lived operations
+
+---
+
+### Scenario 2: GKE Pod Stuck in Pending State
+
+**Symptom:**
+- New pods not scheduling, stuck in "Pending"
+- Existing pods still running fine
+- No deployments or config changes
+
+**Diagnostic Commands:**
+```bash
+# Describe the pod to see why it's pending
+kubectl describe pod myapp-xyz-12345
+
+# Output shows:
+# Events:
+#   Type     Reason            Age   From               Message
+#   ----     ------            ----  ----               -------
+#   Warning  FailedScheduling  2m    default-scheduler  0/3 nodes are available: 1 Insufficient cpu, 2 node(s) had taint
+
+# Check node resources
+kubectl describe nodes | grep -A 5 "Allocated resources"
+
+# Check for pod affinity/anti-affinity issues
+kubectl get pod myapp-xyz-12345 -o jsonpath='{.spec.affinity}'
+
+# Check if it's a zone constraint
+kubectl get pod myapp-xyz-12345 -o jsonpath='{.spec.topologySpreadConstraints}'
+
+# Check cluster autoscaler logs
+kubectl logs -n kube-system -l app=gke-cluster-autoscaler --tail=100
+
+# Check quota in the namespace
+kubectl describe resourcequota
+```
+
+**Root Cause:**
+A new deployment requested 4 CPU cores but the cluster only had 3 cores available across all nodes. The cluster autoscaler wasn't configured for the node pool, so it couldn't scale up.
+
+**Fix:**
+```bash
+# Enable autoscaler on node pool
+gcloud container node-pools update default-pool \
+  --cluster=cluster-1 \
+  --zone=us-central1-a \
+  --enable-autoscaling \
+  --min-nodes=1 \
+  --max-nodes=10 \
+  --num-nodes=2
+
+# Or temporarily reduce resource request
+kubectl patch deployment myapp -p '{"spec":{"template":{"spec":{"containers":[{"name":"myapp","resources":{"requests":{"cpu":"500m"}}}]}}}}'
+
+# Check cluster autoscaler status
+gcloud container clusters describe cluster-1 --zone us-central1-a | grep autoscaling
+```
+
+**Prevention:**
+- Always set resource limits AND requests
+- Enable cluster autoscaler
+- Implement pod disruption budgets
+- Monitor resource utilization proactively
+
+---
+
+### Scenario 3: Cloud SQL Connection Limit Reached
+
+**Symptom:**
+- Application throwing "Too many connections" errors
+- Database appears healthy in GCP console
+- Connection count showing maxed out
+
+**Diagnostic Commands:**
+```bash
+# List Cloud SQL instances
+gcloud sql instances list
+
+# Get instance details including connection count
+gcloud sql instances describe instance-1 --project=my-project
+
+# Sample output:
+# connectionName: my-project:us-central1:instance-1
+# databaseVersion: POSTGRES_14
+# ipAddresses:
+# - ipAddress: 10.0.0.5
+#   type: PRIVATE
+# state: RUNNABLE
+# settings:
+#   ipConfiguration:
+#     privateNetwork: projects/my-project/global/networks/vpc
+#   tier: db-g1-small
+#   dataDiskSizeGb: '10'
+
+# Check current connections
+gcloud sql connect instance-1 --user=postgres
+# Then run:
+postgres=> SELECT count(*) FROM pg_stat_activity;
+
+# Check max_connections setting
+postgres=> SHOW max_connections;
+#  max_connections
+#  ----------------
+#  100
+
+# Cloud SQL Auth Proxy test
+cloud-sql-proxy my-project:us-central1:instance-1 &
+curl -v 127.0.0.1:5432
+```
+
+**Root Cause:**
+The application was creating a new database connection for every request instead of using connection pooling. With 1000 requests/second and no pooling, the 100 max_connections was exhausted.
+
+**Fix:**
+```bash
+# Temporarily increase max connections (PostgreSQL)
+gcloud sql instances patch instance-1 --project=my-project \
+  --database-version=POSTGRES_14 \
+  --tier=db-g1-small \
+  --pricing-plan=PER_USE
+
+# But main fix is application-side:
+# Add connection pooling (PgBouncer, HikariCP, etc.)
+
+# Example: PgBouncer configuration
+cat > /etc/pgbouncer/pgbouncer.ini << 'EOF'
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb
+
+[pgbouncer]
+listen_port = 6432
+listen_addr = 127.0.0.1
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 20
+EOF
+```
+
+**Prevention:**
+- Always use connection pooling
+- Set max_connections appropriate for workload
+- Monitor connection count with Cloud Monitoring
+- Implement circuit breaker pattern
+
+---
+
+### Scenario 4: VPC Firewall Rule Blocking Internal Communication
+
+**Symptom:**
+- Services in different VPCs can't communicate
+- Internal load balancer health checks failing
+- No external IPs but connectivity needed
+
+**Diagnostic Commands:**
+```bash
+# List firewall rules
+gcloud compute firewall-rules list
+
+# Describe specific rule
+gcloud compute firewall-rules describe allow-internal --project=my-project
+
+# Sample output:
+# allowed:
+# - IPProtocol: tcp
+#   ports:
+#   - '80'
+# - IPProtocol: icmp
+# direction: INGRESS
+# network: projects/my-project/global/networks/vpc
+# priority: 1000
+# sourceRanges:
+# - 10.0.0.0/8
+
+# Test connectivity using Compute Engine (test-vm)
+gcloud compute ssh test-vm --zone us-central1-a
+# Then inside:
+nc -zv 10.0.1.5 80
+
+# Check if traffic is being blocked by logging
+gcloud logging read 'resource.type="gce_subnetwork" AND jsonPayload.disposition="DENIED"' --limit=50
+
+# Check route tables (for custom routes)
+gcloud compute routes list --project=my-project
+
+# Check VPC peering
+gcloud compute networks peerings list --project=my-project
+```
+
+**Root Cause:**
+A new firewall rule was added with higher priority (lower number) that blocked all traffic from the shared VPC to the service VPC. The rule was meant to block external traffic but inadvertently blocked internal IP ranges too.
+
+**Fix:**
+```bash
+# Find the blocking rule (highest priority that matches)
+gcloud compute firewall-rules list --sort=priority | head -20
+
+# Delete or modify the overly broad rule
+gcloud compute firewall-rules delete block-all-traffic --project=my-project
+
+# Or add exception for internal ranges
+gcloud compute firewall-rules update allow-https \
+  --project=my-project \
+  --source-ranges="10.0.0.0/8,192.168.0.0/16"
+
+# Create more specific rule for internal communication
+gcloud compute firewall-rules create allow-internal-iap \
+  --project=my-project \
+  --network=vpc \
+  --allow=tcp:80,tcp:443,tcp:22 \
+  --source-ranges="35.235.240.0/20" \
+  --priority=1000 \
+  --description="Allow IAP and internal"
+```
+
+**Prevention:**
+- Always use specific source/destination ranges
+- Test firewall rules in staging first
+- Enable firewall rule logging
+- Review firewall rules before adding new ones
+- Use hierarchical firewall policies for organization
+
+---
+
+### Scenario 5: Cloud Function Cold Start Timeout
+
+**Symptom:**
+- Cloud Functions timing out on first request after idle
+- Cold start taking 10+ seconds
+- Subsequent requests fast
+
+**Diagnostic Commands:**
+```bash
+# Get function details
+gcloud functions describe my-function --region=us-central1
+
+# Check recent executions
+gcloud functions logs read my-function --region=us-central1 --limit=50
+
+# Sample log showing cold start:
+# 2026-06-16 10:32:01.234 Function execution started
+# 2026-06-16 10:32:11.567 Function execution took 10567ms (cold start)
+# 2026-06-16 10:32:11.890 Memory (MB): 512, Max Memory Used (MB): 256
+# 2026-06-16 10:32:11.890 Uptime (ms): 10234
+
+# Check concurrent requests
+gcloud functions describe my-function --region=us-central1 | grep concurrent
+
+# Monitor function metrics
+gcloud monitoring metrics list --filter="function:my-function"
+
+# Check for memory issues (slow cold start = loading dependencies)
+gcloud functions logs read my-function --region=us-central1 | grep -E "warning|error|memory"
+```
+
+**Root Cause:**
+The Cloud Function was loading 200MB of ML models during initialization. With default 256MB memory, loading was slow. Also, VPC connector was causing additional latency.
+
+**Fix:**
+```bash
+# Increase memory (also increases CPU)
+gcloud functions deploy my-function \
+  --region=us-central1 \
+  --memory=1GB \
+  --runtime=python39 \
+  --trigger-http \
+  --set-env-vars="ENV=production"
+
+# Or reduce cold start by optimizing imports
+# Instead of: import heavy_module
+# Lazy load:
+def my_function(request):
+    heavy_module = __import__('heavy_module')
+    return heavy_module.process()
+
+# Disable VPC if not needed (adds ~2s to cold start)
+gcloud functions deploy my-function \
+  --region=us-central1 \
+  --clear-vpc-connector
+
+# Or keep VPC but reduce connector size
+gcloud compute networks vpc-access connectors describe my-connector
+```
+
+**Prevention:**
+- Monitor cold start times in Cloud Monitoring
+- Use minimum memory needed + 20% buffer
+- Lazy-load heavy dependencies
+- Consider Cloud Run for containers (similar cold start model)
+- Use pre-warming with scheduled pings
+
+## Step-by-Step Debugging Playbooks
+
+### Playbook: Instance Won't Start
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: CHECK INSTANCE STATUS                               │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud compute instances describe instance-1              │
+│ $ gcloud compute instances list --filter="name:instance-1"  │
+│                                                              │
+│ Status values: PROVISIONING, STAGING, RUNNING, STOPPING,   │
+│                TERMINATED, SUSPENDED                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK SERIAL PORT OUTPUT                            │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud compute instances get-serial-port-output instance-1│
+│                                                              │
+│ Look for: boot errors, disk issues, network errors          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CHECK OPERATION STATUS                              │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud compute operations list \                          │
+│     --filter="targetId:1234567890"                          │
+│                                                              │
+│ Look for: ZONE resources exhausted, Quota exceeded          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK DISK AND SCRATCH DISK                         │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud compute disks describe instance-1-boot-disk        │
+│                                                              │
+│ Check: sourceImage, size, type (pd-ssd vs pd-standard)     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Playbook: "Permission Denied" on GCP Resource
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 1: VERIFY IDENTITY                                     │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud auth list                                          │
+│ $ gcloud config get-value account                           │
+│                                                              │
+│ Ensure you're authenticated as expected                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 2: CHECK IAM ROLE                                      │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud projects get-iam-policy my-project                 │
+│                                                              │
+│ Find your email and check attached roles                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 3: CHECK SPECIFIC RESOURCE IAM                         │
+├─────────────────────────────────────────────────────────────┤
+│ # For Compute                                              │
+│ $ gcloud compute instances describe instance-1 \            │
+│     --format=json | jq '.metadata.items'                    │
+│                                                              │
+│ # For Storage                                              │
+│ $ gsutil iam get gs://my-bucket                             │
+│                                                              │
+│ # For BigQuery                                              │
+│ $ bq show project:dataset.table                             │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│ STEP 4: CHECK ORGANIZATION POLICIES                         │
+├─────────────────────────────────────────────────────────────┤
+│ $ gcloud org-policies describe compute.disableSerialPortAccess \ │
+│     --project=my-project                                    │
+│                                                              │
+│ Organization policies can override IAM                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Common Errors and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `insufficient authentication scopes` | Token expired or wrong scopes | `gcloud auth login`, check scopes |
+| `RESOURCE_EXHAUSTED` | Quota limit reached | Request increase, optimize usage |
+| `INVALID_ARGUMENT: zone not found` | Wrong zone | List valid zones: `gcloud compute zones list` |
+| `ALREADY_EXISTS` | Resource already exists | Use `create` or `apply`, not `apply` |
+| `PERMISSION_DENIED` | IAM issue | Check IAM roles, service account |
+| `NOT_FOUND` | Resource doesn't exist | Verify name, check project/zone |
+| `DEADLINE_EXCEEDED` | Operation timeout | Retry, increase timeout, check quota |
+| `UNAVAILABLE` | Transient error | Retry with exponential backoff |
+
+## Monitoring / Log Analysis
+
+### Key GCP Monitoring Metrics
+
+| Resource | Key Metrics | Alert Threshold |
+|----------|-------------|-----------------|
+| Compute | CPU usage, Instance uptime | >80% CPU, any unexpected termination |
+| GKE | Pod restarts, Node conditions | >5 restarts, NodeReady=False |
+| Cloud SQL | Connections, Queries/sec | >70% max connections |
+| Load Balancer | Backend latency, Error rate | P99 >500ms, >1% 5xx |
+| Cloud Storage | Request count, Latency | >1% 5xx |
+| Cloud Functions | Cold starts, Memory usage | >5s cold start, >90% memory |
+
+### Cloud Logging Advanced Queries
+
+```bash
+# Find errors across all services in last hour
+gcloud logging read 'severity>=ERROR AND timestamp>"2026-06-16T10:00:00Z"' --limit=100
+
+# Trace a specific request by correlation ID
+gcloud logging read 'jsonPayload.correlation_id="abc-123"' --project=my-project
+
+# Find slow GKE pods
+gcloud logging read 'resource.type="k8s_container" AND jsonPayload.message:"slow"' \
+  --project=my-project --format=json | jq '.[] | .jsonPayload'
+
+# Count errors by service
+gcloud logging read 'severity>=ERROR' --format=json | \
+  jq -r '.resource.type' | sort | uniq -c | sort -rn
+```
+
+## Interview Questions
+
+### Question 1: GKE Debugging
+
+**Q:** A pod in your GKE cluster can't reach a Cloud SQL instance. Walk me through debugging.
+
+**A:**
+1. Check pod can reach the internet: `kubectl exec -it pod -- ping 8.8.8.8`
+2. Check DNS resolution: `kubectl exec -it pod -- nslookup sql-server`
+3. Verify Cloud SQL Auth Proxy is running in pod
+4. Check service account has Cloud SQL Client role
+5. Verify VPC-native cluster (no host networking)
+6. Check firewall rules allow between pod subnet and Cloud SQL
+7. Test from VM in same VPC: `nc -zv <sql-private-ip> 5432`
+8. Check Cloud SQL instance has private IP enabled
+9. Verify Cloud SQL Auth Proxy logs: `kubectl logs -l app=cloudsql-auth-proxy`
+
+### Question 2: Quota Management
+
+**Q:** Your team is hitting GCP quotas. How do you investigate and resolve?
+
+**A:**
+1. List current quotas: `gcloud compute project-info describe`
+2. Identify which quotas are hit: check operation errors
+3. Determine if limit is appropriate or needs increase
+4. For compute: use sustained use discounts, preemptible VMs
+5. For API quotas: implement exponential backoff, caching
+6. Request increase via Cloud Console or support ticket
+7. Set up quota alerts in Cloud Monitoring
+8. Implement cleanup policies for unused resources
+
+### Question 3: Networking Debugging
+
+**Q:** How do you debug connectivity between GKE and Cloud Storage?
+
+**A:**
+1. Check if nodes have private Google access enabled
+2. Verify Cloud NAT is configured if using private nodes
+3. Test from pod: `kubectl exec -it pod -- curl -v https://storage.googleapis.com`
+4. Check service account has Storage Object access
+5. For VPC firewall, ensure egress to 199.36.153.4/30 allowed
+6. Check if using Cloud CDN or direct access
+7. Monitor with VPC Flow Logs
+
+## Cheat Sheet
+
+| Command | Purpose |
+|---------|---------|
+| `gcloud compute instances list` | List all VMs |
+| `gcloud compute instances get-serial-port-output` | Boot logs when SSH fails |
+| `gcloud logging read` | Query Cloud Logs |
+| `gcloud sql connect` | Connect to Cloud SQL |
+| `gcloud container clusters get-credentials` | Get kubectl credentials |
+| `gcloud projects get-iam-policy` | List IAM policy |
+| `gcloud compute firewall-rules list` | List firewall rules |
+| `gcloud logging write` | Write test log entry |
+| `gcloud operations list` | List async operations |
+| `cloud-sql-proxy` | Local Cloud SQL connection |
+
+## Related Topics
+
+- [Overview](./overview) - General troubleshooting principles
+- [Kubernetes Troubleshooting](./kubernetes-troubleshooting) - K8s debugging
+- [Network Troubleshooting](./network-troubleshooting) - Network debugging
+- [Common Issues](./common-issues) - Frequently occurring problems

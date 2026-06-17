@@ -1,0 +1,401 @@
+---
+sidebar_position: 4
+description: Linux boot process, runlevels, package management, and kernel fundamentals for production systems.
+---
+
+# Linux Fundamentals
+
+## Overview
+
+This page covers the foundational concepts that DevOps engineers encounter daily but often take for granted. The boot process, package management, and kernel fundamentals are the bedrock of every Linux system. Misunderstanding these leads to failed deployments, inability to debug production issues, and poor architectural decisions.
+
+The boot process has evolved significantly — traditional SysV init gave way to systemd, which now manages services, sockets, timers, and more. Package management differs substantially between distributions: apt on Debian/Ubuntu, dnf/yum on Red Hat systems, apk on Alpine. Each ecosystem has its own conventions for repositories, package signing, and dependency resolution.
+
+## When To Use
+
+- Troubleshooting boot failures
+- Debugging service startup order issues
+- Planning package management automation
+- Understanding kernel module dependencies
+- Configuring automatic updates
+
+## When NOT To Use
+
+- Application-level debugging (that's a different layer)
+- Network troubleshooting (see networking.mdx)
+- When a container abstracts these details away
+
+## Core Concepts
+
+### Boot Process
+
+```
+Power On → BIOS/UEFI → Boot Loader (GRUB2) → Kernel + initramfs → systemd → Target
+```
+
+1. **BIOS/UEFI**: Hardware initialization, reads first sector
+2. **Boot Loader**: Loads kernel and initramfs from disk
+3. **Kernel**: Decompresses, initializes, runs /init from initramfs
+4. **initramfs**: Early user-space (udev, LVM, RAID, filesystem mounts)
+5. **systemd**: PID 1, activates target based on symlinks
+
+### Runlevels vs Targets
+
+Systemd replaced SysV runlevels with targets. Understanding the mapping:
+
+| SysV Runlevel | Systemd Target | Purpose |
+|--------------|----------------|---------|
+| 0 | shutdown.target | Halt system |
+| 1 | rescue.target | Single user mode |
+| 2-4 | multi-user.target | Multi-user, no GUI |
+| 5 | graphical.target | Multi-user with GUI |
+| 6 | reboot.target | Reboot |
+
+### Initramfs
+
+The initial ram filesystem contains minimal tooling to boot the real system:
+
+```bash
+# Show initramfs contents
+lsinitramfs /boot/initrd.img-$(uname -r)
+
+# Rebuild initramfs (after driver updates)
+sudo dracut -f --kver $(uname -r)
+
+# On Debian/Ubuntu
+sudo update-initramfs -u
+```
+
+### Package Management
+
+**Debian/Ubuntu (apt):**
+
+```bash
+# Update package index
+sudo apt update
+
+# Upgrade packages
+sudo apt upgrade          # Smart upgrade (no removals)
+sudo apt full-upgrade     # May remove packages
+
+# Install with deps
+sudo apt install nginx
+
+# Remove package (keep config)
+sudo apt remove nginx
+
+# Remove package + config
+sudo apt purge nginx
+
+# Search packages
+apt search "^nginx$"
+
+# Show package info
+apt show nginx
+
+# List installed
+dpkg -l
+apt list --installed
+```
+
+**Red Hat (dnf/yum):**
+
+```bash
+# Update all
+sudo dnf update
+
+# Install
+sudo dnf install nginx
+
+# Remove
+sudo dnf remove nginx
+
+# Search
+dnf search nginx
+
+# List updates
+dnf check-update
+
+# History (undo operations)
+dnf history
+dnf history undo <transaction_id>
+```
+
+**Alpine (apk):**
+
+```bash
+apk update
+apk add nginx
+apk del nginx
+apk search nginx
+apk info nginx
+```
+
+### Kernel Modules
+
+```bash
+# List all loaded modules
+lsmod
+
+# Module info (parameters, deps, description)
+modinfo br_netfilter
+
+# Load module
+sudo modprobe br_netfilter
+
+# Load with parameters
+sudo modprobe nf_conntrack hashsize=524288
+
+# Unload (must not be in use)
+sudo modprobe -r ebtables
+
+# Show module dependencies
+modprobe -D iptables_nat
+
+# Persistent module loading on boot
+echo "br_netfilter" | sudo tee /etc/modules-load.d/bridging.conf
+```
+
+## Real Production Example
+
+Building a minimal, hardened web server base:
+
+```bash
+#!/bin/bash
+# bootstrap-server.sh - First-boot server hardening
+
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "=== Updating packages ==="
+apt-get update
+apt-get -y upgrade
+
+echo "=== Installing minimal packages ==="
+apt-get install -y \
+    curl \
+    wget \
+    ca-certificates \
+    jq \
+    vim \
+    htop \
+    iotop \
+    strace \
+    tcpdump \
+    linux-tools-generic \
+    auditd \
+    fail2ban \
+    unattended-upgrades \
+    apt-listchanges
+
+echo "=== Configuring automatic security updates ==="
+cat > /etc/apt/apt.conf.d/51unattended-upgrades <<'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Upgrade::Autoclean-Unused-Dependencies "true";
+Unattended-Upgrade::MinimalSteps "true";
+EOF
+
+echo "=== Enabling auditd ==="
+systemctl enable auditd
+systemctl start auditd
+
+echo "=== Setting up fail2ban ==="
+cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = /var/log/auth.log
+EOF
+
+systemctl enable fail2ban
+systemctl start fail2ban
+
+echo "=== Kernel module hardening ==="
+cat > /etc/modprobe.d/security-hardening.conf <<'EOF'
+install usb-storage /bin/true
+blacklist evbug
+blacklist usbmouse
+blacklist sk98lin
+EOF
+
+echo "Done. Reboot recommended."
+```
+
+## CLI Examples
+
+```bash
+# Emergency access - drop to initramfs shell
+# Add to kernel cmdline: init=/bin/bash
+
+# Boot to specific target
+systemctl isolate multi-user.target
+
+# View boot time
+systemd-analyze
+systemd-analyze blame   # Which services took longest
+systemd-analyze critical-chain  # Startup chain
+
+# Set default target
+sudo systemctl set-default graphical.target
+
+# Check runlevel/target
+systemctl get-default
+
+# Emergency boot - add to kernel cmdline:
+# systemd.unit=rescue.target  or  1
+
+# Rebuild initramfs with all modules
+sudo dracut -f --force --kver $(uname -r)
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `systemctl list-units --type=target` | List targets |
+| `systemctl isolate <target>` | Change to target |
+| `systemctl get-default` | Show default target |
+| `systemctl set-default <target>` | Set default target |
+| `lsinitramfs /boot/initrd.img-*` | Inspect initramfs |
+| `dracut -f --kver <ver>` | Rebuild initramfs |
+| `apt-get install -y <pkg>` | Install package |
+| `dnf install <pkg>` | Install package (RHEL) |
+| `dpkg -l` | List installed packages |
+| `rpm -qa` | List packages (RHEL) |
+
+## Monitoring
+
+```bash
+# Service status at boot
+systemctl status <service>
+
+# Boot timing analysis
+systemd-analyze time        # Total boot time
+systemd-analyze blame       # Service-by-service
+systemd-analyze critical-chain  # Dependency chain
+
+# Failed units
+systemctl --failed
+
+# View initramfs contents
+lsinitramfs /boot/initrd.img-$(uname -r) | head
+
+# Package update availability
+apt list --upgradable
+dnf check-update
+```
+
+## Security
+
+- **Disable unused kernel modules**: Prevent hardware attacks via usb-storage, etc.
+- **UEFI Secure Boot**: Ensures kernel and modules are signed
+- **Boot loader password**: Prevent single-user mode access without password
+- **Unattended upgrades**: Critical for security patches
+- **auditd**: Log all executed commands and system calls
+- **fail2ban**: Automate blocking of brute force attempts
+
+Boot loader password (GRUB):
+```bash
+# Generate hashed password
+grub-mkpasswd-pbkdf2
+
+# Add to /etc/grub.d/40_custom
+cat >> /etc/grub.d/40_custom <<'EOF'
+set superusers="admin"
+password_pbkdf2 admin <hash>
+EOF
+update-grub
+```
+
+## Troubleshooting
+
+**Boot hangs at "Loading initial ramdisk":**
+- Boot with previous kernel
+- Check filesystem UUIDs in /etc/fstab
+- Regenerate initramfs: `update-initramfs -u`
+
+**Service fails with "dependency" error:**
+```
+Failed to start some-service.service: Dependency failed for...
+```
+Check: `systemctl list-dependencies some-service`
+
+**apt fails with signature error:**
+```
+The following signatures couldn't be verified
+```
+Fix: `sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys <KEYID>`
+
+**Package in broken state:**
+```bash
+sudo dpkg --configure -a
+sudo apt-get install -f
+```
+
+## Interview Questions
+
+1. **Describe the Linux boot process from power-on to login prompt.**
+
+BIOS/UEFI runs POST, locates boot device, loads and executes boot loader from MBR/GPT. GRUB2 loads selected kernel and initramfs into memory. Kernel decompresses, initializes core subsystems, mounts initramfs as root. /init (systemd) runs, reads /etc/systemd/system/default.target, activates basic.target, which brings up local-fs.target (mounts filesystems) and various services based on dependencies. Finally graphical.target or multi-user.target reaches login prompt.
+
+2. **What's the purpose of initramfs?**
+
+Initramfs provides minimal user-space environment with tools needed before the real root filesystem is accessible. It contains kernel modules for storage controllers (SATA, NVMe, SCSI), LVM/RAID utilities, and filesystem drivers (ext4, xfs, btrfs). Without initramfs, the kernel couldn't mount the root filesystem if it requires special drivers.
+
+3. **apt upgrade vs apt full-upgrade — what's the difference?**
+
+`apt upgrade` installs available updates but never removes packages or change what's installed. `apt full-upgrade` may remove packages if necessary to complete the upgrade (e.g., dependency conflicts). In production, prefer `apt upgrade` unless you specifically need the full-upgrade behavior and have tested it.
+
+4. **How would you investigate a service that's timing out during boot?**
+
+Use `systemd-analyze blame` to see service startup times. `systemctl status <service>` shows dependencies. `journalctl -b -u <service>` shows logs. Check if the service waits for network (After=network.target) when it doesn't need network, or if it requires another service that fails silently. Dependencies can be visualized with `systemd-analyze dot | dot -Tsvg > deps.svg`.
+
+5. **What happens if you delete /lib/modules/$(uname -r)?**
+
+That directory contains kernel modules for the running kernel version. If deleted, the system continues running but: you cannot load additional modules, depmod will fail (breaking some kernel module tools), some udev hardware detection may fail, and the system may not boot after reboot. You must regenerate it with `dracut -f` or `update-initramfs -u`.
+
+## Cheat Sheet
+
+```
+# Boot process
+systemd-analyze              # Total boot time
+systemd-analyze blame        # Time per service
+systemctl list-units --type=service --state=failed
+
+# Package management (Debian)
+apt update && apt upgrade
+dpkg -l | grep <package>
+apt-cache search <pattern>
+
+# Package management (RHEL)
+dnf check-update
+dnf update
+rpm -qa | grep <package>
+
+# Kernel modules
+lsmod
+modprobe <module>
+modinfo <module>
+echo "<module>" >> /etc/modules-load.d/xxx.conf  # Persistent
+
+# Rebuild initramfs
+update-initramfs -u  # Debian
+dracut -f --kver $(uname -r)  # RHEL
+```
+
+## Related Topics
+
+- [Systemd](./systemd) — Service management and unit files
+- [Storage](./storage) — Filesystem and LVM
+- [Memory](./memory) — Swap and OOM handling
+- [Permissions](./permissions) — File permissions and security

@@ -1,0 +1,8 @@
+{
+  "label": "Networking",
+  "position": 3,
+  "link": {
+    "type": "generated-index",
+    "description": "Load balancing, DNS architecture, firewall rules, and diagnosing connectivity issues in distributed systems."
+  }
+}

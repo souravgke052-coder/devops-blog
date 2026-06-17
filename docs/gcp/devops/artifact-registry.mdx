@@ -1,0 +1,534 @@
+# Artifact Registry
+
+## Overview
+
+Google Cloud Artifact Registry is a fully managed artifact repository service that stores, manages, and secures Docker images, Maven packages, npm packages, and more. It provides vulnerability scanning, fine-grained access control, and regional/multi-region deployment options for efficient artifact distribution.
+
+## When To Use
+
+- Storing and managing Docker container images
+- Hosting private Maven/npm packages
+- CI/CD pipeline artifact storage
+- Multi-cloud artifact management
+- Helm chart repositories
+- Python package hosting
+
+## When NOT To Use
+
+- Public open-source package hosting (use Docker Hub, npm registry)
+- Binary artifacts that don't fit supported formats
+- Large binary blobs (use Cloud Storage directly)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Artifact Registry                          │
+├─────────────────────────────────────────────────────────────┤
+│  Repository Formats:                                        │
+│  ├── Docker                                                  │
+│  ├── Maven                                                  │
+│  ├── npm                                                    │
+│  ├── Python (Artifact Registry)                            │
+│  └── APT/ yum (Rocky Linux)                                │
+├─────────────────────────────────────────────────────────────┤
+│  Repository Types:                                          │
+│  ├── Docker (hosted private registries)                    │
+│  ├── Google-hosted (Artifact Analysis)                     │
+│  └── Remote (proxy caches for upstream)                    │
+├─────────────────────────────────────────────────────────────┤
+│  Locations:                                                 │
+│  ├── Regional (us-central1, europe-west1, etc.)            │
+│  └── Multi-region (us, eu, asia)                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Repository
+Container for artifacts with format-specific configuration.
+
+### Artifact
+Docker image, Maven package, npm package, etc.
+
+### Virtual Repository
+Aggregates multiple repositories under one endpoint.
+
+### Remote Repository
+Proxy cache for upstream repositories (e.g., Docker Hub).
+
+### Vulnerability Scanning
+Automatic scanning for known CVEs in container images.
+
+## Real Production Example
+
+**Multi-Environment Container Registry**
+
+```hcl
+# Terraform configuration for Artifact Registry
+
+# Create Docker repository for production
+resource "google_artifact_registry_repository" "docker-prod" {
+  location      = "us-central1"
+  repository_id = "docker-prod"
+  description   = "Production container images"
+  format       = "DOCKER"
+  
+  docker_config {
+    clean_up_policy = "DELETE_MANIFEST"
+  }
+  
+  labels = {
+    environment = "production"
+    team        = "platform"
+  }
+}
+
+# Create Docker repository for staging
+resource "google_artifact_registry_repository" "docker-staging" {
+  location      = "us-central1"
+  repository_id = "docker-staging"
+  description   = "Staging container images"
+  format       = "DOCKER"
+  
+  docker_config {
+    clean_up_policy = "DELETE_MANIFEST"
+  }
+  
+  labels = {
+    environment = "staging"
+  }
+}
+
+# Create remote repository for Docker Hub caching
+resource "google_artifact_registry_repository" "docker-remote" {
+  location      = "us-central1"
+  repository_id = "docker-remote"
+  description   = "Docker Hub proxy cache"
+  format       = "DOCKER"
+  
+  remote_repository_config {
+    description = "Docker Hub"
+    docker_repository {
+      public_repository = "DOCKER_HUB"
+    }
+  }
+  
+  labels = {
+    type = "cache"
+  }
+}
+
+# Create Maven repository
+resource "google_artifact_registry_repository" "maven-internal" {
+  location      = "us-central1"
+  repository_id = "maven-internal"
+  description   = "Internal Maven packages"
+  format       = "MAVEN"
+  
+  maven_config {
+    version_policy = "RELEASE"
+  }
+  
+  labels = {
+    team = "development"
+  }
+}
+
+# Create npm repository
+resource "google_artifact_registry_repository" "npm-private" {
+  location      = "us-central1"
+  repository_id = "npm-private"
+  description   = "Private npm packages"
+  format       = "NPM"
+  
+  npm_config {
+    public_repository = "https://registry.npmjs.org"
+  }
+  
+  labels = {
+    team = "frontend"
+  }
+}
+
+# IAM for Artifact Registry
+resource "google_artifact_registry_repository_iam_member" "builder" {
+  location   = "us-central1"
+  repository = google_artifact_registry_repository.docker-prod.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.cloudbuild.email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "developer" {
+  location   = "us-central1"
+  repository = google_artifact_registry_repository.docker-prod.name
+  role       = "roles/artifactregistry.reader"
+  member     = "group:developers@company.com"
+}
+
+resource "google_artifact_registry_repository_iam_member" "deployer" {
+  location   = "us-central1"
+  repository = google_artifact_registry_repository.docker-prod.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:k8s-deployer@project.iam.gserviceaccount.com"
+}
+
+# Enable vulnerability scanning
+resource "google_artifact_registry_repository" "docker-prod" {
+  # ... previous config ...
+  
+  maven_config {
+    version_policy = "RELEASE"
+  }
+  
+  # Vulnerability scanning is enabled by default for Docker repositories
+}
+```
+
+## CLI Examples
+
+```bash
+# Create Docker repository
+gcloud artifacts repositories create my-repo \
+  --repository-format=docker \
+  --location=us-central1 \
+  --description="My Docker repository"
+
+# Create with cleanup policy
+gcloud artifacts repositories create my-repo \
+  --repository-format=docker \
+  --location=us-central1 \
+  --docker-cleanup-policy=delete-unmatched
+
+# List repositories
+gcloud artifacts repositories list --location=us-central1
+
+# Describe repository
+gcloud artifacts repositories describe my-repo --location=us-central1
+
+# Configure Docker authentication
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+# Push Docker image
+docker push us-central1-docker.pkg.dev/my-project/my-repo/my-image:tag
+
+# Pull Docker image
+docker pull us-central1-docker.pkg.dev/my-project/my-repo/my-image:tag
+
+# List images
+gcloud artifacts docker list us-central1-docker.pkg.dev/my-project/my-repo
+
+# List versions of an image
+gcloud artifacts versions list us-central1-docker.pkg.dev/my-project/my-repo/my-image
+
+# Delete image version
+gcloud artifacts versions delete us-central1-docker.pkg.dev/my-project/my-repo/my-image:tag
+
+# Create Maven repository
+gcloud artifacts repositories create maven-repo \
+  --repository-format=maven \
+  --location=us-central1 \
+  --description="Maven repository"
+
+# Create npm repository
+gcloud artifacts repositories create npm-repo \
+  --repository-format=npm \
+  --location=us-central1 \
+  --description="NPM repository"
+
+# Set IAM policy
+gcloud artifacts repositories add-iam-policy-binding my-repo \
+  --location=us-central1 \
+  --member=serviceAccount:sa@project.iam.gserviceaccount.com \
+  --role=roles/artifactregistry.writer
+
+# Docker cleanup policies
+gcloud artifacts repositories update my-repo \
+  --location=us-central1 \
+  --docker-cleanup-policy=delete-unmatched
+
+# Update repository description
+gcloud artifacts repositories update my-repo \
+  --location=us-central1 \
+  --description="Updated description"
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Docker repository
+resource "google_artifact_registry_repository" "docker" {
+  location      = "us-central1"
+  repository_id = "docker"
+  description   = "Docker images"
+  format        = "DOCKER"
+  
+  docker_config {
+    clean_up_policy = "DELETE_MANIFEST"
+  }
+}
+
+# Remote repository (Docker Hub cache)
+resource "google_artifact_registry_repository" "docker_hub_cache" {
+  location      = "us-central1"
+  repository_id = "docker-hub-cache"
+  description   = "Docker Hub proxy cache"
+  format        = "DOCKER"
+  
+  remote_repository_config {
+    description = "Docker Hub cache"
+    docker_repository {
+      public_repository = "DOCKER_HUB"
+    }
+  }
+}
+
+# Maven repository
+resource "google_artifact_registry_repository" "maven" {
+  location      = "us-central1"
+  repository_id = "maven"
+  description   = "Maven packages"
+  format        = "MAVEN"
+  
+  maven_config {
+    version_policy = "RELEASE"
+  }
+}
+
+# NPM repository
+resource "google_artifact_registry_repository" "npm" {
+  location      = "us-central1"
+  repository_id = "npm"
+  description   = "NPM packages"
+  format        = "NPM"
+  
+  npm_config {
+    public_repository = "https://registry.npmjs.org"
+  }
+}
+
+# IAM for service account
+resource "google_artifact_registry_repository_iam_member" "writer" {
+  location   = "us-central1"
+  repository = google_artifact_registry_repository.docker.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:ci@project.iam.gserviceaccount.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Repository management
+gcloud artifacts repositories create REPO --repository-format=FMT --location=LOC
+gcloud artifacts repositories list --location=LOC
+gcloud artifacts repositories describe REPO --location=LOC
+gcloud artifacts repositories delete REPO --location=LOC
+
+# Docker operations
+gcloud auth configure-docker LOCATION-docker.pkg.dev
+docker push LOCATION-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG
+docker pull LOCATION-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG
+
+# Version management
+gcloud artifacts versions list REPO --location=LOC
+gcloud artifacts versions delete REPO/IMAGE:VERSION --location=LOC
+
+# IAM
+gcloud artifacts repositories add-iam-policy-binding REPO --location=LOC [flags]
+```
+
+## Monitoring
+
+### Vulnerability Scanning
+```bash
+# View vulnerability report
+gcloud artifacts docker describe us-central1-docker.pkg.dev/my-project/my-repo/my-image:tag \
+  --show-discovery-results
+
+# Get vulnerability summary
+gcloud artifacts docker list us-central1-docker.pkg.dev/my-project/my-repo \
+  --include-tags
+
+# Filter by vulnerability severity
+gcloud artifacts docker list us-central1-docker.pkg.dev/my-project/my-repo \
+  --tag-filter=security-summary=SUMMARY
+```
+
+### Cloud Monitoring
+```bash
+# View storage metrics
+gcloud monitoring metrics list --filter="resource.type=artifact_registry"
+
+# Create storage alert
+gcloud monitoring policies create \
+  --display-name="AR Storage Alert" \
+  --condition-display-name="Storage > 100GB" \
+  --condition-filter='resource.type="artifact_registry" AND metric.type="artifactregistry.googleapis.com/repository/storage_bytes"' \
+  --condition-threshold-value=107374182400 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### Authentication
+```bash
+# Configure Docker auth for Artifact Registry
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+# This adds the registry to Docker's insecure registries (if needed)
+# and configures credential helper
+```
+
+### IAM Roles
+| Role | Permissions |
+|------|-------------|
+| artifactregistry.reader | Read artifacts |
+| artifactregistry.writer | Read/write artifacts |
+| artifactregistry.admin | Full control |
+| artifactregistry.versionmanager | Manage versions only |
+
+### Encryption
+- At rest: Google-managed encryption
+- In transit: TLS 1.2+
+- CMEK: Not directly supported
+
+## Cost Optimization
+
+### Storage Pricing
+| Storage | Price |
+|---------|-------|
+| Docker, Maven, npm | $0.10/GB/month |
+| Remote repository cache | $0.10/GB/month |
+
+### Optimization Tips
+```bash
+# Use cleanup policies to remove untagged manifests
+gcloud artifacts repositories update my-repo \
+  --location=us-central1 \
+  --docker-cleanup-policy=delete-unmatched
+
+# Delete old image versions
+gcloud artifacts versions delete REPO/IMAGE:OLD_VERSION --location=us-central1 --quiet
+
+# Set retention policies via lifecycle
+# Use Maven snapshot policies appropriately
+```
+
+## Troubleshooting
+
+### Authentication Issues
+```bash
+# Reconfigure Docker auth
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+# Verify credentials
+cat ~/.docker/config.json
+
+# Test connection
+docker pull us-central1-docker.pkg.dev/my-project/my-repo/ubuntu:22.04
+```
+
+### Push/Pull Failures
+```bash
+# Check repository exists
+gcloud artifacts repositories describe my-repo --location=us-central1
+
+# Verify IAM permissions
+gcloud artifacts repositories get-iam-policy my-repo --location=us-central1
+
+# Check Docker is configured for Artifact Registry
+gcloud auth configure-docker --quiet us-central1-docker.pkg.dev
+```
+
+### Image Not Found
+```bash
+# List images in repository
+gcloud artifacts docker list us-central1-docker.pkg.dev/my-project/my-repo
+
+# List versions
+gcloud artifacts versions list us-central1-docker.pkg.dev/my-project/my-repo/my-image
+
+# Check image digest
+docker images --digests | grep my-image
+```
+
+## Interview Questions
+
+**Q: What is the difference between Artifact Registry and Container Registry?**
+A: Container Registry (gcr.io) is the legacy service. Artifact Registry is the modern replacement with additional features: multiple format support (Docker, Maven, npm), vulnerability scanning, fine-grained IAM, remote repositories for caching, and better scalability. Migration from Container Registry to Artifact Registry is recommended.
+
+**Q: How does vulnerability scanning work in Artifact Registry?**
+A: When you push a Docker image, Artifact Registry automatically scans it for known vulnerabilities using the Container Analysis service. You can view the vulnerability report via CLI or Cloud Console. Severity levels include CRITICAL, HIGH, MEDIUM, and LOW.
+
+**Q: What are remote repositories in Artifact Registry?**
+A: Remote repositories act as proxy caches for upstream repositories (like Docker Hub or npmjs.org). They cache fetched artifacts, reducing external network calls and providing faster subsequent pulls. The cache is populated on-demand.
+
+**Q: How do you clean up old image versions?**
+A: Use the cleanup policy on the repository: `delete-unmatched` removes manifests not tagged after a specified time. Alternatively, manually delete versions using `gcloud artifacts versions delete`. Lifecycle policies can automate cleanup.
+
+**Q: What Docker cleanup policies are available?**
+A: `delete-unmatched` removes untagged manifests that haven't been accessed for a configurable period. `never` (default) retains all manifests. You can also manually manage cleanup via lifecycle scripts.
+
+## Cheat Sheet
+
+```bash
+# Configure Docker auth
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+# Push/pull images
+docker push us-central1-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG
+docker pull us-central1-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG
+
+# List and manage
+gcloud artifacts repositories list --location=REGION
+gcloud artifacts docker list us-central1-docker.pkg.dev/PROJECT/REPO
+gcloud artifacts versions list us-central1-docker.pkg.dev/PROJECT/REPO/IMAGE
+
+# Cleanup
+gcloud artifacts versions delete REPO/IMAGE:VERSION --location=REGION --quiet
+gcloud artifacts repositories update REPO --location=REGION --docker-cleanup-policy=delete-unmatched
+```
+
+## Labs
+
+### Lab 1: CI/CD Pipeline Integration
+Integrate Artifact Registry with Cloud Build.
+1. Create Artifact Registry repository
+2. Configure Docker auth in Cloud Build
+3. Push images in build pipeline
+4. Enable vulnerability scanning
+5. Deploy from Artifact Registry
+
+### Lab 2: Multi-Environment Registry
+Set up registry per environment.
+1. Create prod, staging, dev repositories
+2. Configure IAM per repository
+3. Set up cleanup policies
+4. Implement image promotion workflow
+5. Monitor storage usage
+
+### Lab 3: Remote Repository Caching
+Set up Docker Hub proxy cache.
+1. Create remote repository with Docker Hub upstream
+2. Configure CI/CD to use remote
+3. Test image caching behavior
+4. Monitor cache hit rates
+5. Optimize storage
+
+## Related Services
+
+- **Cloud Build**: Container image builds
+- **Cloud Run**: Container deployment
+- **GKE**: Kubernetes deployment
+- **Container Analysis**: Vulnerability scanning
+- **Secret Manager**: Image pull secrets

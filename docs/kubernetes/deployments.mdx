@@ -1,0 +1,934 @@
+---
+title: "Kubernetes Deployments"
+description: "Complete guide to Kubernetes Deployments - managing application updates, rollbacks, and release strategies"
+sidebar_position: 5
+---
+
+# Kubernetes Deployments
+
+## Overview
+
+A **Deployment** is a Kubernetes resource that provides declarative updates for Pods and ReplicaSets. It allows you to describe an application's desired state in a manifest, and the Deployment controller will systematically change the actual state to the desired state at a controlled rate. Deployments are the primary mechanism for managing application lifecycle in production environments.
+
+## When To Use
+
+- **Application deployments** requiring rolling updates with zero downtime
+- **When you need rollback capabilities** to previous versions
+- **When you need to pause and resume** deployments
+- **Scaling applications** up or down
+- **Blue-green or canary deployments** requiring controlled traffic shifting
+- **Any production workload** that needs self-healing and high availability
+
+## When NOT To Use
+
+- **Stateful applications requiring ordered deployment** - use StatefulSets
+- **Daemon sets running one pod per node** - use DaemonSets
+- **Jobs or batch workloads** - use Jobs or CronJobs
+- **When you need exactly-once execution** - use Jobs
+
+## Core Concepts
+
+### Deployment, ReplicaSet, and Pod Relationship
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Deployment                                │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Deployment Record                                         │  │
+│  │  - Revision history (for rollback)                        │  │
+│  │  - Strategy configuration                                  │  │
+│  │  - Current and previous ReplicaSet                         │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                              ▼                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    ReplicaSet (v1)                         │  │
+│  │  Replicas: 3                                               │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│           ┌─────────────────┼─────────────────┐                 │
+│           ▼                 ▼                 ▼                 │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
+│  │   Pod 1     │   │   Pod 2     │   │   Pod 3     │           │
+│  └─────────────┘   └─────────────┘   └─────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
+
+After update to v2:
+┌─────────────────────────────────────────────────────────────────┐
+│                        Deployment                                │
+│                                                                      │
+│  ┌─────────────────────┐    ┌─────────────────────┐              │
+│  │  ReplicaSet (v1)    │    │  ReplicaSet (v2)    │              │
+│  │  Replicas: 0        │    │  Replicas: 3        │              │
+│  └─────────────────────┘    └─────────────────────┘              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Rolling Update Strategy
+
+```
+                    Rolling Update Configuration
+                    maxSurge: 1, maxUnavailable: 0
+
+Step 1:  [v1] [v1] [v1]  →  [v1] [v1] [v1]  (3 pods running v1)
+Step 2:  [v2] [v1] [v1]  →  Create 1 v2 pod (maxSurge=1)
+Step 3:  [v2] [v2] [v1]  →  Scale up v2 to 2
+Step 4:  [v2] [v2] [v2]  →  Scale down v1, up v2
+Step 5:  [v2] [v2] [v2]  →  Complete (all 3 pods running v2)
+```
+
+## Architecture / How It Works
+
+### Deployment Controller Reconciliation
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   Deployment Controller                        │
+├──────────────────────────────────────────────────────────────┤
+│  1. Watch Deployment spec for changes                         │
+│  2. Generate new ReplicaSet spec (if image/version changed)  │
+│  3. Create new ReplicaSet                                     │
+│  4. Scale up new ReplicaSet based on strategy                 │
+│  5. Scale down old ReplicaSet                                 │
+│  6. Record revision in history                                │
+│  7. Report status                                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Strategy Types
+
+| Strategy | Description | Use Case |
+|----------|-------------|----------|
+| RollingUpdate | Gradually replace pods | Default, zero-downtime updates |
+| Recreate | Kill all pods, then create new | Breaking changes, no concurrent runs |
+| BlueGreen | Run both versions, switch traffic | Instant rollback capability |
+
+## Real Production Example
+
+### Production API Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+  labels:
+    app: api-service
+    team: platform
+    cost-center: "12345"
+  annotations:
+    kubernetes.io/change-cause: "Update to v2.3.1 - Performance improvements"
+spec:
+  # Replica count
+  replicas: 5
+  
+  # Rolling update configuration
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2           # Can have 2 more than desired during update
+      maxUnavailable: 0     # Never have fewer than desired ready
+  
+  # Selector (immutable)
+  selector:
+    matchLabels:
+      app: api-service
+  
+  # Minimum time before pod is considered ready
+  minReadySeconds: 15
+  
+  # Revision history for rollback
+  revisionHistoryLimit: 10
+  
+  # Pause deployment
+  paused: false
+  
+  # Pod template
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: v2.3.1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      # Service account
+      serviceAccountName: api-service-account
+      
+      # Termination
+      terminationGracePeriodSeconds: 60
+      
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Topology spread for HA
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: api-service
+      
+      # Anti-affinity to spread across nodes
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - api-service
+            topologyKey: kubernetes.io/hostname
+      
+      # Pod disruption budget
+      podDisruptionBudget:
+        minAvailable: 3
+      
+      # Init containers
+      initContainers:
+      - name: migrations
+        image: gcr.io/myproject/api-service:v2.3.1
+        command: ["./run-migrations.sh"]
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: database-url
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      
+      # Main container
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: grpc
+          containerPort: 9090
+          protocol: TCP
+        
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: database-url
+        - name: REDIS_HOST
+          value: "redis.production.svc.cluster.local"
+        - name: METRICS_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: metrics-user
+        - name: METRICS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: metrics-password
+        
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /healthz/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+        
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          failureThreshold: 30
+          periodSeconds: 10
+        
+        # Lifecycle hooks
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 10"]
+          postStart:
+            exec:
+              command: ["/bin/sh", "-c", "echo 'Container started'"]
+        
+        # Security
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        
+        # Volume mounts
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: ca-certificates
+          mountPath: /etc/ssl/certs
+          readOnly: true
+        - name: ssl-certs
+          mountPath: /etc/ssl/private
+          readOnly: true
+      
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+      - name: ca-certificates
+        configMap:
+          name: ca-certificates
+      - name: ssl-certs
+        secret:
+          secretName: api-tls
+```
+
+### Canary Deployment with Multiple Deployments
+
+```yaml
+# Primary deployment (95% traffic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 19
+  selector:
+    matchLabels:
+      app: api-service
+      track: stable
+  template:
+    metadata:
+      labels:
+        app: api-service
+        track: stable
+        version: v2.3.0
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.0
+
+---
+# Canary deployment (5% traffic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service-canary
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-service
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: api-service
+        track: canary
+        version: v2.4.0
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.4.0
+
+---
+# Service with canary weight (using nginx-ingress annotation)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "5"
+spec:
+  selector:
+    app: api-service
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+## YAML Examples
+
+### Blue-Green Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service-green
+  namespace: production
+spec:
+  replicas: 5
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: api-service
+      version: v2
+      color: green
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: v2
+        color: green
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+---
+# Service switching from blue to green
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  selector:
+    app: api-service
+    color: green  # Change to switch traffic
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+### Deployment with HPA
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+    spec:
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.1
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create deployment
+kubectl apply -f deployment.yaml
+kubectl create deployment nginx --image=nginx:1.25
+
+# List deployments
+kubectl get deployments
+kubectl get deploy
+kubectl get deploy -o wide
+kubectl get deploy -l app=myapp
+
+# Describe deployment
+kubectl describe deployment api-service
+
+# Get deployment YAML
+kubectl get deployment api-service -o yaml
+
+# Scale deployment
+kubectl scale deployment api-service --replicas=5
+
+# Delete deployment
+kubectl delete deployment api-service
+```
+
+### Rolling Updates and Rollbacks
+
+```bash
+# Update image
+kubectl set image deployment/api-service api=gcr.io/myproject/api:v2.4.0
+
+# View rollout status
+kubectl rollout status deployment/api-service
+kubectl rollout status deployment/api-service --timeout=5m
+
+# Rolling restart (triggers update)
+kubectl rollout restart deployment/api-service
+
+# View rollout history
+kubectl rollout history deployment/api-service
+kubectl rollout history deployment/api-service --revision=3
+
+# Rollback to previous version
+kubectl rollout undo deployment/api-service
+
+# Rollback to specific revision
+kubectl rollout undo deployment/api-service --to-revision=2
+```
+
+### Advanced Operations
+
+```bash
+# Pause deployment (for multiple changes)
+kubectl rollout pause deployment/api-service
+# Make multiple changes
+kubectl set image deployment/api-service api=v2.4.1
+kubectl set resources deployment/api-service --limits=cpu=2,memory=4Gi
+# Resume
+kubectl rollout resume deployment/api-service
+
+# View ReplicaSets
+kubectl get rs
+kubectl get rs -l app=api-service
+
+# Scale specific ReplicaSet (for canary)
+kubectl scale deployment api-service-canary --replicas=2
+
+# Apply with record (save to annotation)
+kubectl apply -f deployment.yaml --record
+```
+
+## Common Commands
+
+```bash
+# Check deployment status
+kubectl get deployment api-service
+
+# Watch rollout progress
+kubectl rollout status -f deployment.yaml
+
+# Generate deployment YAML
+kubectl create deployment api --image=nginx --dry-run=client -o yaml
+
+# Edit deployment
+kubectl edit deployment api-service
+
+# Patch deployment
+kubectl patch deployment api-service -p '{"spec":{"replicas":10}}'
+
+# Set environment variables
+kubectl set env deployment/api-service DATABASE_URL=postgres://...
+
+# View deployment logs
+kubectl logs -l app=api-service --tail=100
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description | Alert Threshold |
+|--------|-------------|-----------------|
+| deployment_replicas | Desired replica count | N/A |
+| deployment_replicas_available | Available replicas | < desired |
+| deployment_replicas_ready | Ready replicas | < desired |
+| deployment_replicas_unavailable | Unavailable replicas | > 0 |
+
+### Prometheus Queries
+
+```promql
+# Deployments not fully available
+deployment_replicas_available{namespace="production"} < deployment_replicas{namespace="production"}
+
+# All deployment status
+sum(deployment_replicas) by (namespace, deployment)
+sum(deployment_replicas_available) by (namespace, deployment)
+
+# Failed deployments
+kubeDeployment.spec.replicas - kube_deployment_status_replicas_ready > 0
+```
+
+### GKE Monitoring
+
+```bash
+# View deployment status in GKE
+gcloud container workloads list --region=us-central1
+
+# Get workload details
+gcloud container workloads describe WORKLOAD_NAME --region=us-central1
+```
+
+## Security
+
+### RBAC for Deployment Management
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-manager
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments/status"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deployment-manager-binding
+subjects:
+- kind: ServiceAccount
+  name: ci-pipeline
+  namespace: production
+roleRef:
+  kind: Role
+  name: deployment-manager
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### PodDisruptionBudget
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-service-pdb
+  namespace: production
+spec:
+  minAvailable: 3  # At least 3 pods during disruptions
+  # OR maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: api-service
+```
+
+## Cost Optimization
+
+### Resource Optimization
+
+```bash
+# Find over-provisioned deployments
+kubectl top deployment -A | sort -k2 -r
+
+# Check for missing resource requests
+kubectl get deploy -A -o json | jq '.items[] | select(.spec.template.spec.containers[].resources.requests == null) | .metadata.name'
+```
+
+### VPA Integration
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-service-vpa
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: api
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 4
+        memory: 8Gi
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Deployment stuck | Pod scheduling failure, image pull | Check events, describe pods |
+| Rolling update not progressing | Liveness probe failing | Adjust probes, check app health |
+| High restart count | OOMKilled, crash loops | Check resource limits, logs |
+| Old ReplicaSet not deleted | revisionHistoryLimit too high | Reduce limit, check rollback policy |
+
+### Diagnostic Commands
+
+```bash
+# Check deployment status
+kubectl get deployment api-service
+kubectl describe deployment api-service
+
+# Check rollout status
+kubectl rollout status deployment/api-service
+
+# Check rollout history
+kubectl rollout history deployment/api-service
+
+# Check ReplicaSets
+kubectl get rs -l app=api-service
+
+# Check events
+kubectl get events --field-selector involvedObject.name=api-service
+
+# Check pod issues
+kubectl get pods -l app=api-service
+kubectl describe pods -l app=api-service
+
+# Force rollback
+kubectl rollout undo deployment/api-service --to-revision=0
+```
+
+### Recovery Procedures
+
+```bash
+# Complete rollout stuck in progress
+kubectl rollout undo deployment/api-service
+
+# Clear deployment
+kubectl scale deployment api-service --replicas=0
+# Fix issues
+kubectl apply -f fixed-deployment.yaml
+kubectl scale deployment api-service --replicas=5
+
+# View previous configuration
+kubectl rollout history deployment/api-service --revision=1
+kubectl rollout history deployment/api-service --revision=2
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a Kubernetes Deployment?**
+A: A Deployment is a resource that provides declarative updates for Pods and ReplicaSets. It allows you to describe an application's desired state and will manage the rollout and rollback of changes systematically.
+
+**Q: What is the difference between RollingUpdate and Recreate strategies?**
+A: RollingUpdate gradually replaces old pods with new ones, maintaining availability throughout. Recreate terminates all existing pods before creating new ones, which causes downtime but ensures no version overlap.
+
+**Q: What does maxSurge and maxUnavailable control?**
+A: maxSurge is the number of extra pods allowed during updates. maxUnavailable is the number of pods that can be unavailable. Together they control the speed vs. availability tradeoff during rolling updates.
+
+### Intermediate Questions
+
+**Q: How do you perform a rolling update with zero downtime?**
+A: Set maxUnavailable: 0 and maxSurge: 1. This ensures all old pods stay up until new pods are ready. Configure proper readiness probes so new pods only receive traffic when healthy.
+
+**Q: How does the deployment controller track revisions?**
+A: Each time a deployment is updated, a new ReplicaSet is created and the old one is kept (up to revisionHistoryLimit). The controller stores the revision annotation on the ReplicaSet for tracking.
+
+**Q: What is the purpose of minReadySeconds?**
+A: minReadySeconds specifies the minimum time a pod must be running without issues before it's considered ready. This prevents moving to the next pod too quickly in a rolling update.
+
+### Advanced Questions
+
+**Q: How would you implement a canary deployment?**
+A: Run two Deployments: stable (majority of replicas) and canary (few replicas). Use Service with label selectors to route most traffic to stable. Use weighted routing (via Ingress or service mesh) for gradual traffic shifting.
+
+**Q: What happens during a Deployment update with HPA enabled?**
+A: The HPA and Deployment controller coordinate: HPA may scale up during the update (due to maxSurge), and the rollout proceeds. After the update, HPA adjusts replicas based on actual metrics.
+
+**Q: How do you debug a Deployment that's not progressing?**
+A: Check: 1) kubectl rollout status for errors, 2) kubectl describe pods for scheduling/image issues, 3) pod logs for application errors, 4) events for resource issues, 5) readiness/liveness probe configuration.
+
+## Cheat Sheet
+
+### Deployment YAML Template
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  replicas: 3
+  
+  # Strategy: RollingUpdate or Recreate
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  
+  # Selector (immutable)
+  selector:
+    matchLabels:
+      app: my-app
+  
+  # Rollback config
+  revisionHistoryLimit: 10
+  minReadySeconds: 10
+  
+  # Pause deployment
+  paused: false
+  
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 80
+```
+
+### Essential Commands
+
+```bash
+# Create/Update
+kubectl apply -f deployment.yaml
+kubectl set image deployment/myapp app=nginx:v2
+
+# Status
+kubectl get deployment
+kubectl rollout status deployment/myapp
+kubectl rollout history deployment/myapp
+
+# Rollback
+kubectl rollout undo deployment/myapp
+kubectl rollout undo deployment/myapp --to-revision=2
+
+# Scale
+kubectl scale deployment/myapp --replicas=5
+
+# Restart
+kubectl rollout restart deployment/myapp
+
+# Pause/Resume
+kubectl rollout pause deployment/myapp
+kubectl rollout resume deployment/myapp
+```
+
+### Strategy Comparison
+
+| Strategy | maxSurge | maxUnavailable | Zero Downtime | Resource Usage |
+|----------|----------|----------------|---------------|----------------|
+| RollingUpdate | 1 | 0 | Yes | Higher |
+| RollingUpdate | 0 | 1 | No | Lower |
+| Recreate | N/A | N/A | No | Minimal |
+
+## Related Topics
+
+- [ReplicaSets](./replicasets) - Controller managing pods
+- [Pods](./pods) - Pod specifications
+- [Services](./services) - Traffic routing
+- [HPA](./autoscaling) - Horizontal scaling
+- [RBAC](./rbac) - Access control

@@ -1,0 +1,1181 @@
+---
+sidebar_position: 7
+title: CI/CD Labs
+description: Hands-on Continuous Integration and Deployment labs
+---
+
+# CI/CD Labs
+
+## Overview
+
+Build production-ready CI/CD pipelines through hands-on labs covering GitHub Actions, GitLab CI, Jenkins, and deployment strategies.
+
+## Prerequisites
+
+- GitHub account
+- GitLab account (for GitLab CI lab)
+- Docker installed locally (for container builds)
+- Basic understanding of git workflows
+
+### Required Setup
+
+```bash
+# Verify Git installation
+git --version
+
+# Configure Git
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+
+# Verify Docker
+docker --version
+docker login
+```
+
+---
+
+## Lab 1: GitHub Actions - Basic Pipeline
+
+**Objective**: Create a basic GitHub Actions workflow for CI
+**Estimated Time**: 30 minutes
+**Prerequisites**: GitHub account, GitHub repository
+
+### Step-by-Step
+
+#### 1. Create Workflow Directory
+
+```bash
+# Navigate to your repository
+cd your-repo
+
+# Create workflow directory
+mkdir -p .github/workflows
+
+# Create your first workflow
+cat > .github/workflows/ci.yml << 'EOF'
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '18.x'
+
+jobs:
+  test:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run linting
+      run: npm run lint
+
+    - name: Run tests
+      run: npm test
+      env:
+        CI: true
+
+    - name: Upload coverage report
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage/lcov.info
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=semver,pattern={{version}}
+
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Deploy application
+      run: |
+        echo "Deploying image ${{ needs.build.outputs.image }}"
+        # Add your deployment commands here
+EOF
+```
+
+#### 2. Commit and Push
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "Add GitHub Actions CI pipeline"
+git push origin main
+```
+
+#### 3. Monitor Workflow
+
+```bash
+# View workflow runs
+gh run list
+
+# Watch workflow status
+gh run watch
+
+# View workflow logs
+gh run view --log
+
+# Download artifacts
+gh run download
+```
+
+#### 4. Add Notifications
+
+```yaml
+# Add to workflow for Slack notifications (in existing workflow)
+    - name: Notify Slack on failure
+      if: failure()
+      uses: slackapi/slack-github-action@v1
+      with:
+        payload: |
+          {
+            "text": "Workflow ${{ github.workflow }} failed on ${{ github.ref }}",
+            "blocks": [{
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*${{ github.workflow }}* failed :x:"
+              }
+            }]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### Validation
+
+```bash
+# Verify workflow syntax
+cat .github/workflows/ci.yml | head -20
+
+# Check workflow in GitHub UI
+# Navigate to: Repository -> Actions tab
+
+# Trigger a test run
+git push origin main
+gh run watch
+```
+
+### Cleanup
+
+```bash
+# Remove workflow (if needed)
+rm .github/workflows/ci.yml
+git add -A
+git commit -m "Remove CI workflow"
+git push
+```
+
+---
+
+## Lab 2: GitHub Actions - Advanced Patterns
+
+**Objective**: Implement matrix builds, caching, and deployment strategies
+**Estimated Time**: 35 minutes
+**Prerequisites**: GitHub repository with GitHub Actions configured
+
+### Step-by-Step
+
+#### 1. Matrix Builds
+
+```yaml
+cat > .github/workflows/matrix-build.yml << 'EOF'
+name: Multi-Platform Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}, ${{ matrix.node_version }})
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node_version: ['16.x', '18.x', '20.x']
+        exclude:
+          - os: windows-latest
+            node_version: '16.x'
+          - os: macos-latest
+            node_version: '16.x'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js ${{ matrix.node_version }} on ${{ matrix.os }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node_version }}
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run tests
+      run: npm test
+      env:
+        CI: true
+
+    - name: Build
+      run: npm run build
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.os }}-node-${{ matrix.node_version }}
+        path: dist/
+        retention-days: 7
+EOF
+```
+
+#### 2. Dependency Caching
+
+```yaml
+cat > .github/workflows/cached-build.yml << 'EOF'
+name: Cached Build Pipeline
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Node.js caching
+    - name: Cache npm packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-npm-
+
+    # pip caching (for Python)
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    # Docker layer caching
+    - name: Build with Docker cache
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        load: true
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+EOF
+```
+
+#### 3. Environment-based Deployment
+
+```yaml
+cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run tests
+      run: npm test
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging..."
+        # Add deployment commands
+        curl -X POST "https://staging-api.example.com/deploy" \
+          -H "Authorization: Bearer ${{ secrets.STAGING_DEPLOY_TOKEN }}"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: startsWith(github.ref, 'refs/heads/release/')
+    environment:
+      name: production
+      url: https://example.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production..."
+        # Add deployment commands
+
+    - name: Notify success
+      if: success()
+      uses: slackapi/slack-github-action@v1
+      with:
+        payload: |
+          {
+            "text": "Production deployment successful :tada:"
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+EOF
+```
+
+#### 4. Reusable Workflows
+
+```yaml
+# .github/workflows/reusable-test.yml
+cat > .github/workflows/reusable-test.yml << 'EOF'
+name: Reusable Test Workflow
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        required: false
+        default: '18.x'
+        type: string
+    outputs:
+      test_result:
+        value: ${{ jobs.test.outputs.result }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.test.outputs.result }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+
+    - name: Install dependencies
+      run: npm ci
+
+    - id: test
+      name: Run tests
+      run: |
+        npm test
+        echo "result=passed" >> $GITHUB_OUTPUT
+EOF
+
+# .github/workflows/call-test.yml
+cat > .github/workflows/call-test.yml << 'EOF'
+name: Test Matrix
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  call-test-workflow:
+    uses: ./.github/workflows/reusable-test.yml
+    with:
+      node_version: '20.x'
+EOF
+```
+
+### Validation
+
+```bash
+# View workflow runs with matrix
+gh run list --workflow=matrix-build.yml
+
+# View specific run details
+gh run view RUN_ID
+
+# Check matrix build outputs
+gh run view RUN_ID --log | grep "Build"
+```
+
+### Cleanup
+
+```bash
+rm .github/workflows/matrix-build.yml
+rm .github/workflows/cached-build.yml
+rm .github/workflows/deploy.yml
+rm .github/workflows/reusable-test.yml
+rm .github/workflows/call-test.yml
+git add -A
+git commit -m "Remove workflow files"
+git push
+```
+
+---
+
+## Lab 3: GitLab CI/CD
+
+**Objective**: Configure GitLab CI pipelines with stages, artifacts, and deployments
+**Estimated Time**: 35 minutes
+**Prerequisites**: GitLab account, GitLab repository
+
+### Step-by-Step
+
+#### 1. Create .gitlab-ci.yml
+
+```yaml
+cat > .gitlab-ci.yml << 'EOF'
+stages:
+  - build
+  - test
+  - deploy
+  - notify
+
+variables:
+  DOCKER_DRIVER: overlay2
+  APP_NAME: myapp
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+
+# Default image for all jobs
+image: docker:24-dind
+
+# Cache configuration
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .npm/
+    - .cache/pip
+
+before_script:
+  - echo "Pipeline started at $(date)"
+
+# Build stage
+build:
+  stage: build
+  only:
+    - main
+    - develop
+    - merge_requests
+  services:
+    - docker:24-dind
+  script:
+    - |
+      echo "Building Docker image..."
+      docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+      docker build -t $DOCKER_IMAGE .
+      docker tag $DOCKER_IMAGE $CI_REGISTRY_IMAGE:latest
+      docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+      docker push $CI_REGISTRY_IMAGE:latest
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - build/
+
+# Test stage
+test-unit:
+  stage: test
+  image: node:18-alpine
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .npm/
+  script:
+    - npm ci
+    - npm run lint
+    - npm run test:unit -- --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+
+test-integration:
+  stage: test
+  image: node:18-alpine
+  services:
+    - postgres:15-alpine
+    - redis:7-alpine
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_password
+    DATABASE_URL: postgres://test_user:test_password@postgres:5432/test_db
+  script:
+    - npm ci
+    - npm run test:integration
+  artifacts:
+    reports:
+      junit: junit-integration.xml
+
+# Deploy stages
+deploy-staging:
+  stage: deploy
+  only:
+    - develop
+  environment:
+    name: staging
+    url: https://staging.example.com
+    on_stop: stop-staging
+  script:
+    - echo "Deploying to staging..."
+    - kubectl config use-context staging
+    - kubectl set image deployment/$APP_NAME app=$DOCKER_IMAGE
+    - kubectl rollout status deployment/$APP_NAME -n staging
+  when: manual
+
+deploy-production:
+  stage: deploy
+  only:
+    - main
+  environment:
+    name: production
+    url: https://example.com
+  script:
+    - echo "Deploying to production..."
+    - kubectl config use-context production
+    - kubectl set image deployment/$APP_NAME app=$DOCKER_IMAGE
+    - kubectl rollout status deployment/$APP_NAME -n production
+  when: manual
+
+stop-staging:
+  stage: deploy
+  only:
+    - develop
+  environment:
+    name: staging
+    action: stop
+  script:
+    - echo "Stopping staging environment..."
+    - kubectl delete deployment $APP_NAME -n staging
+  when: manual
+
+# Notification
+notify-slack:
+  stage: notify
+  only:
+    - main
+  script:
+    - |
+      if [ "$CI_COMMIT_REF_NAME" == "main" ]; then
+        curl -X POST "$SLACK_WEBHOOK_URL" \
+          -H 'Content-type: application/json' \
+          --data '{"text":"Deployment completed: '"$APP_NAME"' v'"$CI_COMMIT_SHORT_SHA"'"}'
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_COMMIT_STATUS == "success"
+EOF
+```
+
+#### 2. Configure GitLab Runner
+
+```yaml
+# .gitlab-ci.yml - with runner tags
+deploy-production:
+  stage: deploy
+  tags:
+    - production
+    - docker
+  script:
+    - echo "Deploying..."
+```
+
+#### 3. Use GitLab CI Templates
+
+```yaml
+# Inherit from Auto DevOps (if enabled)
+include:
+  - template: Auto-DevOps.gitlab-ci.yml
+
+# Or include specific templates
+include:
+  - local: '.gitlab-ci-templates.yml'
+  
+  - remote: 'https://gitlab.com/example/ci-templates/raw/main/templates.yml'
+```
+
+### Validation
+
+```bash
+# View pipeline
+glab pipeline list
+
+# View pipeline status
+glab pipeline status
+
+# View job logs
+glab ci view
+
+# Retry failed job
+glab ci retry JOB_ID
+```
+
+### Cleanup
+
+```bash
+rm .gitlab-ci.yml
+git add -A
+git commit -m "Remove GitLab CI configuration"
+git push
+```
+
+---
+
+## Lab 4: ArgoCD - GitOps Deployments
+
+**Objective**: Set up ArgoCD for GitOps-based continuous deployment
+**Estimated Time**: 40 minutes
+**Prerequisites**: Kubernetes cluster with ArgoCD installed
+
+### Step-by-Step
+
+#### 1. Install ArgoCD
+
+```bash
+# Create namespace
+kubectl create namespace argocd
+
+# Install ArgoCD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Install ArgoCD CLI
+brew install argocd
+
+# Wait for ArgoCD server to be ready
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server -n argocd --timeout=300s
+
+# Get initial admin password
+argocd admin initial-password -n argocd
+
+# Port forward to access UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+```
+
+#### 2. Register Cluster with ArgoCD
+
+```bash
+# Login via CLI
+argocd login localhost:8080 --username admin --password PASSWORD --insecure
+
+# List clusters
+argocd cluster list
+
+# Add external cluster
+argocd cluster add target-cluster --name production
+
+# Get cluster context
+kubectl config get-contexts
+```
+
+#### 3. Create Application
+
+```yaml
+# application.yaml
+cat > application.yaml << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp-production
+  namespace: argocd
+spec:
+  project: default
+  
+  source:
+    repoURL: https://github.com/your-org/your-repo
+    targetRevision: HEAD
+    path: k8s/production
+    
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+
+  revisionHistoryLimit: 3
+EOF
+
+# Apply application
+kubectl apply -f application.yaml
+
+# Or use ArgoCD CLI
+argocd app create myapp-production \
+  --repo https://github.com/your-org/your-repo \
+  --path k8s/production \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace production \
+  --sync-policy auto
+```
+
+#### 4. Configure GitOps Repository
+
+```bash
+# Create Kubernetes manifests directory
+mkdir -p k8s/production
+mkdir -p k8s/staging
+
+# Create deployment
+cat > k8s/production/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  labels:
+    app: myapp
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+      - name: myapp
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            memory: 256Mi
+            cpu: 500m
+          requests:
+            memory: 128Mi
+            cpu: 100m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp
+spec:
+  selector:
+    app: myapp
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+EOF
+```
+
+#### 5. Sync and Manage Application
+
+```bash
+# Sync application manually
+argocd app sync myapp-production
+
+# Watch sync progress
+argocd app wait myapp-production --sync --timeout 300s
+
+# Get application status
+argocd app get myapp-production
+
+# List applications
+argocd app list
+
+# View application history
+argocd app history myapp-production
+
+# Rollback to previous version
+argocd app rollback myapp-production
+
+# Sync specific revision
+argocd app sync myapp-production --revision v1.2.3
+```
+
+### Validation
+
+```bash
+# Check ArgoCD application status
+argocd app status myapp-production
+
+# Verify resources in Kubernetes
+kubectl get all -n production
+
+# Check sync status
+argocd app list -o wide
+
+# View ArgoCD logs
+kubectl logs -n argocd -l app.kubernetes.io/name=argocd-server
+```
+
+### Cleanup
+
+```bash
+# Delete application
+kubectl delete -f application.yaml
+argocd app delete myapp-production
+
+# Optional: Uninstall ArgoCD
+kubectl delete -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Clean up GitOps repo
+rm -rf k8s
+git add -A
+git commit -m "Remove GitOps manifests"
+git push
+```
+
+---
+
+## Lab 5: Jenkins Pipeline
+
+**Objective**: Create Jenkins declarative pipelines with advanced features
+**Estimated Time**: 35 minutes
+**Prerequisites**: Jenkins instance with pipeline plugin
+
+### Step-by-Step
+
+#### 1. Create Jenkinsfile
+
+```groovy
+// Jenkinsfile (declarative pipeline)
+pipeline {
+    agent {
+        docker {
+            image 'node:18-alpine'
+            args '-u root:root'
+        }
+    }
+
+    environment {
+        APP_NAME = 'myapp'
+        REGISTRY = 'ghcr.io'
+        REGISTRY_CREDS = credentials('github-token')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''
+                    npm ci
+                    npm run build
+                '''
+            }
+        }
+
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'npm run test:unit'
+                    }
+                    post {
+                        always {
+                            junit '**/junit.xml'
+                            cobertura coberturaReportFile: '**/cobertura.xml'
+                        }
+                    }
+                }
+
+                stage('Integration Tests') {
+                    steps {
+                        sh 'npm run test:integration'
+                    }
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                sh 'npm audit --audit-level=moderate'
+                script {
+                    if (env.BRANCH_NAME == 'main') {
+                        sh 'trivy image --severity HIGH,CRITICAL $REGISTRY/$APP_NAME:$GIT_COMMIT_SHORT'
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh """
+                    echo $REGISTRY_CREDS | docker login $REGISTRY -u _json_key --password-stdin
+                    docker build -t $REGISTRY/$APP_NAME:$GIT_COMMIT_SHORT .
+                    docker push $REGISTRY/$APP_NAME:$GIT_COMMIT_SHORT
+                    docker tag $REGISTRY/$APP_NAME:$GIT_COMMIT_SHORT $REGISTRY/$APP_NAME:latest
+                    docker push $REGISTRY/$APP_NAME:latest
+                """
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh """
+                    kubectl config use-context staging
+                    kubectl set image deployment/$APP_NAME app=$REGISTRY/$APP_NAME:$GIT_COMMIT_SHORT
+                    kubectl rollout status deployment/$APP_NAME -n staging
+                """
+            }
+        }
+
+        stage('Smoke Test') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh """
+                    sleep 30  # Wait for deployment
+                    curl -f https://staging.example.com/health || exit 1
+                """
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Deploy to production?', ok: 'Deploy'
+                sh """
+                    kubectl config use-context production
+                    kubectl set image deployment/$APP_NAME app=$REGISTRY/$APP_NAME:$GIT_COMMIT_SHORT
+                    kubectl rollout status deployment/$APP_NAME -n production
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'build/**/*', fingerprint: true
+            cleanWs()
+        }
+        success {
+            slackSend channel: '#deployments',
+                      message: "Build ${env.BUILD_NUMBER} succeeded: ${env.GIT_COMMIT_SHORT}"
+        }
+        failure {
+            slackSend channel: '#deployments',
+                      color: 'danger',
+                      message: "Build ${env.BUILD_NUMBER} failed: ${env.GIT_URL}"
+        }
+    }
+}
+```
+
+#### 2. Use Shared Libraries
+
+```groovy
+// vars/buildImage.groovy (in shared library)
+def call(Map config) {
+    pipeline {
+        agent { label 'docker' }
+        
+        stages {
+            stage('Build Image') {
+                steps {
+                    sh """
+                        docker build -t ${config.image}:${config.tag} .
+                        docker push ${config.image}:${config.tag}
+                    """
+                }
+            }
+        }
+    }
+}
+
+// In Jenkinsfile
+@Library('my-shared-library') _
+
+buildImage(image: 'myapp', tag: 'v1.0')
+```
+
+#### 3. Multibranch Pipeline Configuration
+
+```groovy
+// Jenkinsfile with conditional deployment
+pipeline {
+    stages {
+        stage('Deploy') {
+            steps {
+                script {
+                    switch (env.BRANCH_NAME) {
+                        case 'main':
+                            deployTo('production')
+                            break
+                        case 'develop':
+                            deployTo('staging')
+                            break
+                        default:
+                            echo "No deployment for feature branch"
+                    }
+                }
+            }
+        }
+    }
+}
+
+def deployTo(String environment) {
+    echo "Deploying to ${environment}..."
+    // Add deployment logic
+}
+```
+
+### Validation
+
+```bash
+# View build logs in Jenkins UI
+# Navigate to: Jenkins -> Pipeline -> Build History -> Console Output
+
+# Trigger build manually
+jenkins-cli build my-pipeline
+
+# Check build status via CLI (if configured)
+curl -s -u admin:API_TOKEN http://jenkins:8080/job/my-pipeline/lastBuild/api/json
+```
+
+### Cleanup
+
+```bash
+rm Jenkinsfile
+git add -A
+git commit -m "Remove Jenkinsfile"
+git push
+```
+
+---
+
+## Interview Prep Connections
+
+Review these common CI/CD interview topics:
+
+- [CI/CD Fundamentals](/docs/cicd/pipeline)
+- [GitOps](/docs/cicd/gitops)
+- [Deployment Strategies](/docs/cicd/deployment)
+
+Common interview questions:
+- "Explain the difference between CI and CD"
+- "How would you implement a blue-green deployment?"
+- "What is GitOps and what are its benefits?"
+- "How do you handle secrets in CI/CD pipelines?"
+
+## Related Topics
+
+- [Docker Basics](/docs/containers/docker)
+- [Kubernetes Deployments](/labs/kubernetes-labs)
+- [Monitoring Deployments](/docs/monitoring/prometheus)

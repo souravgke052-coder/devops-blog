@@ -1,0 +1,1816 @@
+# GCP Automation
+
+## Overview
+
+GCP automation with Terraform enables programmatic infrastructure deployment, configuration management, and operational workflows. This guide covers GCP-specific patterns, native integrations, and production-grade automation strategies.
+
+## When To Use
+
+- **Infrastructure provisioning**: Create GCP resources via Terraform
+- **Multi-environment deployments**: Dev/staging/prod with consistent config
+- **GCP service automation**: Cloud SQL, GKE, Cloud Functions, etc.
+- **Policy enforcement**: Enforce GCP organization policies
+- **Compliance automation**: Apply security baselines automatically
+
+## When NOT To Use
+
+- **Real-time scaling**: Use native autoscaling or Kubernetes for sub-minute scale events
+- **One-off commands**: Use `gcloud` CLI for ad-hoc operations
+- **GKE workload management**: Use kubectl/Helm for application workloads
+- **Secret rotation**: Use Secret Manager rotation features
+
+## Core Concepts
+
+### GCP Terraform Providers
+
+```hcl
+# Standard Google provider
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# Beta features (preview)
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
+}
+```
+
+### GCP Resource Hierarchy
+
+```
+Organization
+└── Folder
+    └── Project
+        └── Resource (Compute, Storage, etc.)
+```
+
+### Key GCP Services in Terraform
+
+| Service | Resource Type | Use Case |
+|---------|--------------|----------|
+| Compute | `google_compute_*` | VMs, networks, load balancers |
+| GKE | `google_container_*` | Kubernetes clusters |
+| Cloud SQL | `google_sql_database_instance` | Managed databases |
+| Cloud Storage | `google_storage_bucket` | Object storage |
+| Cloud Functions | `google_cloudfunctions2_function` | Serverless |
+| Secret Manager | `google_secret_manager_secret` | Secrets storage |
+| Cloud Build | `google_cloudbuild_trigger` | CI/CD triggers |
+| Cloud Scheduler | `google_cloud_scheduler_job` | Scheduled jobs |
+
+## Real Production Example
+
+### Complete GCP Project Structure
+
+```
+gcp-infrastructure/
+├── organization/
+│   ├── main.tf                 # Org-level resources
+│   ├── folders.tf              # Folder structure
+│   ├── policies.tf             # Organization policies
+│   └── variables.tf
+├── environments/
+│   ├── common/                 # Shared resources
+│   │   ├── main.tf
+│   │   ├── network.tf
+│   │   └── security.tf
+│   ├── dev/
+│   │   ├── main.tf
+│   │   ├── terraform.tfvars
+│   │   └── backend.tf
+│   ├── staging/
+│   │   ├── main.tf
+│   │   └── terraform.tfvars
+│   └── prod/
+│       ├── main.tf
+│       └── terraform.tfvars
+├── modules/
+│   ├── network/
+│   │   ├── vpc/
+│   │   ├── subnets/
+│   │   ├── firewall/
+│   │   └── load-balancer/
+│   ├── compute/
+│   │   ├── instance-template/
+│   │   ├── managed-instance-group/
+│   │   └── autoscaler/
+│   ├── container/
+│   │   └── gke/
+│   ├── database/
+│   │   ├── cloudsql/
+│   │   └── redis/
+│   ├── storage/
+│   │   └── bucket/
+│   └── security/
+│       ├── service-accounts/
+│       ├── kms/
+│       └── secret-manager/
+└── scripts/
+    ├── startup.sh
+    └── shutdown.sh
+```
+
+### Organization-Level Resources
+
+```hcl
+# organization/main.tf
+locals {
+  organization_id = var.organization_id
+  billing_account = var.billing_account
+}
+
+# Create folders
+resource "google_folder" "engineering" {
+  display_name = "Engineering"
+  parent       = "organizations/${local.organization_id}"
+}
+
+resource "google_folder" "dev" {
+  display_name = "Development"
+  parent       = google_folder.engineering.name
+}
+
+resource "google_folder" "prod" {
+  display_name = "Production"
+  parent       = google_folder.engineering.name
+}
+
+# Organization policies
+resource "google_org_policy_policy" "disable_nested_virtualization" {
+  org_id     = local.organization_id
+  constraint = "compute.disableNestedVirtualization"
+
+  spec {
+    inherit_from_parent = false
+    rules {
+      enforce = true
+    }
+  }
+}
+
+resource "google_org_policy_policy" "require_os_login" {
+  org_id     = local.organization_id
+  constraint = "compute.requireOsLogin"
+
+  spec {
+    inherit_from_parent = false
+    rules {
+      enforce = true
+    }
+  }
+}
+
+resource "google_org_policy_policy" "restrict_vpc_peering" {
+  org_id     = local.organization_id
+  constraint = "compute.restrictVpcPeering"
+
+  spec {
+    inherit_from_parent = false
+    rules {
+      allow {
+        values = ["projects/${var.restricted_project_id}/global/networks/${var.allowed_vpc}"]
+      }
+    }
+  }
+}
+```
+
+### VPC Network Module
+
+```hcl
+# modules/network/vpc/main.tf
+variable "project_id" {
+  description = "GCP project ID"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "VPC CIDR range"
+  type        = string
+  default     = "10.0.0.0/8"
+}
+
+variable "routing_mode" {
+  description = "Routing mode: REGIONAL or GLOBAL"
+  type        = string
+  default     = "REGIONAL"
+}
+
+variable "mtu" {
+  description = "MTU size"
+  type        = number
+  default     = 1460
+}
+
+variable "vpc_asn" {
+  description = "BGP ASN for Cloud Router"
+  type        = number
+  default     = 65001
+}
+
+resource "google_compute_network" "vpc" {
+  name                    = "${var.environment}-vpc"
+  auto_create_subnetworks = false
+  description             = "Custom VPC for ${var.environment} environment"
+  
+  routing_mode = var.routing_mode
+  mtu         = var.mtu
+  
+  # Private Google Access enabled by default
+  private_ip_google_access = true
+  
+  # BGP routing for Cloud Router (for HA/VM migration)
+  dynamic "bgp" {
+    for_each = var.routing_mode == "GLOBAL" ? [1] : []
+    content {
+      asn = var.vpc_asn
+    }
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_compute_firewall" "allow_internal" {
+  name        = "${var.environment}-allow-internal"
+  network     = google_compute_network.vpc.name
+  direction   = "INGRESS"
+  priority    = 65534
+  source_ranges = [var.vpc_cidr]
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "udp"
+    ports    = ["0-65535"]
+  }
+  
+  allow {
+    protocol = "icmp"
+  }
+}
+
+resource "google_compute_firewall" "allow_ssh" {
+  name        = "${var.environment}-allow-ssh"
+  network     = google_compute_network.vpc.name
+  direction   = "INGRESS"
+  priority    = 1000
+  
+  # Limit SSH access to VPN/Bastion only
+  source_ranges = var.bastion_cidr
+  
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+  
+  target_tags = ["bastion", "admin"]
+}
+
+# Private Service Connect for managed services
+resource "google_compute_global_address" "vpc_peering" {
+  name         = "${var.environment}-vpc-peering"
+  purpose      = "VPC_PEERING"
+  address_type = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.vpc.id
+}
+
+resource "google_service_networking_connection" "vpc_peering" {
+  network       = google_compute_network.vpc.id
+  service       = "servicenetworking.googleapis.com"
+  
+  reserved_peering_ranges = [google_compute_global_address.vpc_peering.name]
+}
+
+output "vpc_id" {
+  value = google_compute_network.vpc.id
+}
+
+output "vpc_name" {
+  value = google_compute_network.vpc.name
+}
+
+output "vpc_self_link" {
+  value = google_compute_network.vpc.self_link
+}
+```
+
+### GKE Cluster Module
+
+```hcl
+# modules/container/gke/main.tf
+variable "project_id" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "region" {
+  type = string
+}
+
+variable "kubernetes_version" {
+  type    = string
+  default = "1.28"
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "subnetwork_id" {
+  type = string
+}
+
+variable "pod_cidr" {
+  type    = string
+  default = "10.1.0.0/16"
+}
+
+variable "service_cidr" {
+  type    = string
+  default = "10.2.0.0/16"
+}
+
+variable "enable_horizontal_pod_autoscaling" {
+  type    = bool
+  default = true
+}
+
+variable "enable_network_policy" {
+  type    = bool
+  default = true
+}
+
+locals {
+  cluster_name = "${var.environment}-gke"
+  labels = {
+    environment = var.environment
+    team        = "platform"
+    managed_by  = "terraform"
+  }
+}
+
+resource "google_container_cluster" "primary" {
+  name     = local.cluster_name
+  location = var.region
+  
+  # Minimum version for security and features
+  min_master_version = var.kubernetes_version
+  
+  # Network configuration
+  network    = var.vpc_id
+  subnetwork = var.subnetwork_id
+  
+  # Private cluster configuration
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = true
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+  
+  # Master authorized networks (for kubectl access)
+  master_authorized_networks_config {
+    cidr_blocks {
+      cidr_mask   = 28
+      display_name = "Bastion Host"
+      cidr_block  = var.bastion_cidr
+    }
+  }
+  
+  # IP aliases for pod and service ranges
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+    
+    # Use VPC-native (GKE native) networking
+    stack_type              = "IPV4"
+    ip_cidr_range           = null
+    services_ipv4_cidr_block = null
+  }
+  
+  # Node pool configuration
+  default_max_pods_constraint {
+    fixed = 110  # GCP limit
+  }
+  
+  # Network policy (Calico)
+  network_policy {
+    enabled  = var.enable_network_policy
+    provider = "CALICO"
+  }
+  
+  # Horizontal pod autoscaling
+  horizontal_pod_autoscaling {
+    disabled = !var.enable_horizontal_pod_autoscaling
+  }
+  
+  # Binary authorization
+  binary_authorization {
+    evaluation_mode = "PROJECT_SINGLETON_POLICY_ENFORCE"
+  }
+  
+  # Maintenance window
+  maintenance_policy {
+    recurring_window {
+      start_time = "2024-01-01T04:00:00Z"
+      end_time   = "2024-01-01T12:00:00Z"
+      recurrence = "FREQ=DAILY"
+    }
+    
+    maintenance_exclusions {
+      name      = "holiday-freeze"
+      start_time = "2024-12-20T00:00:00Z"
+      end_time   = "2024-12-26T23:59:59Z"
+    }
+  }
+  
+  # Workload identity
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+  
+  # Vertical pod autoscaling (recommended)
+  vertical_pod_autoscaling {
+    enabled = true
+  }
+  
+  # Enable cost management labels
+  resource_labels = local.labels
+  
+  # Database encryption
+  database_encryption {
+    state    = "ENCRYPTED"
+    key_name = google_kms_key.gke.key_id
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes = [min_master_version]
+  }
+}
+
+# Node Pool
+resource "google_container_node_pool" "primary" {
+  name       = "${local.cluster_name}-node-pool"
+  location   = var.region
+  cluster    = google_container_cluster.primary.name
+  
+  node_count = 3
+  
+  node_locations = [
+    "${var.region}-a",
+    "${var.region}-b",
+    "${var.region}-c",
+  ]
+  
+  version = var.kubernetes_version
+  
+  node_config {
+    machine_type = "e2-medium"
+    
+    # Spot instances for cost savings
+    spot = true
+    
+    # Service account with least privilege
+    service_account = google_service_account.gke.email
+    
+    # Boot disk encryption
+    disk_size_gb = 50
+    disk_type    = "pd-ssd"
+    
+    # Shielded VM
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_vtpm                 = true
+      enable_integrity_monitoring = true
+    }
+    
+    # Network tags
+    tags = ["gke-node", "https-server"]
+    
+    # Metadata
+    metadata = {
+      disable-legacy-endpoint = "true"
+    }
+    
+    # Labels
+    labels = {
+      "node.kubernetes.io/component" = "node"
+    }
+  }
+  
+  # Autoscaling configuration
+  autoscaling {
+    min_node_count = 1
+    max_node_count = 10
+  }
+  
+  # Upgrade settings
+  upgrade_settings {
+    strategy        = "SURGE"
+    max_surge       = 1
+    max_unavailable = 0
+  }
+  
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+}
+
+# KMS Key for GKE encryption
+resource "google_kms_key_ring" "gke" {
+  name     = "${var.environment}-gke-keyring"
+  location = var.region
+}
+
+resource "google_kms_key" "gke" {
+  name         = "${var.environment}-gke-key"
+  key_ring     = google_kms_key_ring.gke.key_ring
+  purpose      = "ENCRYPT_DECRYPT"
+  
+  version_template {
+    algorithm = "GOOGLE_SYMMETRIC_ENCRYPTION"
+  }
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Service Account for GKE nodes
+resource "google_service_account" "gke" {
+  account_id   = "${var.environment}-gke-node"
+  display_name = "GKE Node Service Account"
+}
+
+resource "google_project_iam_member" "gke_node" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.gke.email}"
+}
+
+resource "google_project_iam_member" "gke_workload" {
+  project = var.project_id
+  role    = "roles/storage.objectViewer"
+  member  = "serviceAccount:${google_service_account.gke.email}"
+}
+
+output "cluster_name" {
+  value = google_container_cluster.primary.name
+}
+
+output "cluster_endpoint" {
+  value = google_container_cluster.primary.endpoint
+}
+
+output "cluster_id" {
+  value = google_container_cluster.primary.id
+}
+```
+
+### Cloud SQL with High Availability
+
+```hcl
+# modules/database/cloudsql/main.tf
+variable "project_id" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "region" {
+  type = string
+}
+
+variable "database_version" {
+  type    = string
+  default = "POSTGRES_15"
+}
+
+variable "db_name" {
+  type = string
+}
+
+variable "db_user" {
+  type = string
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+variable "db_tier" {
+  type    = string
+  default = "db-custom-2-8192"
+}
+
+variable "db_disk_size" {
+  type    = number
+  default = 100
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "authorized_cidrs" {
+  type    = list(string)
+  default = []
+}
+
+resource "google_sql_database_instance" "postgres" {
+  name             = "${var.environment}-postgres"
+  database_version = var.database_version
+  region           = var.region
+  
+  deletion_protection = var.environment == "prod" ? true : false
+  
+  settings {
+    tier              = var.db_tier
+    region            = var.region
+    availability_type = var.environment == "prod" ? "REGIONAL" : "ZONAL"
+    
+    # High availability for production
+    # Regional instance provides automatic failover
+    if var.environment == "prod" {
+      availability_type = "REGIONAL"
+    }
+    
+    # Disk configuration
+    disk_size      = var.db_disk_size
+    disk_type      = "PD_SSD"
+    disk_autoresize = true
+    
+    # Backup settings
+    backup_configuration {
+      enabled                        = true
+      start_time                     = "03:00"
+      point_in_time_recovery_enabled = var.environment == "prod"
+      
+      backup_retention_settings {
+        retained_backups = var.environment == "prod" ? 14 : 7
+        retention_unit   = "COUNT"
+      }
+    }
+    
+    # IP configuration - private IP only
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = var.vpc_id
+      require_ssl     = true
+      
+      # Additional authorized networks
+      dynamic "authorized_networks" {
+        for_each = var.authorized_cidrs
+        content {
+          name  = "cidr-${index(var.authorized_cidrs, authorized_networks.value)}"
+          value = authorized_networks.value
+        }
+      }
+      
+      # IAM authentication
+      iam_authentication = true
+    }
+    
+    # Maintenance window - avoid peak hours
+    maintenance_window {
+      day          = 0  # Sunday
+      hour         = 4  # 4 AM
+      update_track = "stable"
+    }
+    
+    # Insights for query performance
+    insights_config {
+      query_insights_enabled  = true
+      query_string_length     = 1024
+      record_application_tags = true
+      record_client_address   = false
+    }
+    
+    # Database flags
+    database_flags {
+      name  = "max_connections"
+      value = "200"
+    }
+    
+    database_flags {
+      name  = "log_min_duration_statement"
+      value = "1000"  # Log queries taking > 1 second
+    }
+    
+    database_flags {
+      name  = "pg_stat_statements.track"
+      value = "all"
+    }
+    
+    # Collation for proper sorting
+    database_flags {
+      name  = "icu.case_sensitive_collation"
+      value = "off"
+    }
+    
+    # Enable PITR
+    if var.environment == "prod" {
+      settings {
+        backup_configuration {
+          point_in_time_recovery_enabled = true
+        }
+      }
+    }
+  }
+  
+  # Timeouts
+  timeouts {
+    create = "30m"
+    update = "30m"
+    delete = "30m"
+  }
+}
+
+# Database
+resource "google_sql_database" "app_db" {
+  name     = var.db_name
+  instance = google_sql_database_instance.postgres.name
+  
+  charset = "UTF8"
+  collation = "en_US.UTF8"
+}
+
+# Additional database for analytics
+resource "google_sql_database" "analytics_db" {
+  name     = "${var.db_name}_analytics"
+  instance = google_sql_database_instance.postgres.name
+  
+  charset = "UTF8"
+  collation = "en_US.UTF8"
+}
+
+# User with IAM authentication
+resource "google_sql_user" "app_user" {
+  name     = var.db_user
+  instance = google_sql_database_instance.postgres.name
+  type     = "CLOUD_IAM_USER"
+}
+
+# Read replica for production
+resource "google_sql_database_instance" "read_replica" {
+  count = var.environment == "prod" ? 1 : 0
+  
+  name             = "${var.environment}-postgres-replica"
+  database_version = var.database_version
+  region           = var.region
+  
+  master_instance_name = google_sql_database_instance.postgres.name
+  
+  deletion_protection = false  # Allow deletion of replica
+  
+  replica_configuration {
+    failover_target = false
+  }
+  
+  settings {
+    tier              = var.db_tier
+    region            = var.region
+    availability_type = "ZONAL"
+    
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = var.vpc_id
+      require_ssl     = true
+    }
+    
+    # Read replica specific flags
+    database_flags {
+      name  = "max_connections"
+      value = "400"
+    }
+  }
+}
+
+output "instance_name" {
+  value = google_sql_database_instance.postgres.name
+}
+
+output "private_ip" {
+  value = google_sql_database_instance.postgres.private_ip_address
+}
+
+output "connection_name" {
+  value = google_sql_database_instance.postgres.connection_name
+}
+```
+
+### Cloud Build Trigger Automation
+
+```hcl
+# modules/ci/cloudbuild-trigger/main.tf
+variable "project_id" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "github_repo" {
+  type = string
+}
+
+variable "github_branch" {
+  type    = string
+  default = "main"
+}
+
+variable "cloudbuild_yaml" {
+  type    = string
+  default = "cloudbuild.yaml"
+}
+
+resource "google_cloudbuild_trigger" "terraform_plan" {
+  name        = "${var.environment}-terraform-plan"
+  description = "Trigger Terraform plan for ${var.environment}"
+  
+  github {
+    owner = split("/", var.github_repo)[0]
+    repo  = split("/", var.github_repo)[1]
+    
+    push {
+      branch = var.github_branch
+    }
+  }
+  
+  substitutions = {
+    _ENVIRONMENT = var.environment
+    _REGION      = "us-central1"
+  }
+  
+  filename = var.cloudbuild_yaml
+  
+  service_account = google_service_account.cloudbuild.email
+}
+
+resource "google_cloudbuild_trigger" "terraform_apply" {
+  name        = "${var.environment}-terraform-apply"
+  description = "Trigger Terraform apply for ${var.environment} (manual approval required)"
+  
+  github {
+    owner = split("/", var.github_repo)[0]
+    repo  = split("/", var.github_repo)[1]
+    
+    push {
+      branch = "^main$"  # Only on main branch
+    }
+  }
+  
+  substitutions = {
+    _ENVIRONMENT = var.environment
+    _REGION      = "us-central1"
+    _AUTO_APPLY  = "true"
+  }
+  
+  filename = var.cloudbuild_yaml
+  
+  # Require manual approval for production
+  approval_config {
+    required = var.environment == "prod" ? true : false
+  }
+  
+  service_account = google_service_account.cloudbuild.email
+}
+
+resource "google_service_account" "cloudbuild" {
+  account_id   = "cloudbuild-${var.environment}"
+  display_name = "Cloud Build Service Account"
+}
+
+resource "google_project_iam_member" "cloudbuild_editor" {
+  project = var.project_id
+  role    = "roles/editor"
+  member  = "serviceAccount:${google_service_account.cloudbuild.email}"
+}
+
+resource "google_project_iam_member" "cloudbuild_state_admin" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.cloudbuild.email}"
+}
+
+resource "google_project_iam_member" "cloudbuild_secret_accessor" {
+  project = var.project_id
+  role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.cloudbuild.email}"
+}
+```
+
+### Cloud Functions with EventArc
+
+```hcl
+# modules/serverless/cloud-function/main.tf
+variable "project_id" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "function_name" {
+  type = string
+}
+
+variable "source_directory" {
+  type    = string
+  default = "./function_code"
+}
+
+variable "entry_point" {
+  type    = string
+  default = "hello_http"
+}
+
+variable "runtime" {
+  type    = string
+  default = "nodejs18"
+}
+
+variable "event_trigger" {
+  type = object({
+    trigger_id   = string
+    event_type   = string
+    pubsub_topic = optional(string)
+  })
+  default = null
+}
+
+variable "https_trigger" {
+  type    = bool
+  default = true
+}
+
+locals {
+  function_name = "${var.environment}-${var.function_name}"
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+  }
+}
+
+resource "google_cloudfunctions2_function" "function" {
+  name        = local.function_name
+  location    = var.project_id  # Use project as location
+  description = "Cloud Function ${var.function_name}"
+  
+  build_config {
+    runtime     = var.runtime
+    entry_point = var.entry_point
+    
+    source {
+      storage_source {
+        bucket = google_storage_bucket.function_source.name
+        object = google_storage_bucket_object.function_source.name
+      }
+    }
+  }
+  
+  service_config {
+    max_instance_count    = 10
+    min_instance_count    = 0
+    available_memory      = "512M"
+    timeout_seconds       = 60
+    service_account_email = google_service_account.function.email
+    
+    environment_variables = {
+      ENVIRONMENT = var.environment
+      LOG_LEVEL   = "info"
+    }
+    
+    # Ingress settings
+    ingress_settings = "ALLOW_INTERNAL_AND_GCLB"
+    
+    # Security
+    all_traffic_on_latest_revision = true
+    
+    secret_environment_variables {
+      key  = "API_KEY"
+      secret = google_secret_manager_secret.api_key.secret_id
+      version = "latest"
+    }
+  }
+  
+  labels = local.labels
+  
+  # Event trigger
+  dynamic "event_trigger" {
+    for_each = var.event_trigger != null ? [1] : []
+    content {
+      trigger = var.event_trigger.trigger_id
+      event_type = var.event_trigger.event_type
+      
+      # For CloudEvent sources
+      retry_policy = "RETRY_ALWAYS"
+    }
+  }
+  
+  # HTTPS trigger (always available)
+  dynamic "https_trigger" {
+    for_each = var.https_trigger ? [1] : []
+    content {}
+  }
+}
+
+# Source bucket
+resource "google_storage_bucket" "function_source" {
+  name          = "${var.project_id}-function-source-${var.environment}"
+  location      = "US"
+  storage_class = "STANDARD"
+  
+  uniform_bucket_level_access = true
+  
+  lifecycle_rule {
+    condition { age = 30 }
+    action { type = "Delete" }
+  }
+}
+
+resource "google_storage_bucket_object" "function_source" {
+  name   = "function.zip"
+  bucket = google_storage_bucket.function_source.name
+  source = var.source_directory
+  
+  # Trigger update on source change
+  detect_md5hash = "any"
+}
+
+# Service account
+resource "google_service_account" "function" {
+  account_id   = "function-${var.function_name}"
+  display_name = "Cloud Function Service Account"
+}
+
+resource "google_project_iam_member" "function_invoker" {
+  project = var.project_id
+  role    = "roles/cloudfunctions.invoker"
+  member  = "serviceAccount:${google_service_account.function.email}"
+}
+
+# Event trigger for Cloud Storage
+resource "google_eventarc_trigger" "storage_trigger" {
+  count = var.event_trigger != null ? 1 : 0
+  
+  name      = "${local.function_name}-storage-trigger"
+  location  = "us-central1"
+  project   = var.project_id
+  
+  matching_criteria {
+    type = "EVENT_TYPE"
+    value = google_cloudfunctions2_function.function.event_trigger[0].event_type
+  }
+  
+  destination {
+    cloud_function {
+      name = google_cloudfunctions2_function.function.name
+    }
+  }
+  
+  service_account = google_service_account.trigger.email
+}
+
+# Secret for API key
+resource "google_secret_manager_secret" "api_key" {
+  secret_id = "${local.function_name}-api-key"
+  
+  labels = local.labels
+}
+
+resource "google_secret_manager_secret_version" "api_key" {
+  secret = google_secret_manager_secret.api_key.id
+  
+  secret_data = "placeholder-api-key"
+}
+
+output "function_name" {
+  value = google_cloudfunctions2_function.function.name
+}
+
+output "function_uri" {
+  value = google_cloudfunctions2_function.function.url
+}
+
+output "function_service_account" {
+  value = google_service_account.function.email
+}
+```
+
+## HCL Examples
+
+### Project Factory (Create Projects via Terraform)
+
+```hcl
+# modules/project-factory/main.tf
+variable "project_name" {
+  type = string
+}
+
+variable "folder_id" {
+  type = string
+}
+
+variable "billing_account" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "apis" {
+  type    = list(string)
+  default = ["compute.googleapis.com", "storage.googleapis.com"]
+}
+
+resource "google_project" "project" {
+  name       = var.project_name
+  project_id = var.project_name
+  folder_id  = var.folder_id
+  
+  billing_account = var.billing_account
+  
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+  }
+}
+
+resource "google_project_service" "apis" {
+  for_each = toset(var.apis)
+  
+  project = google_project.project.id
+  service = each.value
+  
+  disable_dependent_services = false
+  disable_on_destroy         = true
+}
+
+output "project_id" {
+  value = google_project.project.id
+}
+
+output "project_number" {
+  value = google_project.project.number
+}
+```
+
+### Cloud Scheduler with Cloud Function
+
+```hcl
+# modules/automation/scheduled-task/main.tf
+variable "function_name" {
+  type = string
+}
+
+variable "schedule" {
+  type    = string
+  default = "0 9 * * 1-5"  # 9 AM weekdays
+}
+
+variable "time_zone" {
+  type    = string
+  default = "America/New_York"
+}
+
+resource "google_cloud_scheduler_job" "scheduled_function" {
+  name        = var.function_name
+  description = "Scheduled trigger for ${var.function_name}"
+  schedule    = var.schedule
+  time_zone   = var.time_zone
+  region      = "us-central1"
+  
+  http_target {
+    http_method = "POST"
+    uri         = "https://${var.region}-${var.project_id}.cloudfunctions.net/${var.function_name}"
+    
+    oidc_token {
+      service_account_email = var.service_account_email
+    }
+    
+    headers = {
+      Content-Type = "application/json"
+    }
+    
+    body = base64encode(jsonencode({
+      triggered_by = "cloud-scheduler"
+      timestamp    = "{{ .FC_SCHEDULER_NOW }}"
+    }))
+  }
+  
+  retry_config {
+    retry_count          = 3
+    min_backoff_duration = "5s"
+    max_backoff_duration = "300s"
+  }
+}
+```
+
+### Shared VPC Configuration
+
+```hcl
+# modules/network/shared-vpc/main.tf
+variable "host_project_id" {
+  type = string
+}
+
+variable "service_project_id" {
+  type = string
+}
+
+variable "subnet_cidr" {
+  type = string
+}
+
+variable "region" {
+  type = string
+}
+
+# Enable Shared VPC
+resource "google_compute_shared_vpc_host_project" "host" {
+  project = var.host_project_id
+}
+
+resource "google_compute_shared_vpc_service_project" "service" {
+  host_project    = google_compute_shared_vpc_host_project.host.project
+  service_project = var.service_project_id
+}
+
+# Subnet in host project
+resource "google_compute_subnetwork" "shared_subnet" {
+  name          = "shared-subnet"
+  network       = var.host_vpc_id
+  ip_cidr_range = var.subnet_cidr
+  region        = var.region
+  
+  private_ip_google_access = true
+  
+  # Enable private service access
+  secondary_ip_range {
+    ip_cidr_range = "10.1.0.0/20"
+    range_name    = "services"
+  }
+  
+  secondary_ip_range {
+    ip_cidr_range = "10.2.0.0/20"
+    range_name    = "pods"
+  }
+}
+
+# Grant subnet access to service project
+resource "google_compute_subnetwork_iam_member" "service_network_user" {
+  subnetwork = google_compute_subnetwork.shared_subnet.name
+  region     = var.region
+  role       = "roles/compute.networkUser"
+  member     = "serviceAccount:${var.service_project_id}@cloudservices.gserviceaccount.com"
+}
+```
+
+## CLI Examples
+
+### GCP Authentication for Terraform
+
+```bash
+# Service account key (legacy, not recommended)
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+
+# Application Default Credentials (recommended)
+gcloud auth application-default login
+gcloud auth application-default set-quota-project PROJECT
+
+# Workload Identity (GKE/GitHub Actions)
+gcloud iam workload-identity-pools create-cred-config \
+  projects/${PROJECT}/locations/global/workloadIdentityPools/${POOL}/providers/${PROVIDER} \
+  --service-account=${SA_EMAIL} \
+  --output-file=/tmp/credentials.json
+
+# Activate service account
+gcloud auth activate-service-account --key-file=/path/to/key.json
+```
+
+### GCP Project Operations
+
+```bash
+# List projects
+gcloud projects list
+
+# Set project context
+gcloud config set project my-project
+
+# Create project via Terraform (when not using organization)
+# Use google_project resource, then:
+gcloud config set project $(terraform output -raw project_id)
+
+# Enable APIs
+gcloud services enable compute.googleapis.com \
+  container.googleapis.com \
+  sqladmin.googleapis.com
+```
+
+### GKE Cluster Operations
+
+```bash
+# Get cluster credentials
+gcloud container clusters get-credentials CLUSTER_NAME \
+  --region=us-central1 \
+  --project=my-project
+
+# List clusters
+gcloud container clusters list
+
+# Resize node pool
+gcloud container clusters resize CLUSTER_NAME \
+  --node-pool=default-pool \
+  --num-nodes=3 \
+  --region=us-central1
+
+# Upgrade cluster
+gcloud container clusters upgrade CLUSTER_NAME \
+  --master \
+  --region=us-central1
+```
+
+### Cloud SQL Operations
+
+```bash
+# Connect via proxy
+cloud_sql_proxy -instances=PROJECT:REGION:INSTANCE=tcp:5432
+
+# Import/Export
+gcloud sql import csv INSTANCE \
+  gs://bucket/file.csv \
+  --database=mydb
+
+# Create read replica
+gcloud sql instances create REPLICA \
+  --master-instance-name=MASTER \
+  --region=us-central1 \
+  --tier=db-custom-2-8192
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `gcloud auth application-default login` | Authenticate for Terraform |
+| `gcloud config set project` | Set active project |
+| `gcloud services enable` | Enable GCP APIs |
+| `gcloud container clusters get-credentials` | Get Kubeconfig |
+| `gsutil mb` | Create storage bucket |
+| `gcloud builds triggers create` | Create Cloud Build trigger |
+
+## Best Practices
+
+### 1. Use Organization Policies
+
+```hcl
+# Enforce organization-wide policies
+resource "google_org_policy_policy" "enforce" {
+  org_id     = var.organization_id
+  constraint = "compute.disableSerialPortAccess"
+  
+  spec {
+    enforce = true
+  }
+}
+```
+
+### 2. Enable VPC Service Controls
+
+```hcl
+# Perimeter for sensitive projects
+resource "google_access_context_manager_service_perimeter" "sensitive" {
+  perimeter_title = "Sensitive Resources"
+  perimeter_type  = "PERIMETER_TYPE_REGULAR"
+  
+  status {
+    resources = ["projects/${var.project_id}"]
+    
+    restricted_services = [
+      "bigquery.googleapis.com",
+      "storage.googleapis.com",
+    ]
+  }
+}
+```
+
+### 3. Use Workload Identity
+
+```hcl
+# For GKE workloads
+resource "google_service_account" "workload" {
+  account_id = "workload-sa"
+}
+
+resource "google_service_account_iam_member" "workload_binding" {
+  service_account_id = google_service_account.workload.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.namespace}/${var_kubernetes_sa}]"
+}
+```
+
+### 4. Implement Defense in Depth
+
+```hcl
+# Multiple layers of security
+resource "google_compute_firewall" "web" {
+  name    = "allow-https"
+  network = google_compute_network.vpc.name
+  
+  # Only from Load Balancer ranges
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
+  
+  allow { protocol = "tcp", ports = ["443"] }
+  target_tags = ["https-server"]
+}
+
+# Cloud Armor for WAF
+resource "google_compute_security_policy" "waf" {
+  name = "web-security-policy"
+  
+  rule {
+    action   = "allow"
+    priority = 1000
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      expr {
+        expression = "true"
+      }
+    }
+  }
+  
+  rule {
+    action   = "deny(403)"
+    priority = 2000
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      expr {
+        expression = "evaluatePreconfiguredExpr('xss-stable')"
+      }
+    }
+  }
+}
+```
+
+## Security
+
+### Secret Manager Integration
+
+```hcl
+# Store and access secrets
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "prod-db-password"
+  
+  labels = {
+    environment = "prod"
+  }
+}
+
+resource "google_secret_manager_secret_version" "db_password" {
+  secret = google_secret_manager_secret.db_password.id
+  
+  secret_data = var.db_password
+}
+
+# Access in Terraform
+data "google_secret_manager_secret_version" "db_password" {
+  secret  = "prod-db-password"
+  version = "latest"
+}
+
+# Access in application
+# Use Secret Manager client library, not Terraform outputs
+```
+
+### KMS for Encryption
+
+```hcl
+# Key ring
+resource "google_kms_key_ring" "keyring" {
+  name     = "my-keyring"
+  location = "global"
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Crypto key
+resource "google_kms_key" "key" {
+  name         = "my-key"
+  key_ring     = google_kms_key_ring.keyring.key_ring
+  purpose      = "ENCRYPT_DECRYPT"
+  
+  version_template {
+    algorithm        = "GOOGLE_SYMMETRIC_ENCRYPTION"
+    protection_level = "HSM"
+  }
+  
+  rotation_period = "7776000s"  # 90 days
+  
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Grant access
+resource "google_kms_crypto_key_iam_member" "key_user" {
+  crypto_key_id = google_kms_key.key.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${var.service_account}"
+}
+```
+
+### Binary Authorization
+
+```hcl
+resource "google_binary_authorization_policy" "enforce" {
+  admission_whitelist = []
+  
+  default_admission_rule {
+    enforcement_mode = "ENFORCED_BLOCK_AND_AUDIT_LOG"
+    evaluation_mode  = "REQUIRE_ATTESTATION"
+    
+    require_attestors {
+      attestor_ids = [google_binary_authorization_attestor.attestor.id]
+    }
+  }
+}
+
+resource "google_binary_authorization_attestor" "attestor" {
+  name        = "my-attestor"
+  description = "Attestor for production images"
+  
+  attester {
+    public_key {
+      ascii_cert = file("/path/to/cosigning-public-key.txt")
+    }
+  }
+  
+  project = var.project_id
+}
+```
+
+## Cost Optimization
+
+### Resource Scheduling
+
+```hcl
+# Stop non-production instances after hours
+resource "google_cloud_scheduler_job" "stop_dev_instances" {
+  name        = "stop-dev-instances"
+  schedule    = "0 20 * * 1-5"  # 8 PM weekdays
+  time_zone   = "America/New_York"
+  region      = var.region
+  
+  http_target {
+    uri         = "https://compute.googleapis.com/compute/v1/projects/${var.project_id}/zones/${var.region}-a/instances/stop"
+    http_method = "POST"
+  }
+}
+
+# Use preemptible instances for batch processing
+resource "google_compute_instance_template" "batch" {
+  name = "batch-template"
+  
+  scheduling {
+    preemptible     = true
+    automatic_restart = false
+  }
+}
+```
+
+### Rightsizing Recommendations
+
+```bash
+# Get rightsizing recommendations
+gcloud recommender recommendations list \
+  --recommender=google.cloudsql.instance.RightSizingRecommender \
+  --project=my-project
+
+# Apply recommendation
+gcloud recommender recommendations apply RECOMMENDATION_ID \
+  --project=my-project
+```
+
+## Troubleshooting
+
+### Common GCP-Specific Issues
+
+#### API Not Enabled
+
+```bash
+# Error: Google API has not been used
+# Solution: Enable the API
+gcloud services enable compute.googleapis.com
+gcloud services enable container.googleapis.com
+gcloud services enable sqladmin.googleapis.com
+```
+
+#### Permission Denied
+
+```bash
+# Error: Permission denied on resource
+# Solution: Check IAM permissions
+gcloud projects get-iam-policy PROJECT
+
+# Grant required role
+gcloud projects add-iam-policy-binding PROJECT \
+  --member="serviceAccount:SA@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/editor"
+```
+
+#### Quota Exceeded
+
+```bash
+# Error: Quota exceeded
+# Solution: Request quota increase
+gcloud compute regions describe us-central1
+
+# Request increase via console or:
+gcloud compute regions update us-central1 --quiet \
+  --enable-flow-logs \
+  --verbosity=debug
+
+# Or use different region
+```
+
+#### Private IP Connectivity
+
+```bash
+# Error: Cannot reach private IP
+# Solution: Check Private Google Access and VPC peering
+gcloud compute networks peerings list
+
+# Verify Private Google Access is enabled
+gcloud compute networks describe vpc-name
+```
+
+### Debugging Tips
+
+```bash
+# Enable debug logging
+export TF_LOG=DEBUG
+export TF_LOG_PATH=/tmp/terraform.log
+
+# Verify GCP configuration
+gcloud config list
+
+# Check API status
+gcloud services list --enabled
+
+# Verify service account
+gcloud iam service-accounts describe SA@PROJECT.iam.gserviceaccount.com
+
+# Test network connectivity
+gcloud compute ssh INSTANCE --zone=us-central1-a -- curl https://www.googleapis.com/
+```
+
+## Interview Questions
+
+### Q1: How do you manage GCP projects with Terraform?
+**A:** Use `google_project` resource to create projects, `google_project_service` to enable APIs, and organize with folders for hierarchy. Use separate state per environment.
+
+### Q2: What is the difference between google and google-beta providers?
+**A:** `google-beta` provides early access to GCP features before they're GA. Use `google` for stable features, `google-beta` for preview features with caution about breaking changes.
+
+### Q3: How do you configure Private Google Access?
+**A:** Set `private_ip_google_access = true` on VPC or subnetwork. Enables VMs without external IPs to reach Google APIs and services.
+
+### Q4: How do you implement high availability in GCP with Terraform?
+**A:** Use regional managed instance groups, regional Cloud SQL, multi-zonal GKE clusters, global load balancers, and Cloud Armor for DDoS protection.
+
+### Q5: What is VPC Service Controls and how do you configure it?
+**A:** Creates security perimeters around GCP resources. Use `google_access_context_manager_service_perimeter` to define restricted services and allowed resources.
+
+### Q6: How do you manage secrets in GCP for Terraform?
+**A:** Store in Secret Manager, access via `google_secret_manager_secret_version` data source. Never commit secrets to state or config files.
+
+### Q7: What is Workload Identity and why use it?
+**A:** Allows Kubernetes service accounts to impersonate GCP service accounts. Eliminates need for service account keys. Use `google_service_account_iam_member` with workload identity binding.
+
+### Q8: How do you set up Cloud Build for Terraform automation?
+**A:** Create Cloud Build triggers, service account with proper IAM, cloudbuild.yaml with terraform steps. Use substitutions for environment-specific values.
+
+### Q9: What organization policies should you enforce?
+**A:** `compute.disableSerialPortAccess`, `compute.requireOsLogin`, `storage.uniformBucketLevelAccess`, `iam.disableServiceAccountKeyCreation` for security hardening.
+
+### Q10: How do you encrypt data in GCP?
+**A:** Use Google-managed encryption (default), CMEK via `encryption_key` on resources, customer-supplied encryption keys (CSEK), or Cloud KMS for key management.
+
+## Cheat Sheet
+
+### GCP Terraform Resources
+
+```hcl
+# Compute
+google_compute_instance
+google_compute_instance_template
+google_compute_instance_group_manager
+google_compute_network
+google_compute_subnetwork
+google_compute_firewall
+google_compute_global_forwarding_rule
+google_compute_health_check
+
+# Container
+google_container_cluster
+google_container_node_pool
+
+# Database
+google_sql_database_instance
+google_sql_database
+google_sql_user
+
+# Storage
+google_storage_bucket
+google_storage_bucket_object
+
+# Serverless
+google_cloudfunctions2_function
+google_cloud_scheduler_job
+google_eventarc_trigger
+
+# Security
+google_kms_key_ring
+google_kms_key
+google_secret_manager_secret
+google_project_iam_member
+google_org_policy_policy
+
+# CI/CD
+google_cloudbuild_trigger
+google_cloudbuildv2_connection
+```
+
+### Key Terraform Commands
+
+```bash
+# Init with GCS backend
+terraform init \
+  -backend-config="bucket=state-bucket" \
+  -backend-config="prefix=env"
+
+# Plan with var file
+terraform plan -var-file="prod.tfvars" -out=tfplan
+
+# Apply
+terraform apply tfplan
+
+# Import existing GCP resource
+terraform import google_compute_instance.instance \
+  projects/PROJECT/zones/ZONE/instances/NAME
+```
+
+### Essential GCP CLI Commands
+
+```bash
+# Auth
+gcloud auth application-default login
+
+# Project
+gcloud config set project PROJECT
+gcloud projects describe PROJECT
+
+# APIs
+gcloud services enable API_NAME
+gcloud services list --enabled
+
+# GKE
+gcloud container clusters get-credentials NAME --region=REGION
+
+# Storage
+gsutil ls gs://BUCKET/
+gsutil cp LOCAL gs://BUCKET/
+```
+
+## Related Topics
+
+- [CI/CD](./cicd.mdx) - Pipeline automation
+- [Testing](./testing.mdx) - Testing strategies
+- [Modules](./modules.mdx) - Module patterns
+- [Security](./secrets.mdx) - Secrets management
+- [Backend](./backend.mdx) - State management

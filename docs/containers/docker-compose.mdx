@@ -1,0 +1,1106 @@
+---
+title: "Docker Compose"
+description: "Complete guide to Docker Compose - local development, multi-container applications"
+sidebar_position: 4
+---
+
+# Docker Compose
+
+## Overview
+
+Docker Compose is a tool for defining and running multi-container Docker applications. With Compose, you use a YAML file to configure your application's services, networks, and volumes, then create and start all services with a single command.
+
+**Key Features:**
+- **Multi-container management**: Define and run related containers together
+- **Service orchestration**: Configure dependencies, health checks, scaling
+- **Environment consistency**: Same configuration from dev to production
+- **Variable substitution**: Parameterize configurations for different environments
+- **Networking**: Automatic network creation and service discovery
+
+## When To Use
+
+- **Local development environments** requiring multiple services (app, database, cache)
+- **CI/CD testing** with isolated, reproducible test environments
+- **Local debugging** of microservices architectures
+- **Demo and showcase environments** needing quick setup
+- **Integration testing** requiring running services
+- **Learning and exploration** of complex applications
+- **Staging environments** for pre-production validation
+
+## When NOT To Use
+
+- **Production deployments** (use Kubernetes, Docker Swarm, or orchestration platforms)
+- **Single container applications** (use `docker run`)
+- **Dynamic scaling** based on load (orchestrators handle this)
+- **Cross-host networking** (use Docker Swarm overlay)
+- **Service mesh** requirements (use specialized tools)
+- **Long-running production workloads** requiring high availability
+
+## Core Concepts
+
+### Compose File Structure
+
+```yaml
+version: "3.9"  # Compose file format version
+
+services:        # Container definitions
+  web:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    networks:
+      - frontend
+  
+  api:
+    build: ./api
+    environment:
+      - DB_HOST=db
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+    networks:
+      - backend
+
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+    networks:
+      - backend
+
+networks:        # Network definitions
+  frontend:
+  backend:
+
+volumes:         # Volume definitions
+  postgres_data:
+```
+
+### Service Dependencies (depends_on)
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    depends_on Options                         │
+│                                                              │
+│  Simple (start order only):                                  │
+│    depends_on:                                               │
+│      - db                                                     │
+│      - redis                                                  │
+│                                                              │
+│  Condition (with health check):                              │
+│    depends_on:                                               │
+│      db:                                                     │
+│        condition: service_healthy                            │
+│      redis:                                                  │
+│        condition: service_started                            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Health Check Conditions
+
+| Condition | Description |
+|-----------|-------------|
+| `service_started` | Container started (default) |
+| `service_healthy` | Container healthy (healthcheck passed) |
+| `service_completed_successfully` | Container exited with code 0 |
+
+## Real Production Example
+
+### Full-Stack E-commerce Application
+
+```yaml
+version: "3.9"
+
+services:
+  # ============================================
+  # Frontend - Next.js Application
+  # ============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    image: myregistry.io/ecommerce/frontend:${VERSION:-latest}
+    container_name: frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://api:8080
+      - NEXT_PUBLIC_WS_URL=ws://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    networks:
+      - ecommerce-network
+    profiles:
+      - dev
+
+  # ============================================
+  # API Gateway - Kong
+  # ============================================
+  api-gateway:
+    image: kong:3.4-alpine
+    container_name: api-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"     # Proxy
+      - "8443:8443"     # Proxy TLS
+      - "8001:8001"     # Admin API
+    environment:
+      - KONG_DATABASE=postgres
+      - KONG_PG_HOST=postgres
+      - KONG_PG_USER=${DB_USER}
+      - KONG_PG_PASSWORD=${DB_PASSWORD}
+      - KONG_PG_DATABASE=kong
+      - KONG_DECLARATIVE_CONFIG=/usr/local/kong/kong.yml
+      - KONG_PROXY_ACCESS_LOG=/dev/stdout
+      - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+      - KONG_PROXY_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_ERROR_LOG=/dev/stderr
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./kong/kong.yml:/usr/local/kong/kong.yml:ro
+    networks:
+      - ecommerce-network
+    profiles:
+      - prod
+
+  # ============================================
+  # API Service - Go Microservice
+  # ============================================
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: production
+    image: myregistry.io/ecommerce/api:${VERSION:-latest}
+    container_name: api
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=ecommerce
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET=${JWT_SECRET}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - ecommerce-network
+
+  # ============================================
+  # Worker Service - Background Jobs
+  # ============================================
+  worker:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: production
+    image: myregistry.io/ecommerce/worker:${VERSION:-latest}
+    container_name: worker
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=ecommerce
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    command: ["go", "run", "cmd/worker/main.go"]
+    networks:
+      - ecommerce-network
+    profiles:
+      - worker
+
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=ecommerce
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ecommerce"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    networks:
+      - ecommerce-network
+
+  # ============================================
+  # Redis Cache
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - ecommerce-network
+
+  # ============================================
+  # RabbitMQ Message Queue
+  # ============================================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-admin}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-password}
+      - RABBITMQ_DEFAULT_VHOST=/
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    networks:
+      - ecommerce-network
+    profiles:
+      - messaging
+
+  # ============================================
+  # Nginx Reverse Proxy
+  # ============================================
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - nginx_cache:/var/cache/nginx
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ecommerce-network
+    profiles:
+      - prod
+
+  # ============================================
+  # Prometheus Monitoring
+  # ============================================
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - ecommerce-network
+    profiles:
+      - monitoring
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  ecommerce-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ============================================
+# Volumes
+# ============================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  nginx_cache:
+  nginx_logs:
+```
+
+### Environment File (.env)
+
+```bash
+# Application
+NODE_ENV=production
+VERSION=1.0.0
+
+# Database
+DB_USER=ecommerce
+DB_PASSWORD=changeme_secure_password_123
+
+# Authentication
+JWT_SECRET=your-super-secret-jwt-key-change-in-production
+
+# RabbitMQ
+RABBITMQ_USER=admin
+RABBITMQ_PASSWORD=changeme_rabbitmq_password
+
+# Logging
+LOG_LEVEL=info
+```
+
+## CLI Examples
+
+### Service Management
+
+```bash
+# Start services defined in compose file
+docker compose up -d
+
+# Start with specific file
+docker compose -f docker-compose.yml up -d
+docker compose -f docker-compose.prod.yml up -d
+
+# Start specific services
+docker compose up -d api frontend
+
+# Start with profile
+docker compose --profile worker up -d
+
+# Start and recreate if image changed
+docker compose up -d --build
+
+# Force rebuild without cache
+docker compose up -d --build --no-cache
+
+# Stop services (keep containers)
+docker compose stop
+
+# Stop and remove containers, networks
+docker compose down
+
+# Stop and remove containers, networks, volumes
+docker compose down -v
+
+# Stop and remove containers, networks, volumes, images
+docker compose down --volumes --rmi local
+
+# Restart services
+docker compose restart
+docker compose restart api
+
+# Pause/unpause services
+docker compose pause
+docker compose unpause
+```
+
+### Viewing Logs
+
+```bash
+# View logs for all services
+docker compose logs
+
+# View logs with follow mode
+docker compose logs -f
+
+# View logs for specific service
+docker compose logs api
+docker compose logs -f api
+
+# View logs with timestamp
+docker compose logs -t api
+
+# View last N lines
+docker compose logs --tail 100 api
+
+# Logs for stopped services
+docker compose logs --tail 100 --since 1h api
+```
+
+### Inspecting Services
+
+```bash
+# List services
+docker compose ps
+docker compose ps --format json
+
+# List services with status
+docker compose ps -a
+
+# Show running processes
+docker compose top
+
+# Show port mappings
+docker compose ps --format "table {{.Name}}\t{{.Ports}}"
+
+# Show image being used
+docker compose images
+```
+
+### Executing Commands
+
+```bash
+# Execute command in service
+docker compose exec api ls -la
+
+# Execute with interactive terminal
+docker compose exec api sh
+docker compose exec -it api sh
+
+# Execute as specific user
+docker compose exec -u root api sh
+
+# Run one-off command
+docker compose run --rm api npm test
+
+# Run with environment variables
+docker compose run -e NODE_ENV=test --rm api npm test
+```
+
+### Building Images
+
+```bash
+# Build all images defined in compose
+docker compose build
+
+# Build specific service
+docker compose build api
+
+# Build with no cache
+docker compose build --no-cache api
+
+# Build with parallel
+docker compose build --parallel
+
+# Build and push
+docker compose build
+docker compose push
+```
+
+### Configuration
+
+```bash
+# Validate compose file
+docker compose config
+
+# Validate and show merged configuration
+docker compose config --services
+
+# Show service ports
+docker compose config --ports
+
+# Convert to canonical format
+docker compose convert
+
+# Convert specific service
+docker compose convert api
+```
+
+## Dockerfile / Compose Examples
+
+### Development vs Production Compose
+
+**docker-compose.yml (Development):**
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      target: development
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: npm run dev
+
+  db:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: devpassword
+    volumes:
+      - postgres_dev:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  postgres_dev:
+```
+
+**docker-compose.prod.yml (Production):**
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      target: production
+    image: myregistry.io/app:${VERSION:-latest}
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_prod:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+volumes:
+  postgres_prod:
+```
+
+### Using Override Files
+
+```yaml
+# docker-compose.yml (base)
+version: "3.9"
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+  db:
+    image: postgres:15-alpine
+```
+
+```yaml
+# docker-compose.override.yml (dev overrides - auto-loaded)
+version: "3.9"
+services:
+  app:
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: npm run dev
+  db:
+    ports:
+      - "5432:5432"
+```
+
+```bash
+# Run with overrides (docker-compose.override.yml auto-loaded)
+docker compose up -d
+
+# Without override file
+docker compose -f docker-compose.yml up -d
+```
+
+## Common Commands
+
+### Complete Command Reference
+
+| Command | Description |
+|---------|-------------|
+| `docker compose up` | Create and start containers |
+| `docker compose down` | Stop and remove containers |
+| `docker compose start` | Start existing containers |
+| `docker compose stop` | Stop running containers |
+| `docker compose restart` | Restart containers |
+| `docker compose pause` | Pause containers |
+| `docker compose unpause` | Unpause containers |
+| `docker compose ps` | List containers |
+| `docker compose top` | Show running processes |
+| `docker compose logs` | View logs |
+| `docker compose build` | Build images |
+| `docker compose pull` | Pull images |
+| `docker compose push` | Push images |
+| `docker compose exec` | Execute command |
+| `docker compose run` | Run one-off command |
+| `docker compose config` | Validate config |
+| `docker compose convert` | Convert to canonical |
+| `docker compose images` | List images |
+| `docker compose port` | Show port mappings |
+| `docker compose scale` | Scale services (deprecated) |
+| `docker compose create` | Create containers |
+| `docker compose rm` | Remove stopped containers |
+| `docker compose kill` | Force stop containers |
+| `docker compose events` | Show real-time events |
+| `docker compose ls` | List compose projects |
+| `docker compose version` | Show version |
+
+### Service Discovery
+
+```bash
+# Services can reach each other using service names as hostnames
+# From 'api' service, connect to 'db' using hostname 'db'
+# postgres://db:5432
+```
+
+## Monitoring
+
+### Health Checks in Compose
+
+```yaml
+services:
+  api:
+    image: myapp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+```
+
+### Logging Configuration
+
+```yaml
+services:
+  api:
+    image: myapp
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+```
+
+## Security
+
+### Security Hardened Compose
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    image: myapp
+    # Read-only root filesystem
+    read_only: true
+    # Temporary filesystem
+    tmpfs:
+      - /tmp
+    # Drop all capabilities
+    cap_drop:
+      - ALL
+    # Add specific capabilities
+    cap_add:
+      - NET_BIND_SERVICE
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    # Non-root user
+    user: "1000:1000"
+    # Restrict resources
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    # Network isolation
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+### Network Isolation
+
+```yaml
+services:
+  frontend:
+    networks:
+      - frontend-network
+  
+  backend:
+    networks:
+      - frontend-network
+      - backend-network
+  
+  database:
+    networks:
+      - backend-network
+
+networks:
+  frontend-network:
+  backend-network:
+```
+
+## Cost Optimization
+
+### Resource Limits
+
+```yaml
+services:
+  app:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+```
+
+### Build Optimization
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      cache_from:
+        - myapp:build-1
+        - myapp:build-2
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Service won't start | Dependency not ready | Use `depends_on` with `condition: service_healthy` |
+| Port conflicts | Port already in use | Change port mapping |
+| Volume permission | User mismatch | Use `--chown` in COPY, match UID/GID |
+| Environment not loaded | .env not in directory | Check `env_file` or `docker compose --env-file` |
+| Image not found | Build context issue | Check `build.context`, ensure Dockerfile exists |
+
+### Debugging Commands
+
+```bash
+# Check service status
+docker compose ps
+
+# View logs
+docker compose logs -f api
+
+# Inspect service
+docker compose exec api sh
+
+# Check network
+docker network inspect ecommerce_ecommerce-network
+
+# Validate config
+docker compose config
+
+# Check port conflicts
+docker compose port api 3000
+```
+
+### Dependency Issues
+
+```yaml
+# Problem: Service starts before database ready
+# Solution: Use healthcheck conditions
+
+services:
+  api:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:15-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+```
+
+## Interview Questions
+
+### Q1: What is the difference between `docker compose up` and `docker compose run`?
+**A:** `up` starts services defined in the compose file and keeps them running. `run` starts a specific service as a one-off command (like `docker run`), executing and then exiting. `run` is useful for one-time tasks like running migrations.
+
+### Q2: How do you handle secrets in Docker Compose?
+**A:** Never put secrets in the compose file or image. Use environment variables from `.env` files (`${VAR}` syntax), pass secrets at runtime via `-e` flag, or integrate with external secret management tools for production.
+
+### Q3: What is the purpose of profiles in Compose?
+**A:** Profiles allow conditionally starting services. Services with a `profiles` attribute only start when that profile is activated with `--profile`. This allows having optional services (like monitoring) that aren't started by default.
+
+### Q4: How does `depends_on` work with health checks?
+**A:** Without health checks, `depends_on` only ensures containers start in order. With `condition: service_healthy`, Compose waits for the dependency's healthcheck to pass before starting the dependent service. `condition: service_completed_successfully` waits for the container to exit with code 0.
+
+### Q5: How do you scale services in Compose?
+**A:** Use `docker compose up -d --scale api=5`. Note that scaling requires port mapping conflicts to be handled via `ports` with explicit container ports. In Compose v2, use `deploy.replicas` for declarative scaling.
+
+### Q6: What is the difference between `image` and `build` in Compose?
+**A:** `image` specifies an existing image to pull from a registry. `build` specifies how to build an image from source. When using `build`, Compose builds the image and tags it with the service name, or you can specify an image name for the built image.
+
+### Q7: How do override files work?
+**A:** `docker-compose.override.yml` is automatically loaded alongside the base `docker-compose.yml`. It can override any service configuration. This allows separating base config from environment-specific overrides without specifying files manually.
+
+### Q8: How does networking work in Compose?
+**A:** By default, all services join a shared network and can reach each other by service name. Each service's container hostname equals the service name. External services outside Compose can only access explicitly `ports`-mapped services.
+
+### Q9: What is the difference between `volumes` and `tmpfs`?
+**A:** `volumes` persist data across container restarts and can be shared between containers. `tmpfs` mounts a RAM filesystem that doesn't persist—useful for temporary files that shouldn't be written to disk or survive container restarts.
+
+### Q10: How do you handle different environments (dev/staging/prod)?
+**A:** Use multiple compose files (`-f docker-compose.yml -f docker-compose.prod.yml`), override files (`docker-compose.override.yml` for dev), or environment variables with `.env` files. Profile activation (`--profile`) can also enable environment-specific services.
+
+## Cheat Sheet
+
+### Essential Commands
+
+```bash
+# Start services
+docker compose up -d
+
+# Start with rebuild
+docker compose up -d --build
+
+# Stop services
+docker compose down
+
+# View logs
+docker compose logs -f
+
+# Execute in service
+docker compose exec api sh
+
+# Run one-off command
+docker compose run --rm api npm test
+
+# Scale service
+docker compose up -d --scale api=5
+
+# Validate config
+docker compose config
+
+# Show running processes
+docker compose top
+
+# Pull images
+docker compose pull
+
+# Build images
+docker compose build
+```
+
+### Compose File Reference
+
+| Key | Description |
+|-----|-------------|
+| `version` | Compose file format version |
+| `services` | Container definitions |
+| `networks` | Network definitions |
+| `volumes` | Volume definitions |
+| `configs` | Config definitions |
+| `secrets` | Secret definitions |
+| `profiles` | Profile assignments |
+
+### Service Keys
+
+| Key | Description |
+|-----|-------------|
+| `image` | Image to use |
+| `build` | Build configuration |
+| `ports` | Port mappings |
+| `expose` | Internal ports |
+| `environment` | Environment variables |
+| `env_file` | Environment file |
+| `volumes` | Volume mounts |
+| `depends_on` | Service dependencies |
+| `healthcheck` | Health check config |
+| `restart` | Restart policy |
+| `networks` | Network attachments |
+| `deploy` | Deployment config |
+| `command` | Override command |
+| `entrypoint` | Override entrypoint |
+
+### Networking Keys
+
+```yaml
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+```
+
+### Volume Keys
+
+```yaml
+volumes:
+  data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /path/to/host
+```
+
+## Related Topics
+
+- [Container Overview](./overview.mdx) - Container fundamentals
+- [Docker](./docker.mdx) - Docker CLI reference
+- [Dockerfile](./dockerfile.mdx) - Dockerfile best practices
+- [Container Runtime](./container-runtime.mdx) - Runtime internals
+- [Image Security](./image-security.mdx) - Vulnerability scanning
+- [Registry](./registry.mdx) - Image registries
+- [Troubleshooting](./troubleshooting.mdx) - Debugging containers

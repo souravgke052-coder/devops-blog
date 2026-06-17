@@ -1,0 +1,879 @@
+---
+sidebar_position: 8
+title: "SRE Interview Questions"
+description: "Senior SRE interview questions covering SLOs, incident management, alerting, reliability patterns, and chaos engineering"
+---
+
+# SRE Interview Questions
+
+## Overview
+
+Site Reliability Engineering combines software engineering with operations to build and maintain reliable systems at scale. Senior SREs understand how to balance reliability with development velocity, design systems that fail gracefully, and run effective incident management processes.
+
+These questions probe your understanding of reliability engineering principles, your experience with production systems, and your ability to design systems that meet reliability targets.
+
+## Question Categories
+
+### Conceptual Questions
+
+**Q: Explain the SLO/SLI/SLA model. How do you set appropriate SLOs?**
+
+A: **The hierarchy**:
+
+**SLI (Service Level Indicator)** — The metric:
+- Request latency (p50, p95, p99)
+- Error rate (5xx, or 4xx depending on definition)
+- Availability (uptime percentage)
+- Throughput (requests per second)
+
+**SLO (Service Level Objective)** — The target:
+- "99.9% of requests complete in < 200ms"
+- "99.95% availability per month"
+- "p99 latency < 500ms during business hours"
+
+**SLA (Service Level Agreement)** — The contractual obligation:
+- Often more lenient than SLO (e.g., 99.9% SLO, 99.5% SLA)
+- Violations may have financial penalties
+- Defined by business, not engineering
+
+**SLO selection framework**:
+
+1. **Start with user impact**:
+   - What matters to users? (Speed? Availability? Correctness?)
+   - Survey users or analyze support tickets
+   - Look at competitors' SLAs
+
+2. **Consider the cost of reliability**:
+```python
+# Reliability cost curve (exponential)
+#
+#   Cost
+#     │
+# 100X│                              ***
+#     │                        *        *
+#  10X│                   *                *
+#     │              *                       *
+#   1X│         *                               *
+#     └────────────────────────────────────────────
+#         99%      99.9%      99.99%      99.999%
+#                     Availability target
+```
+
+3. **Error budget approach**:
+```python
+# Monthly SLO: 99.9% = 43.8 minutes downtime allowed
+# If you're at 99.99%, you have error budget to spend on:
+# - New features that might be risky
+# - Technical debt fixes
+# - Experiments
+
+# Budget consumption rate
+error_budget_remaining = 1 - (actual_error_rate / SLO_target)
+
+if error_budget_remaining < 0.3:
+    # Alert: Focus on reliability, freeze risky changes
+    print("Error budget burn rate high - focus on stability")
+else:
+    # Can afford to ship faster
+    print("Healthy error budget - can take risks")
+```
+
+**Bad SLO examples**:
+- "Four 9s for a new startup's internal dashboard" (too aggressive, expensive)
+- "99% availability for payment processing" (too lenient, users will suffer)
+
+**Good SLO examples**:
+- "p99 API latency < 300ms for 95% of requests"
+- "API error rate < 0.1% measured over 5-minute windows"
+- "Successful job completion rate > 99.5%"
+
+---
+
+**Q: What is toil? How do you measure and reduce it?**
+
+A: **Understanding toil**:
+
+Toil is manual, repetitive, automatable work that scales linearly with service growth. If you doubled your users/servers, toil would double.
+
+**Characteristics of toil** (Google's SRE book):
+1. Manual (requires human intervention)
+2. Repetitive (same steps, same outcome)
+3. Automatable (could be done by a script/algorithm)
+4. Tactical (reactive, not proactive)
+5. No enduring value (work product doesn't last)
+6. Scales linearly (more users = more toil)
+
+**Measuring toil**:
+```yaml
+# Weekly toil tracking
+# In weekly SRE review, each SRE reports:
+toil_tracking:
+  engineer: "Jane"
+  week: "2024-W24"
+  hours_on_toil:
+    - task: "Manual cert renewals"
+      hours: 4
+      reason: "No auto-renewal configured"
+    - task: "Responding to duplicate alerts"
+      hours: 2
+      reason: "Alert deduplication needed"
+  
+  total_hours: 6
+  target: "< 2 hours"
+  
+  action_items:
+    - "Implement cert-manager for auto-renewal"
+    - "Fix alert grouping rules"
+```
+
+**Target**: Google recommends keeping toil below 50% of SRE time. For critical services, strive for < 20%.
+
+**Reducing toil patterns**:
+
+```yaml
+# Example: Automatic certificate rotation
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+# Certificates auto-renew before expiry
+# Eliminates manual cert management toil
+```
+
+**Common toil sources**:
+| Toil Type | Solution |
+|-----------|----------|
+| Manual deployments | CI/CD, GitOps |
+| Certificate renewals | cert-manager, automation |
+| Log rotation/management | Centralized logging |
+| User support escalations | Better runbooks, self-service |
+| Capacity planning | Auto-scaling |
+| Debugging production | Better observability |
+
+---
+
+**Q: Explain blameless postmortems. How do you write an effective one?**
+
+A: **Blameless postmortem principles**:
+
+The goal is to understand what happened and why (the system failed), not to assign blame (who failed). People make mistakes in complex systems — the focus is on improving the system.
+
+**Structure of an effective postmortem**:
+
+```markdown
+# Postmortem: Payment Service Outage
+
+**Date**: 2024-06-15
+**Duration**: 45 minutes (14:23 - 15:08 UTC)
+**Severity**: SEV1
+**Author**: SRE Team
+
+## Summary
+Payment processing was unavailable for 45 minutes affecting ~12,000 transactions.
+Root cause: Database connection pool exhaustion due to slow queries.
+
+## Impact
+- 12,347 failed transactions
+- Estimated revenue impact: $245,000
+- Customer support tickets: 89
+
+## Timeline
+- 14:23 - Monitoring alerts: elevated error rate
+- 14:25 - On-call engineer paged
+- 14:32 - Initial mitigation: scale up database
+- 14:45 - Identified slow query causing connection buildup
+- 14:58 - Applied query optimization
+- 15:08 - Service recovered
+
+## Root Cause
+A deployment at 13:45 introduced a query without proper index usage.
+Under load, query time increased from 5ms to 5000ms.
+Connection pool filled up waiting for slow queries.
+New requests couldn't get connections and failed immediately.
+
+## Contributing Factors
+1. Query plan changed with new data distribution
+2. Index recommendations not implemented from previous analysis
+3. Load testing didn't cover this specific query pattern
+4. Alert thresholds were too lenient to catch earlier
+
+## What Went Well
+- Detection was fast (automated alerting)
+- Communication during incident was clear
+- Rollback was executed smoothly
+
+## What Went Poorly
+- Database metrics dashboard was down during incident (monitoring issue)
+- On-call runbook didn't cover this scenario
+- Escalation took 7 minutes
+
+## Action Items
+| Action | Owner | Due Date | Status |
+|--------|-------|----------|--------|
+| Add index for slow query | DB Team | 2024-06-22 | Done |
+| Update on-call runbook | SRE | 2024-06-18 | In Progress |
+| Fix monitoring dashboard | Platform | 2024-06-20 | Done |
+| Add p95 latency alert | SRE | 2024-06-18 | Done |
+```
+
+**What NOT to do in blameless postmortems**:
+- Don't name individuals as causes
+- Don't focus on what people "should have done"
+- Don't use blame-worthy language ("they failed to...", "they forgot to...")
+- Don't treat this as a performance review
+
+**What TO do**:
+- Focus on system failures
+- Ask "why" multiple times to find root causes
+- Identify contributing factors (multiple causes)
+- Create actionable, specific improvements
+- Follow up on action items
+
+---
+
+**Q: What are the key reliability patterns every senior SRE should know?**
+
+A: **Core reliability patterns**:
+
+**1. Circuit Breaker**:
+```python
+import time
+from enum import Enum
+
+class CircuitState(Enum):
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing recovery
+
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, timeout=60):
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = CircuitState.CLOSED
+    
+    def call(self, func):
+        if self.state == CircuitState.OPEN:
+            if time.time() - self.last_failure_time > self.timeout:
+                self.state = CircuitState.HALF_OPEN
+            else:
+                raise CircuitOpenError("Circuit is OPEN")
+        
+        try:
+            result = func()
+            self.on_success()
+            return result
+        except Exception as e:
+            self.on_failure()
+            raise
+    
+    def on_success(self):
+        self.failure_count = 0
+        self.state = CircuitState.CLOSED
+    
+    def on_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = CircuitState.OPEN
+```
+
+**2. Retry with exponential backoff**:
+```python
+import time
+import random
+
+def retry_with_backoff(func, max_retries=3, base_delay=1, max_delay=30):
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except transient_error:
+            delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+            print(f"Retry {attempt + 1}/{max_retries} in {delay:.2f}s")
+            time.sleep(delay)
+    raise MaxRetriesExceeded()
+```
+
+**3. Bulkhead**:
+```python
+# Separate thread pools for different operation types
+# Prevents one failure from affecting others
+
+bulkhead_config = {
+    "critical": ThreadPoolExecutor(max_workers=50),
+    "background": ThreadPoolExecutor(max_workers=10),
+    "analytics": ThreadPoolExecutor(max_workers=5),
+}
+```
+
+**4. Timeout and deadline propagation**:
+```python
+import context
+
+def call_service(ctx, service_name):
+    # Propagate timeout from parent
+    remaining = ctx.deadline - time.time()
+    if remaining <= 0:
+        raise TimeoutError("Deadline exceeded")
+    
+    try:
+        return service_client.call(timeout=remaining * 0.9)  # Buffer
+    except DeadlineExceeded:
+        raise
+```
+
+**5. Load shedding**:
+```python
+def handle_request(request):
+    current_load = get_current_rps()
+    max_load = get_capacity()
+    
+    # Reject requests when overloaded
+    if current_load > max_load * 0.95:
+        if request.priority == "background":
+            raise RejectedError("System overloaded")
+    
+    # Prioritize critical requests
+    return process_request(request)
+```
+
+**6. Graceful degradation**:
+```python
+def get_user_profile(user_id):
+    try:
+        # Try primary data source
+        return database.get(user_id)
+    except Exception:
+        # Fall back to cache (might be stale)
+        try:
+            return cache.get(f"user:{user_id}")
+        except Exception:
+            # Return minimal data
+            return {"id": user_id, "name": "Unknown"}
+```
+
+---
+
+**Q: What is chaos engineering? How do you implement it safely?**
+
+A: **Chaos engineering fundamentals**:
+
+Chaos engineering is the practice of deliberately injecting failures into systems to test their resilience. It's different from debugging — it's proactive discovery of weaknesses.
+
+**GameDay structure**:
+
+1. **Define steady state** (what normal looks like):
+```yaml
+# Hypotheses about steady state
+steady_state:
+  - "95% of requests return < 200ms"
+  - "Error rate < 0.1%"
+  - "Queue depth < 1000"
+  - "All instances healthy"
+```
+
+2. **Plan experiment** (what you'll break):
+```yaml
+experiment:
+  title: "API server failure"
+  method: "Terminate 1 of 3 API servers"
+  expected_outcome: "Requests continue with < 10% latency increase"
+  abort_conditions:
+    - "Error rate > 5%"
+    - "Latency p99 > 1s"
+    - "Queue depth > 5000"
+```
+
+3. **Execute in production** (carefully):
+```yaml
+# Use automated abort conditions
+# Run during low-traffic windows
+# Have observers ready
+# Have rollback plan
+```
+
+4. **Measure and learn**:
+```yaml
+# Did the system behave as expected?
+# If yes: document resilience
+# If no: you've found a weakness - create action item
+```
+
+**Chaos tools**:
+
+| Tool | Focus | Use Case |
+|------|-------|----------|
+| Chaos Monkey (Netflix) | Instance termination | Validate auto-scaling |
+| Gremlin | Multiple failure types | Comprehensive testing |
+| LitmusChaos | Kubernetes | K8s resilience |
+| Toxiproxy | Network latency | Network resilience |
+| AWS Fault Injection Simulator | AWS infrastructure | Cloud resilience |
+
+**Safety guardrails**:
+```yaml
+# Always define scope
+scope:
+  services: ["api-gateway", "user-service"]
+  regions: ["us-east-1"]
+  exclude_critical: ["payment-service"]
+
+# Define automatic aborts
+abort_conditions:
+  - metric: "error-rate"
+    threshold: 0.05
+    window: "1m"
+  - metric: "latency-p99"
+    threshold: 2000
+    window: "30s"
+
+# Rollback immediately if conditions met
+```
+
+---
+
+### Practical / Hands-On Questions
+
+**Q: How do you design an alerting system that balances detection speed vs alert fatigue?**
+
+A: **Alerting design principles**:
+
+**The alert quality spectrum**:
+```
+Pages ──────────────────────────────────── Tickets
+  │                                        │
+  │                                        │
+Low volume                               High volume
+High urgency                             Low urgency
+Must act now                             Can act later
+```
+
+**Effective alerting rules**:
+
+```yaml
+# BAD: Too sensitive
+alert: HighCPU
+expr: cpu_usage > 80
+for: 0m  # Triggers immediately, lots of noise
+# Problem: Brief spikes cause pages
+
+# GOOD: Sustained high CPU
+alert: HighCPU
+expr: cpu_usage > 80
+for: 5m  # Wait 5 minutes of sustained high CPU
+# Only pages if problem persists
+```
+
+**Multi-window alerting**:
+```yaml
+# Alert on sustained problems
+# Short window: catch quickly
+# Long window: avoid noise
+
+alert: HighLatencySustained
+expr: |
+  (
+    job:request_latency:p99_rate5m > 1
+  )
+  and
+  (
+    job:request_latency:p99_rate15m > 0.8
+  )
+for: 0m
+labels:
+  severity: critical
+annotations:
+  summary: "High latency sustained for 5 minutes"
+  runbook: "https://wiki.runbook/high-latency"
+```
+
+**Actionable alerts checklist**:
+```yaml
+# Every alert should have:
+checklist:
+  - name: "Clear symptom"
+    description: "Can a human understand what is broken?"
+  - name: "Clear cause"
+    description: "Does the alert tell you where to look?"
+  - name: "Clear action"
+    description: "Is there something specific to do?"
+  - name: "No noise"
+    description: "Will this fire for transient issues?"
+  - name: "Runbook exists"
+    description: "Is there documented response procedure?"
+```
+
+**Alert fatigue solutions**:
+
+1. **Deduplication**:
+```yaml
+# Group alerts by root cause
+# Don't alert per-instance, alert per-service
+alert: ServiceErrorRate
+expr: sum(rate(http_errors[5m])) by (service) / sum(rate(http_requests[5m])) by (service) > 0.05
+# This alerts once per service, not per instance
+```
+
+2. **Severity stratification**:
+```yaml
+# Page (immediate action): SEV1
+# Ticket (next business day): SEV2/3
+# Log (forensics): only log
+```
+
+3. **SLO-based alerting**:
+```yaml
+# Alert on error budget burn rate
+alert: ErrorBudgetCritical
+expr: |
+  (
+    1 - (
+      sum(rate(http_requests{status=~"5.."}[1h]))
+      /
+      sum(rate(http_requests[1h]))
+    )
+  ) > 0.9  # 90% of error budget burned
+# This tells you when to focus on reliability
+```
+
+---
+
+**Q: How do you conduct capacity planning for a growing service?**
+
+A: **Capacity planning process**:
+
+**1. Understand current usage**:
+```yaml
+# Key metrics to track
+capacity_metrics:
+  - name: "Requests per second"
+    current: 10000
+    peak: 15000
+    headroom: 1.5  # 50% buffer
+  
+  - name: "Database connections"
+    current: 500
+    max: 2000
+    projected_6mo: 1500
+  
+  - name: "Storage"
+    current: 2TB
+    max: 10TB
+    growth_rate: "20% per month"
+```
+
+**2. Project future demand**:
+```python
+# Simple linear projection
+def project_capacity(current, growth_rate, months):
+    return current * (1 + growth_rate) ** months
+
+# More realistic: consider seasonality
+# and compounding effects during peak
+```
+
+**3. Build scaling headroom into SLOs**:
+```yaml
+# Design for peak + headroom
+design_capacity:
+  rps: 20000  # For 10k current with 2x growth
+  instances: 10  # For 5 current with 2x
+  
+# Auto-scaling buffer
+autoscaling:
+  min: 5
+  max: 20
+  target_cpu: 60  # Don't run at 100%!
+```
+
+**4. Cost-efficient scaling tiers**:
+```yaml
+# Avoid expensive vertical scaling
+# Instead: horizontal + right-sizing
+
+scaling_strategy:
+  - tier: "baseline"
+    instance_type: "t3.medium"
+    min_instances: 3
+    # For steady, predictable traffic
+  
+  - tier: "spike"
+    instance_type: "t3.large"
+    min_instances: 1
+    # For burst traffic
+    # Auto-scale based on queue depth
+  
+  - tier: "batch"
+    instance_type: "c5.xlarge"
+    spot: true
+    # For non-time-sensitive workloads
+```
+
+**Capacity review cadence**:
+```yaml
+# Weekly: Review utilization trends
+# Monthly: Capacity planning review  
+# Quarterly: Major scaling decisions
+# On event: Product launches, marketing events
+
+# Trigger capacity work when:
+# - Average utilization > 70%
+# - Peak utilization > 85%
+# - Growth rate will exhaust capacity in < 3 months
+```
+
+---
+
+### Architecture / Design Questions
+
+**Q: How do you design for reliability in a distributed system?**
+
+A: **Reliability design principles**:
+
+**1. Assume failures will happen**:
+```yaml
+# Design for partial failure
+resilience_config:
+  # Don't fail entire request for partial failure
+  timeout_per_call: 5s
+  total_timeout: 30s
+  retry_attempts: 3
+  
+  # Circuit breaker per dependency
+  dependencies:
+    - name: "user-service"
+      timeout: 2s
+      circuit_breaker: true
+    - name: "payment-gateway"
+      timeout: 10s
+      circuit_breaker: true
+      fallback: "queue_for_later"  # Degrade gracefully
+```
+
+**2. Redundancy at every level**:
+```yaml
+# Multi-AZ deployment
+topology:
+  regions:
+    - name: "us-east-1"
+      zones: ["1a", "1b", "1c"]
+    - name: "us-west-2"
+      zones: ["2a", "2b", "2c"]
+  
+  # No single zone failure affects service
+  # Data replicated across zones
+  
+  # RPO (Recovery Point Objective): data you can afford to lose
+  # RTO (Recovery Time Objective): downtime you can afford
+  
+  database:
+    rpo: "0"  # Zero data loss
+    rto: "30s"
+    replication: "sync across 2 zones"
+```
+
+**3. Design for horizontal scaling**:
+```yaml
+# Avoid sticky sessions
+# All state in distributed cache/database
+# Stateless application servers
+
+scaling_design:
+  instances: "stateless app servers"
+  state: "distributed redis or database"
+  sessions: "JWT or cookie-based"
+  files: "S3/GCS (shared storage)"
+```
+
+**4. Observability for debugging**:
+```yaml
+# You can't fix what you can't see
+observability:
+  metrics:
+    - RED: Rate, Errors, Duration
+    - USE: Utilization, Saturation, Errors
+  
+  logs:
+    - Structured JSON
+    - Correlation IDs
+    - Sampling for high-volume paths
+  
+  traces:
+    - Distributed tracing (OpenTelemetry)
+    - Every service in trace
+    - Sample 10% + 100% of errors
+```
+
+**5. Dependency management**:
+```yaml
+# Know your critical dependencies
+dependency_criticality:
+  critical:
+    - Database (primary)
+    - Authentication
+    - Payment processing
+  
+  important:
+    - Recommendation engine
+    - Analytics
+    - Email service
+  
+  nice_to_have:
+    - Feature flags
+    - A/B testing
+    - Third-party feeds
+
+# For each dependency:
+# - What happens if it fails?
+# - Can we serve stale data?
+# - What's the fallback?
+```
+
+---
+
+**Q: What does on-call best practices look like at a senior level?**
+
+A: **On-call maturity model**:
+
+**Level 1: Reactive**
+- Paged for every alert
+- No runbooks
+- Long MTTR
+
+**Level 2: Documented**
+- Runbooks exist for common issues
+- Alerts are categorized
+- Some self-service remediation
+
+**Level 3: Proactive**
+- Alerts are actionable
+- Runbooks are tested
+- Pre-built automation for common fixes
+- Post-mortems improve system
+
+**Level 4: Preventive**
+- SLO-based alerting (error budget)
+- Chaos engineering regularly
+- Dependencies are monitored holistically
+- Zero unplanned incidents during business hours
+
+**On-call tooling requirements**:
+```yaml
+tooling:
+  alerting:
+    - PagerDuty/OpsGenie integration
+    - Alert severity classification
+    - Escalation policies
+  
+  communication:
+    - Incident channel (Slack/Teams)
+    - Status page updates
+    - Stakeholder notifications
+  
+  documentation:
+    - Runbooks (always up-to-date)
+    - Architecture diagrams
+    - Dependency map
+  
+  automation:
+    - Auto-remediation for known issues
+    - Diagnostic commands accessible
+    - Log aggregation
+```
+
+**On-call rotation design**:
+```yaml
+# Avoid burnout
+rotation:
+  team_size: 6-8  # Minimum for sustainable rotation
+  shift_length: 1 week  # Or less for high-stress services
+  
+  # Escalation:
+  primary: 5 min response
+  secondary: 15 min response (if primary no ack)
+  manager: 30 min response
+  
+  # After hours vs business hours
+  # Business hours: Less critical, can be async
+  # After hours: Only critical pages
+  
+  # Avoid scheduling conflicts
+  # Allow swaps with 48h notice
+  # Compensation for off-hours
+```
+
+**Runbook example**:
+```markdown
+# High Error Rate Runbook
+
+## Symptoms
+- Alert: error-rate > 5%
+- Dashboard shows error spike
+
+## Quick Diagnosis
+1. Check which endpoints are failing
+   - `kubectl logs -l app=api | grep "ERROR"`
+2. Check if it's a specific service
+   - Look at traces in Jaeger
+3. Check recent deployments
+   - `argocd history api`
+
+## Common Causes
+1. Database connection exhausted
+   - Fix: Scale database or tune queries
+   
+2. Dependency returning errors
+   - Fix: Check dependent service health
+   
+3. Bad deployment
+   - Fix: `argocd rollback api`
+
+## Mitigation Steps
+1. If deployment-related: rollback
+2. If scale-related: scale up
+3. If dependency-related: canary traffic away
+
+## Escalate If
+- Error rate > 20%
+- More than 15 minutes to resolve
+- Customer-visible impact > 30 minutes
+```
+
+---
+
+## Common Mistakes Candidates Make
+
+1. **Confusing reliability with perfection**: Perfect is the enemy of good. Some downtime is acceptable if within SLOs.
+
+2. **Not understanding error budgets**: Error budgets tell you when to focus on reliability vs. features.
+
+3. **Over-alerting**: Alert fatigue is real. Only page for things that need immediate action.
+
+4. **Not practicing on-call**: Being theoretical vs. practical is a common gap.
+
+5. **Missing the business context**: Reliability decisions should tie to business impact.
+
+## How to Structure Your Answers
+
+For **SLO questions**: Explain the metrics, the targets, and the trade-offs.
+
+For **incident questions**: Focus on process, communication, and blameless culture.
+
+For **design questions**: Start with requirements, then discuss component selection and trade-offs.
+
+## Related Topics
+
+- [Linux Questions](./linux-questions.mdx)
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [Architecture Questions](./architecture-questions.mdx)
+- [Scenario Questions](./scenario-questions.mdx)

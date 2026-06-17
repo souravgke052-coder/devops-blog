@@ -1,0 +1,618 @@
+---
+sidebar_position: 17
+description: Bash scripting for DevOps — patterns, techniques, and best practices for production automation.
+---
+
+# Bash Scripting
+
+## Overview
+
+Bash is the dominant scripting language in DevOps — it powers CI/CD pipelines, deployment scripts, infrastructure automation, and operational tooling. While Python and Go are better for complex applications, bash excels at gluing together system commands, managing files, and orchestrating shell pipelines.
+
+The key to production bash scripting is discipline: strict error handling (`set -euo pipefail`), proper quoting, defensive variable handling, and comprehensive logging. Scripts that work in development but fail silently in production are a common source of incidents. This guide covers bash-specific patterns — for POSIX-compatible scripting, see the Shell Fundamentals page.
+
+## When To Use
+
+- CI/CD pipeline steps
+- Deployment and rollback automation
+- System administration tooling
+- File manipulation and batch operations
+- Orchestrating command-line tools
+- Quick one-off automation
+
+## When NOT To Use
+
+- Complex data structures (use Python/Go)
+- Cross-platform scripts that must run on any Unix (use POSIX sh)
+- Performance-critical processing (use awk, sed, or compiled languages)
+- Network APIs and HTTP (use curl + jq or a proper HTTP library)
+- Complex error recovery with state machines (use a programming language)
+
+## Core Concepts
+
+### Strict Mode
+
+Always start production scripts with strict mode:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# -e: exit on command failure
+# -u: exit on undefined variable reference
+# -o pipefail: pipeline fails if any command fails (not just the last)
+
+# Also recommended:
+IFS=$'\n\t'   # Prevent word splitting on spaces in filenames
+```
+
+### Variables and Parameter Expansion
+
+```bash
+# Basic assignment (no $ when setting)
+name="value"
+
+# Parameter expansion
+echo "${name}"              # Basic
+echo "${name:-default}"     # Default if unset
+echo "${name:=default}"     # Set default if unset (also assigns to name)
+echo "${name:+alternate}"   # Alternate if set (empty if unset)
+echo "${#name}"             # String length
+echo "${name#pattern}"      # Remove shortest match from beginning
+echo "${name##pattern}"     # Remove longest match from beginning
+echo "${name%pattern}"      # Remove shortest match from end
+echo "${name%%pattern}"     # Remove longest match from end
+echo "${name/old/new}"      # Replace first match
+echo "${name//old/new}"     # Replace all matches
+echo "${name^}"             # Uppercase first char (bash 4+)
+echo "${name^^}"            # Uppercase all (bash 4+)
+echo "${name,}"}            # Lowercase first char (bash 4+)
+echo "${name,,}"            # Lowercase all (bash 4+)
+```
+
+### Arrays
+
+```bash
+# Indexed arrays (0-based)
+colors=("red" "green" "blue")
+echo "${colors[0]}"         # red
+echo "${colors[@]}"         # All elements
+echo "${#colors[@]}"        # Array length
+echo "${!colors[@]}"        # Indices
+
+# Associative arrays (bash 4+)
+declare -A users
+users[alice]="1001"
+users[bob]="1002"
+echo "${users[alice]}"
+
+# Iterate arrays
+for color in "${colors[@]}"; do
+    echo "Color: $color"
+done
+
+# mapfile/readarray: read lines into array
+mapfile -t lines < <(find /var/log -name "*.log")
+printf '%s\n' "${lines[@]}"
+
+# Slice
+echo "${colors[@]:1:2}"     # elements 1 and 2 (0-indexed)
+```
+
+### Functions
+
+```bash
+# Basic function
+greet() {
+    echo "Hello, $1"
+}
+greet "world"
+
+# Return vs exit
+# return sets exit code, does NOT return a value
+# To return a value, echo it and capture:
+get_date() {
+    date +%Y-%m-%d
+}
+today=$(get_date)
+
+# Return proper exit codes
+validate_input() {
+    if [[ ! "$1" =~ ^[a-z]+$ ]]; then
+        echo "ERROR: Invalid input" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Local variables
+process() {
+    local temp_file=$(mktemp)
+    local count=0
+    # ...
+    rm -f "$temp_file"
+}
+```
+
+### Error Handling with Traps
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cleanup on exit (any exit)
+cleanup() {
+    rm -f "$TEMP_FILE"
+    echo "Cleaned up"
+}
+trap cleanup EXIT
+
+# Run on error
+error_handler() {
+    local exit_code=$?
+    echo "ERROR: Command failed with exit code $exit_code at line $1" >&2
+    # Could send alert, rollback, etc.
+}
+trap 'error_handler $LINENO' ERR
+
+# Debug: trace commands
+debug_handler() {
+    echo "DEBUG: Running '$BASH_COMMAND' at line $1" >&2
+}
+trap 'debug_handler $LINENO' DEBUG
+
+TEMP_FILE=$(mktemp)
+```
+
+### getopts for Option Parsing
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $0 [-v] [-c CONFIG] [-p PORT] [--retry COUNT] FILE
+
+Options:
+    -v          Verbose mode
+    -c CONFIG   Config file path
+    -p PORT     Port number (default: 8080)
+    --retry N   Retry N times on failure
+    -h          Show this help
+EOF
+}
+
+RETRY=3
+VERBOSE=false
+CONFIG="/etc/app.conf"
+PORT=8080
+
+# Colon after option means it takes an argument
+while getopts "c:p:r:vh" opt; do
+    case "$opt" in
+        c) CONFIG="$OPTARG" ;;
+        p) PORT="$OPTARG" ;;
+        r) RETRY="$OPTARG" ;;
+        v) VERBOSE=true ;;
+        h) usage; exit 0 ;;
+        \?) usage; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+FILE="${1:-}"
+if [[ -z "$FILE" ]]; then
+    echo "ERROR: FILE argument required" >&2
+    exit 1
+fi
+```
+
+### Arithmetic
+
+```bash
+# Integer arithmetic (bash built-in)
+a=$((1 + 2))
+((a++))
+((a += 5))
+
+# Floating point: use bc or awk
+result=$(echo "scale=2; 10 / 3" | bc)
+result=$(awk 'BEGIN {printf "%.2f", 10/3}')
+
+# Hex conversion
+printf '%d\n' 0xFF          # 255
+printf '%x\n' 255            # ff
+```
+
+### Here-Documents and Here-Strings
+
+```bash
+# Here-doc: multi-line input to a command
+cat <<'EOF'                  # Single quotes = no expansion
+Received: $(date)
+User: $USER
+EOF
+
+cat <<EOF                    # No quotes = variable expansion
+Received: $(date)
+User: $USER
+EOF
+
+# Here-doc with indentation (tabs)
+if true; then
+    cat <<-EOF
+	Indented content
+	with tabs
+	EOF
+fi
+
+# Here-string
+read -r line <<< "first second third"
+echo "$line"                 # first
+read -r a b c <<< "1 2 3"
+echo "$c"                    # 3
+```
+
+### Mktemp and Secure Temporary Files
+
+```bash
+# Always use mktemp for temp files in scripts
+TEMP_DIR=$(mktemp -d)
+TEMP_FILE=$(mktemp)
+TEMP_PATTERN=$(mktemp /tmp/myapp.XXXXXX)
+
+# Cleanup on exit
+trap 'rm -rf "$TEMP_DIR" "$TEMP_FILE"' EXIT
+
+# For temp files in loop (avoid race conditions)
+for i in {1..10}; do
+    tmp=$(mktemp)
+    # use $tmp
+    rm -f "$tmp"
+done
+```
+
+## Real Production Example
+
+Production deployment script with rollback, health checks, signal handling, and Slack notifications:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === CONFIGURATION ===
+readonly APP_NAME="myapp"
+readonly APP_DIR="/opt/${APP_NAME}"
+readonly BACKUP_DIR="/opt/backups/${APP_NAME}"
+readonly RELEASE_DIR="/tmp/${APP_NAME}-release-$$"
+readonly HEALTH_URL="http://localhost:8080/health"
+readonly HEALTH_TIMEOUT=60
+readonly SLACK_WEBHOOK="${SLACK_WEBHOOK_URL:-}"
+readonly LOG_FILE="/var/log/${APP_NAME}/deploy.log"
+
+# === LOGGING ===
+log() { echo "[$(date -Iseconds)] [INFO] $*" | tee -a "$LOG_FILE"; }
+log_error() { echo "[$(date -Iseconds)] [ERROR] $*" | tee -a "$LOG_FILE" >&2; }
+log_slack() {
+    [[ -z "$SLACK_WEBHOOK" ]] && return
+    curl -s -X POST "$SLACK_WEBHOOK" \
+        -H 'Content-Type: application/json' \
+        -d "{\"text\":\"$*\"}" > /dev/null 2>&1 || true
+}
+
+# === CLEANUP ===
+cleanup() {
+    local exit_code=$?
+    rm -rf "$RELEASE_DIR"
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Deployment failed with exit code $exit_code"
+        log_slack ":x: Deploy failed on $(hostname)"
+    fi
+}
+trap cleanup EXIT
+
+# === ROLLBACK ===
+rollback() {
+    log_error "Deployment failed, rolling back..."
+    if [[ -d "${BACKUP_DIR}/current" ]]; then
+        rm -rf "${APP_DIR}"
+        cp -a "${BACKUP_DIR}/current" "${APP_DIR}"
+        systemctl restart "${APP_NAME}"
+        log "Rollback complete"
+        log_slack ":warning: Rollback complete on $(hostname)"
+    else
+        log_error "No backup found, cannot rollback"
+        log_slack ":rotating_light: Deploy AND rollback failed on $(hostname)"
+        exit 1
+    fi
+}
+trap rollback ERR
+
+# === PRE-FLIGHT ===
+log "Starting deployment of ${APP_NAME} to $(hostname)"
+mkdir -p "$(dirname "$LOG_FILE")" "${BACKUP_DIR}"
+
+# === BACKUP ===
+log "Backing up current version..."
+rm -rf "${BACKUP_DIR}/previous" 2>/dev/null || true
+[[ -d "${APP_DIR}" ]] && cp -a "${APP_DIR}" "${BACKUP_DIR}/previous"
+rm -rf "${BACKUP_DIR}/current" 2>/dev/null || true
+[[ -d "${APP_DIR}" ]] && cp -a "${APP_DIR}" "${BACKUP_DIR}/current"
+
+# === DEPLOY ===
+log "Extracting new version to ${RELEASE_DIR}..."
+mkdir -p "$RELEASE_DIR"
+tar -xzf "/tmp/${APP_NAME}.tar.gz" -C "$RELEASE_DIR"
+
+log "Stopping current service..."
+systemctl stop "${APP_NAME}" || true
+
+log "Installing new version..."
+rm -rf "${APP_DIR}"
+cp -a "${RELEASE_DIR}/${APP_NAME}" "${APP_DIR}"
+chown -R appuser:appuser "${APP_DIR}"
+
+log "Starting service..."
+systemctl start "${APP_NAME}"
+
+# === HEALTH CHECK ===
+log "Waiting for health check..."
+declare -i elapsed=0
+while (( elapsed < HEALTH_TIMEOUT )); do
+    if curl -sf "${HEALTH_URL}" > /dev/null 2>&1; then
+        log "Health check passed after ${elapsed}s"
+        break
+    fi
+    sleep 2
+    elapsed+=2
+    echo -n "."
+done
+echo
+
+if (( elapsed >= HEALTH_TIMEOUT )); then
+    log_error "Health check failed after ${HEALTH_TIMEOUT}s"
+    exit 1
+fi
+
+log "Deployment complete"
+log_slack ":white_check_mark: Deploy succeeded on $(hostname)"
+```
+
+## CLI Examples
+
+```bash
+# Array operations
+arr=(one two three)
+arr+=(four five)           # Append
+unset arr[1]               # Remove element
+unset arr                  # Remove entire array
+
+# String operations
+str="hello-world"
+echo "${str//-/_}"         # hello_world (replace all)
+
+# Conditional with regex
+if [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    echo "Valid email"
+fi
+
+# Process substitution in loops
+while IFS= read -r -d '' file; do
+    echo "Processing: $file"
+done < <(find /tmp -name "*.log" -print0)
+
+# Read with timeout
+read -t 5 -r -p "Continue? " response || true
+
+# Coprocess (background process with bidirectional communication)
+coproc BC { bc -l; }
+echo "scale=4; 22/7" >&${BC[1]}
+read -r result <&${BC[0]}
+echo "Result: $result"
+kill $BC_PID 2>/dev/null || true
+```
+
+## Common Commands
+
+| Pattern | Description |
+|---------|-------------|
+| `set -euo pipefail` | Strict mode |
+| `"${array[@]}"` | All array elements (quoted) |
+| `"${!array[@]}"` | Array indices |
+| `${var,,}` | Lowercase (bash 4+) |
+| `${var^^}` | Uppercase (bash 4+) |
+| `readarray -t arr < <(cmd)` | Read command output to array |
+| `local var=$(cmd)` | Capture in function (local) |
+| `trap 'cleanup $LINENO' ERR` | Error handler with line |
+| `readonly CONST=value` | Immutable variable |
+| `${param:?err}` | Required (exit if unset) |
+
+## Monitoring
+
+```bash
+# Enable execution trace
+bash -x script.sh 2>&1 | tee trace.log
+
+# Trace with timestamps (bash 5.1+)
+exec 3>/tmp/trace.log
+BASH_XTRACEFD=3
+PS4='+$(date "+%H:%M:%S.%N") '
+set -x
+# commands
+set +x
+exec 3>&-
+
+# time output with resource usage
+TIMEFORMAT='%R real %U user %S sys'
+time script.sh
+/usr/bin/time -v script.sh
+
+# ShellCheck for static analysis
+shellcheck -x -S warning script.sh
+# -x: follow source
+# -S severity: error/warning/style
+```
+
+## Security
+
+**ShellCheck is mandatory for production scripts:**
+```bash
+shellcheck script.sh
+# Fix all errors before deploying
+```
+
+**Secret handling:**
+```bash
+# NEVER do this:
+# API_KEY="secret" ./script.sh   # Shows in ps
+# echo "$API_KEY" >> /tmp/log    # Leaks to logs
+
+# Instead: read from file with restricted permissions
+API_KEY=$(cat /run/secrets/api_key 2>/dev/null || cat /etc/${APP_NAME}/secrets/api_key)
+chmod 600 /etc/${APP_NAME}/secrets/api_key
+
+# Or use environment with masking
+export API_KEY="secret"
+# Script should never echo $API_KEY
+```
+
+**Defensive patterns:**
+```bash
+# Always quote variable expansions
+rm -- "$FILE"          # Safe even with spaces/special chars
+[[ -f "$FILE" ]]       # Check before using
+
+# Validate input
+case "$INPUT" in
+    [0-9]*) ;;          # Starts with digit
+    [a-zA-Z]*) ;;       # Starts with letter
+    *) echo "Invalid" >&2; exit 1 ;;
+esac
+
+# Prevent glob expansion
+# In scripts that process filenames:
+set -o noglob            # Disable globbing
+# Or: use -- to stop option parsing, quote all variables
+```
+
+## Troubleshooting
+
+**"unbound variable" error:**
+```bash
+# When you need to allow unset variables:
+# Option 1: provide default
+echo "${UNDEFINED:-default}"
+
+# Option 2: allow in specific cases
+set +u
+# ... code ...
+set -u
+
+# Option 3: check before use
+: "${VAR:?required}"
+```
+
+**set -e in loops and conditionals:**
+```bash
+# set -e is suppressed in these contexts:
+# But only for simple commands, not pipelines or subshells!
+set -e
+if grep -q pattern file; then  # Fine (grep exit code is checked)
+    echo "found"
+fi
+
+# Pipelines DO cause exit with pipefail
+# Without pipefail: pipeline returns last command's exit code
+# With pipefail: pipeline fails if ANY command fails
+cmd1 | cmd2 | cmd3   # All must succeed
+
+# Wrap problematic commands:
+set -e
+cmd_that_might_fail || true     # Ignore failure
+```
+
+**FD exhaustion:**
+```bash
+# Each subshell and pipe creates FDs. In tight loops, FDs can leak.
+# Use subshells sparingly, close explicit FDs:
+exec 3>&-   # Close FD 3
+
+# Check FD usage:
+ls -la /proc/$$/fd
+# In a script: ls -la /proc/$$/fd | wc -l
+```
+
+## Interview Questions
+
+1. **What is the difference between `$()` and backtick command substitution, and why does it matter?**
+
+Both perform command substitution, but `$()` is preferred because: (1) It nests cleanly — `` `cmd \`inner\` ` `` is messy, `$($(cmd))` is readable. (2) It handles quotes better — `` `echo "it's"` `` breaks, `$(echo "it's")` works. (3) It is POSIX-compliant (unlike some bash-specific `$()` features). Backticks are legacy and should be avoided.
+
+2. **Explain `set -euo pipefail` in detail — what are the edge cases?**
+
+`-e`: Exit immediately if a command exits with non-zero. Edge cases: within `if`, `||`, `&&`, `while/until` test conditions, `!` negation — bash suppresses `set -e` in these contexts for interactive convenience. Pipelines: without `pipefail`, only the last command's exit code matters; `grep pattern file` returns 0 (match), 1 (no match), or 2 (error). With `pipefail`, pipeline fails if ANY command fails.
+`-u`: Treat unset variables as errors. `${var}` with unset var causes exit. `${var:-default}` avoids this. Edge case: `${!var}` (indirect reference) doesn't trigger if var is unset.
+`-o pipefail`: Pipeline returns the exit status of the rightmost command that failed, or zero if all succeed.
+
+3. **What is the difference between a subshell and a current shell? When do subshells occur?**
+
+Subshells are child processes with an inherited but isolated copy of the environment. They are created by: `(command)`, `` `command` ``, `$(command)`, `| pipeline`, `&` background, `coproc`, and process substitution `<(...)`. Key difference: variables set in a subshell don't affect the parent. `cd /tmp && pwd` in a subshell: `cd` in `(cd /tmp && pwd)`, parent stays in original directory. Use subshells to isolate state changes; use current shell when you need persistence.
+
+4. **How does `readarray`/`mapfile` work, and what are the alternatives?**
+
+`readarray -t arr < <(command)` reads command output into an indexed array, one line per element. `-t` removes trailing newlines. Alternatives: `while IFS= read -r line; do arr+=("$line"); done < <(cmd)` — more control, handles binary data, but slower. `mapfile` is faster for large inputs but less flexible. `readarray -t lines < file` — simplest way to read file into array. For NUL-delimited data (handles all characters): `readarray -t -d '' arr < <(find ... -print0)`.
+
+5. **What is the difference between `local` and declaring a variable without `local` in a function?**
+
+Without `local`, the assignment is in the function's scope but persists after the function returns (visible to the calling script). With `local`, the variable is function-local — it shadows any global variable of the same name, and is destroyed when the function returns. Best practice: always use `local` for intermediate variables in functions to avoid polluting the global namespace. Exception: variables intentionally returned via name references or echo capture.
+
+## Cheat Sheet
+
+```bash
+# Strict mode
+set -euo pipefail
+IFS=$'\n\t'
+
+# Arrays
+arr=(a b c)
+${arr[@]}           # All elements (quoted for safety)
+${!arr[@]}          # Indices
+${#arr[@]}          # Length
+declare -A dict     # Associative array (bash 4+)
+
+# Parameter expansion
+${var:-default}     # Default if unset
+${var:=default}     # Set default if unset
+${var:?error}       # Error if unset
+${var//old/new}     # Replace all
+${var,,}            # Lowercase (4+)
+${var^^}            # Uppercase (4+)
+
+# Functions
+func() {
+    local var=$(cmd)
+    return $?
+}
+
+# Error handling
+trap 'cleanup $LINENO' ERR EXIT
+
+# Option parsing
+while getopts "c:p:vh" opt; do
+    case "$opt" in
+        c) config="$OPTARG" ;;
+        h) usage; exit 0 ;;
+    esac
+done
+
+# shellcheck
+shellcheck -x script.sh
+```
+
+## Related Topics
+
+- [Shell](./shell) — Shell fundamentals and expansion
+- [Processes](./processes) — Background jobs and signals
+- [Cron](./cron) — Scheduled scripts
+- [Security](./security) — Script hardening
+- [Troubleshooting](./troubleshooting) — Debugging scripts

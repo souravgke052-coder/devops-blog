@@ -1,0 +1,124 @@
+---
+sidebar_position: 1
+title: Labs Overview
+description: Hands-on lab exercises for DevOps learning
+---
+
+# Labs Overview
+
+Welcome to our hands-on lab exercises. These labs provide practical experience with real tools, real commands, and real infrastructure.
+
+## Lab Categories
+
+### Infrastructure & Operating Systems
+- **Linux Labs** — Essential Linux administration, scripting, and system management
+- **Networking Labs** — Network configuration, troubleshooting, and security
+
+### Cloud Platforms
+- **GCP Labs** — Google Cloud Platform fundamentals and advanced services
+- **Kubernetes Labs** — Container orchestration with Kubernetes
+
+### Automation & DevOps Practices
+- **Terraform Labs** — Infrastructure as Code with Terraform
+- **CI/CD Labs** — Continuous Integration and Deployment pipelines
+- **SRE Labs** — Site Reliability Engineering practices and tools
+
+## Lab Structure
+
+Each lab follows a consistent format:
+
+| Section | Description |
+|---------|-------------|
+| **Objective** | What you will accomplish |
+| **Estimated Time** | Time commitment required |
+| **Prerequisites** | Required tools, accounts, and knowledge |
+| **Step-by-Step** | Detailed instructions with real commands |
+| **Validation** | How to verify success |
+| **Cleanup** | How to tear down resources |
+
+## Getting Started
+
+### Prerequisites Checklist
+
+Before starting any lab, ensure you have:
+
+1. **Account Access**
+   - GCP project with billing enabled (free tier works)
+   - GitHub account
+   - Docker Hub account (optional)
+
+2. **Tools Installed**
+   - Google Cloud SDK (`gcloud`)
+   - kubectl (latest)
+   - Terraform (1.0+)
+   - Docker
+   - Git
+
+3. **Local Environment**
+   - Linux/macOS/WSL2 terminal
+   - Text editor (VS Code recommended)
+   - Internet connection
+
+### Quick Verification
+
+Run this to verify your tools are ready:
+
+```bash
+# Check installed tools
+gcloud version
+kubectl version --client
+terraform --version
+docker --version
+git --version
+
+# Verify GCP authentication
+gcloud auth list
+gcloud projects list --limit=1
+```
+
+## Lab Environment Recommendations
+
+### Option 1: Cloud Shell (Recommended)
+- Pre-installed tools
+- No local setup required
+- Access: [console.cloud.google.com](https://console.cloud.google.com)
+
+### Option 2: Local Development
+- Full control over environment
+- Use provided setup scripts
+- Enable nested virtualization for Kubernetes labs
+
+### Option 3: GitHub Codespaces
+- Cloud-based development environment
+- Pre-configured DevOps tools
+- Free tier available
+
+## Lab Difficulty Levels
+
+| Level | Description | Prerequisites |
+|-------|-------------|---------------|
+| **Beginner** | Foundational concepts, guided steps | Basic command line |
+| **Intermediate** | Multi-step workflows, troubleshooting | One technology area |
+| **Advanced** | Production scenarios, optimization | Multiple technologies |
+
+## Progress Tracking
+
+As you complete labs, track your progress:
+
+1. Complete all steps without looking at solutions
+2. Complete validation checks independently
+3. Complete labs without prerequisites listed
+4. Solve challenges without step-by-step guidance
+
+## Next Steps
+
+- Start with [Linux Labs](/labs/linux-labs) if you're new to the command line
+- Skip to [Kubernetes Labs](/labs/kubernetes-labs) if you're comfortable with containers
+- Explore [Terraform Labs](/labs/terraform-labs) for Infrastructure as Code practice
+
+## Contributing Labs
+
+Have a lab to share? See our [contribution guidelines](/docs/contributing) for:
+- Lab template and format requirements
+- Validation step requirements
+- Review process timeline

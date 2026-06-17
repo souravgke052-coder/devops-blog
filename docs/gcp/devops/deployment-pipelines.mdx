@@ -1,0 +1,669 @@
+# Deployment Pipelines
+
+## Overview
+
+Google Cloud provides multiple services for orchestrating deployment pipelines: Cloud Deploy, GKE Deployment Manager, Config Connector, and Terraform. This page covers strategies and implementation patterns for reliable, automated deployment to GCP infrastructure.
+
+## When To Use
+
+- Progressive delivery to GKE/Cloud Run
+- Multi-environment deployments (dev/staging/prod)
+- GitOps-based deployments
+- Infrastructure as Code
+- Blue-green and canary deployments
+- Policy-compliant deployments
+
+## When NOT To Use
+
+- One-time manual deployments
+- Very simple single-service deployments
+- Development experimentation
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Deployment Pipeline                         │
+├─────────────────────────────────────────────────────────────┤
+│  Source:                                                    │
+│  ├── Cloud Source Repositories                             │
+│  ├── GitHub/GitLab                                        │
+│  └── Artifact Registry                                     │
+├─────────────────────────────────────────────────────────────┤
+│  Build:                                                     │
+│  ├── Cloud Build                                           │
+│  └── GitHub Actions                                        │
+├─────────────────────────────────────────────────────────────┤
+│  Deploy:                                                    │
+│  ├── Cloud Deploy (GKE/App Hub)                           │
+│  ├── GKE Config Sync                                      │
+│  └── Terraform/Config Connector                            │
+├─────────────────────────────────────────────────────────────┤
+│  Verify:                                                    │
+│  ├── Cloud Monitoring                                      │
+│  ├── SRE/Logging                                           │
+│  └── Testing frameworks                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Skaffold
+Local development and CI/CD tool for Kubernetes applications.
+
+### Cloud Deploy
+Managed progressive delivery service for GKE.
+
+### Config Sync
+GitOps-based configuration synchronization for GKE.
+
+### Config Controller
+Kubernetes-style deployment using Config Connector.
+
+### Progressive Delivery
+Gradual rollout with canary/blue-green strategies.
+
+## Real Production Example
+
+**GitOps Deployment with Config Sync**
+
+```hcl
+# Terraform configuration for GitOps deployment infrastructure
+
+# GKE Cluster
+resource "google_container_cluster" "primary" {
+  name               = "primary-cluster"
+  location           = "us-central1"
+  initial_node_count = 3
+  
+  network    = google_compute_network.vpc.id
+  subnetwork = google_compute_subnetwork.primary.id
+  
+  addons_config {
+    config_connector_config {
+      enabled = true
+    }
+  }
+  
+  workload_identity_config {
+    workload_pool = "${var.project}.svc.id.goog"
+  }
+  
+  labels = {
+    environment = "production"
+  }
+}
+
+# Config Sync for GitOps
+resource "google_gke_hub_feature" "config_sync" {
+  name = "configsync"
+  spec {
+    configsync {
+      enabled = true
+    }
+  }
+}
+
+resource "google_gke_hub_feature_membership" "config_sync_member" {
+  location = "global"
+  feature  = google_gke_hub_feature.config_sync.name
+  configsync {
+    git {
+      remote   = "https://github.com/org/config-repo"
+      branch   = "main"
+      dir      = "deployments/prod"
+      secret_type = "git"
+    }
+    sync_branch = "main"
+    policy_dir  = "deployments/prod"
+    source_format = "hierarchical"
+  }
+}
+
+# Cloud Deploy for progressive delivery
+resource "google_clouddeploy_delivery_pipeline" "production" {
+  name        = "production-pipeline"
+  location    = "us-central1"
+  description = "Production deployment pipeline"
+  
+  serial_pipeline {
+    stages {
+      target_id = "staging"
+      profiles = ["staging"]
+    }
+    stages {
+      target_id = "production"
+      profiles = ["production"]
+    }
+  }
+  
+  annotations = {
+    environment = "production"
+  }
+}
+
+# Staging target
+resource "google_clouddeploy_target" "staging" {
+  location                     = "us-central1"
+  name                         = "staging"
+  deploy_parameters = {
+    "SERVICE_TYPE" = "staging"
+    "REPLICAS"     = "2"
+    "CLOUD_RUN_MEMORY" = "512Mi"
+    "CLOUD_RUN_CPU" = "1"
+  }
+  
+  gke {
+    cluster = "projects/${var.project}/locations/us-central1/clusters/${google_container_cluster.primary.name}"
+  }
+}
+
+# Production target
+resource "google_clouddeploy_target" "production" {
+  location                     = "us-central1"
+  name                         = "production"
+  require_approval             = true
+  
+  deploy_parameters = {
+    "SERVICE_TYPE" = "production"
+    "REPLICAS"     = "5"
+    "CLOUD_RUN_MEMORY" = "1Gi"
+    "CLOUD_RUN_CPU" = "2"
+  }
+  
+  gke {
+    cluster = "projects/${var.project}/locations/us-central1/clusters/${google_container_cluster.primary.name}"
+  }
+}
+
+# Skaffold configuration (skaffold.yaml in repo)
+# This would be in your source repository
+```
+
+### Skaffold Configuration (skaffold.yaml)
+
+```yaml
+# Skaffold configuration for multi-service deployment
+apiVersion: skaffold/v4beta7
+kind: Config
+
+metadata:
+  name: production-app
+
+profiles:
+  # Development profile
+  - name: dev
+    build:
+      artifacts:
+        - image: us-central1-docker.pkg.dev/my-project/app/backend
+          docker:
+            dockerfile: Dockerfile
+        - image: us-central1-docker.pkg.dev/my-project/app/frontend
+          docker:
+            dockerfile: frontend/Dockerfile
+    deploy:
+      kubectl:
+        manifests:
+          - k8s/dev/*
+    portForward:
+      - resourceType: deployment
+        resourceName: backend
+        port: 8080
+        localPort: 8080
+
+  # Staging profile
+  - name: staging
+    build:
+      artifacts:
+        - image: us-central1-docker.pkg.dev/my-project/app/backend
+          docker:
+            dockerfile: Dockerfile
+        - image: us-central1-docker.pkg.dev/my-project/app/frontend
+          docker:
+            dockerfile: frontend/Dockerfile
+    deploy:
+      kubectl:
+        manifests:
+          - k8s/staging/*
+      helm:
+        releases:
+          - name: app
+            chartPath: charts/app
+            setValues:
+              image.repository: us-central1-docker.pkg.dev/my-project/app/backend
+              replicaCount: "2"
+              environment: staging
+
+  # Production profile
+  - name: production
+    build:
+      artifacts:
+        - image: us-central1-docker.pkg.dev/my-project/app/backend
+          docker:
+            dockerfile: Dockerfile
+            cache:
+              path: /cache
+        - image: us-central1-docker.pkg.dev/my-project/app/frontend
+          docker:
+            dockerfile: frontend/Dockerfile
+    deploy:
+      kubectl:
+        manifests:
+          - k8s/production/*
+      helm:
+        releases:
+          - name: app
+            chartPath: charts/app
+            setValues:
+              image.repository: us-central1-docker.pkg.dev/my-project/app/backend
+              replicaCount: "5"
+              environment: production
+              autoscaling:
+                enabled: true
+                minReplicas: 3
+                maxReplicas: 10
+
+# Default profile (development)
+build:
+  artifacts:
+    - image: us-central1-docker.pkg.dev/my-project/app/backend
+      docker:
+        dockerfile: Dockerfile
+```
+
+### Kubernetes Manifests (k8s/production/)
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: production
+  labels:
+    app: backend
+    environment: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: backend
+        environment: production
+    spec:
+      serviceAccountName: backend
+      containers:
+        - name: backend
+          image: us-central1-docker.pkg.dev/my-project/app/backend:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: ENVIRONMENT
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: database-url
+```
+
+```yaml
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: production
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: ClusterIP
+```
+
+```yaml
+# horizontalpodautoscaler.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+```yaml
+# networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: database
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+## CLI Examples
+
+```bash
+# Cloud Deploy commands
+gcloud deploy create-delivery-pipeline PIPELINE \
+  --release-format="helm" \
+  --location=us-central1
+
+gcloud deploy targets create staging \
+  --delivery-pipeline=PIPELINE \
+  --location=us-central1 \
+  --gke-cluster=projects/P/locations/us-central1/clusters/cluster
+
+gcloud deploy releases create release-001 \
+  --delivery-pipeline=PIPELINE \
+  --source=./charts/app \
+  --region=us-central1
+
+gcloud deploy rollouts list --delivery-pipeline=PIPELINE
+
+# Skaffold commands
+skaffold init
+skaffold dev
+skaffold build
+skaffold deploy
+skaffold render --output=rendered.yaml
+skaffold debug
+
+# Config Sync commands
+nomos status
+nomos apply
+nomos reconcile
+
+# Manual kubectl apply
+kubectl apply -f k8s/production/
+kubectl rollout status deployment/backend -n production
+kubectl rollout history deployment/backend -n production
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Cloud Deploy delivery pipeline
+resource "google_clouddeploy_delivery_pipeline" "pipeline" {
+  name        = "my-pipeline"
+  location    = "us-central1"
+  description = "Deployment pipeline"
+  
+  serial_pipeline {
+    stages {
+      target_id = "dev"
+      profiles  = ["dev"]
+      deploy_parameters = {
+        "memory" = "512Mi"
+      }
+    }
+    stages {
+      target_id = "staging"
+      profiles  = ["staging"]
+      deploy_parameters = {
+        "memory" = "1Gi"
+      }
+    }
+    stages {
+      target_id = "production"
+      profiles  = ["production"]
+      require_approval = true
+      deploy_parameters = {
+        "memory" = "2Gi"
+      }
+    }
+  }
+}
+
+# Targets
+resource "google_clouddeploy_target" "dev" {
+  location  = "us-central1"
+  name      = "dev"
+  gke {
+    cluster = google_container_cluster.dev.id
+  }
+}
+
+resource "google_clouddeploy_target" "production" {
+  location          = "us-central1"
+  name              = "production"
+  require_approval  = true
+  gke {
+    cluster = google_container_cluster.prod.id
+  }
+}
+```
+
+## Common Commands
+
+```bash
+# Cloud Deploy
+gcloud deploy delivery-pipelines create NAME [flags]
+gcloud deploy targets create NAME --pipeline=PIPELINE [flags]
+gcloud deploy releases create NAME --pipeline=PIPELINE [flags]
+gcloud deploy rollouts list --pipeline=PIPELINE
+
+# Skaffold
+skaffold init | dev | build | deploy | render | debug
+
+# Config Sync
+nomos status | apply | reconcile
+```
+
+## Monitoring
+
+### Deployment Metrics
+- Deployment duration
+- Success/failure rate
+- Rollback frequency
+- Resource utilization during rollout
+
+### Cloud Monitoring
+```bash
+# Create deployment failure alert
+gcloud monitoring policies create \
+  --display-name="Deployment Failure" \
+  --condition-filter='resource.type="k8s_container" AND metric.type="kubernetes.io/container/restart_count"' \
+  --condition-threshold-value=1 \
+  --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+### Workload Identity
+```yaml
+# For GKE pods using service accounts
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend
+  namespace: production
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backend
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: backend
+    namespace: production
+roleRef:
+  kind: Role
+  name: backend
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Policy Enforcement
+- Use OPA Gatekeeper for policy enforcement
+- Config Connector with policy constraints
+- Binary Authorization for container trust
+
+## Troubleshooting
+
+### Deployment Failures
+```bash
+# Check rollout status
+kubectl rollout status deployment/backend -n production
+
+# View pod logs
+kubectl logs -l app=backend -n production --tail=100
+
+# Check events
+kubectl get events -n production --sort-by='.lastTimestamp'
+
+# Cloud Deploy: check release status
+gcloud deploy releases list --delivery-pipeline=PIPELINE --region=us-central1
+```
+
+### Rollback
+```bash
+# Kubernetes rollback
+kubectl rollout undo deployment/backend -n production
+
+# Cloud Deploy: deploy previous release
+gcloud deploy releases create rollback \
+  --delivery-pipeline=PIPELINE \
+  --rollout-id=ROLLBACK_ID
+```
+
+## Interview Questions
+
+**Q: What is GitOps and how does Config Sync implement it?**
+A: GitOps uses Git as the source of truth for infrastructure and configuration. Config Sync continuously monitors a Git repository and syncs desired state to GKE. Any drift from Git-defined state is automatically corrected.
+
+**Q: How does Cloud Deploy handle progressive delivery?**
+A: Cloud Deploy supports canary and rolling update strategies for GKE deployments. It manages the full release lifecycle including promotion between targets and rollback capabilities.
+
+**Q: What is the difference between Cloud Deploy and manual kubectl?**
+A: Cloud Deploy provides managed progressive delivery, approval gates, audit logging, and integration with Cloud Monitoring. kubectl is manual with no built-in delivery guarantees.
+
+**Q: How do you handle secrets in GitOps?**
+A: Use Secret Manager with external secrets operator, or use Sealed Secrets for encrypted-at-rest secrets in Git. Never commit raw secrets to Git.
+
+**Q: What is Skaffold's role in the deployment pipeline?**
+A: Skaffold automates the build-deploy-test cycle for Kubernetes applications during development. It supports local development, CI/CD integration, and multi-environment deployment.
+
+## Cheat Sheet
+
+```bash
+# Skaffold
+skaffold init    # Initialize
+skaffold dev     # Development mode
+skaffold build   # Build only
+skaffold deploy  # Deploy only
+skaffold render  # Render manifests
+
+# Cloud Deploy
+gcloud deploy releases create NAME --pipeline=PIPELINE
+gcloud deploy rollouts list --pipeline=PIPELINE
+
+# Config Sync
+nomos status     # Check sync status
+nomos apply      # Apply configs
+```
+
+## Labs
+
+### Lab 1: GitOps with Config Sync
+Set up GitOps deployment.
+1. Create Config Repo with Kubernetes manifests
+2. Configure Config Sync on GKE
+3. Implement multi-environment namespaces
+4. Add policy enforcement
+5. Test drift detection
+
+### Lab 2: Progressive Delivery
+Implement canary deployment.
+1. Create Cloud Deploy pipeline
+2. Define canary strategy
+3. Configure monitoring
+4. Add approval gates
+5. Test rollback
+
+### Lab 3: Multi-Environment Pipeline
+Build complete deployment pipeline.
+1. Set up Cloud Build for CI
+2. Configure Cloud Deploy for CD
+3. Implement environment promotion
+4. Add security scanning
+5. Set up notifications
+
+## Related Services
+
+- **Cloud Build**: CI/CD builds
+- **Artifact Registry**: Image storage
+- **Cloud Deploy**: Progressive delivery
+- **Config Sync**: GitOps
+- **GKE**: Deployment target
+- **Cloud Run**: Alternative target

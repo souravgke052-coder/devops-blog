@@ -1,0 +1,584 @@
+# Cloud DNS
+
+## Overview
+
+Cloud DNS is a scalable, reliable, and managed authoritative DNS service provided by Google Cloud. It provides DNS resolution for your domain names, translating human-readable domain names (like example.com) into IP addresses that computers use to communicate. Cloud DNS is a global service that offers 100% uptime SLA and supports both public and private DNS zones.
+
+Cloud DNS supports various zone types: public zones for internet-accessible domains, private zones for internal VPC DNS resolution, and managed reverse DNS zones. It integrates with other GCP services like Load Balancers, Cloud Run, and GKE for automatic DNS record management. The service supports DNSSEC for enhanced security and offers low-latency anycast routing for fast DNS resolution worldwide.
+
+## When To Use
+
+- **Hosting public domains**: Point your domain's DNS to GCP's name servers
+- **Private DNS for VPC**: Create private DNS zones for internal service discovery
+- **Multi-cloud DNS**: Manage DNS for hybrid or multi-cloud environments
+- **Split-horizon DNS**: Different responses for internal vs external queries
+- **Automatic DNS for GCP services**: Managed integration with Load Balancers, Cloud Run
+- **DNSSEC signing**: Add security to your DNS records
+
+## When NOT To Use
+
+- **Simple personal projects**: Free DNS providers like Route53 or Cloudflare may suffice
+- **Only need reverse DNS**: Use GCP's managed reverse DNS automatically
+- **Third-party DNS management**: If you already use another DNS provider and don't want to migrate
+
+## Architecture
+
+**Cloud DNS Components:**
+```
+Managed Zone: example.com
+├── DNSSEC: enabled
+├── Type: public | private
+├── Name servers: ns-cloud-a1.googledomains.com, etc.
+└── Records:
+    ├── A: example.com → 203.0.113.1
+    ├── AAAA: example.com → 2001:db8::
+    ├── CNAME: www → example.com
+    ├── MX: example.com → mail.example.com
+    └── TXT: example.com → "v=spf1 include:_spf.example.com ~all"
+```
+
+**Resolution Flow:**
+```
+Client Query: api.example.com
+    ↓
+Cloud DNS Resolver (8.8.8.8 or VPC resolver)
+    ↓
+Check Private Zone (if applicable)
+    ↓
+Check Managed Zones
+    ↓
+Return IP Address
+```
+
+## Core Concepts
+
+### Creating and Managing Zones
+
+```bash
+# Create public managed zone
+gcloud dns managed-zones create my-zone \
+    --dns-name="example.com." \
+    --description="Production DNS zone" \
+    --visibility=public
+
+# Create private managed zone
+gcloud dns managed-zones create my-private-zone \
+    --dns-name="internal.example.com." \
+    --description="Internal DNS zone" \
+    --visibility=private \
+    --networks=projects/my-project/regions/us-central1/networks/prod-vpc
+
+# List managed zones
+gcloud dns managed-zones list
+
+# Describe zone
+gcloud dns managed-zones describe my-zone
+
+# Update zone (enable DNSSEC)
+gcloud dns managed-zones update my-zone --dnssec-state=on
+
+# Delete zone (must be empty)
+gcloud dns managed-zones delete my-zone
+```
+
+### Managing DNS Records
+
+```bash
+# Add A record
+gcloud dns record-sets create api.example.com. \
+    --zone=my-zone \
+    --type=A \
+    --ttl=300 \
+    --rrdatas=203.0.113.1
+
+# Add AAAA record
+gcloud dns record-sets create api.example.com. \
+    --zone=my-zone \
+    --type=AAAA \
+    --ttl=300 \
+    --rrdatas=2001:db8::1
+
+# Add CNAME record
+gcloud dns record-sets create www.example.com. \
+    --zone=my-zone \
+    --type=CNAME \
+    --ttl=3600 \
+    --rrdatas=example.com.
+
+# Add MX record
+gcloud dns record-sets create example.com. \
+    --zone=my-zone \
+    --type=MX \
+    --ttl=3600 \
+    --rrdatas="10 mail.example.com.,20 mail2.example.com."
+
+# Add TXT record
+gcloud dns record-sets create example.com. \
+    --zone=my-zone \
+    --type=TXT \
+    --ttl=3600 \
+    --rrdatas="v=spf1 include:_spf.example.com ~all"
+
+# List record sets
+gcloud dns record-sets list --zone=my-zone
+
+# List specific record type
+gcloud dns record-sets list --zone=my-zone --type=A
+
+# Delete record
+gcloud dns record-sets delete api.example.com. --zone=my-zone --type=A
+
+# Transaction-based updates
+gcloud dns record-sets transaction start --zone=my-zone
+gcloud dns record-sets transaction add api.example.com. \
+    --zone=my-zone --type=A --ttl=300 --rrdatas=203.0.113.2
+gcloud dns record-sets transaction remove api.example.com. \
+    --zone=my-zone --type=A --rrdatas=203.0.113.1
+gcloud dns record-sets transaction execute --zone=my-zone
+```
+
+### Private DNS Zones
+
+```bash
+# Create private zone with VPC network
+gcloud dns managed-zones create internal \
+    --dns-name="internal.example.com." \
+    --visibility=private \
+    --networks=projects/my-project/global/networks/prod-vpc
+
+# Add records to private zone
+gcloud dns record-sets create db.internal.example.com. \
+    --zone=internal \
+    --type=A \
+    --ttl=300 \
+    --rrdatas=10.0.3.5
+
+# Verify internal resolution
+# From instance in prod-vpc:
+nslookup db.internal.example.com
+
+# Update VPC networks for private zone
+gcloud dns managed-zones update internal \
+    --add-networks=projects/my-project/global/networks/dev-vpc
+```
+
+### DNSSEC Configuration
+
+```bash
+# Enable DNSSEC
+gcloud dns managed-zones update my-zone --dnssec-state=on
+
+# Check DNSSEC status
+gcloud dns managed-zones describe my-zone | grep dnssec
+
+# Get DNSSEC key digests for registrar
+gcloud dns dnskeys describe KEY_ID --zone=my-zone
+
+# List DNSSEC keys
+gcloud dns dnskeys list --zone=my-zone
+
+# Disable DNSSEC
+gcloud dns managed-zones update my-zone --dnssec-state=off
+```
+
+### Importing/Exporting Zone Files
+
+```bash
+# Export zone to file
+gcloud dns record-sets export zone-backup.txt \
+    --zone=my-zone
+
+# Import zone from file (transaction)
+gcloud dns record-sets import zone-backup.txt \
+    --zone=my-zone \
+    --zone-file-format \
+    --delete-all-existing
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Managed zones per project | 10,000 |
+| DNSSEC keys per zone | 20 |
+| Records per managed zone | 50,000 |
+| Records per transaction | 1,000 |
+| Changes per managed zone per day | 500 |
+
+### Key Gotchas
+
+- **Zone names must end with trailing dot** (`example.com.`)
+- **Private zones require VPC network specification** for resolution
+- **DNSSEC takes time to propagate**—registrar DS records needed
+- **Records changes take time to propagate**—usually 1-2 minutes globally
+- **Deleting zone deletes all records**—export first if needed
+- **Transaction commits are atomic**—all or nothing
+- **Reverse DNS auto-managed for GCP IPs**—no manual PTR records needed
+
+## Real Production Example
+
+Production DNS setup:
+
+```bash
+#!/bin/bash
+set -e
+
+# Create public zone
+gcloud dns managed-zones create production \
+    --dns-name="example.com." \
+    --description="Production DNS zone" \
+    --visibility=public
+
+# Add records in transaction
+gcloud dns record-sets transaction start --zone=production
+
+# Apex records
+gcloud dns record-sets transaction add example.com. \
+    --zone=production --type=A --ttl=300 --rrdatas=203.0.113.1
+
+gcloud dns record-sets transaction add example.com. \
+    --zone=production --type=AAAA --ttl=300 --rrdatas=2001:db8::1
+
+# WWW CNAME
+gcloud dns record-sets transaction add www.example.com. \
+    --zone=production --type=CNAME --ttl=3600 --rrdatas=example.com.
+
+# API A record (load balancer IP)
+gcloud dns record-sets transaction add api.example.com. \
+    --zone=production --type=A --ttl=300 --rrdatas=203.0.113.10
+
+# MX records
+gcloud dns record-sets transaction add example.com. \
+    --zone=production --type=MX --ttl=3600 --rrdatas="10 mail.example.com."
+
+# TXT records for SPF
+gcloud dns record-sets transaction add example.com. \
+    --zone=production --type=TXT --ttl=3600 --rrdatas="v=spf1 include:_spf.example.com ~all"
+
+gcloud dns record-sets transaction execute --zone=production
+
+# Get name servers to update with registrar
+gcloud dns managed-zones describe production --format="value(nameServers)"
+
+# Create private zone for internal services
+gcloud dns managed-zones create internal \
+    --dns-name="internal.example.com." \
+    --description="Internal DNS zone" \
+    --visibility=private \
+    --networks=projects/my-project/global/networks/prod-vpc
+
+# Add internal records
+gcloud dns record-sets create db.internal.example.com. \
+    --zone=internal --type=A --ttl=300 --rrdatas=10.0.3.5
+
+gcloud dns record-sets create redis.internal.example.com. \
+    --zone=internal --type=A --ttl=300 --rrdatas=10.0.3.10
+
+# Enable DNSSEC after initial setup
+gcloud dns managed-zones update production --dnssec-state=on
+```
+
+```hcl
+# Terraform: Cloud DNS configuration
+resource "google_dns_managed_zone" "production" {
+  name        = "production"
+  dns_name    = "example.com."
+  description = "Production DNS zone"
+  visibility  = "public"
+}
+
+resource "google_dns_managed_zone" "internal" {
+  name        = "internal"
+  dns_name    = "internal.example.com."
+  description = "Internal DNS zone"
+  visibility  = "private"
+
+  private_visibility_config {
+    networks {
+      network_url = google_compute_network.prod_vpc.id
+    }
+  }
+}
+
+# DNS A record
+resource "google_dns_record_set" "api" {
+  name         = "api.example.com."
+  type         = "A"
+  ttl          = 300
+  managed_zone = google_dns_managed_zone.production.name
+
+  rrdatas = ["203.0.113.10"]
+}
+
+# DNS CNAME record
+resource "google_dns_record_set" "www" {
+  name         = "www.example.com."
+  type         = "CNAME"
+  ttl          = 3600
+  managed_zone = google_dns_managed_zone.production.name
+
+  rrdatas = ["example.com."]
+}
+
+# Internal DNS record
+resource "google_dns_record_set" "db_internal" {
+  name         = "db.internal.example.com."
+  type         = "A"
+  ttl          = 300
+  managed_zone = google_dns_managed_zone.internal.name
+
+  rrdatas = ["10.0.3.5"]
+}
+```
+
+## CLI Examples
+
+```bash
+# Managed zones
+gcloud dns managed-zones list
+gcloud dns managed-zones create NAME --dns-name=DOMAIN --visibility=public|private
+gcloud dns managed-zones describe NAME
+gcloud dns managed-zones update NAME --dnssec-state=on
+gcloud dns managed-zones delete NAME
+
+# Record sets
+gcloud dns record-sets list --zone=ZONE
+gcloud dns record-sets create NAME --zone=ZONE --type=TYPE --ttl=N --rrdatas=DATA
+gcloud dns record-sets delete NAME --zone=ZONE --type=TYPE
+
+# Transactions
+gcloud dns record-sets transaction start --zone=ZONE
+gcloud dns record-sets transaction add ...
+gcloud dns record-sets transaction remove ...
+gcloud dns record-sets transaction execute --zone=ZONE
+gcloud dns record-sets transaction abort --zone=ZONE
+
+# DNSSEC
+gcloud dns dnskeys list --zone=ZONE
+gcloud dns dnskeys describe KEY_ID --zone=ZONE
+
+# Import/Export
+gcloud dns record-sets export FILE --zone=ZONE
+gcloud dns record-sets import FILE --zone=ZONE --zone-file-format
+```
+
+## Terraform Example
+
+```hcl
+# Complete DNS configuration
+resource "google_dns_managed_zone" "main" {
+  name        = "main"
+  dns_name    = "example.com."
+  description = "Main DNS zone"
+  visibility  = "public"
+}
+
+# Enable DNSSEC
+resource "google_dns_managed_zone" "main" {
+  name        = "main"
+  dns_name    = "example.com."
+  dnssec_config {
+    state = "on"
+  }
+}
+
+# Multiple record types
+resource "google_dns_record_set" "a" {
+  name         = "example.com."
+  type         = "A"
+  ttl          = 300
+  managed_zone = google_dns_managed_zone.main.name
+  rrdatas      = ["203.0.113.1"]
+}
+
+resource "google_dns_record_set" "aaaa" {
+  name         = "example.com."
+  type         = "AAAA"
+  ttl          = 300
+  managed_zone = google_dns_managed_zone.main.name
+  rrdatas      = ["2001:db8::1"]
+}
+
+resource "google_dns_record_set" "mx" {
+  name         = "example.com."
+  type         = "MX"
+  ttl          = 3600
+  managed_zone = google_dns_managed_zone.main.name
+  rrdatas      = ["10 mail.example.com."]
+}
+
+resource "google_dns_record_set" "txt" {
+  name         = "example.com."
+  type         = "TXT"
+  ttl          = 3600
+  managed_zone = google_dns_managed_zone.main.name
+  rrdatas      = ["v=spf1 include:_spf.example.com ~all"]
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| List zones | `gcloud dns managed-zones list` |
+| Create zone | `gcloud dns managed-zones create NAME --dns-name=DOMAIN` |
+| Describe zone | `gcloud dns managed-zones describe NAME` |
+| List records | `gcloud dns record-sets list --zone=ZONE` |
+| Create record | `gcloud dns record-sets create NAME --zone=ZONE --type=TYPE --ttl=N --rrdatas=DATA` |
+| Delete record | `gcloud dns record-sets delete NAME --zone=ZONE --type=TYPE` |
+| Transaction start | `gcloud dns record-sets transaction start --zone=ZONE` |
+| Transaction execute | `gcloud dns record-sets transaction execute --zone=ZONE` |
+
+## Monitoring
+
+**Cloud DNS Metrics:**
+- Query/second
+- Response latency
+- Zone response count
+- DNSSEC validation errors
+
+```bash
+# View DNS metrics
+gcloud monitoring metrics list --filter="metric.type:starts_with('dns.googleapis.com')"
+
+# Check zone status
+gcloud dns managed-zones describe my-zone
+
+# View DNS logs
+gcloud logging read 'resource.type="dns_query" AND resource.labels.dns_name="example.com"'
+```
+
+## Security
+
+**DNS Security Best Practices:**
+
+1. **Enable DNSSEC** to prevent DNS spoofing
+   ```bash
+   gcloud dns managed-zones update my-zone --dnssec-state=on
+   ```
+
+2. **Use private zones** for internal services
+   ```bash
+   gcloud dns managed-zones create internal --dns-name="internal.example.com." \
+       --visibility=private --networks=projects/my-project/global/networks/my-vpc
+   ```
+
+3. **Restrict who can modify DNS records** via IAM
+   ```bash
+   gcloud dns managed-zones add-iam-policy-binding my-zone \
+       --member="group:dns-admins@company.com" \
+       --role="roles/dns.admin"
+   ```
+
+4. **Monitor for unauthorized changes**
+   ```bash
+   gcloud logging read 'resource.type="managed_zone" AND protoPayload.methodName="change.additions"'
+   ```
+
+## Cost Optimization
+
+**Cloud DNS Pricing:**
+| Resource | Price |
+|----------|-------|
+| First 1 billion queries/month | Free |
+| Additional per million queries | $0.20 |
+| Zone rental (public) | $0.20/month |
+| DNSSEC signing | $0.10/month |
+
+**Optimization:**
+- Cloud DNS is very cost-effective at scale
+- No optimization needed for most use cases
+- Use DNS32 instead of A records for Cloud Run services (automatic)
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **DNS not resolving**
+   ```bash
+   # Check zone exists
+   gcloud dns managed-zones list
+   
+   # Check records exist
+   gcloud dns record-sets list --zone=my-zone --type=A
+   
+   # Check DNSSEC if enabled
+   gcloud dns managed-zones describe my-zone | grep dnssec
+   
+   # Check propagation (takes 1-2 minutes)
+   # Use dig to test from external
+   dig @8.8.8.8 api.example.com
+   ```
+
+2. **Private zone not resolving**
+   ```bash
+   # Check VPC network is attached
+   gcloud dns managed-zones describe internal | grep networks
+   
+   # Check instance is in correct VPC
+   gcloud compute instances describe instance --zone=zone | grep network
+   
+   # Test from instance
+   nslookup db.internal.example.com
+   ```
+
+3. **Transaction failed**
+   ```bash
+   # Abort and restart
+   gcloud dns record-sets transaction abort --zone=my-zone
+   
+   # Check for duplicate records
+   gcloud dns record-sets list --zone=my-zone | grep "record.name"
+   ```
+
+## Interview Questions
+
+1. **What's the difference between public and private DNS zones in Cloud DNS?**
+
+2. **How does DNSSEC work in Cloud DNS?**
+
+3. **Explain how you would set up split-horizon DNS in GCP.**
+
+4. **How does Cloud DNS integrate with other GCP services like Load Balancers?**
+
+5. **What are the DNS record types supported by Cloud DNS and when would you use each?**
+
+## Cheat Sheet
+
+```
+# Zone Management
+gcloud dns managed-zones list
+gcloud dns managed-zones create NAME --dns-name=DOMAIN [--visibility=private]
+gcloud dns managed-zones describe NAME
+gcloud dns managed-zones update NAME --dnssec-state=on
+gcloud dns managed-zones delete NAME
+
+# Record Management
+gcloud dns record-sets list --zone=ZONE
+gcloud dns record-sets create NAME --zone=ZONE --type=TYPE --ttl=N --rrdatas=DATA
+gcloud dns record-sets delete NAME --zone=ZONE --type=TYPE
+
+# Transactions
+gcloud dns record-sets transaction start --zone=ZONE
+gcloud dns record-sets transaction add|remove NAME --zone=ZONE [FLAGS]
+gcloud dns record-sets transaction execute --zone=ZONE
+
+# Import/Export
+gcloud dns record-sets export FILE --zone=ZONE
+gcloud dns record-sets import FILE --zone=ZONE --zone-file-format
+```
+
+## Labs
+
+1. **Public DNS Zone**: Create a public zone and configure basic records
+2. **Private DNS Zone**: Set up private DNS for VPC internal resolution
+3. **DNSSEC Configuration**: Enable DNSSEC and configure at registrar
+4. **DNS for Load Balancer**: Point domain to load balancer IP
+5. **DNS Transactions**: Use transactions for bulk record updates
+
+## Related Services
+
+- [VPC](./vpc)
+- [Cloud Run](../compute/cloud-run)
+- [GKE](../compute/gke)
+- [Load Balancer](./load-balancer)

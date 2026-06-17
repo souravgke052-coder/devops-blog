@@ -1,0 +1,363 @@
+# Firewall
+
+## Overview
+
+Firewalls filter network traffic based on rules. In Linux environments, iptables and nftables are the primary firewall tools, with netfilter as the underlying kernel framework. Cloud environments add security groups (stateful instance-level) and network ACLs (stateless subnet-level). Understanding firewall architecture, rule ordering, and connection tracking is essential for securing production systems.
+
+This page covers iptables/nftables architecture, cloud firewalls, and production hardening.
+
+## When To Use
+
+- **Securing servers**: Default-deny firewall
+- **Perimeter security**: Blocking unwanted traffic
+- **Cloud security groups**: Instance-level access control
+- **Network segmentation**: Isolating workloads
+
+## When NOT To Use
+
+- **Application-level security**: Use WAF, app authentication
+- **Encryption**: Firewalls don't encrypt, use TLS
+
+## Core Concepts
+
+### iptables Tables and Chains
+
+```
+Tables: filter, nat, mangle, raw
+
+filter (default):
+  INPUT → Local process
+  FORWARD → Routed through
+  OUTPUT → Locally generated
+
+nat:
+  PREROUTING → Before routing (DNAT)
+  INPUT → Local process (rare)
+  OUTPUT → Locally generated (rare)
+  POSTROUTING → After routing (SNAT)
+
+mangle:
+  All 5 chains for packet modification (ToS, TTL, marks)
+
+raw:
+  PREROUTING, OUTPUT for disabling conntrack
+```
+
+### Rule Matching
+
+```bash
+# Basic matching
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+iptables -A INPUT -s 10.0.0.0/8 -j ACCEPT
+iptables -A INPUT -i eth0 -j ACCEPT
+
+# Connection tracking states
+# NEW: New connection
+# ESTABLISHED: Part of existing connection
+# RELATED: Related to existing (e.g., FTP data)
+# INVALID: Cannot be identified
+
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -m state --state NEW -p tcp --dport 22 -j ACCEPT
+
+# Multiple ports
+iptables -A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+
+# Logging
+iptables -A INPUT -j LOG --log-prefix "IPTABLES DROP: "
+```
+
+### nftables (Modern iptables)
+
+```bash
+# nftables is the successor to iptables
+# Single tool, better performance, atomic rules
+
+# Create table
+nft add table ip filter
+
+# Create chains
+nft add chain ip filter input { type filter hook input priority 0 \; }
+nft add chain ip filter forward { type filter hook forward priority 0 \; }
+nft add chain ip filter output { type filter hook output priority 0 \; }
+
+# Add rules
+nft add rule ip filter input ct state established,related accept
+nft add rule ip filter input iif lo accept
+nft add rule ip filter input ip protocol tcp tcp dport 22 accept
+nft add rule ip filter input ip protocol tcp tcp dport {80, 443} accept
+nft add rule ip filter input counter drop
+
+# List rules with handles
+nft -a list ruleset
+
+# Delete specific rule
+nft delete rule ip filter input handle 5
+```
+
+## Real Production Example
+
+### Hardened iptables Rules
+
+```bash
+# /etc/iptables/rules.v4
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+
+# Allow loopback
+-A INPUT -i lo -j ACCEPT
+
+# Allow established connections
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Allow ICMP (ping)
+-A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+
+# Allow SSH (limit rate)
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --set --name SSH
+-A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW -m recent --update --seconds 60 --hitcount 4 --name SSH -j DROP
+-A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Allow HTTP/HTTPS
+-A INPUT -p tcp --dport 80 -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+
+# Allow from specific IP ranges
+-A INPUT -s 10.0.0.0/8 -p tcp --dport 8080 -j ACCEPT
+
+# Log dropped packets
+-A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables-dropped: " --log-level 4
+
+COMMIT
+
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+
+# Set ToS for SSH (minimize delay)
+-A PREROUTING -p tcp --dport 22 -j TOS --set-tos 0x10
+
+# Preserve DSCP for VoIP
+-A PREROUTING -p udp --dport 5060 -j DSCP --set-dscp 0x2e
+
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+
+# DNAT for internal service
+-A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 10.0.0.5:80
+
+# SNAT/MASQUERADE for outbound
+-A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+
+COMMIT
+```
+
+### AWS Security Groups
+
+```bash
+# Create security group
+aws ec2 create-security-group \
+  --group-name web-sg \
+  --description "Web server security group" \
+  --vpc-id vpc-xxx
+
+# Allow HTTP/HTTPS from anywhere
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-xxx \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-xxx \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0
+
+# Allow SSH only from corporate
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-xxx \
+  --protocol tcp \
+  --port 22 \
+  --cidr 203.0.113.0/24
+
+# Allow from another security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-xxx \
+  --protocol tcp \
+  --port 8080 \
+  --source-group sg-alb-xxx
+
+# Outbound: allow all (default)
+# Or restrict:
+aws ec2 revoke-security-group-egress \
+  --group-id sg-xxx \
+  --protocol all \
+  --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-egress \
+  --group-id sg-xxx \
+  --protocol tcp \
+  --port 443 \
+  --cidr 0.0.0.0/0
+```
+
+## CLI Examples
+
+```bash
+# iptables
+iptables -L -v -n              # List rules verbose
+iptables -L -v -n --line-numbers  # With line numbers
+iptables -S                    # Show rules as commands
+iptables-save > /etc/iptables/rules.v4  # Save
+iptables-restore < /etc/iptables/rules.v4  # Restore
+
+# nftables
+nft list ruleset
+nft -a list table ip filter
+nft flush ruleset
+
+# Connection tracking
+conntrack -L                    # List conntrack entries
+conntrack -L -p tcp --dport 80  # Filter by port
+conntrack -F                   # Flush conntrack table
+cat /proc/net/nf_conntrack     # Raw conntrack
+
+# Cloud firewalls
+aws ec2 describe-security-groups
+gcloud compute firewall-rules list
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `iptables -L` | List rules | `iptables -L -v -n` |
+| `iptables -A` | Append rule | `iptables -A INPUT -j ACCEPT` |
+| `iptables -D` | Delete rule | `iptables -D INPUT 1` |
+| `conntrack -L` | Conntrack | `conntrack -L -p tcp` |
+| `nft list ruleset` | nftables | `nft list ruleset` |
+
+## Monitoring
+
+### Firewall Metrics
+
+```bash
+# Rule hit counts
+iptables -L -v -n -Z  # Zero counters, then observe
+
+# Conntrack table usage
+cat /proc/sys/net/netfilter/nf_conntrack_max
+wc -l /proc/net/nf_conntrack  # Current entries
+
+# Alert if > 80% full
+python3 -c "print(f'{(entries/max)*100:.1f}%')"
+```
+
+### Prometheus Alerts
+
+```promql
+# Conntrack table utilization
+conntrack_entries / conntrack_max > 0.8
+
+# Firewall blocks (if logging)
+rate(iptables_filter_INPUT_audit_log_total[5m]) > 100
+```
+
+## Security
+
+### Firewall Hardening
+
+```bash
+# Default deny
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+
+# Connection tracking
+modprobe nf_conntrack
+modprobe nf_conntrack_ftp  # For FTP
+
+# Tune conntrack timeouts
+sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=3600
+sysctl -w net.netfilter.nf_conntrack_udp_timeout=30
+
+# Rate limiting new connections
+iptables -A INPUT -m hashlimit --hashlimit-above 10/second --hashlimit-burst 20 --hashlimit-mode srcip --hashlimit-name conn_rate -j DROP
+```
+
+## Troubleshooting
+
+### Common Firewall Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Can't connect | Rule blocking | Check rules, states |
+| Connection drops | Conntrack timeout | Tune timeouts |
+| High conntrack usage | Many connections | Increase max or reduce timeout |
+| Can't ping | ICMP blocked | Allow ICMP (limited) |
+
+## Interview Questions
+
+**Q1: What's the difference between stateful and stateless firewalls?**
+
+A: Stateful firewalls track connection state. When an outbound packet matches a new connection, the firewall creates a conntrack entry and automatically allows return traffic. When inbound packet matches existing ESTABLISHED connection, it's allowed automatically. Stateless firewalls only check individual packets against rules—no memory of previous packets. iptables is stateful (uses conntrack). Network ACLs in AWS are stateless—return traffic must be explicitly allowed. Stateful is easier to manage (don't need separate rules for return traffic).
+
+**Q2: How does connection tracking work?**
+
+A: Conntrack intercepts packets at the netfilter PREROUTING or OUTPUT hooks. For new connections, it creates an entry with: protocol, source IP/port, destination IP/port, state (NEW). Packets matching the entry get state ESTABLISHED. For related connections (like FTP data), state RELATED. If an entry times out with no matching packets, it's deleted. Conntrack entries are stored in a hash table for O(1) lookup. For NAT, conntrack also stores translation information so return traffic can be un-NATed. TCP has special handling for state (SYN, FIN, RST affect conntrack state).
+
+## Cheat Sheet
+
+### Common iptables Commands
+
+```bash
+# List rules
+iptables -L -v -n
+iptables -L -v -n --line-numbers
+
+# Add rule
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Delete rule
+iptables -D INPUT 1
+
+# Replace rule
+iptables -R INPUT 1 -p tcp --dport 22 -j ACCEPT
+
+# Insert at position
+iptables -I INPUT 1 -p tcp --dport 22 -j ACCEPT
+
+# Flush chain
+iptables -F INPUT
+
+# Default policy
+iptables -P INPUT DROP
+```
+
+### nftables vs iptables
+
+| Feature | iptables | nftables |
+|---------|----------|----------|
+| Tables | filter, nat, mangle, raw | User-defined |
+| Chains | Built-in | User-defined |
+| Sets | No (ipset separate) | Yes (built-in) |
+| Atomic updates | No | Yes (single transaction) |
+| Performance | Good | Better |
+
+## Related Topics
+
+- [NAT](./nat) — NAT table
+- [Packet Flow](./packet-flow) — Linux packet processing
+- [VPC](./vpc) — Security groups
+- [Firewall](./firewall) — Cloud firewalls

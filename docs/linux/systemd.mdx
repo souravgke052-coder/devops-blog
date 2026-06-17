@@ -1,0 +1,491 @@
+---
+sidebar_position: 8
+description: systemd unit files, service management, targets, journalctl, and troubleshooting failed services in production.
+---
+
+# Systemd
+
+## Overview
+
+systemd is the init system and service manager for most Linux distributions. It handles boot sequencing, service management, logging, and system configuration. Understanding systemd is critical for DevOps because it controls every service — from nginx to docker to your custom application. systemd replaced the legacy SysV init system with a more sophisticated dependency-based service manager.
+
+The core abstraction is the unit. Units have types (service, socket, target, mount, timer, etc.) and are defined by unit files. systemd resolves dependencies automatically, starts services in parallel where possible, and manages processes via cgroups for accurate resource accounting. It also provides log management via journald.
+
+## When To Use
+
+- Starting, stopping, restarting services
+- Creating custom service units
+- Troubleshooting boot issues
+- Configuring service dependencies
+- Managing timers for scheduled tasks
+- Viewing service logs
+
+## When NOT To Use
+
+- When you need SysV init compatibility (rare)
+- When working with containers (use docker run, kubernetes instead)
+
+## Core Concepts
+
+### Unit Files
+
+**Location priority (first found wins):**
+```
+/etc/systemd/system/        # Local configuration (highest)
+/run/systemd/system/        # Runtime-generated (volatile)
+/usr/lib/systemd/system/    # Package-installed (lowest)
+```
+
+**Service unit structure:**
+```ini
+[Unit]
+Description=My Application Web Server
+Documentation=https://myapp.example.com/docs
+After=network.target
+Wants=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/bin/myapp-server --config /opt/myapp/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=60s
+LimitNOFILE=65536
+Environment="PORT=8080"
+Environment="LOG_LEVEL=info"
+ProtectSystem=strict
+ReadOnlyPaths=/opt/myapp
+ReadWritePaths=/var/log/myapp /tmp
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Service Types
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| simple | Main process doesn't fork | Most services |
+| forking | Main process forks, parent exits | Legacy daemons |
+| oneshot | Runs once and exits | One-time tasks |
+| exec | Like simple but exec() replaces shell | Modern services |
+| notify | Daemon sends READY=1 via sd_notify | Services with notification |
+| dbus | Bus name acquisition triggers start | D-Bus activated services |
+
+### Targets (Runlevels)
+
+```bash
+# Common targets
+multi-user.target      # Text mode, multi-user (runlevel 3)
+graphical.target       # GUI mode (runlevel 5)
+rescue.target          # Single-user rescue mode (runlevel 1)
+emergency.target       # Emergency shell (runlevel 1 equivalent)
+shutdown.target        # System shutdown
+reboot.target          # System reboot
+
+# View current target
+systemctl get-default
+
+# Set default target
+sudo systemctl set-default multi-user.target
+
+# Change target at runtime
+sudo systemctl isolate multi-user.target
+sudo systemctl isolate rescue.target
+
+# View target dependencies
+systemctl list-dependencies graphical.target
+```
+
+### Dependencies
+
+```ini
+[Unit]
+# Start after these units
+After=network.target redis.service
+
+# Want these to start (but don't require)
+Wants=redis.service
+
+# Require these to start (fail if any fail)
+Requires=redis.service
+
+# BindsTo= is like Requires= but also stops if bound unit stops
+BindsTo=redis.service
+
+# Conflicts= means mutual exclusion
+Conflicts=shutdown.target
+```
+
+### Timer Units (cron replacement)
+
+```ini
+[Unit]
+Description=Daily backup task
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=timers.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/backup/backup.sh
+```
+
+## Real Production Example
+
+Production nginx service unit with hardening:
+
+```ini
+# /etc/systemd/system/nginx.service
+[Unit]
+Description=nginx HTTP and reverse proxy server
+Documentation=http://nginx.org/en/docs/
+After=network.target local-fs.target remote-fs.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=forking
+PIDFile=/run/nginx.pid
+ExecStartPre=/usr/sbin/nginx -t
+ExecStart=/usr/sbin/nginx
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s QUIT $MAINPID
+TimeoutStartSec=60
+TimeoutStopSec=60s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/
+ReadWritePaths=/run /var/log/nginx
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectCurtinStates=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=af_inet,af_inet6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## CLI Examples
+
+```bash
+# Service management
+systemctl start nginx
+systemctl stop nginx
+systemctl restart nginx
+systemctl reload nginx           # Graceful reload (nginx -s reload)
+systemctl status nginx
+systemctl is-active nginx
+systemctl is-enabled nginx
+
+# Enable/disable at boot
+systemctl enable nginx
+systemctl disable nginx
+systemctl enable --now nginx     # Enable and start
+systemctl disable --now nginx    # Disable and stop
+
+# List units
+systemctl list-units --type=service --state=running
+systemctl list-units --type=service --state=failed
+systemctl list-unit-files       # All unit files
+
+# Reload systemd (after creating/modifying units)
+sudo systemctl daemon-reload
+
+# Show dependencies
+systemctl list-dependencies nginx
+systemctl list-dependencies --reverse nginx     # What depends on nginx
+
+# Masks (completely disable)
+systemctl mask nginx            # Symlink to /dev/null
+systemctl unmask nginx
+
+# Reset failed state
+systemctl reset-failed
+```
+
+## journalctl Examples
+
+```bash
+# View logs
+journalctl -u nginx
+journalctl -u nginx -u postgresql    # Multiple units
+journalctl -u nginx --since "1 hour ago"
+journalctl -u nginx --since today
+journalctl -u nginx --since "2024-01-01" --until "2024-01-02"
+
+# Follow logs
+journalctl -f                      # All logs
+journalctl -u nginx -f             # Specific service
+journalctl -f -b                   # Follow from boot
+
+# Kernel messages
+journalctl -k                     # Kernel ring buffer
+journalctl -b                     # Current boot
+journalctl -b -1                  # Previous boot
+
+# Disk usage
+journalctl --disk-usage
+journalctl --vacuum-size=500M     # Limit log size
+
+# Show log fields
+journalctl -o json-pretty
+journalctl -o verbose
+
+# Find priority
+journalctl -p err                 # Error and above
+journalctl -p warning             # Warning and above
+journalctl -p info..err           # Info through error
+
+# Boots
+journalctl --list-boots
+journalctl -b <boot_id>
+```
+
+## Common Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `systemctl start` | Start service | `systemctl start nginx` |
+| `systemctl stop` | Stop service | `systemctl stop nginx` |
+| `systemctl restart` | Restart service | `systemctl restart nginx` |
+| `systemctl status` | Show status | `systemctl status nginx` |
+| `systemctl enable` | Enable at boot | `systemctl enable nginx` |
+| `systemctl disable` | Disable at boot | `systemctl disable nginx` |
+| `systemctl daemon-reload` | Reload config | After editing unit files |
+| `systemctl list-dependencies` | Show deps | `systemctl list-deps nginx` |
+| `journalctl -u` | Unit logs | `journalctl -u nginx -f` |
+| `journalctl -b` | Boot logs | `journalctl -b -1` |
+
+## Monitoring
+
+```bash
+# Service health
+systemctl status nginx
+systemctl is-active nginx
+systemctl is-failed nginx
+
+# Failed services (email-worthy)
+systemctl --failed --type=service
+
+# Resource usage per service
+systemctl show nginx | grep -E "(Memory|CPU|PID)"
+
+# Service startup time
+systemd-analyze critical-chain nginx
+
+# Per-service resource limits
+cat /proc/<PID>/limits
+
+# cgroup tree
+systemd-cgtop
+```
+
+## Security
+
+**systemd security features:**
+
+```ini
+[Service]
+# Prevent privilege escalation
+NoNewPrivileges=true
+
+# Use minimal system calls
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Restrict namespaces
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+
+# Restrict capabilities
+AmbientCapabilities=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Lock down personality
+LockPersonality=true
+
+# Restrict realtime
+RestrictRealtime=true
+
+# Restrict address families
+RestrictAddressFamilies=af_inet,af_inet6
+
+# User/group
+User=myapp
+Group=myapp
+```
+
+**Audit security with systemd-run:**
+
+```bash
+# Run command with security restrictions
+systemd-run --scope -p DevicePolicy=closed \
+    -p PrivateTmp=true \
+    --user /bin/bash -c 'echo test'
+
+# Create temporary scoped service
+systemd-run --scope -p MemoryMax=512M \
+    /path/to/command
+```
+
+## Troubleshooting
+
+**Service fails to start:**
+
+```bash
+# Check status and recent logs
+systemctl status nginx
+journalctl -u nginx -n 50 --no-pager
+
+# Check for dependency failures
+systemctl list-dependencies nginx --all
+
+# Verbose mode (rare)
+systemctl start nginx -vv
+
+# Check PID file issues
+cat /run/nginx.pid
+kill -0 $(cat /run/nginx.pid) 2>/dev/null && echo "Process exists"
+```
+
+**Restart loops:**
+
+```
+# Look for StartLimit settings
+journalctl -u nginx | grep -i restart
+
+# Check what triggers restarts
+journalctl -u nginx | grep -i triggered
+
+# Temporarily prevent restart
+systemctl mask nginx
+```
+
+**Boot failures:**
+
+```bash
+# Emergency mode
+systemctl emergency
+
+# Rescue mode
+systemctl rescue
+
+# View failed boot units
+systemctl list-units --state=failed
+
+# Check boot log
+journalctl -b | grep -i failed
+```
+
+**High CPU/memory service:**
+
+```bash
+# Show resource usage
+systemctl show nginx -p MemoryMax,MemoryCurrent
+systemctl show nginx -p CPUWeight,CPUSchedulingPolicy
+
+# Set limits
+systemctl set-property nginx MemoryMax=512M
+systemctl set-property nginx CPUWeight=512
+```
+
+## Interview Questions
+
+1. **What's the difference between After= and Wants= in systemd unit files?**
+
+`After=` is an ordering dependency — if unit A has `After=B`, A starts after B completes. But A can still start if B fails. `Wants=` is a weaker dependency — A wants B to start (and start it if not running), but B's failure doesn't prevent A from starting. `Requires=` is the strong dependency — A requires B to be running, and if B fails, A stops.
+
+2. **When should you use Type=forking vs Type=simple?**
+
+Use `Type=simple` for services that don't daemonize and stay in the foreground. Use `Type=forking` for legacy daemons that fork a child process and the parent exits. systemd monitors the parent in forking mode. Modern services typically use `Type=simple` and stay in foreground (managed by systemd directly). If your service forks and the parent exits, use `Type=forking`.
+
+3. **What does systemctl daemon-reload do?**
+
+It tells systemd to re-read all unit files from disk, re-parse them, and update its internal state. Use it after creating, modifying, or deleting unit files. It does NOT restart any services — if you modified a running service, you need to also restart it (`systemctl restart service`).
+
+4. **How do you debug a service that starts but immediately exits?**
+
+Run `systemctl status <service>` to see the exit code and signal. Check `journalctl -u <service> -n 100` for logs. Common causes: wrong working directory, missing environment variables (check `Environment=` in unit), missing dependencies (try `systemctl list-dependencies --all <service>`), permission issues (check `User=`, `ReadWritePaths=`), or the application itself crashing (needs strace).
+
+5. **What is the difference between mask and disable?**
+
+`disable` stops the service and prevents it from starting at boot (removes symlink from /etc/systemd/system/multi-user.target.wants/). `mask` creates a symlink to /dev/null, making the unit completely unstartable — even manually with `systemctl start`. Use mask for services you want to guarantee will never run (like an unused service you're troubleshooting).
+
+## Cheat Sheet
+
+```
+# Service management
+systemctl start|stop|restart|reload <service>
+systemctl status <service>
+systemctl enable|disable <service>
+systemctl daemon-reload        # After editing unit files
+
+# Masks
+systemctl mask <service>       # Hard disable
+systemctl unmask <service>     # Unmask
+
+# List units
+systemctl list-units --type=service --state=running
+systemctl list-units --type=service --state=failed
+systemctl list-unit-files
+
+# Targets
+systemctl get-default
+systemctl set-default multi-user.target
+systemctl isolate multi-user.target
+
+# Journal
+journalctl -u <service>
+journalctl -u <service> -f
+journalctl -b
+journalctl --since "1 hour ago"
+
+# Dependencies
+systemctl list-dependencies <service>
+systemctl list-dependencies --reverse <service>
+```
+
+## Related Topics
+
+- [Processes](./processes) — Process management
+- [Memory](./memory) — Memory limits and OOM
+- [Performance](./performance) — System resource tuning
+- [Security](./security) — Service hardening

@@ -1,0 +1,845 @@
+---
+id: overview
+title: CI/CD Overview
+description: Introduction to CI/CD fundamentals, pipeline stages, and tooling landscape
+sidebar_position: 1
+---
+
+# CI/CD Overview
+
+## Overview
+
+CI/CD (Continuous Integration/Continuous Delivery or Continuous Deployment) is the backbone of modern DevOps practices. It automates the process of integrating code changes, testing them thoroughly, and deploying validated builds to various environments.
+
+A well-implemented CI/CD pipeline:
+- Reduces manual errors
+- Increases deployment frequency
+- Provides faster feedback to developers
+- Enables reliable, repeatable deployments
+
+## When To Use
+
+CI/CD is essential when:
+- Multiple developers work on the same codebase
+- You need consistent, repeatable deployments
+- You want to catch bugs early in the development cycle
+- Compliance requires audit trails of changes
+- You target frequent, incremental releases
+
+## When NOT To Use
+
+CI/CD may be overkill or unnecessary when:
+- Projects are prototypes or proofs-of-concept with short lifecycles
+- Solo developers with infrequent, trivial changes
+- Static content sites with no automated testing requirements
+- Highly regulated environments where manual approval is legally required at every step
+
+## Core Concepts
+
+### Pipeline Stages
+
+```
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│  BUILD  │───▶│  TEST   │───▶│ SECURITY│───▶│ DEPLOY  │───▶│MONITOR  │
+└─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘
+     │              │              │              │              │
+     ▼              ▼              ▼              ▼              ▼
+  Compile       Unit Tests    SAST/DAST      Staging        Metrics
+  Lint          Integration   Container      Production     Alerts
+  Package       E2E Tests     Scan           Approval
+```
+
+### CI/CD Maturity Levels
+
+| Level | Description | Deployment Frequency |
+|-------|-------------|---------------------|
+| Level 0 | Manual builds and deployments | Monthly or less |
+| Level 1 | Automated builds | Weekly |
+| Level 2 | Automated builds and tests | Daily |
+| Level 3 | Automated builds, tests, and deploys | Multiple daily |
+| Level 4 | Continuous Delivery (automated deploy to prod) | On every commit |
+
+### Key Principles
+
+1. **Everything as Code**: Pipelines, infrastructure, and configurations are version-controlled
+2. **Immutability**: Built artifacts are never modified; new builds are created for changes
+3. **Idempotency**: Pipelines can be run multiple times with the same result
+4. **Fast Feedback**: Pipeline completes in under 10 minutes for typical projects
+
+## Real Production Example
+
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         Production CI/CD Pipeline                          │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐            │
+│  │  Lint &  │    │  Build   │    │ Unit &   │    │Security  │            │
+│  │  Format  │───▶│  Docker  │───▶│Integration│───▶│  Scan    │            │
+│  │  Check   │    │  Image   │    │  Tests   │    │  (SAST)  │            │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘            │
+│       │              │                │               │                  │
+│       │              │                │               │                  │
+│       ▼              ▼                ▼               ▼                  │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐           │
+│  │ Container│    │ Push to  │    │ Push to  │    │  Block   │           │
+│  │  Scan    │───▶│Registry  │───▶│ Staging  │───▶│  on CVEs │           │
+│  │ (Trivy)  │    │ (GHCR)   │    │  Auto    │    │  > HIGH  │           │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘           │
+│                                              │                             │
+│                                              ▼                             │
+│                                       ┌──────────┐                        │
+│                                       │ E2E &    │                        │
+│                                       │ Load Test│                        │
+│                                       └──────────┘                        │
+│                                              │                             │
+│                                              ▼                             │
+│                                       ┌──────────┐                        │
+│                                       │ Approval │                        │
+│                                       │ Gate     │                        │
+│                                       │ (Prod)   │                        │
+│                                       └──────────┘                        │
+│                                              │                             │
+│                                              ▼                             │
+│                                       ┌──────────┐                        │
+│                                       │ Deploy   │                        │
+│                                       │ Blue/Green                        │
+│                                       └──────────┘                        │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Technology Stack
+
+| Component | Tools |
+|-----------|-------|
+| Source Control | GitHub, GitLab, Bitbucket |
+| CI/CD Platform | GitHub Actions, GitLab CI, Jenkins, Google Cloud Build |
+| Container Registry | GHCR, GCR, ECR, Artifact Registry |
+| Container Security | Trivy, Grype, Snyk |
+| Secret Management | Vault, Secret Manager, GitHub Secrets |
+| Infrastructure | Terraform, Pulumi, Ansible |
+| Monitoring | Prometheus, Grafana, Datadog |
+| Deployment | ArgoCD, Flux, Spinnaker |
+
+## Configuration / Pipeline Examples
+
+### GitHub Actions - Complete Production Pipeline
+
+```yaml
+name: Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, 'release/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_VERSION: '20'
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # ============================================
+  # STAGE 1: Code Quality
+  # ============================================
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Prettier Check
+        run: npm run format:check
+
+      - name: Commit Lint
+        run: npm run commitlint
+
+  # ============================================
+  # STAGE 2: Build & Test
+  # ============================================
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Unit Tests
+        run: npm run test:unit -- --coverage
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test:test@localhost:5432/testdb
+          REDIS_URL: redis://localhost:6379
+
+      - name: Run Integration Tests
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://test:test@localhost:5432/testdb
+          REDIS_URL: redis://localhost:6379
+
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true
+
+  # ============================================
+  # STAGE 3: Security Scanning
+  # ============================================
+  security:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          languages: javascript, typescript
+          queries: security-extended
+
+  # ============================================
+  # STAGE 4: Build Docker Image
+  # ============================================
+  build:
+    name: Build & Push Container
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build with cache
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ============================================
+  # STAGE 5: Container Security Scan
+  # ============================================
+  container-scan:
+    name: Container Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Run Trivy on Built Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ needs.build.outputs.image-tag }}'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          vuln-type: 'os,library'
+
+  # ============================================
+  # STAGE 6: Deploy to Staging
+  # ============================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: container-scan
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.STAGING_SA }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Deploy to GKE Staging
+        run: |
+          gcloud container clusters get-credentials ${{ vars.STAGING_CLUSTER }} --region us-central1
+          kubectl set image deployment/api api=${{ needs.build.outputs.image-tag }}
+          kubectl rollout status deployment/api --timeout=5m
+
+  # ============================================
+  # STAGE 7: E2E & Smoke Tests
+  # ============================================
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E Tests
+        run: npm run test:e2e
+        env:
+          BASE_URL: https://staging.example.com
+
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+
+  # ============================================
+  # STAGE 8: Deploy to Production
+  # ============================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://example.com
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Deploy Blue-Green
+        run: |
+          gcloud container clusters get-credentials ${{ vars.PROD_CLUSTER }} --region us-central1
+          kubectl set image deployment/api-blue api=${{ needs.build.outputs.image-tag }}
+          kubectl rollout status deployment/api-blue --timeout=10m
+
+      - name: Switch Traffic (Blue-Green)
+        run: |
+          kubectl patch service api --type='json' -p='[{"op":"replace","path":"/spec/selector","value":{"app":"api-blue"}}]'
+
+      - name: Verify Deployment
+        run: |
+          curl -f https://example.com/health || exit 1
+
+      - name: Cleanup Old Green Deployment
+        run: |
+          kubectl delete deployment api-green --ignore-not-found
+```
+
+### Google Cloud Build Configuration
+
+```yaml
+# cloudbuild.yaml
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/api:latest'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/api:latest'
+      - '.'
+    id: 'build'
+
+  # Push images to registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/api'
+    id: 'push'
+    waitFor: ['build']
+
+  # Scan for vulnerabilities
+  - name: 'gcr.io/$PROJECT_ID/trivy:latest'
+    args:
+      - 'image'
+      - '--exit-code'
+      - '1'
+      - '--severity'
+      - 'CRITICAL,HIGH'
+      - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+    id: 'scan'
+    waitFor: ['push']
+
+  # Deploy to staging
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'api'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--tag'
+      - 'staging'
+    id: 'deploy-staging'
+    waitFor: ['scan']
+
+  # Run smoke tests
+  - name: 'curlimages/curl'
+    entrypoint: sh
+    args:
+      - '-c'
+      - |
+        sleep 30 && curl -f https://staging-api-$$(gcloud run services describe api --region us-central1 --format="value(status.url)" | grep -oP "(?<=https://).+"):8080/health || exit 1
+    id: 'smoke-test'
+    waitFor: ['deploy-staging']
+
+images:
+  - 'gcr.io/$PROJECT_ID/api:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/api:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+  dynamicSubstitutions: true
+
+substitutions:
+  _REGION: us-central1
+  _SERVICE: api
+```
+
+## Common Commands / Steps
+
+### Setting Up a New Pipeline
+
+```bash
+# Clone repository
+git clone git@github.com:org/api.git
+cd api
+
+# Initialize GitHub Actions (if not present)
+mkdir -p .github/workflows
+
+# Create workflow file
+cat > .github/workflows/ci.yml << 'EOF'
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm test
+EOF
+```
+
+### Running Pipelines Locally
+
+```bash
+# Using Act (run GitHub Actions locally)
+act -l                      # List available workflows
+act -W .github/workflows/ci.yml  # Run specific workflow
+act --container-architecture linux/amd64  # For Apple Silicon
+
+# Using Cloud Build locally
+gcloud builds submit --config=cloudbuild.yaml .
+```
+
+### Triggering Manual Deployments
+
+```bash
+# GitHub Actions
+gh workflow run deploy.yml -f environment=production
+
+# With parameters
+gh workflow run deploy.yml -f environment=staging -f image_tag=sha-abc123
+
+# Cloud Build
+gcloud builds submit --substitutions=_TAG=v1.2.3 .
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Target | Alert Threshold |
+|--------|--------|----------------|
+| Pipeline Duration | < 10 min | > 15 min |
+| Build Success Rate | > 95% | < 90% |
+| Deployment Frequency | Daily | No deploys in 7 days |
+| Change Lead Time | < 1 hour | > 4 hours |
+| MTTR (Mean Time to Recovery) | < 30 min | > 2 hours |
+| Failed Deployments | < 5% | > 10% |
+
+### Dashboard Queries
+
+**Grafana - Pipeline Duration:**
+```promql
+histogram_quantile(0.95,
+  rate(ci_pipeline_duration_seconds_bucket[5m])
+)
+```
+
+**Deployment Success Rate:**
+```promql
+sum(rate(deployment_success_total[5m])) /
+sum(rate(deployment_total[5m])) * 100
+```
+
+### Pipeline Observability
+
+```yaml
+# Add to GitHub Actions for observability
+- name: Datadog metrics
+  if: always()
+  run: |
+    curl -X POST https://api.datadoghq.com/api/v2/series \
+    -H "Content-Type: application/json" \
+    -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+    -d '{
+      "series": [{
+        "metric": "ci.pipeline.duration",
+        "points": [['"$(date +%s)"', '${{ job.steps.*.outcome == "success" && 1 || 0 }}']],
+        "tags": ["pipeline:${{ github.workflow }}", "job:${{ matrix.job }}"]
+      }]
+    }'
+```
+
+## Security
+
+### OIDC Federation (No Long-Lived Credentials)
+
+```yaml
+# GitHub Actions - Workload Identity Federation
+- name: Authenticate to GCP
+  uses: google-github-actions/auth@v2
+  with:
+    workload_identity_provider: 'projects/123/locations/global/workloadIdentityPools/github/providers/github'
+    service_account: 'ci-deploy@project.iam.gserviceaccount.com'
+    audience: 'https://github.com/${{ github.repository }}'
+```
+
+### Secret Management
+
+| Secret Store | Use Case | Access Method |
+|--------------|----------|---------------|
+| GitHub Secrets | Non-sensitive config | `${{ secrets.SECRET_NAME }}` |
+| Secret Manager | API keys, credentials | `gcloud secrets` + workload identity |
+| Vault | Dynamic secrets, rotation | HashiCorp Vault Agent |
+| Cloud KMS | Encryption keys | GCP IAM |
+
+### Security Best Practices
+
+1. **Never store secrets in code or logs**
+2. **Use short-lived tokens via OIDC**
+3. **Rotate credentials automatically**
+4. **Enable secret scanning on all repos**
+5. **Require approval for production secrets**
+6. **Audit all secret access**
+
+```yaml
+# Audit secret access
+- name: Audit Secrets Access
+  run: |
+    gcloud secrets instances list
+    gcloud secrets get-iam-policy my-api-key --format=json
+```
+
+## Cost Optimization
+
+### Cache Strategies
+
+```yaml
+# Docker layer caching
+- name: Build and push
+  uses: docker/build-push-action@v5
+  with:
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+
+# npm cache
+- name: Setup Node.js
+  uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: 'npm'
+
+# pip cache
+- uses: actions/cache@v4
+  with:
+    path: ~/.cache/pip
+    key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+    restore-keys: |
+      ${{ runner.os }}-pip-
+```
+
+### Cost-Saving Strategies
+
+| Strategy | Savings | Implementation |
+|----------|---------|----------------|
+| Cache dependencies | 30-50% | Use `actions/cache` or built-in caching |
+| Spot instances | 60-70% | Use `self-hosted` runners on spot |
+| Concurrency limits | 20-40% | `cancel-in-progress: true` |
+| Artifact retention | 10-20% | Set `retention-days` on artifacts |
+| Matrix builds | Parallel execution | Use `matrix` strategy |
+
+### Cost Monitoring
+
+```bash
+# Check GitHub Actions usage
+gh api /repos/$org/$repo/actions/runners -X GET | jq '.runners[] | {name, status, labels}'
+
+# GCP Cloud Build costs
+gcloud builds list --limit=10 --format=json | jq '.[] | {id, status, createTime, finishTime}'
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pipeline hangs | Missing permissions, deadlocks | Check required scopes, add timeout |
+| Cache miss | Cache key changes | Use stable cache keys, avoid full sha for cache |
+| OOM errors | Memory limits | Increase runner memory, optimize builds |
+| Secret not found | Wrong scope | Check secret is in repo/org, matching case |
+| Image pull failure | Registry auth | Refresh login, check credentials |
+
+### Debug Commands
+
+```bash
+# Re-run failed job with debug logging
+gh api repos/$org/$repo/actions/runs/$run_id/jobs -X GET | jq '.jobs[] | select(.conclusion == "failure")'
+
+# Check runner logs
+gh run view $run_id --log
+
+# Debug Docker build locally
+docker buildx build --progress=plain -t test:latest .
+
+# Check Cloud Build status
+gcloud builds describe $build_id --format=json | jq '.status, .steps'
+```
+
+### Retry Strategies
+
+```yaml
+# Automatic retry on transient failures
+- name: Push to Registry
+  uses: docker/build-push-action@v5
+  with:
+    push: true
+  retry:
+    maxAttempts: 3
+    backoff: exponential
+```
+
+## Interview Questions
+
+### Q1: What is the difference between Continuous Delivery and Continuous Deployment?
+
+**Answer:** Continuous Delivery (CD) ensures code is always in a deployable state by automatically building, testing, and preparing changes for production deployment. A human approval step or manual trigger deploys to production. Continuous Deployment goes further by automatically deploying every change that passes all stages directly to production without manual intervention.
+
+### Q2: How would you design a zero-downtime deployment?
+
+**Answer:** Use blue-green deployment with two identical environments. Deploy to the inactive environment, run smoke tests, then switch traffic via load balancer or DNS cutover. Maintain old environment briefly for instant rollback. Alternative: canary deployment that gradually shifts traffic while monitoring metrics.
+
+### Q3: Explain how OIDC federation works and why it's preferred over service account keys.
+
+**Answer:** OIDC federation uses short-lived tokens instead of long-lived service account keys. GitHub's OIDC provider issues JWT tokens that GCP validates against a workload identity provider. This eliminates key rotation, reduces blast radius if compromised, and provides automatic expiration.
+
+### Q4: What strategies do you use to speed up CI/CD pipelines?
+
+**Answer:** 1) Parallelize independent jobs, 2) Cache dependencies and build layers, 3) Use incremental builds, 4) Optimize test suites (parallel execution, test selection), 5) Use faster runners (E2_HIGHCPU_8), 6) Skip unnecessary steps (only run full scan on main branch).
+
+### Q5: How do you handle secrets in CI/CD?
+
+**Answer:** Never store secrets in code or environment variables directly. Use secret managers (GCP Secret Manager, HashiCorp Vault, GitHub Secrets). Prefer OIDC for cloud auth. For runtime secrets, use Kubernetes secrets synced from Vault, or inject via init containers.
+
+## Cheat Sheet
+
+```bash
+# GitHub Actions
+gh workflow list                          # List workflows
+gh workflow run <name>                    # Trigger workflow
+gh run list                               # List runs
+gh run watch                              # Watch run progress
+gh run download <run-id>                  # Download artifacts
+
+# Docker
+docker buildx build --push --cache-from=type=gha,mode=max .
+docker scan <image>                       # Scan for vulnerabilities
+
+# GCP Cloud Build
+gcloud builds submit --config=cloudbuild.yaml .
+gcloud builds list                        # List recent builds
+gcloud builds describe <build-id>         # Build details
+
+# Kubernetes
+kubectl set image deploy/<name> <container>=<image>:<tag>
+kubectl rollout status deploy/<name>
+kubectl rollout undo deploy/<name>
+
+# Trivy
+trivy image <image>                       # Scan image
+trivy fs --scanners vuln,secret .         # Scan filesystem
+trivy image --exit-code 1 --severity HIGH <image>
+```
+
+## Related Topics
+
+- [Git Workflows](./git.mdx)
+- [GitHub Actions](./github.mdx)
+- [Build Automation](./build.mdx)
+- [Testing Strategies](./test.mdx)
+- [Artifact Management](./artifact-management.mdx)
+- [Deployment Strategies](./deploy.mdx)
+- [Blue-Green Deployments](./blue-green.mdx)
+- [Canary Deployments](./canary.mdx)
+- [Rollback Procedures](./rollback.mdx)
+- [GitOps & Automation](./automation.mdx)

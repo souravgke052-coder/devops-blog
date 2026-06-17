@@ -1,0 +1,485 @@
+# Networking Overview
+
+## Overview
+
+Modern production networking is a complex discipline spanning on-premises infrastructure, cloud providers (AWS, GCP, Azure), and hybrid architectures. For DevOps and SRE engineers, understanding networking isn't optional—it's foundational. Every service you deploy communicates over the network, every incident you debug has a networking component, and every architecture decision has networking implications.
+
+The shift from monolithic applications to distributed microservices has multiplied network communication volume and complexity. A single user request might traverse 10-20 network hops across Kubernetes pods, services, ingress controllers, load balancers, and cloud VPCs. Network latency, packet loss, and misconfigured firewall rules are among the top root causes of production incidents.
+
+This documentation section covers networking from the physical layer up through application protocols, with heavy emphasis on Linux networking internals (since most servers run Linux), cloud-native patterns (Kubernetes networking, service meshes), and cloud provider networking services (AWS VPC, GCP Network). We assume you're already familiar with basic networking concepts and want production-grade depth.
+
+## When To Use
+
+- **Architecting new services**: Understanding load balancing, service mesh, and VPC design before you deploy
+- **Debugging production incidents**: Systematic approaches to network troubleshooting when latency spikes or connectivity drops
+- **Designing cloud infrastructure**: Creating VPCs, subnets, routing tables, and security groups correctly the first time
+- **Implementing security controls**: Firewall rules, TLS termination, network policies in Kubernetes
+- **Performance optimization**: Identifying network bottlenecks with iperf, tcpdump, and eBPF-based tools
+- **Onboarding to networking team**: Getting up to speed on DNS, TCP internals, and routing protocols
+
+## When NOT To Use
+
+- **Learning networking from scratch**: This documentation assumes intermediate knowledge—see introductory materials first
+- **Hardware switch/router configuration**: This focuses on Linux and cloud networking, not Cisco/Juniper CLI
+- **WAN optimization specifics**: While we cover VPN and tunneling, carrier-grade WAN tech is out of scope
+- **Writing network drivers**: This is userspace/Kubernetes level, not kernel driver development
+
+## Core Concepts
+
+### The Network Stack in Production
+
+Production networks operate across multiple abstraction layers simultaneously. At the physical layer, you're dealing with 1G/10G/25G/100G Ethernet, fiber optics, SFP+ modules, and copper cables. The mental model for network engineers isn't the OSI 7-layer abstraction—it's understanding how packets actually flow through Linux kernel netfilter, iptables rules, routing tables, and network namespaces.
+
+```bash
+# View network interfaces and addresses
+ip addr show
+ip link show
+ip -s link show eth0
+
+# View routing table
+ip route show
+ip route show table all
+
+# View network statistics
+ss -s
+netstat -i
+cat /proc/net/dev
+```
+
+### Hybrid Cloud Networking
+
+Modern production networks span multiple environments. Typical patterns include:
+
+1. **AWS/GCP VPC with on-prem**: Site-to-site VPN or Direct Connect/Interconnect connecting corporate network to cloud VPC
+2. **Multi-cloud**: Separate VPCs in AWS and GCP with VPN between them
+3. **Kubernetes clusters**: EKS/GKE with pod networks, service networks, and ingress resources
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      On-Premises                            │
+│  ┌──────────────┐     ┌──────────────┐                     │
+│  │ 10.0.0.0/16  │────▶│  Core Router │                     │
+│  │  Internal    │     │   BGP AS 65001│                    │
+│  └──────────────┘     └──────┬───────┘                     │
+└──────────────────────────────┼──────────────────────────────┘
+                               │ BGP
+                    ┌──────────▼──────────┐
+                    │   Direct Connect    │
+                    │   / Interconnect    │
+                    └──────────┬──────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────┐
+│                      AWS us-east-1                          │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                     VPC 172.16.0.0/16                  │ │
+│  │  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐  │ │
+│  │  │ Public Subnet│   │Private Subnet│   │  RDS Subnet │  │ │
+│  │  │172.16.0.0/24 │   │172.16.1.0/24 │   │172.16.2.0/24│  │ │
+│  │  │ ALB, Bastion │   │  ECS, EKS   │   │  RDS, ElastiCache│ │
+│  │  └─────────────┘   └─────────────┘   └─────────────┘  │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Network Namespaces and Virtualization
+
+Linux network namespaces provide isolation for network stack resources. Kubernetes uses them extensively for pod networking. Understanding `ip netns`, veth pairs, and bridge devices is critical for debugging container networking issues.
+
+```bash
+# List network namespaces
+ip netns list
+
+# Create network namespace for testing
+ip netns add testns
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns testns
+ip netns exec testns ip addr add 172.18.0.1/24 dev veth1
+ip netns exec testns ip link set veth1 up
+```
+
+## Real Production Example
+
+### Multi-Account AWS Networking Architecture
+
+A production multi-account AWS networking setup typically uses AWS Organizations with a dedicated Network Account containing transitive routing infrastructure:
+
+```bash
+# Core Transit VPC routing (Network Account)
+# Attach Transit Gateway to VPCs
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-0a1b2c3d4e5f6g7h8 \
+  --vpc-id vpc-0abcd1234efgh5678 \
+  --subnet-ids subnet-0123456789abcdef0 subnet-0123456789abcdef1
+
+# Configure Transit Gateway Route Table
+aws ec2 associate-transit-gateway-route-table \
+  --transit-gateway-route-table-id tgw-rtb-0abc123def456 \
+  --transit-gateway-id tgw-0a1b2c3d4e5f6g7h8 \
+  --vpc-id vpc-0abcd1234efgh5678
+
+# Add static route for on-premises CIDR via Direct Connect
+aws ec2 create-transit-gateway-route \
+  --destination-cidr-block 10.0.0.0/8 \
+  --transit-gateway-route-table-id tgw-rtb-0abc123def456 \
+  --transit-gateway-attachment-id tgw-attach-ondemand
+```
+
+### Kubernetes Networking
+
+Production Kubernetes networking involves multiple layers: CNI plugin (Cilium, Calico, Flannel), kube-proxy (iptables or IPVS), and potentially a service mesh (Istio, Linkerd). Each pod gets its own IP address from a pod CIDR block, and Services get ClusterIPs from the service CIDR.
+
+```yaml
+# Kubernetes NetworkPolicy example (Calico)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-access-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api-server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: nginx-ingress
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+## CLI Examples
+
+```bash
+# Basic network diagnostics
+ip addr show eth0
+ip route show
+ip neigh show
+ss -tuln
+
+# Advanced socket statistics
+ss -ti state established
+ss -s
+netstat -anp
+
+# Interface statistics and errors
+ip -s link show eth0
+cat /proc/net/dev
+ethtool -S eth0
+
+# DNS lookups
+dig +trace example.com A
+nslookup -type=AAAA example.com
+host -a example.com
+
+# Connectivity testing
+ping -c 4 8.8.8.8
+ping6 -c 4 2001:4860:4860::8888
+traceroute -m 30 8.8.8.8
+mtr -n 8.8.8.8
+
+# Port and service checking
+nc -zv example.com 443
+telnet example.com 22
+nmap -Pn -sT -p 443 example.com
+
+# Bandwidth testing
+iperf3 -s  # Server side
+iperf3 -c server.example.com -P 4 -t 30  # Client with 4 parallel streams
+
+# HTTP/HTTPS testing
+curl -Iv https://example.com
+curl -w "@curl-format.txt" -o /dev/null -s https://example.com
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `ip addr` | View/manage IP addresses | `ip addr add 10.0.0.1/24 dev eth0` |
+| `ip route` | View/manage routing table | `ip route add default via 10.0.0.1` |
+| `ip link` | View/manage network interfaces | `ip link set eth0 mtu 9000` |
+| `ip neigh` | View/manage ARP table | `ip neigh show` |
+| `ss` | Socket statistics | `ss -tulnp` |
+| `netstat` | Network statistics | `netstat -rnv` |
+| `ipcs` | Inter-process communication | `ipcs -m` |
+| `tcpdump` | Packet capture | `tcpdump -i eth0 port 80` |
+| `dig` | DNS lookup | `dig @8.8.8.8 example.com MX` |
+| `nslookup` | DNS query | `nslookup example.com` |
+| `ping` | Reachability testing | `ping -c 3 8.8.8.8` |
+| `traceroute` | Path tracing | `traceroute -I 8.8.8.8` |
+| `mtr` | Combined ping/traceroute | `mtr 8.8.8.8` |
+| `nc` | Network swiss army knife | `nc -lvp 8080` |
+| `nmap` | Port scanning | `nmap -Pn host.example.com` |
+| `curl` | HTTP client | `curl -X POST -d '{}' api.example.com` |
+| `ethtool` | NIC settings | `ethtool -i eth0` |
+| `iperf3` | Bandwidth testing | `iperf3 -s` |
+| `bridge` | Bridge management | `bridge link show` |
+| `tc` | Traffic control | `tc qdisc show` |
+
+## Monitoring
+
+### Key Network Metrics
+
+**Infrastructure metrics** (via node_exporter, collectd):
+- Interface throughput: rx_bytes/sec, tx_bytes/sec
+- Packet rates: rx_packets/sec, tx_packets/sec
+- Errors: rx_errors, tx_errors, rx_dropped, tx_dropped
+- TCP stats: curr_estab, segs_in, segs_out, retrans_segs
+- Socket memory: mem, rmem, wmem (via /proc/net/sockstat)
+
+**Cloud-specific metrics**:
+- AWS: VPC Flow Logs (ACCEPT/REJECT), NAT Gateway bytes, Transit Gateway traffic
+- GCP: VPC Flow Logs, Cloud Router advertisements, VPN tunnel status
+
+**Application-level metrics**:
+- HTTP request latency (p50, p95, p99)
+- gRPC response codes
+- DNS resolution time
+- Database connection pool utilization
+
+### Alerting Thresholds
+
+| Metric | Warning | Critical | Reason |
+|--------|---------|----------|--------|
+| TCP retransmits | >0.5% | >2% | Network instability |
+| Interface errors | >100/min | >1000/min | Hardware issues |
+| Connection table utilization | >70% | >90% | Risk of connection exhaustion |
+| DNS resolution time | >100ms | >500ms | Affects all dependent services |
+| Latency p99 | >500ms | >2000ms | User-facing impact |
+
+### Tools
+
+- **Prometheus + node_exporter**: Time-series metrics for all network interfaces
+- **Grafana dashboards**: Network I/O, TCP stats, connection counts
+- **eBPF-based**: Cilium Hubble, Falco for real-time flow visibility
+- **Flow exports**: sFlow, NetFlow/IPFIX for traffic analysis
+
+## Security
+
+### Network Security Fundamentals
+
+**Principle of least privilege**: Every security group, firewall rule, and ACL should allow only required traffic. Default-deny is the only sane starting point.
+
+**Defense in depth**: Network-level controls (security groups, NACLs) + application-level controls (mTLS, OAuth) + monitoring (flow logs, IDS).
+
+**Encryption everywhere**: Internal traffic should use mTLS or at minimum TLS. No plaintext credentials over internal networks.
+
+### Hardening Checklist
+
+```bash
+# Disable IP forwarding unless needed
+sysctl -w net.ipv4.ip_forward=0
+
+# Disable source packet routing
+sysctl -w net.ipv4.conf.all.accept_source_route=0
+sysctl -w net.ipv6.conf.all.accept_source_route=0
+
+# Enable IP spoofing protection
+sysctl -w net.ipv4.conf.all.rp_filter=1
+
+# Disable ICMP redirect acceptance
+sysctl -w net.ipv4.conf.all.accept_redirects=0
+sysctl -w net.ipv6.conf.all.accept_redirects=0
+
+# Enable TCP SYN cookies for DoS protection
+sysctl -w net.ipv4.tcp_syncookies=1
+
+# Apply settings persistently
+echo "net.ipv4.tcp_syncookies=1" >> /etc/sysctl.d/99-security.conf
+```
+
+### Cloud Security Groups
+
+```bash
+# AWS CLI security group rules
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0abc123def456 \
+  --protocol tcp \
+  --port 443 \
+  --cidr 10.0.0.0/8 \
+  --description "Internal HTTPS access"
+
+aws ec2 authorize-security-group-egress \
+  --group-id sg-0abc123def456 \
+  --protocol -1 \
+  --cidr 0.0.0.0/0 \
+  --description "Allow all outbound (restrictive alternative: specific CIDRs)"
+```
+
+## Cost Optimization
+
+### Network Cost Drivers
+
+**Cloud provider egress**: The largest cost factor. AWS egress to internet is $0.09/GB (first 10TB). Cross-AZ traffic is $0.01/GB. Private networking within VPC is free.
+
+**NAT Gateway**: $0.045/GB processed + $0.045/GB transferred. For high-traffic workloads, consider NAT instances or VPC endpoints.
+
+**Load Balancers**: ALB is $0.0225/hour + $0.008/LCU-hour. NLB is $0.0225/hour + $0.0065/NCU-hour. Minimize idle load balancers.
+
+**VPN and Direct Connect**: VPN is $0.05/hour ($36/month). Direct Connect is $0.03/GB for port speeds up to 1Gbps.
+
+### Optimization Strategies
+
+1. **Use VPC endpoints**: S3, DynamoDB, Secrets Manager accessed via private IP avoid egress charges
+2. **Cache aggressively**: CloudFront for static assets reduces origin traffic
+3. **Right-size NAT**: Calculate actual throughput needs; NAT Gateway handles 5Gbps by default
+4. **Connection reuse**: HTTP keep-alive reduces TLS handshakes
+5. **Compression**: gzip/brotli reduces bandwidth, especially for text APIs
+
+```bash
+# Example: Cost comparison for S3 access
+# Without VPC Endpoint: $0.09/GB egress (internet) + $0.005/1000 PUT
+# With VPC Endpoint: $0.00 for same-region S3 access
+
+# Calculate monthly S3 data transfer savings
+# Monthly data: 1TB read, 100GB write
+# Without VPC Endpoint: $92.50 (1TB egress) + $0.50 (100GB) = $93
+# With VPC Endpoint: $0.00
+```
+
+## Troubleshooting
+
+### Systematic Approach
+
+**Layer 1-2 (Physical/Data Link)**:
+1. Check cables, lights, SFP modules
+2. Verify duplex/speed settings: `ethtool eth0`
+3. Check VLANs are configured correctly
+4. Look for spanning tree issues
+
+**Layer 3 (Network)**:
+1. Verify IP addressing: `ip addr`
+2. Check routing: `ip route`, `ip route get <destination>`
+3. Check ARP table: `ip neigh`
+4. Trace path: `traceroute`, `mtr`
+
+**Layer 4 (Transport)**:
+1. Check listening sockets: `ss -tuln`
+2. Verify connection states: `ss -ti`
+3. Test port accessibility: `nc -zv host port`
+4. Capture packets: `tcpdump -i any port X`
+
+**Layer 7 (Application)**:
+1. DNS resolution: `dig`, `nslookup`
+2. Application logs
+3. Certificate validity: `openssl s_client -connect host:443`
+4. Request/response timing: `curl -w`
+
+### Common Issues
+
+| Symptom | Likely Cause | Verification | Fix |
+|---------|--------------|--------------|-----|
+| Intermittent timeouts | Firewall drops, MTU issues | `tcpdump` for drops, `ping -M do` | Adjust MSS, check firewall rules |
+| High latency | Congestion, bufferbloat | `ss -ti`, `iperf3` | QoS, rate limiting, more capacity |
+| Connection refused | Service down, wrong port | `ss -tuln | grep PORT` | Restart service, fix config |
+| DNS failures | Recursive resolver issue | `dig +trace` | Check /etc/resolv.conf, try different resolver |
+| TLS handshake failures | Cert mismatch, protocol version | `openssl s_client -debug` | Update certs, fix TLS versions |
+
+## Interview Questions
+
+**Q1: What happens when you type `curl https://example.com`? Walk through the entire network stack.**
+
+A: DNS resolution (stub resolver → recursive resolver → authoritative), TCP 3-way handshake to port 443, TLS 1.3 handshake (ClientHello with SNI, ServerHello, key exchange, certificate verification), HTTP request (GET / HTTP/1.1 with Host header), application layer processing, HTTP response, connection close or keep-alive. At each layer: application creates HTTP message, TLS encrypts it, TCP segments with sequence numbers, IP routes packets, Ethernet frames forwarded via ARPResolved MAC addresses.
+
+**Q2: How does TCP congestion control work, and why does it matter for network performance?**
+
+A: TCP congestion control prevents overwhelming the network. Slow start begins with small cwnd (1 MSS), doubles cwnd each RTT until ssthresh. Congestion avoidance then increments cwnd linearly. On loss (3 dup ACKs), cwnd halved (AIMD). Modern cubic uses cubic function for faster recovery. Matters because improperly tuned congestion control causes retransmissions, latency spikes, and throughput collapse under load. In data centers, BBR offers better performance than CUBIC for low-latency networks.
+
+**Q3: What's the difference between a security group and a network ACL in AWS?**
+
+A: Security groups are stateful (return traffic automatically allowed), applied to ENIs attached to instances, support allow rules only (implicit deny), changes take effect immediately. NACLs are stateless (must explicitly allow return traffic), applied at subnet level, support both allow and deny rules, processed in rule number order. Best practice: security groups for instance-level control, NACLs as subnet-level perimeter defense (block specific CIDRs or protocols at subnet boundary).
+
+**Q4: How would you troubleshoot high latency between two services in Kubernetes?**
+
+A: (1) Check if it's DNS: `dig service.namespace.svc.cluster.local`, (2) Check pod networking: `kubectl exec -it source-pod -- curl -v target-service:port/health`, (3) Capture packets: `kubectl exec -it source-pod -- tcpdump -i eth0 port 80`, (4) Check iptables rules: `iptables -L -v -n` on nodes, (5) Check CNI plugin: Cilium Hubble or Calico felix logs, (6) Check sidecar proxy if using service mesh, (7) Look for NAT or conntrack overhead: `ss -ti`, (8) Check for MTU issues: `ping -M do -s 1400 target-ip`.
+
+**Q5: Design a VPC for a three-tier web application with HA requirements.**
+
+A: Use multiple AZs for HA. Public subnet in each AZ for ALB and Bastion host. Private subnets for ASGs running application servers. Private subnets (isolated, no internet) for RDS in each AZ with read replicas. NAT Gateway or NAT instance in each AZ for private subnet outbound. Separate route tables per subnet tier. Security groups: ALB → app servers (80/443 from ALB SG only), app servers → RDS (5432 from app SG only). Use VPC endpoints for S3/DynamoDB to avoid NAT Gateway costs and improve latency. Enable VPC Flow Logs for traffic visibility.
+
+## Cheat Sheet
+
+### Key Ports
+
+| Port | Protocol | Use |
+|------|----------|-----|
+| 22 | TCP | SSH |
+| 25 | TCP | SMTP |
+| 53 | UDP/TCP | DNS |
+| 80 | TCP | HTTP |
+| 443 | TCP | HTTPS |
+| 3306 | TCP | MySQL |
+| 5432 | TCP | PostgreSQL |
+| 6379 | TCP | Redis |
+| 9200 | TCP | Elasticsearch |
+| 9090 | TCP | Prometheus |
+| 3000 | TCP | Grafana |
+| 6443 | TCP | Kubernetes API |
+| 2379 | TCP | etcd client |
+| 2380 | TCP | etcd peer |
+
+### CIDR Ranges (RFC 1918)
+
+| Range | Description |
+|-------|-------------|
+| 10.0.0.0/8 | Private Class A |
+| 172.16.0.0/12 | Private Class B |
+| 192.168.0.0/16 | Private Class C |
+| 169.254.0.0/16 | Link-local (DHCP) |
+| 127.0.0.0/8 | Loopback |
+
+### TCP Flags
+
+| Flag | Name | Purpose |
+|------|------|---------|
+| SYN | Synchronize | Initiate connection |
+| ACK | Acknowledge | Acknowledge data |
+| FIN | Finish | Graceful close |
+| RST | Reset | Abrupt close/abort |
+| PSH | Push | Send buffered data |
+| URG | Urgent | Mark urgent data |
+
+### Key sysctls for Networking
+
+```bash
+# TCP tuning
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem="4096 87380 16777216"
+net.ipv4.tcp_wmem="4096 87380 16777216"
+net.ipv4.tcp_congestion_control=cubic
+
+# Connection tracking
+net.netfilter.nf_conntrack_max=1048576
+net.netfilter.nf_conntrack_tcp_timeout_established=7200
+
+# Buffer sizes
+net.core.rmem_default=124928
+net.core.wmem_default=124928
+net.core.netdev_max_backlog=5000
+```
+
+## Related Topics
+
+- [TCP](./tcp) — Transmission Control Protocol deep dive
+- [UDP](./udp) — User Datagram Protocol
+- [DNS](./dns) — Domain Name System
+- [HTTP/HTTPS](./http) — Application protocols
+- [VPC](./vpc) — Virtual Private Cloud architecture
+- [Subnets](./subnets) — Subnetting and IP addressing
+- [Routing](./routing) — Routing protocols and route tables
+- [Load Balancing](./load-balancing) — L4/L7 load balancing
+- [Firewall](./firewall) — Linux firewall with iptables/nftables

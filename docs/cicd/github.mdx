@@ -1,0 +1,908 @@
+---
+id: github-actions
+title: GitHub Actions
+description: Production GitHub Actions YAML configuration, runners, secrets, and reusable workflows
+sidebar_position: 3
+---
+
+# GitHub Actions
+
+## Overview
+
+GitHub Actions is GitHub's native CI/CD platform that automates build, test, and deployment pipelines. It integrates deeply with GitHub repositories, offering event-driven automation through workflows that respond to repository events like pushes, pull requests, and releases.
+
+## When To Use
+
+- GitHub-hosted or self-hosted CI/CD pipelines
+- Event-driven automation (PRs, issues, releases)
+- Matrix builds (multiple versions/platforms)
+- Containerized deployments
+- Enterprise needs with GitHub Enterprise
+
+## When NOT To Use
+
+- Non-GitHub repositories (use GitLab CI, Jenkins, or CircleCI)
+- Highly specialized build environments not supported by GitHub runners
+- Projects requiring extreme customization of CI infrastructure
+
+## Core Concepts
+
+### Key Terminology
+
+| Term | Description |
+|------|-------------|
+| **Workflow** | Automated process defined in YAML, stored in `.github/workflows/` |
+| **Job** | Set of steps executed on the same runner |
+| **Step** | Individual task (run command or action) |
+| **Action** | Reusable unit of code bundled as a step |
+| **Runner** | Server that executes workflow jobs |
+| **Artifact** | Files created by a job (build outputs, test results) |
+| **Event** | Specific activity that triggers a workflow |
+
+### Workflow Anatomy
+
+```yaml
+name: Workflow Name                    # Optional, shown in GitHub UI
+
+on:                                    # Triggers
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize]
+
+env:                                   # Environment variables (global)
+  NODE_ENV: production
+
+jobs:
+  job-name:                            # Job ID (must be unique)
+    name: Display Name                 # Optional, shown in UI
+    runs-on: ubuntu-latest            # Runner specification
+    
+    outputs:                           # Job outputs for downstream jobs
+      artifact: ${{ steps.build.outputs.artifact }}
+    
+    permissions:                       # Permissions (least privilege)
+      contents: read
+      id-token: write
+    
+    services:                          # Service containers
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4     # Action (third-party)
+      
+      - name: Setup Node              # Custom step
+        run: npm install
+      
+      - name: Test
+        run: npm test
+        env:                          # Job-level env vars
+          NODE_ENV: test
+```
+
+### Event Triggers
+
+```yaml
+on:
+  # Branch events
+  push:
+    branches: [main, 'release/**']
+    tags: ['v*']
+    paths: ['src/**', 'tests/**']
+    paths-ignore: ['docs/**']
+  
+  # PR events
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+  
+  # Manual triggers
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+        default: dev
+      dry_run:
+        type: boolean
+        default: false
+  
+  # Schedule (cron)
+  schedule:
+    - cron: '0 2 * * 1-5'  # 2 AM weekdays
+  
+  # Repository events
+  issues:
+    types: [opened, closed]
+  release:
+    types: [published, created]
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+    branches: [main]
+```
+
+## Real Production Example
+
+### Multi-Environment Production Pipeline
+
+```yaml
+name: Production Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+      skip_tests:
+        description: Skip test execution
+        type: boolean
+        default: false
+
+# Prevent concurrent deployments
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_VERSION: '20'
+  GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+  GKE_REGION: ${{ vars.GKE_REGION }}
+
+jobs:
+  # ============================================
+  # QUALITY GATE
+  # ============================================
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    outputs:
+      should_continue: ${{ steps.evaluate.outputs.should_continue }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check commit messages
+        id: evaluate
+        run: |
+          # Only allow squash merges from main
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ github.event.pull_request.merge_commit_sha }}" == "" ]]; then
+              echo "PR not yet mergeable"
+              echo "should_continue=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "should_continue=true" >> $GITHUB_OUTPUT
+
+  # ============================================
+  # BUILD & TEST
+  # ============================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    if: needs.quality-gate.outputs.should_continue == 'true'
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Lint
+        run: npm run lint
+      
+      - name: Type check
+        run: npm run typecheck
+      
+      - name: Unit tests
+        run: npm run test:unit -- --coverage --reporter=junit --outputFile=test-results.xml
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/test
+          REDIS_URL: redis://localhost:6379
+      
+      - name: Integration tests
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/test
+          REDIS_URL: redis://localhost:6379
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 7
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ============================================
+  # DOCKER BUILD
+  # ============================================
+  docker:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  # ============================================
+  # SECURITY SCAN
+  # ============================================
+  security:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name != 'pull_request'
+    
+    permissions:
+      security-events: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download image
+        run: |
+          docker pull ${{ needs.docker.outputs.image-tag }}
+      
+      - name: Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ needs.docker.outputs.image-tag }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Fail on critical vulnerabilities
+        run: |
+          if grep -q '"Severity": "CRITICAL"' trivy-results.sarif; then
+            echo "Critical vulnerabilities found!"
+            exit 1
+          fi
+      
+      - name: Run CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          languages: javascript, typescript
+          queries: security-extended
+
+  # ============================================
+  # DEPLOY TO STAGING
+  # ============================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker, security]
+    if: github.ref == 'refs/heads/main'
+    
+    environment:
+      name: staging
+      url: https://staging.myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth (Workload Identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.STAGING_SA }}
+          audience: https://github.com/${{ github.repository }}
+      
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker ${{ env.REGISTRY }}
+      
+      - name: Deploy to GKE
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} --region ${{ env.GKE_REGION }}
+          kubectl set image deployment/api \
+            api=${{ needs.docker.outputs.image-tag }} \
+            --namespace=staging
+          kubectl rollout status deployment/api --namespace=staging --timeout=10m
+      
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -f https://staging.myapp.com/health || exit 1
+
+  # ============================================
+  # E2E TESTS
+  # ============================================
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Playwright
+        run: |
+          npm install -g playwright
+          npx playwright install --with-deps chromium
+      
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          BASE_URL: https://staging.myapp.com
+      
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+
+  # ============================================
+  # DEPLOY TO PRODUCTION
+  # ============================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: e2e
+    if: github.ref == 'refs/heads/main'
+    
+    environment:
+      name: production
+      url: https://myapp.com
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth (Workload Identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIP }}
+          service_account: ${{ vars.PROD_SA }}
+          audience: https://github.com/${{ github.repository }}
+      
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker ${{ env.REGISTRY }}
+      
+      - name: Blue-Green Deploy
+        run: |
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} --region ${{ env.GKE_REGION }}
+          
+          # Deploy to blue environment (idle)
+          kubectl set image deployment/api-blue \
+            api=${{ needs.docker.outputs.image-tag }} \
+            --namespace=production
+          kubectl rollout status deployment/api-blue --namespace=production --timeout=10m
+          
+          # Run smoke tests against blue
+          kubectl exec -n production deployment/api-blue -- curl -f localhost:8080/health
+          
+          # Switch traffic
+          kubectl patch service api \
+            -n production \
+            --type='json' \
+            -p='[{"op":"replace","path":"/spec/selector","value":{"app":"api-blue"}}]'
+          
+          # Verify
+          sleep 10
+          curl -f https://myapp.com/health || exit 1
+      
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && ':white_check_mark:' || ':x:' }} Production Deployment",
+              "blocks": [{
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*${{ github.workflow }}*\nStatus: ${{ job.status }}\nCommit: `${{ github.sha }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                }
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+### Reusable Workflow
+
+```yaml
+# .github/workflows/reusable-deploy.yml
+name: Reusable Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+    secrets:
+      gcp_workload_identity_provider:
+        required: true
+      gcp_service_account:
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: GCP Auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.gcp_workload_identity_provider }}
+          service_account: ${{ secrets.gcp_service_account }}
+      
+      - name: Deploy
+        run: |
+          kubectl set image deployment/api api=${{ inputs.image_tag }}
+```
+
+### Composite Action
+
+```yaml
+# .github/actions/docker-build/action.yml
+name: 'Docker Build and Push'
+description: 'Build Docker image with caching and provenance'
+
+inputs:
+  image-name:
+    description: 'Image name'
+    required: true
+  registry:
+    description: 'Container registry'
+    default: ghcr.io
+
+outputs:
+  image-tag:
+    description: 'Full image tag with digest'
+    value: ${{ steps.meta.outputs.tags }}
+
+runs:
+  using: composite
+  
+  steps:
+    - uses: docker/setup-buildx-action@v3
+    
+    - name: Docker meta
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ inputs.registry }}/${{ inputs.image-name }}
+        tags: |
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Login to registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        provenance: true
+```
+
+## Configuration / Pipeline Examples
+
+### Matrix Strategy
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+        database: [postgres:14, postgres:15]
+        include:
+          - node-version: 20
+            database: mysql:8
+            coverage: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Test
+        run: npm test
+```
+
+### Environment-Specific Configuration
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Deploy
+        run: |
+          echo "Deploying to ${{ inputs.environment }}"
+          # Environment-specific secrets available only after approval
+```
+
+## Common Commands / Steps
+
+### GitHub CLI Commands
+
+```bash
+# Authentication
+gh auth login
+gh auth status
+
+# Workflow management
+gh workflow list
+gh workflow view ci.yml
+gh workflow run ci.yml
+gh workflow run ci.yml -f environment=staging
+gh workflow enable deploy.yml
+gh workflow disable deploy.yml
+
+# Run management
+gh run list
+gh run view
+gh run watch
+gh run download <run-id>
+gh run cancel <run-id>
+gh run rerun <run-id>
+
+# Secret management
+gh secret list
+gh secret set API_KEY -b "value"
+gh secret set API_KEY < secret.txt
+gh secret delete API_KEY
+
+# Variable management
+gh variable list
+gh variable set GKE_CLUSTER -b "my-cluster"
+gh variable delete GKE_CLUSTER
+```
+
+## Monitoring
+
+### Workflow Metrics
+
+| Metric | Query |
+|--------|-------|
+| Run duration | `workflow_runs` API |
+| Success rate | Success vs failure counts |
+| Queue time | Time from trigger to start |
+| Step duration | Individual step timings |
+
+### Dashboards
+
+```bash
+# Get workflow run statistics
+gh api repos/$owner/$repo/actions/runs \
+  -f workflow_id=$WORKFLOW_ID \
+  -f created_after=2024-01-01 \
+  --jq '.workflow_runs | length'
+
+# Export to CSV for analysis
+gh api repos/$owner/$repo/actions/runs \
+  --paginate \
+  --jq '.workflow_runs[] | {id, name, status, conclusion, created_at, updated_at, duration: (.updated_at | todate | . - .created_at | todate)}' \
+  > runs.json
+```
+
+## Security
+
+### Permissions Model
+
+```yaml
+permissions:
+  contents: read      # Only read repository contents
+  packages: write     # Write to packages registry
+  id-token: write     # For OIDC authentication
+  actions: read       # For workflow management
+  pull-requests: write # For PR operations
+  statuses: write     # For status checks
+```
+
+### OIDC Configuration
+
+```yaml
+# Workload Identity Federation
+- name: Authenticate to GCP
+  uses: google-github-actions/auth@v2
+  with:
+    workload_identity_provider: 'projects/123/locations/global/workloadIdentityPools/github/providers/github'
+    service_account: 'deploy@project.iam.gserviceaccount.com'
+    audience: 'https://github.com/${{ github.repository }}'
+    # No long-lived credentials needed!
+```
+
+### Secret Scanning
+
+```yaml
+# Enable secret scanning
+# Repository Settings > Security > Secret scanning
+# Also enable:
+# - Push protection
+# - Dependency review
+# - Code scanning
+
+# Dependency review in workflow
+- name: Dependency Review
+  uses: actions/dependency-review-action@v4
+  with:
+    fail-on-severity: high
+    deny: >
+      [
+        {"name": "lodash", "version": "<=4.17.21"},
+        {"name": "axios", "version": "<=1.6.0"}
+      ]
+```
+
+## Cost Optimization
+
+### Matrix Optimization
+
+```yaml
+jobs:
+  test:
+    strategy:
+      matrix:
+        shards: [1, 2, 3, 4]
+    steps:
+      - name: Run tests (shard ${{ matrix.shards }}/4)
+        run: npm test -- --shard=${{ matrix.shards }}/${{ strategy.job-total }}
+```
+
+### Caching
+
+```yaml
+# Multiple cache types
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.npm
+      .next/cache
+    key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-npm-
+
+# Docker layer caching
+- uses: docker/build-push-action@v5
+  with:
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+```
+
+### Runner Selection
+
+| Runner | Use Case | Cost |
+|--------|----------|------|
+| ubuntu-latest | General purpose | Included |
+| windows-latest | Windows-specific builds | 2x credits |
+| macos-latest | Apple Silicon builds | 10x credits |
+| Self-hosted | Custom needs, private repos | Infrastructure cost |
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| `Resource not accessible` | Check permissions in workflow |
+| `No such file or directory` | Check working directory, use `actions/checkout` with `path` |
+| `OIDC token exchange failed` | Verify workload identity configuration |
+| `Job queued indefinitely` | Check runner availability, concurrency limits |
+| `Cache not restored` | Verify cache key matches, check retention |
+
+### Debug Mode
+
+```bash
+# Enable debug logging
+gh run list --debug
+
+# Watch run with debug
+gh run watch <run-id> --exit-status
+
+# Download and inspect logs
+gh run download <run-id> --dir ./logs
+```
+
+## Interview Questions
+
+### Q1: How do you secure credentials in GitHub Actions?
+
+**Answer:** Never store long-lived credentials. Use OIDC for cloud providers (Workload Identity Federation), GitHub Secrets for non-sensitive values, external secret managers (HashiCorp Vault, GCP Secret Manager) for sensitive data. Set minimal permissions with `permissions` block. Enable secret scanning and push protection.
+
+### Q2: What is the difference between `secrets` and `variables`?
+
+**Answer:** Secrets are encrypted values not exposed in logs, used for credentials and sensitive data. Variables are unencrypted, visible in logs, suitable for non-sensitive configuration like feature flags or instance names.
+
+### Q3: How would you share workflow code across multiple repositories?
+
+**Answer:** Use reusable workflows (`.github/workflows/reusable-*.yml`) for CI/CD patterns, composite actions (`.github/actions/*/action.yml`) for reusable step groups, and GitHub Enterprise shared workflow repositories for organization-wide templates.
+
+### Q4: Explain the concurrency settings and when to use them.
+
+**Answer:** Concurrency groups prevent redundant parallel runs. When a new workflow starts matching an existing group's criteria, it can either wait or cancel the old run. Essential for preventing deployment conflicts: `concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }`.
+
+## Cheat Sheet
+
+```bash
+# Workflow Commands
+gh workflow list
+gh workflow run deploy.yml -f env=prod
+gh run list --status in_progress
+gh run watch
+gh run rerun failed
+
+# Secret Management
+gh secret list
+gh secret set DB_PASSWORD -b "secret123"
+gh secret set DOCKER_TOKEN < token.txt
+
+# Variable Management
+gh variable set REGION -b "us-central1"
+gh variable list
+
+# Matrix Debug
+gh run list --workflow=ci.yml | jq '.[] | select(.conclusion=="failure")'
+```
+
+## Related Topics
+
+- [CI/CD Overview](./overview.mdx)
+- [Git Workflows](./git.mdx)
+- [Build Automation](./build.mdx)
+- [Deployment Strategies](./deploy.mdx)
+- [GitOps & Automation](./automation.mdx)

@@ -1,0 +1,691 @@
+# Identity and Access Management (IAM)
+
+## Overview
+
+Cloud IAM is Google's unified access control system for all GCP resources. It provides fine-grained identity and access management through a **who-can-do-what** model, combining `who` (principals), `can do what` (roles), and `on which resources` (conditions). IAM is hierarchical by default—policies set at a parent level cascade to all child resources, though child-level policies can be more restrictive but never more permissive.
+
+IAM operates on the principle of least privilege: grant only the permissions required for a task. GCP provides over 300 predefined roles covering every service, plus the ability to create custom roles for precise permission control. The system supports both human users (via Google accounts, Google Workspace, or Cloud Identity) and non-human identities (service accounts, workload identity).
+
+Understanding IAM is fundamental to GCP security because it controls access to everything—from creating a Compute Engine instance to accessing data in BigQuery. Misconfigured IAM is one of the most common causes of security incidents, making it critical to master this service.
+
+## When To Use
+
+- **Granting human users access to GCP resources**: Use Google groups with IAM roles, never assign roles directly to individual users
+- **Service-to-service authentication**: Service accounts allow workloads to authenticate to other GCP services (e.g., a GKE pod accessing Cloud Storage)
+- **Cross-project access**: Share VPCs or access BigQuery datasets across projects using IAM
+- **Conditional access based on attributes**: Use IAM Conditions to grant time-limited access or access from specific IP ranges
+- **Auditing compliance**: IAM Admin Activity logs track every permission change for compliance
+- **Workload identity federation**: Replace service account keys with workload identity for external systems (AWS, GitHub, OIDC)
+
+## When NOT To Use
+
+- **Application-level authorization**: IAM controls GCP-level permissions, not application-level logic—implement application auth (OAuth, JWT) for business rules
+- **Operating system access**: Use OS Login for SSH access to VMs, not IAM roles
+- **Database-level access control**: Use Cloud SQL IAM database authentication for database users, not project-level IAM
+- **Fine-grained file/object access**: Cloud Storage supports object-level ACLs in addition to IAM for bucket-level access
+
+## Architecture
+
+IAM's architecture consists of three core components:
+
+**Principals (Who)**
+- Google accounts (user@gmail.com)
+- Service accounts (sa-name@project-id.iam.gserviceaccount.com)
+- Google groups (group-name@googlegroups.com)
+- Google Workspace or Cloud Identity domains
+- AllAuthenticatedUsers, AllUsers (public resources)
+
+**Roles (What)**
+- Basic roles: Owner, Editor, Viewer (too broad for production)
+- Predefined roles: Service-specific (roles/compute.instanceAdmin)
+- Custom roles: User-defined combinations of permissions
+- Role recommendations: AI-suggested roles based on usage
+
+**Resources (Which)**
+- Organization, Folder, Project, or individual resource
+- Policies are hierarchical—parent policies grant permissions to children
+
+**IAM Policy Structure:**
+```
+binding:
+  members: [user:alice@example.com, serviceAccount:sa@project.iam.gserviceaccount.com]
+  role: roles/compute.instanceAdmin
+  condition:  # Optional
+    title: only-from-office
+    expression: "ip(source.ip) inIpRange(['10.0.0.0/8'])"
+```
+
+**Policy Evaluation Logic:**
+1. If no policy grants access, access is denied
+2. Deny rules override allow rules (if configured)
+3. Most restrictive policy wins in hierarchy
+4. Resource-level policies can only restrict, not expand
+
+## Core Concepts
+
+### Roles and Permissions
+
+**Permission Format**: `service.resource.verb` (e.g., `compute.instances.create`)
+
+**Basic Roles (Avoid in Production):**
+| Role | Access Level |
+|------|--------------|
+| Viewer | Read-only access to all resources |
+| Editor | Create, modify, delete resources (no billing management) |
+| Owner | Full access including IAM and billing |
+
+**Predefined Roles**: Granular, service-specific roles. Examples:
+- `roles/compute.instanceAdmin`: Full control of instances and related resources
+- `roles/compute.viewer`: Read-only Compute access
+- `roles/iam.serviceAccountUser`: Create and manage service accounts
+- `roles/storage.objectViewer`: Read objects in Cloud Storage
+
+**Custom Roles**: Combine specific permissions for least privilege.
+
+### Service Accounts
+
+Service accounts authenticate as a non-human identity:
+```bash
+# Create service account
+gcloud iam service-accounts create my-sa \
+    --display-name="My Service Account" \
+    --project=my-project
+
+# Grant roles
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:my-sa@my-project.iam.gserviceaccount.com" \
+    --role="roles/storage.objectAdmin"
+```
+
+### Workload Identity Federation
+
+Replaces service account keys for external workloads:
+```bash
+# For GitHub Actions
+gcloud iam workload-identity-pools create github-pool \
+    --location=global \
+    --description="GitHub Actions"
+
+gcloud iam workload-identity-pools providers create-oidc github-provider \
+    --workload-identity-pool=github-pool \
+    --issuer-uri="https://token.actions.githubusercontent.com" \
+    --attribute-mapping="attribute.actor=assertion.actor,attribute.repository=assertion.repository"
+
+# Allow GitHub workflow to impersonate service account
+gcloud iam service-accounts add-iam-policy-binding my-sa@my-project.iam.gserviceaccount.com \
+    --member="principalSet://iam.googleapis.com/projects/PROJECT/locations/global/workloadIdentityPools/github-pool/attribute.repository/my-org/my-repo" \
+    --role="roles/iam.workloadIdentityUser"
+```
+
+### IAM Conditions
+
+Time-based or attribute-based restrictions:
+```yaml
+condition:
+  title: "Office Hours Only"
+  expression: "request.time.getHours() >= 9 && request.time.getHours() < 18"
+```
+
+```yaml
+condition:
+  title: "Production Restriction"
+  expression: "resource.name.startsWith('projects/my-project/zones/us-central1-a/')"
+```
+
+### Organization Policies
+
+Enforce constraints across the organization:
+```bash
+# Disable serial port access
+gcloud org-policies set-policy org-policy-serial-port.yaml
+
+# Require resources in specific regions
+gcloud org-policies set-policy org-policy-resource-locations.yaml
+```
+
+### Quotas and Limits
+
+| Resource | Limit |
+|----------|-------|
+| Custom roles per organization | 300 |
+| Role bindings per resource | 1,500 |
+| Members per binding | 250 |
+| IAM policies per resource | 1 |
+| Service accounts per project | 2,000 |
+| Service account keys | 10 per service account (recommended max) |
+
+### Key Gotchas
+
+- **Service account keys never expire by default**—use key rotation or workload identity federation instead
+- **Basic roles (Owner, Editor, Viewer) apply to ALL resources in a project**—use predefined or custom roles instead
+- **IAM changes can take up to 7 minutes** to propagate (usually &lt;2 minutes)
+- **Deleting a service account while keys are in use breaks those workloads**—disable first, monitor, then delete after 30 days
+- **Organization admin role is extremely powerful**—use with caution, prefer more specific roles
+- **Cross-project IAM requires both projects to have the service enabled**—check API enablement first
+- **Audit logs are not retroactive**—enable Data Access logs before sensitive operations
+
+## Real Production Example
+
+A production setup with proper IAM architecture:
+
+```bash
+# 1. Create organizational structure with folders
+gcloud resource-manager folders create "platform" \
+    --organization=123456789012 \
+    --display-name="Platform Team"
+
+gcloud resource-manager folders create "production" \
+    --organization=123456789012 \
+    --display-name="Production Environment"
+
+# 2. Create service accounts for different workloads
+gcloud iam service-accounts create app-backend-sa \
+    --display-name="App Backend Service Account" \
+    --project=my-project
+
+gcloud iam service-accounts create data-pipeline-sa \
+    --display-name="Data Pipeline Service Account" \
+    --project=my-project
+
+gcloud iam service-accounts create monitoring-sa \
+    --display-name="Monitoring Service Account" \
+    --project=my-project
+
+# 3. Grant roles to service accounts
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:app-backend-sa@my-project.iam.gserviceaccount.com" \
+    --role="roles/run.invoker" \
+    --condition=None
+
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:app-backend-sa@my-project.iam.gserviceaccount.com" \
+    --role="roles/cloudsql.client" \
+    --condition=None
+
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:data-pipeline-sa@my-project.iam.gserviceaccount.com" \
+    --role="roles/bigquery.dataEditor" \
+    --condition=None
+
+gcloud projects add-iam-policy-binding my-project \
+    --member="serviceAccount:data-pipeline-sa@my-project.iam.gserviceaccount.com" \
+    --role="roles/storage.objectAdmin" \
+    --condition=None
+
+# 4. Grant time-limited access for on-call
+gcloud projects add-iam-policy-binding my-project \
+    --member="user:oncall-engineer@company.com" \
+    --role="roles/viewer" \
+    --condition="title=On-call Access,expression=request.time < timestamp('2024-12-31T23:59:59Z')"
+
+# 5. Create custom role for platform team
+gcloud iam roles create platformDeveloper \
+    --project=my-project \
+    --title="Platform Developer" \
+    --description="Custom role for platform developers" \
+    --permissions="compute.instances.create,compute.instances.delete,compute.instances.get,container.clusters.get,container.clusters.update"
+
+gcloud projects add-iam-policy-binding my-project \
+    --member="group:platform-developers@company.com" \
+    --role="roles/my-project.platformDeveloper"
+```
+
+```hcl
+# Terraform: Production IAM setup
+resource "google_service_account" "app_backend" {
+  project    = var.project_id
+  account_id = "app-backend-sa"
+  display_name = "App Backend Service Account"
+}
+
+resource "google_service_account" "data_pipeline" {
+  project    = var.project_id
+  account_id = "data-pipeline-sa"
+  display_name = "Data Pipeline Service Account"
+}
+
+# Grant Cloud Run Invoker to app backend
+resource "google_project_iam_member" "app_backend_run" {
+  project = var.project_id
+  role    = "roles/run.invoker"
+  member  = "serviceAccount:${google_service_account.app_backend.email}"
+}
+
+# Grant BigQuery Data Editor to data pipeline
+resource "google_project_iam_member" "data_pipeline_bigquery" {
+  project = var.project_id
+  role    = "roles/bigquery.dataEditor"
+  member  = "serviceAccount:${google_service_account.data_pipeline.email}"
+}
+
+# Grant Storage Object Admin to data pipeline
+resource "google_project_iam_member" "data_pipeline_storage" {
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${google_service_account.data_pipeline.email}"
+}
+
+# Custom role for platform developers
+resource "google_project_iam_custom_role" "platform_developer" {
+  project_id = var.project_id
+  role_id    = "platformDeveloper"
+  title      = "Platform Developer"
+  description = "Custom role for platform developers"
+  permissions = [
+    "compute.instances.create",
+    "compute.instances.delete",
+    "compute.instances.get",
+    "compute.instances.list",
+    "container.clusters.get",
+    "container.clusters.update",
+    "container.clusters.list",
+  ]
+}
+
+# Grant custom role to group
+resource "google_project_iam_member" "platform_developers" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.platform_developer.name
+  member  = "group:platform-developers@company.com"
+}
+
+# Conditional binding for on-call access
+resource "google_project_iam_member" "oncall_access" {
+  project = var.project_id
+  role    = "roles/viewer"
+
+  member  = "user:oncall@company.com"
+
+  condition {
+    title      = "On-call access until end of year"
+    expression = "request.time < timestamp('2024-12-31T23:59:59Z')"
+  }
+}
+```
+
+## CLI Examples
+
+```bash
+# Get IAM policy for a project
+gcloud projects get-iam-policy my-project
+
+# Get IAM policy for a specific resource
+gcloud compute instances get-iam-policy my-instance --zone=us-central1-a
+
+# Set IAM policy (replace entire policy)
+gcloud projects set-iam-policy my-project policy.json
+
+# Add IAM policy binding
+gcloud projects add-iam-policy-binding my-project \
+    --member="user:alice@company.com" \
+    --role="roles/editor"
+
+# Remove IAM policy binding
+gcloud projects remove-iam-policy-binding my-project \
+    --member="user:alice@company.com" \
+    --role="roles/editor"
+
+# List service accounts
+gcloud iam service-accounts list
+
+# Create service account key (avoid in production)
+gcloud iam service-accounts keys create key.json \
+    --iam-account=my-sa@my-project.iam.gserviceaccount.com
+
+# List service account keys
+gcloud iam service-accounts keys list \
+    --iam-account=my-sa@my-project.iam.gserviceaccount.com
+
+# Create workload identity pool
+gcloud iam workload-identity-pools create my-pool \
+    --location=global
+
+# Create OIDC provider for workload identity
+gcloud iam workload-identity-pools providers create-oidc my-provider \
+    --workload-identity-pool=my-pool \
+    --issuer-uri="https://token.actions.githubusercontent.com"
+
+# List predefined roles
+gcloud iam roles list
+
+# Describe a specific role
+gcloud iam roles describe roles/compute.instanceAdmin
+```
+
+## Terraform Example
+
+```hcl
+# Complete IAM configuration
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Service Account with Workload Identity
+resource "google_service_account" "gke_workload" {
+  project    = var.project_id
+  account_id = "gke-workload-sa"
+  display_name = "GKE Workload Service Account"
+  description  = "Service account for GKE workloads"
+}
+
+# Workload Identity Pool
+resource "google_iam_workload_identity_pool" "github_pool" {
+  workload_identity_pool_id = "github-actions"
+}
+
+resource "google_iam_workload_identity_pool_provider" "github_oidc" {
+  workload_identity_pool_id          = google_iam_workload_identity_pool.github_pool.workload_identity_pool_id
+  workload_identity_pool_provider_id = "github-provider"
+  issuer                             = "https://token.actions.githubusercontent.com"
+  attribute_mapping = {
+    "google.subject"     = "assertion.sub"
+    "attribute.actor"    = "assertion.actor"
+    "attribute.repository" = "assertion.repository"
+  }
+}
+
+# Grant Workload Identity User to service account
+resource "google_service_account_iam_member" "workload_identity" {
+  service_account_id = google_service_account.gke_workload.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.id}/attribute.repository/${var.github_org}/${var.github_repo}"
+}
+
+# Project IAM with member conditions
+resource "google_project_iam_member" "dev_engineer" {
+  project = var.project_id
+  role    = "roles/container.developer"
+
+  member = "user:dev-engineer@company.com"
+
+  condition {
+    title      = "Dev environment only"
+    expression = "resource.location.startsWith('projects/${var.project_id}/locations/us-central1')"
+  }
+}
+
+# Folder-level IAM
+resource "google_folder_iam_member" "platform_team_admin" {
+  folder = "folders/123456789012"
+  role   = "roles/container.admin"
+  member = "group:platform-team@company.com"
+}
+
+# Organization-level audit config
+resource "google_organization_iam_audit_config" "primary" {
+  org_id = "123456789012"
+  service = "allServices"
+
+  audit_log_config {
+    log_type = "ADMIN_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}
+```
+
+## Common Commands
+
+| Task | Command |
+|------|---------|
+| Get IAM policy | `gcloud projects get-iam-policy PROJECT` |
+| Set IAM policy | `gcloud projects set-iam-policy PROJECT policy.json` |
+| Add binding | `gcloud projects add-iam-policy-binding PROJECT --member=MEMBER --role=ROLE` |
+| Remove binding | `gcloud projects remove-iam-policy-binding PROJECT --member=MEMBER --role=ROLE` |
+| List service accounts | `gcloud iam service-accounts list` |
+| Create service account | `gcloud iam service-accounts create SA_ID --display-name=NAME` |
+| Create SA key | `gcloud iam service-accounts keys create FILE --iam-account=SA` |
+| List SA keys | `gcloud iam service-accounts keys list --iam-account=SA` |
+| Delete SA key | `gcloud iam service-accounts keys delete KEY_ID --iam-account=SA` |
+| List predefined roles | `gcloud iam roles list` |
+| Describe role | `gcloud iam roles describe ROLE` |
+| Create custom role | `gcloud iam roles create ROLE_ID --project=PROJECT --title=TITLE --permissions=PERMS` |
+| Test IAM permissions | `gcloud alpha iap test-iam-permissions RESOURCE --permissions=PERMS` |
+
+## Monitoring
+
+**Key Metrics and Logs:**
+- **Cloud Audit Logs**: Track all IAM changes (who changed what, when)
+  - Admin Activity log: `cloudaudit.googleapis.com/activity`
+  - Data Access log: `cloudaudit.googleapis.com/data_access`
+- **IAM Recommender**: AI-suggested role recommendations based on usage patterns
+- **Policy Troubleshooter**: Analyze effective permissions for a principal
+
+```bash
+# Query IAM changes in Cloud Logging
+gcloud logging read 'resource.type="project" AND protoPayload.methodName="google.iam.admin.v1.SetIAMPolicy"' \
+    --project=my-project \
+    --freshness=1h
+
+# Enable IAM recommender
+gcloud services enable recommender.googleapis.com --project=my-project
+
+# Get IAM recommendations
+gcloud recommender iam recommendations list \
+    --project=my-project \
+    --location=global
+
+# Accept a recommendation
+gcloud recommender iam recommendations apply RECOMMENDATION_ID \
+    --project=my-project \
+    --location=global
+```
+
+**Alerting Setup:**
+```bash
+# Alert on IAM policy changes
+gcloud alpha monitoring policies create \
+    --display-name="IAM Policy Change Alert" \
+    --condition-display-name="IAM change detected" \
+    --notification-channels=CHANNEL_ID
+```
+
+## Security
+
+**IAM Security Best Practices:**
+
+1. **Use service accounts over user accounts for workloads**
+   - Service accounts are machine identities, not human
+   - Rotate keys or use Workload Identity Federation
+
+2. **Enable Workload Identity Federation**
+   ```bash
+   # For Kubernetes
+   kubectl create serviceaccount k8s-workload -n default
+   gcloud iam service-accounts add-iam-policy-binding my-sa@my-project.iam.gserviceaccount.com \
+       --role="roles/iam.workloadIdentityUser" \
+       --member="serviceAccount:my-project.svc.id.goog[default/k8s-workload]"
+   kubectl annotate serviceaccount k8s-workload -n default \
+       iam.gke.io/gcp-service-account=my-sa@my-project.iam.gserviceaccount.com
+   ```
+
+3. **Restrict service account key creation**
+   ```bash
+   # Set organization policy
+   gcloud org-policies set-policy no-sa-keys-policy.yaml
+   ```
+
+4. **Use groups for human access**
+   - Assign roles to groups, not individuals
+   - Use Cloud Identity for group management
+
+5. **Audit service account usage**
+   - Enable Data Access logs
+   - Use Policy Intelligence for insights
+
+6. **Implement least privilege with custom roles**
+   ```bash
+   gcloud iam roles create developer \
+       --project=my-project \
+       --title="Developer" \
+       --permissions="container.clusters.get,container.clusters.update,compute.instances.get,compute.instances.list"
+   ```
+
+7. **Use IAM Conditions for time-limited access**
+   - Grant elevated access during incidents only
+   - Auto-expire after incident resolution
+
+**Sensitive Role Combinations to Monitor:**
+- `roles/owner` + `roles/iam.securityAdmin`
+- `roles/editor` on production projects
+- Service accounts with `roles/owner`
+
+## Cost Optimization
+
+IAM itself is free, but misuse leads to unnecessary costs:
+
+**Cost Drivers from IAM Misuse:**
+- Over-provisioned resources from `roles/editor` allowing anyone to create
+- Service account keys stored insecurely leading to data exfiltration
+- Excessive API enablement from overly permissive roles
+
+**Optimization Strategies:**
+
+1. **Use predefined roles over basic roles**
+   - Basic roles often grant more permissions than needed
+   - Predefined roles are scoped to specific services
+
+2. **Audit and remove unused IAM grants**
+   ```bash
+   # Find unused service accounts
+   gcloud asset search-all-iam-policies \
+       --query="policy:serviceAccount" \
+       --asset-types=iam.googleapis.com/ServiceAccount
+   ```
+
+3. **Use groups for bulk permission management**
+   - Easier to audit, faster to modify
+
+4. **Set organization policies to restrict resource creation**
+   ```yaml
+   # org-policy.yaml
+   constraint: constraints/compute.disableSerialPortAccess
+   listPolicy:
+     denied: ["ENABLED"]
+   ```
+
+## Troubleshooting
+
+**Common Issues:**
+
+1. **"Permission denied" despite having the role**
+   ```bash
+   # Check effective permissions
+   gcloud projects get-iam-policy my-project
+   # Look for org policies blocking access
+   gcloud org-policies list-policies --project=my-project
+   
+   # Check if role is granted at correct level
+   gcloud asset search-all-iam-policies \
+       --query="policy:user:alice@company.com"
+   ```
+
+2. **Service account key authentication failing**
+   ```bash
+   # Verify key exists and is enabled
+   gcloud iam service-accounts keys list \
+       --iam-account=my-sa@my-project.iam.gserviceaccount.com
+   
+   # Check if SA is disabled
+   gcloud iam service-accounts describe my-sa@my-project.iam.gserviceaccount.com
+   
+   # Verify key is valid (decode JWT)
+   openssl base64 -d < key.json | head -c 100
+   ```
+
+3. **Workload Identity not working**
+   ```bash
+   # Verify pool and provider exist
+   gcloud iam workload-identity-pools list
+   gcloud iam workload-identity-pools providers list --workload-identity-pool=my-pool
+   
+   # Check attribute mapping
+   gcloud iam workload-identity-pools providers describe my-provider \
+       --workload-identity-pool=my-pool
+   ```
+
+4. **IAM policy update not taking effect**
+   ```bash
+   # IAM changes can take up to 7 minutes
+   # Force sync
+   gcloud auth revoke && gcloud auth login
+   
+   # Check for conflicts
+   gcloud projects get-iam-policy my-project --format=json | jq '.bindings'
+   ```
+
+5. **"Service account has been deleted" errors**
+   ```bash
+   # Find deleted service accounts in audit logs
+   gcloud logging read 'protoPayload.methodName="google.iam.admin.v1.DeleteServiceAccount"' \
+       --project=my-project --freshness=30d
+   ```
+
+## Interview Questions
+
+1. **Explain the difference between predefined, custom, and basic roles in GCP IAM. When would you use each?**
+
+2. **How do you implement least privilege for a Kubernetes workload running on GKE that needs to access Cloud Storage?**
+
+3. **What is Workload Identity Federation and why is it preferred over service account keys?**
+
+4. **How do IAM Conditions work and provide an example of when you'd use them?**
+
+5. **You're seeing "Permission denied" errors even though the user has the expected IAM role. How do you troubleshoot?**
+
+## Cheat Sheet
+
+```
+# Service Accounts
+gcloud iam service-accounts create SA_ID --display-name="NAME"
+gcloud iam service-accounts list
+gcloud iam service-accounts describe SA_EMAIL
+gcloud iam service-accounts keys list --iam-account=SA_EMAIL
+gcloud iam service-accounts keys create FILE.json --iam-account=SA_EMAIL
+gcloud iam service-accounts keys delete KEY_ID --iam-account=SA_EMAIL
+
+# IAM Policy
+gcloud projects get-iam-policy PROJECT
+gcloud projects set-iam-policy PROJECT policy.json
+gcloud projects add-iam-policy-binding PROJECT --member=MEMBER --role=ROLE
+gcloud projects remove-iam-policy-binding PROJECT --member=MEMBER --role=ROLE
+
+# Custom Roles
+gcloud iam roles list --project=PROJECT
+gcloud iam roles describe ROLE
+gcloud iam roles create ROLE_ID --project=PROJECT --title=TITLE --permissions=PERMS
+
+# Workload Identity
+gcloud iam workload-identity-pools create POOL_ID --location=global
+gcloud iam workload-identity-pools providers create-oidc PROVIDER_ID \
+    --workload-identity-pool=POOL_ID --issuer-uri=URI
+
+# Audit
+gcloud logging read 'resource.type="project" AND protoPayload.methodName="SetIAMPolicy"'
+```
+
+## Labs
+
+1. **IAM Fundamentals**: Create a service account, assign roles, test access from a VM
+2. **Workload Identity**: Configure a GKE workload to use Workload Identity to access Cloud Storage
+3. **Custom Roles**: Create a custom role with specific permissions, test in a sandbox environment
+4. **Conditional IAM**: Implement time-based access for on-call engineers
+5. **Security Hardening**: Audit IAM policies, remove overprivileged accounts, enable organization policies
+
+## Related Services
+
+- [Organization Node](./organization)
+- [Resource Hierarchy](./resource-hierarchy)
+- [Folders](./folders)
+- [Projects](../foundation/projects)
+- [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation)

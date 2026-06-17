@@ -1,0 +1,382 @@
+# Cloud Profiler
+
+## Overview
+
+Google Cloud Profiler provides CPU and memory profiling data for applications running on GCP. It continuously collects profiling data with minimal overhead, helping identify performance optimization opportunities. Profiler supports Go, Java, Node.js, and Python applications.
+
+## When To Use
+
+- CPU usage optimization
+- Memory leak detection
+- Allocation hotspot analysis
+- Performance tuning
+- Resource efficiency improvements
+
+## When NOT To Use
+
+- Production overhead concerns (low overhead ~1-5%)
+- Non-performance issues (use logging/tracing)
+- Real-time request tracing (use Cloud Trace)
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Cloud Profiler                            │
+├─────────────────────────────────────────────────────────────┤
+│  Profile Types:                                            │
+│  ├── CPU time (function call time)                        │
+│  ├── Heap (memory allocation)                             │
+│  ├── Contention (lock wait time)                          │
+│  └── Wall time (elapsed time)                             │
+├─────────────────────────────────────────────────────────────┤
+│  Agents:                                                   │
+│  ├── Go:      Native integration                          │
+│  ├── Java:    Java agent                                  │
+│  ├── Node.js: Native integration                          │
+│  └── Python:  Python agent                                │
+├─────────────────────────────────────────────────────────────┤
+│  Pricing:                                                  │
+│  └── Free for all usage                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Profile
+Captured performance data snapshot showing function call patterns.
+
+### Flat View
+Top-level functions sorted by resource usage.
+
+### Flame Graph
+Visual representation of call stack with width proportional to resource use.
+
+### Heap Profile
+Memory allocation analysis showing where memory is allocated.
+
+## Real Production Example
+
+**Application Profiling Setup**
+
+```hcl
+# Terraform - Cloud Profiler is API-enabled, minimal config needed
+
+# Enable API
+resource "google_project_service" "cloudprofiler" {
+  service = "cloudprofiler.googleapis.com"
+}
+
+# Profiler is configured in application code
+```
+
+### Go Application
+
+```go
+package main
+
+import (
+    "contrib.go.opencensus.io/profiler"
+    cloudprofiler "github.com/GoogleCloudPlatform/opentelemetry-operations-go/profiler"
+)
+
+// Initialize profiler
+func initProfiler(service, version string) error {
+    return cloudprofiler.Start(cloudprofiler.Config{
+        Service: service,
+        ServiceVersion: version,
+        // Optional: ProjectID if not using ADC
+        // ProjectID: "my-project",
+    })
+}
+
+// Or using OpenTelemetry with Cloud Profiler exporter
+import (
+    "go.opentelemetry.io/otel/sdk/trace"
+    texporter "github.com/GoogleCloudPlatform/opentelemetry-go-contrib/resourcemonitor"
+)
+```
+
+### Java Application
+
+```java
+// Add JVM arguments for Cloud Profiler
+// java -javaagent:path/to/cloud_profiler_java_agent.jar \
+//       -Dcloud_profiler_project_id=my-project \
+//       -Dcloud_profiler_service_name=my-service \
+//       -Dcloud_profiler_service_version=1.0.0 \
+//       -jar my-app.jar
+
+// Or programmatically
+import com.google.cloud.profiler.cprofiler.ProfileAgent;
+
+public class MyApplication {
+    public static void main(String[] args) {
+        // Initialize profiler if not using javaagent
+        ProfileAgent.start(new String[]{
+            "--project_id=my-project",
+            "--service_name=my-service",
+            "--service_version=1.0.0"
+        });
+        
+        // Your application code
+    }
+}
+
+// Maven dependency
+/*
+<dependency>
+    <groupId>com.google.cloud</groupId>
+    <artifactId>cloud-profiler-agent</artifactId>
+    <version>2.3.1</version>
+</dependency>
+*/
+```
+
+### Node.js Application
+
+```javascript
+// npm install @google-cloud/profiler
+
+// Option 1: Require before other modules
+const { Profiler } = require('@google-cloud/profiler');
+
+// Option 2: Using ES modules or top-level await
+const profiler = new Profiler({
+    projectId: 'my-project',
+    serviceContext: {
+        service: 'my-service',
+        version: '1.0.0',
+        // Optional: minor version for deployment tracking
+    }
+});
+
+profiler.start();
+
+// Your application code
+const express = require('express');
+const app = express();
+
+// ...
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    profiler.stop();
+    process.exit(0);
+});
+```
+
+### Python Application
+
+```python
+# pip install google-cloud-profiler
+
+# Option 1: At application startup
+import google.cloud.profiler as profiler
+
+profiler.start(service='my-service', service_version='1.0.0')
+
+# Option 2: With configuration
+profiler.start(
+    service='my-service',
+    service_version='1.0.0',
+    project_id='my-project',
+    # Allocation profiles enabled (default: True)
+    enable_contention=True,
+    # CPU profiles enabled (default: True)
+    # Frequency and duration tuned automatically
+)
+
+# Option 3: With gunicorn
+# In gunicorn.conf.py:
+# import google.cloud.profiler as profiler
+# profiler.start()
+
+# Or via environment variable
+# GOOGLE_CLOUD_PROFILER_LOGGING=1 to enable debug logging
+```
+
+### Kubernetes Deployment
+
+```yaml
+# deployment.yaml with profiling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+          env:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "my-project"
+          # Node.js profiling
+          env:
+            - name: NODE_OPTIONS
+              value: "-r @google-cloud/profiler"
+          # Java profiling
+          # args:
+          #   - "-javaagent:/opt/profiler/cloud_profiler_java_agent.jar"
+          #   - "-Dcloud_profiler_service_name=my-app"
+```
+
+## CLI Examples
+
+```bash
+# Profiler is automatically collecting data
+# Use Cloud Console to view profiles
+
+# Cloud Console URL:
+# https://console.cloud.google.com/profiler
+
+# gcloud CLI for profiler
+# No direct gcloud commands - use Console or APIs
+```
+
+## Terraform Example
+
+```hcl
+# Enable Profiler API
+resource "google_project_service" "profiler" {
+  service = "cloudprofiler.googleapis.com"
+}
+
+# No specific Terraform resources needed
+# Profiler is configured in application code
+```
+
+## Monitoring
+
+### Profiler Data
+- CPU time by function
+- Memory allocation by function
+- Flame graphs for visualization
+- Comparison across time periods
+
+### Cloud Monitoring Integration
+```bash
+# No specific metrics from Profiler
+# Use with other observability tools
+# Profiler data visible in Cloud Console
+```
+
+## Security
+
+### IAM Permissions
+```bash
+# Profiler viewer
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:developer@company.com \
+  --role=roles/cloudprofiler.agent
+```
+
+### Data Privacy
+- Profiler data stored in GCP
+- Function names visible, not full source
+- Stack traces include file paths
+
+## Cost
+
+Cloud Profiler is free to use - no additional charges beyond the compute where your application runs.
+
+## Troubleshooting
+
+### No Profiles Appearing
+```bash
+# Check profiler agent is running
+# Application logs should show profiler initialization
+
+# Verify API enabled
+gcloud services list --enabled | grep cloudprofiler
+
+# Check service account has profiler permissions
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/cloudprofiler.agent
+```
+
+### High Overhead
+```bash
+# Profiler overhead is typically 1-5%
+# If too high, reduce collection frequency
+
+# Java: set profiler.collection_interval to higher value
+# Node.js: not easily configurable, generally low overhead
+```
+
+### Unsupported Language
+```bash
+# Profiler supports:
+# - Go 1.11+
+# - Java 8+ (OpenJDK, HotSpot)
+# - Node.js 10+
+# - Python 2.7+, 3.4+
+```
+
+## Interview Questions
+
+**Q: What is the difference between CPU time and wall time profiling?**
+A: CPU time measures actual CPU time spent in a function (excluding wait time). Wall time measures total elapsed time. Use CPU time for CPU-bound code, wall time for I/O-bound or waiting code.
+
+**Q: How does heap profiling work?**
+A: Heap profiling records memory allocations, not deallocations. It shows where objects are created, helping identify memory leaks and excessive allocations. The profile shows allocation counts and sizes.
+
+**Q: What is the overhead of Cloud Profiler?**
+A: Typically 1-5% CPU overhead for most applications. The agent collects data in background threads and buffers it for periodic upload.
+
+**Q: When should you use Profiler vs Trace?**
+A: Use Profiler for understanding where CPU time and memory are spent. Use Trace for understanding request flow and latency across services.
+
+**Q: How do you interpret a flame graph?**
+A: Flame graphs show call stacks with width proportional to resource usage. The bottom is the entry point, top shows leaf functions. Wide segments indicate functions consuming significant resources.
+
+## Cheat Sheet
+
+```bash
+# Enable in application (per language)
+# Go: use cloudprofiler.Start()
+# Java: add -javaagent for profiler
+# Node.js: require('@google-cloud/profiler')
+# Python: import and start google.cloud.profiler
+
+# View profiles in Cloud Console
+# https://console.cloud.google.com/profiler
+
+# No CLI commands for profile management
+```
+
+## Labs
+
+### Lab 1: CPU Optimization
+Profile and optimize CPU usage.
+1. Enable profiler in application
+2. Capture CPU profile during load
+3. Identify hot functions
+4. Optimize critical path
+5. Verify improvement
+
+### Lab 2: Memory Leak Detection
+Find and fix memory leaks.
+1. Enable heap profiling
+2. Capture heap profile at intervals
+3. Compare allocation patterns
+4. Identify leak source
+5. Implement fix
+
+### Lab 3: Performance Tuning
+Optimize application performance.
+1. Profile production workload
+2. Create flame graphs
+3. Identify bottlenecks
+4. Optimize data structures
+5. Measure improvement
+
+## Related Services
+
+- **Cloud Trace**: Distributed request tracing
+- **Cloud Monitoring**: Metrics and alerting
+- **Error Reporting**: Error aggregation
+- **Cloud Debug**: Production debugging

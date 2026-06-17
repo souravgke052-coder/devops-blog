@@ -1,0 +1,611 @@
+# Cloud Spanner
+
+## Overview
+
+Google Cloud Spanner is a globally distributed, strongly consistent relational database service that provides horizontal scalability with ACID transactions. It combines the benefits of traditional relational databases (SQL, strong consistency) with the ability to scale horizontally across regions and globally. Spanner powers Google's own critical services and offers 99.999% availability with global distribution.
+
+## When To Use
+
+- Global-scale applications requiring strong consistency
+- Financial services needing ACID transactions
+- Multi-region deployments with active-active setup
+- Applications requiring > 2 TB of relational data
+- Microservices requiring shared consistent data
+- Gaming backends with global player bases
+- Supply chain and inventory systems
+
+## When NOT To Use
+
+- Single-region workloads with budget constraints (use Cloud SQL)
+- Write-heavy workloads without strong consistency needs
+- Simple key-value access patterns (use Bigtable)
+- Analytics and data warehousing (use BigQuery)
+- Schema-less or document-oriented data (use Firestore)
+- Applications requiring PostgreSQL/MySQL compatibility at low cost
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Cloud Spanner                            │
+├─────────────────────────────────────────────────────────────┤
+│  Global Architecture:                                        │
+│  ├── Zone-level data replication                            │
+│  ├── Synchronous commit with Paxos                          │
+│  ├── Automatic shard management                             │
+│  └── Split-based data distribution                          │
+├─────────────────────────────────────────────────────────────┤
+│  Instance Configuration:                                     │
+│  ├── Regional (single region, 99.99% SLA)                   │
+│  └── Multi-region (2+ regions, 99.999% SLA)                 │
+├─────────────────────────────────────────────────────────────┤
+│  Node Types:                                                │
+│  ├── Standard (3,000 GB per node)                          │
+│  └── Premium (4,096 GB per node)                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Concepts
+
+### Instance
+Top-level container with configuration (regional/multi-region) and nodes.
+
+### Database
+Logical database within an instance containing tables and indexes.
+
+### Table
+Relational table with primary key, supporting interleaving for hierarchy.
+
+### Interleaved Tables
+Parent-child table relationship where child rows are co-located with parent for query efficiency.
+
+### Node
+Compute unit providing storage and processing. Each node handles approximately 3 TB (standard) or 4 TB (premium).
+
+### Schema
+Table definitions with primary keys, columns, and optional interleaving.
+
+### DML
+Data Manipulation Language for inserts, updates, deletes with strong consistency.
+
+## Real Production Example
+
+**Global E-commerce Platform with Spanner**
+
+```hcl
+# Terraform configuration for global e-commerce Spanner deployment
+
+# Create Spanner instance with multi-region config
+resource "google_spanner_instance" "ecommerce" {
+  name         = "ecommerce-global"
+  config       = "regional-us-central1"  # Single region for cost efficiency
+  display_name = "E-commerce Global Database"
+  num_nodes    = 3
+  
+  labels = {
+    environment = "production"
+    application = "ecommerce"
+  }
+}
+
+# For true global distribution with 99.999% SLA:
+resource "google_spanner_instance" "ecommerce_global" {
+  name         = "ecommerce-worldwide"
+  config       = "nam-eur-asia1"  # Multi-region
+  display_name = "E-commerce Worldwide"
+  num_nodes    = 3
+  
+  labels = {
+    environment = "production"
+    tier        = "global"
+  }
+}
+
+# Create database with schema
+resource "google_spanner_database" "ecommerce" {
+  instance = google_spanner_instance.ecommerce.name
+  name     = "ecommerce_db"
+  
+  ddl = [
+    <<-EOT
+    CREATE TABLE customers (
+      customer_id STRING(36) NOT NULL,
+      email STRING(255) NOT NULL,
+      name STRING(100) NOT NULL,
+      created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+      updated_at TIMESTAMP OPTIONS (allow_commit_timestamp = true),
+    ) PRIMARY KEY (customer_id);
+    
+    CREATE TABLE orders (
+      order_id STRING(36) NOT NULL,
+      customer_id STRING(36) NOT NULL,
+      status STRING(20) NOT NULL,
+      total_amount DECIMAL(10,2) NOT NULL,
+      currency STRING(3) NOT NULL,
+      created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+      shipped_at TIMESTAMP OPTIONS (allow_commit_timestamp = true),
+    ) PRIMARY KEY (order_id), INTERLEAVE IN PARENT customers ON DELETE CASCADE;
+    
+    CREATE TABLE order_items (
+      order_id STRING(36) NOT NULL,
+      line_number INT64 NOT NULL,
+      product_id STRING(36) NOT NULL,
+      quantity INT64 NOT NULL,
+      unit_price DECIMAL(10,2) NOT NULL,
+    ) PRIMARY KEY (order_id, line_number), INTERLEAVE IN PARENT orders ON DELETE CASCADE;
+    
+    CREATE TABLE products (
+      product_id STRING(36) NOT NULL,
+      sku STRING(50) NOT NULL,
+      name STRING(200) NOT NULL,
+      description STRING(1000),
+      price DECIMAL(10,2) NOT NULL,
+      inventory_count INT64 NOT NULL,
+      updated_at TIMESTAMP OPTIONS (allow_commit_timestamp = true),
+    ) PRIMARY KEY (product_id);
+    
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    CREATE INDEX idx_orders_status ON orders(status);
+    EOT
+  ]
+  
+  version = 1
+}
+
+# IAM for Spanner access
+resource "google_spanner_database_iam_member" "app_service" {
+  instance  = google_spanner_instance.ecommerce.name
+  database  = google_spanner_database.ecommerce.name
+  role      = "roles/spanner.databaseReader"
+  member    = "serviceAccount:app@my-project.iam.gserviceaccount.com"
+}
+
+resource "google_spanner_database_iam_member" "app_admin" {
+  instance  = google_spanner_instance.ecommerce.name
+  database  = google_spanner_database.ecommerce.name
+  role      = "roles/spanner.databaseAdmin"
+  member    = "serviceAccount:admin@my-project.iam.gserviceaccount.com"
+}
+```
+
+## CLI Examples
+
+```bash
+# Create instance
+gcloud spanner instances create my-instance \
+  --config=regional-us-central1 \
+  --description="My Production Instance" \
+  --nodes=3
+
+# Create database with schema
+gcloud spanner databases create my-db \
+  --instance=my-instance
+
+# Update schema
+gcloud spanner databases ddl update my-db \
+  --instance=my-instance \
+  --ddl='CREATE TABLE users (id STRING(36) NOT NULL, name STRING(100)) PRIMARY KEY (id)'
+
+# Create table with interleaving
+gcloud spanner databases ddl update my-db \
+  --instance=my-instance \
+  --ddl='CREATE TABLE orders (id STRING(36) NOT NULL, user_id STRING(36) NOT NULL, created_at TIMESTAMP) PRIMARY KEY (id), INTERLEAVE IN PARENT users ON DELETE CASCADE'
+
+# Add index
+gcloud spanner databases ddl update my-db \
+  --instance=my-instance \
+  --ddl='CREATE INDEX idx_user_orders ON orders(user_id)'
+
+# List instances
+gcloud spanner instances list
+
+# Describe instance
+gcloud spanner instances describe my-instance
+
+# Update instance (scale nodes)
+gcloud spanner instances update my-instance --nodes=5
+
+# List databases
+gcloud spanner databases list --instance=my-instance
+
+# Query from command line
+gcloud spanner databases execute-query my-db \
+  --instance=my-instance \
+  --sql="SELECT * FROM users WHERE id = '123'"
+
+# Import data (requires CSV in Cloud Storage)
+gcloud spanner databases import my-db \
+  --instance=my-instance \
+  --database=my-db \
+  --operation-prefix=my-import \
+  --file-pattern=gs://my-bucket/export/*.csv
+```
+
+## Terraform Example
+
+```hcl
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Regional Spanner instance
+resource "google_spanner_instance" "production" {
+  name         = "production-spanner"
+  config       = "regional-us-central1"
+  display_name = "Production Database"
+  num_nodes    = 3
+  
+  labels = {
+    environment = "production"
+  }
+}
+
+# Multi-region for global HA
+resource "google_spanner_instance" "global" {
+  name         = "global-spanner"
+  config       = "nam-eur-asia1"  # US, Europe, Asia
+  display_name = "Global Database"
+  num_nodes    = 5  # More nodes for global distribution
+  
+  labels = {
+    environment = "production"
+    global      = "true"
+  }
+}
+
+# Database with comprehensive schema
+resource "google_spanner_database" "app_database" {
+  instance = google_spanner_instance.production.name
+  name     = "app_db"
+  
+  ddl = [
+    <<-EOT
+    CREATE TABLE accounts (
+      account_id STRING(36) NOT NULL,
+      email STRING(255) NOT NULL,
+      status STRING(20) NOT NULL,
+      balance DECIMAL(15,2) NOT NULL,
+      created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+    ) PRIMARY KEY (account_id);
+    
+    CREATE TABLE transactions (
+      transaction_id STRING(36) NOT NULL,
+      account_id STRING(36) NOT NULL,
+      type STRING(20) NOT NULL,
+      amount DECIMAL(15,2) NOT NULL,
+      created_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+    ) PRIMARY KEY (transaction_id), INTERLEAVE IN PARENT accounts ON DELETE CASCADE;
+    
+    CREATE TABLE products (
+      product_id STRING(36) NOT NULL,
+      sku STRING(50) NOT NULL,
+      name STRING(200) NOT NULL,
+      price DECIMAL(10,2) NOT NULL,
+      stock INT64 NOT NULL,
+    ) PRIMARY KEY (product_id);
+    EOT
+  ]
+  
+  deletion_protection = true
+}
+
+# IAM bindings
+resource "google_spanner_instance_iam_member" "app_reader" {
+  instance = google_spanner_instance.production.name
+  role     = "roles/spanner.databaseReader"
+  member   = "serviceAccount:app@project.iam.gserviceaccount.com"
+}
+
+resource "google_spanner_database_iam_member" "app_reader" {
+  instance = google_spanner_instance.production.name
+  database = google_spanner_database.app_database.name
+  role     = "roles/spanner.databaseReader"
+  member   = "serviceAccount:app@project.iam.gserviceaccount.com"
+}
+```
+
+## Common Commands
+
+```bash
+# Instance management
+gcloud spanner instances create NAME --config=CONFIG --nodes=N --description=DESC
+gcloud spanner instances list
+gcloud spanner instances describe NAME
+gcloud spanner instances update NAME --nodes=N
+gcloud spanner instances delete NAME
+
+# Database management
+gcloud spanner databases create NAME --instance=INSTANCE
+gcloud spanner databases list --instance=INSTANCE
+gcloud spanner databases describe NAME --instance=INSTANCE
+gcloud spanner databases ddl update NAME --instance=INSTANCE --ddl=DDL
+gcloud spanner databases delete NAME --instance=INSTANCE
+
+# Query execution
+gcloud spanner databases execute-query DB --instance=INSTANCE --sql=SQL
+gcloud spanner databases query DB --instance=INSTANCE --timestamp=TIMESTAMP
+
+# Backup/Restore
+gcloud spanner backups create --instance=INSTANCE --database=DB --destination=URI
+gcloud spanner backups list --instance=INSTANCE
+gcloud spanner backups restore --instance=INSTANCE --backup=BACKUP --database=NEW_DB
+```
+
+## Monitoring
+
+### Key Metrics
+- **CPU utilization**: Per-node CPU usage (alert at >70%)
+- **Storage per node**: Data distribution across nodes
+- **Session count**: Active database sessions
+- **Queries per second**: Query throughput
+- **Latency**: P50, P90, P99 query latency
+- **Transactions per second**: Write throughput
+- **Deadlock count**: Concurrency issues
+- **Waiting jobs**: Queue depth
+
+### Cloud Monitoring
+
+```bash
+# List available metrics
+gcloud monitoring metrics list --filter="resource.type=spanner_instance"
+
+# Create CPU alert
+gcloud monitoring policies create \
+  --display-name="Spanner High CPU" \
+  --condition-display-name="CPU > 70%" \
+  --condition-filter='resource.type="spanner_instance" AND metric.type="spanner.googleapis.com.instance/cpu/utilization"' \
+  --condition-threshold-value=0.7 \
+  --notification-channels=CHANNEL_ID
+
+# Read specific metrics
+gcloud monitoring metrics read \
+  "spanner.googleapis.com/database/queries" \
+  --filter='resource.instance_id="my-instance"'
+```
+
+### Query Performance Analysis
+
+```sql
+-- Get query statistics
+SELECT 
+  text,
+  execution_count,
+  avg_latency_seconds,
+  avg_rows,
+  total_latency_seconds
+FROM SPANNER_SYS.QUERY_STATS_STMT_TOP
+WHERE interval_end = LATEST
+ORDER BY total_latency_seconds DESC
+LIMIT 20;
+
+-- Get lock wait statistics
+SELECT *
+FROM SPANNER_SYS.LOCK_STATS_TOP
+ORDER BY waiting_seconds DESC
+LIMIT 10;
+
+-- Get transaction statistics
+SELECT *
+FROM SPANNER_SYS.TRANSACTION_STATS_TOP
+ORDER BY avg_latency_seconds DESC
+LIMIT 10;
+```
+
+## Security
+
+### Encryption
+- Default: Google-managed encryption
+- CMEK: Customer-managed via Cloud KMS (Enterprise edition)
+
+```bash
+# Create instance with CMEK (Enterprise)
+gcloud spanner instances create my-instance \
+  --config=regional-us-central1 \
+  --description="CMEK Instance" \
+  --nodes=3 \
+  --kms-key=KMS_KEY_NAME
+```
+
+### IAM Permissions
+```bash
+# Spanner Admin
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:admin@example.com \
+  --role=roles/spanner.admin
+
+# Database Reader
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/spanner.databaseReader
+
+# Database User
+gcloud projects add-iam-policy-binding my-project \
+  --member=serviceAccount:app@project.iam.gserviceaccount.com \
+  --role=roles/spanner.databaseUser
+
+# Database Admin
+gcloud projects add-iam-policy-binding my-project \
+  --member=user:dba@example.com \
+  --role=roles/spanner.databaseAdmin
+```
+
+### Network Security
+```bash
+# Spanner uses Google's network by default
+# For private connectivity, use VPC Service Controls
+# Requires Enterprise edition
+gcloud spanner instances update my-instance \
+  --enable-private-path
+```
+
+## Cost Optimization
+
+### Pricing Structure
+| Component | Price |
+|-----------|-------|
+| Node (Standard) | $0.90/node/hour |
+| Node (Premium) | $1.10/node/hour |
+| Storage | $0.30/GB/month |
+| Backup | $0.20/GB/month |
+| Network egress | Variable |
+
+### Cost-Saving Strategies
+
+```bash
+# Scale nodes based on load
+# Use automatic scaling or scheduled scaling
+
+# Monitor and right-size
+gcloud spanner instances describe my-instance
+
+# Use regional instead of multi-region if global HA not needed
+# Regional: $0.90/node/hour
+# Multi-region: 2-3x regional cost
+
+# Delete unused backups
+gcloud spanner backups delete BACKUP --instance=INSTANCE --quiet
+
+# Consider storage vs compute tradeoffs
+# Standard node: 3 TB storage
+# Premium node: 4 TB storage
+# If storage-bound, premium may be more cost-effective
+```
+
+### Node Sizing Guidelines
+- 1 node ≈ 3 TB storage (standard) or 4 TB (premium)
+- Typical: 3-5 nodes for production
+- Scale at 70% CPU threshold
+
+## Troubleshooting
+
+### High Latency
+```sql
+-- Check if queries are using indexes
+EXPLAIN SELECT * FROM orders WHERE customer_id = '123';
+
+-- Check for full table scans
+EXPLAIN SELECT * FROM orders WHERE status = 'pending';
+
+-- Create missing indexes
+ALTER TABLE orders ADD INDEX idx_status_created (status, created_at);
+```
+
+### Lock Contention
+```sql
+-- Check lock wait times
+SELECT * FROM SPANNER_SYS.LOCK_STATS_TOP ORDER BY waiting_seconds DESC;
+
+-- Optimize transactions to hold locks for shorter duration
+-- Use read-your-writes pattern
+-- Batch operations where possible
+```
+
+### Node Imbalance
+```bash
+# Check storage distribution
+gcloud spanner instances describe my-instance
+
+# If unbalanced:
+# - Spanner automatically rebalances splits
+# - Check for hot spots in data access
+# - Consider different primary key strategy
+```
+
+### Backup/Restore Issues
+```bash
+# List backup operations
+gcloud spanner operations list --instance=my-instance
+
+# Check backup status
+gcloud spanner backups describe my-backup --instance=my-instance
+
+# Restore to new database
+gcloud spanner databases restore \
+  --backup=my-backup \
+  --destination-database=new-db \
+  --instance=my-instance
+```
+
+## Interview Questions
+
+**Q: How does Spanner achieve strong consistency with global distribution?**
+A: Spanner uses TrueTime (atomic clocks with GPS) to assign globally consistent timestamps. Paxos consensus protocol ensures synchronous replication across replicas. All reads can be served from replicas with timestamps greater than the commit timestamp of the last write.
+
+**Q: What is the difference between regional and multi-region Spanner?**
+A: Regional Spanner has 3 replicas in different zones of one region (99.99% SLA, ~$0.90/node/hr). Multi-region Spanner distributes across 2+ regions (99.999% SLA, 2-3x cost) for global active-active with lowest latency worldwide.
+
+**Q: When should you use interleaved tables in Spanner?**
+A: Interleave child tables in parent tables when child rows are frequently accessed together with the parent. This co-locates related data on the same set of nodes, reducing cross-node joins and improving read performance. Use `ON DELETE CASCADE` for referential integrity.
+
+**Q: How do you design primary keys to avoid hot spots in Spanner?**
+A: Avoid sequential or monotonically increasing keys (e.g., auto-increment IDs). Use UUIDs, hash-based keys, or composite keys with high-cardinality leading column. Distribute writes evenly across splits for write scalability.
+
+**Q: What are Spanner's limitations on DML operations?**
+A: Large batch DML operations (millions of rows) should use the bulk mutation API instead of DML for better performance. Long-running transactions (>60 seconds) may be aborted. Large transactions should be split into smaller chunks.
+
+**Q: How does Spanner compare to traditional PostgreSQL?**
+A: Spanner provides horizontal scaling and global distribution that PostgreSQL cannot match. However, Spanner has some restrictions: limited foreign key enforcement, no stored procedures, different index behavior. For global scale, Spanner excels; for single-region cost-sensitive workloads, PostgreSQL (Cloud SQL) may be better.
+
+## Cheat Sheet
+
+```bash
+# Create instance (regional)
+gcloud spanner instances create NAME --config=regional-REGION --nodes=N
+
+# Create multi-region instance
+gcloud spanner instances create NAME --config=nam-eur-asia1 --nodes=N
+
+# Create database with schema
+gcloud spanner databases create DB --instance=INSTANCE
+gcloud spanner databases ddl update DB --instance=INSTANCE --ddl='CREATE TABLE ...'
+
+# Scale nodes
+gcloud spanner instances update INSTANCE --nodes=NEW_COUNT
+
+# Query
+gcloud spanner databases execute-query DB --instance=INSTANCE --sql="SELECT * FROM table"
+
+# Index
+gcloud spanner databases ddl update DB --instance=INSTANCE \
+  --ddl='CREATE INDEX idx_name ON table(column)'
+```
+
+## Labs
+
+### Lab 1: Global E-commerce Database
+Deploy Spanner for global e-commerce.
+1. Create multi-region instance
+2. Design schema with interleaved tables
+3. Add secondary indexes
+4. Implement读写分离 patterns
+5. Test failover and data distribution
+
+### Lab 2: Financial Transaction System
+Build a financial system requiring ACID guarantees.
+1. Create regional instance with 3+ nodes
+2. Design accounts and transactions schema
+3. Implement pessimistic locking for balance updates
+4. Add monitoring and alerts
+5. Test transaction isolation levels
+
+### Lab 3: Data Migration from PostgreSQL
+Migrate from Cloud SQL to Spanner.
+1. Design Spanner schema from PostgreSQL schema
+2. Handle schema differences (no foreign keys enforced)
+3. Use Dataflow for bulk migration
+4. Implement validation and reconciliation
+5. Cut over with minimal downtime
+
+## Related Services
+
+- **Cloud SQL**: Single-region relational databases
+- **BigQuery**: Data warehouse for analytics
+- **Firestore**: Document database for mobile/web
+- **Bigtable**: Wide-column NoSQL for time-series
+- **Cloud KMS**: Customer-managed encryption keys
+- **Dataflow**: Data migration and ETL

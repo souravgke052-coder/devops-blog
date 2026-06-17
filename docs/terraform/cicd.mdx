@@ -1,0 +1,1211 @@
+# Terraform CI/CD
+
+## Overview
+
+CI/CD pipelines automate Terraform workflows from code commit to infrastructure deployment. They ensure consistent, validated, and auditable infrastructure changes while preventing direct access to production environments.
+
+## When To Use
+
+- **Team environments**: Multiple engineers contributing infrastructure code
+- **Production deployments**: Require validation before applying changes
+- **Compliance requirements**: Audit trails and approval workflows
+- **Automation**: Trigger infrastructure updates from Git workflows
+- **Zero-downtime deployments**: Coordinate changes across environments
+
+## When NOT To Use
+
+- **Single developer, experimentation**: Local execution sufficient
+- **Very simple infrastructure**: Manual changes may be faster
+- **Emergency hotfixes**: Direct apply may be necessary (document it!)
+
+## Core Concepts
+
+### Pipeline Stages
+
+```
+┌─────────┐   ┌──────────┐   ┌─────────┐   ┌────────┐
+│  Lint   │ → │ Validate │ → │  Plan   │ → │ Apply  │
+└─────────┘   └──────────┘   └─────────┘   └────────┘
+     │             │             │             │
+   Format       Syntax        Preview       Deploy
+   Style        Logic         Diff          Confirm
+```
+
+### Pipeline Types
+
+| Type | Approval | Environment | Use Case |
+|------|----------|-------------|----------|
+| PR/Feature | Required | Dev/Shared | Validate changes |
+| Merge | Optional | Staging | Deploy to staging |
+| Release | Required | Production | Production deploy |
+
+## Real Production Example
+
+### GitHub Actions - Complete Pipeline
+
+```yaml
+# .github/workflows/terraform.yml
+name: Terraform Infrastructure CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infrastructure/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  TERRAFORM_VERSION: 1.5.0
+  TFLINT_VERSION: 0.47.0
+  TFSEC_VERSION: v1.28.0
+  GOOGLE_CREDENTIALS: ${{ secrets.GCP_SA_KEY }}
+
+jobs:
+  # ==========================================================================
+  # Lint and Validate
+  # ==========================================================================
+  lint:
+    name: Lint Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      format_ok: ${{ steps.fmt.outcome }}
+      validate_ok: ${{ steps.validate.outcome }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)" >> $GITHUB_OUTPUT
+          else
+            echo "files=$(git diff --name-only HEAD~1...HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Terraform
+        if: steps.changed.outputs.files != ''
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Format Check
+        id: fmt
+        if: steps.changed.outputs.files != ''
+        run: |
+          cd infrastructure
+          terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: TFLint Check
+        if: steps.changed.outputs.files != ''
+        uses: terraform-linters/setup-tflint@v3
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+          tflint_rulesets: google
+      - name: Run TFLint
+        if: steps.changed.outputs.files != ''
+        run: |
+          cd infrastructure
+          tflint --config .tflint.hcl --format compact
+
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+    needs: lint
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure GCP Credentials
+        run: |
+          echo '${{ env.GOOGLE_CREDENTIALS }}' | base64 -d > /tmp/credentials.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+          gcloud auth activate-service-account --key-file=/tmp/credentials.json
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ needs.vars.TERRAFORM_PREFIX }}"
+
+      - name: Terraform Validate
+        working-directory: infrastructure
+        run: terraform validate
+
+  # ==========================================================================
+  # Plan for Pull Requests
+  # ==========================================================================
+  plan:
+    name: Plan Changes (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    
+    if: github.event_name == 'pull_request' || github.event.inputs.environment == matrix.environment
+    
+    environment:
+      name: ${{ matrix.environment }}
+      url: ${{ steps.plan.outputs.plan_url }}
+    
+    outputs:
+      plan_json: ${{ steps.plan.outputs.plan_json }}
+      plan_has_changes: ${{ steps.plan.outputs.plan_has_changes }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure GCP Credentials
+        run: |
+          echo '${{ env.GOOGLE_CREDENTIALS }}' | base64 -d > /tmp/credentials.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${{ vars.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ matrix.environment }}"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: infrastructure
+        run: |
+          echo "plan_json=$(terraform plan -var-file="${{ matrix.environment }}.tfvars" -out=tfplan -no-color -json | jq -c .)" >> $GITHUB_OUTPUT
+          
+          terraform plan \
+            -var-file="${{ matrix.environment }}.tfvars" \
+            -out=tfplan \
+            -no-color
+
+      - name: Update Pull Request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const planOutput = `${{ steps.plan.outputs.plan_json }}`;
+            const plan = JSON.parse(planOutput);
+            
+            const changes = plan.resource_changes?.length || 0;
+            const add = plan.resource_changes?.filter(r => r.change_actions?.includes('create')).length || 0;
+            const update = plan.resource_changes?.filter(r => r.change_actions?.includes('update')).length || 0;
+            const del = plan.resource_changes?.filter(r => r.change_actions?.includes('delete')).length || 0;
+            
+            const comment = `
+            ## Terraform Plan Summary
+            
+            **Environment:** ${{ matrix.environment }}
+            
+            **Changes:** ${changes} resource(s)
+            - Create: ${add}
+            - Update: ${update}  
+            - Delete: ${del}
+            
+            ${changes === 0 ? '_No changes required._' : ''}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            })
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ matrix.environment }}
+          path: infrastructure/tfplan
+          retention-days: 7
+
+  # ==========================================================================
+  # Security Scanning
+  # ==========================================================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: TFSec Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: true
+          sarif_file: results/tfsec.sarif
+          working_directory: infrastructure
+
+      - name: Checkov Compliance Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infrastructure
+          framework: terraform
+          output_format: sarif
+          output: results/checkov.sarif
+
+      - name: Upload Security Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-results
+          path: results/
+          retention-days: 30
+
+  # ==========================================================================
+  # Apply to Development
+  # ==========================================================================
+  apply-dev:
+    name: Apply to Dev
+    runs-on: ubuntu-latest
+    needs: [plan, security]
+    
+    environment:
+      name: dev
+    
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure GCP Credentials
+        run: |
+          echo '${{ env.GOOGLE_CREDENTIALS }}' | base64 -d > /tmp/credentials.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${{ vars.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=dev"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan-dev
+          path: infrastructure
+
+      - name: Terraform Apply
+        working-directory: infrastructure
+        run: terraform apply -input=false -auto-approve tfplan
+
+  # ==========================================================================
+  # Apply to Production (Manual Approval Required)
+  # ==========================================================================
+  apply-prod:
+    name: Apply to Production
+    runs-on: ubuntu-latest
+    needs: [plan, security]
+    
+    environment:
+      name: prod
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure GCP Credentials
+        run: |
+          echo '${{ env.GOOGLE_CREDENTIALS }}' | base64 -d > /tmp/credentials.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+
+      - name: Terraform Init
+        working-directory: infrastructure
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${{ vars.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=prod"
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan-prod
+          path: infrastructure
+
+      - name: Terraform Apply
+        working-directory: infrastructure
+        run: terraform apply -input=false -auto-approve tfplan
+
+      - name: Notify Success
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "✅ Terraform apply to production succeeded"}'
+
+      - name: Notify Failure
+        if: failure()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "❌ Terraform apply to production FAILED"}'
+```
+
+### GCP Cloud Build Pipeline
+
+```yaml
+# cloudbuild.yaml
+steps:
+  # ==========================================================================
+  # Setup
+  # ==========================================================================
+  - name: 'hashicorp/terraform:1.5.0'
+    id: 'setup'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        terraform version
+        gcloud secrets versions access latest --secret="terraform-state-key" > /tmp/state.key
+        gcloud secrets versions access latest --secret="gcp-service-account" > /tmp/credentials.json
+        export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+
+  # ==========================================================================
+  # Lint and Validate
+  # ==========================================================================
+  - name: 'hashicorp/terraform:1.5.0'
+    id: 'fmt'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        terraform fmt -check -recursive
+
+  - name: 'hashicorp/terraform:1.5.0'
+    id: 'init'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+        terraform init -input=false \
+          -backend-config="bucket=${_STATE_BUCKET}" \
+          -backend-config="prefix=${_ENVIRONMENT}" \
+          -backend-config="encryption_key=$(cat /tmp/state.key)"
+
+  - name: 'hashicorp/terraform:1.5.0'
+    id: 'validate'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        terraform validate
+
+  # ==========================================================================
+  # Security Scans
+  # ==========================================================================
+  - name: 'aquasec/tfsec:1.28.0'
+    id: 'tfsec'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        tfsec ./infrastructure --format table --soft-fail || true
+
+  - name: 'bridgecrewio/checkov:2.3'
+    id: 'checkov'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        checkov -d ./infrastructure --framework terraform --soft-fail || true
+
+  # ==========================================================================
+  # Plan
+  # ==========================================================================
+  - name: 'hashicorp/terraform:1.5.0'
+    id: 'plan'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+        terraform plan -input=false \
+          -var-file="${_ENVIRONMENT}.tfvars" \
+          -out=tfplan \
+          -no-color
+
+  # ==========================================================================
+  # Apply (only on main branch)
+  # ==========================================================================
+  - name: 'hashicorp/terraform:1.5.0'
+    id: 'apply'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        if [ "${BRANCH_NAME}" != "main" ]; then
+          echo "Skipping apply for non-main branch"
+          exit 0
+        fi
+        export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+        terraform apply -input=false -auto-approve tfplan
+
+  # ==========================================================================
+  # Store Plan Artifact
+  # ==========================================================================
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'archive-plan'
+    args:
+      - 'cp'
+      - 'infrastructure/tfplan'
+      - 'gs://${_STATE_BUCKET}/plans/${_ENVIRONMENT}/${BUILD_ID}.tfplan'
+
+substitutions:
+  _STATE_BUCKET: 'my-project-terraform-state'
+  _ENVIRONMENT: 'dev'
+  BRANCH_NAME: 'main'
+
+timeout: '1200s'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+tags:
+  - terraform
+  - infrastructure
+```
+
+### Terraform Cloud / HCP Terraform
+
+```yaml
+# .github/workflows/terraform-cloud.yml
+name: Terraform Cloud Workflow
+
+on:
+  push:
+    branches: [main]
+
+env:
+  TERRAFORM_TOKEN: ${{ secrets.TF_API_TOKEN }}
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:1.5.0
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get changed files
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "files=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)" 
+          fi > files.txt
+          
+          # Check if infrastructure files changed
+          if grep -q "infrastructure/" files.txt; then
+            echo "INFRA_CHANGED=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure Credentials
+        run: |
+          echo "${{ secrets.GCP_SA_KEY }}" | base64 -d > /tmp/credentials.json
+
+      - name: Create Run
+        if: env.INFRA_CHANGED == 'true'
+        id: run
+        uses: hashicorp/terraform-cloud-action@v1
+        with:
+          workspaces:
+            name: production-infra
+          method: api
+          command: plan
+          parallel: 3
+
+      - name: Apply (Merge Only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: hashicorp/terraform-cloud-action@v1
+        with:
+          workspaces:
+            name: production-infra
+          method: api
+          command: apply
+          run: ${{ steps.run.outputs.run_id }}
+```
+
+## HCL Examples
+
+### Terraform Cloud Workspace Configuration
+
+```hcl
+# backend.tf (Terraform Cloud)
+terraform {
+  cloud {
+    organization = "my-org"
+    
+    workspaces {
+      name = "production-infra"
+      tags = ["production", "gcp"]
+    }
+  }
+}
+
+# Or using CLI-driven workflow
+terraform {
+  backend "remote" {
+    organization = "my-org"
+    
+    workspaces {
+      name = "production-infra"
+    }
+  }
+}
+```
+
+### Variable Files Per Environment
+
+```hcl
+# environments/prod/terraform.tfvars
+project_id     = "my-prod-project"
+environment    = "prod"
+region         = "us-east1"
+vpc_cidr       = "10.1.0.0/16"
+machine_type   = "e2-medium"
+mig_target_size = 5
+db_tier        = "db-custom-4-16384"
+autoscaler_enabled = true
+
+# Enable all production features
+enable_monitoring    = true
+enable_logging       = true
+enable_deletion_protection = true
+```
+
+### Pipeline Configuration
+
+```hcl
+# .gitlab-ci.yml (GitLab CI)
+stages:
+  - validate
+  - scan
+  - plan
+  - apply
+
+variables:
+  TERRAFORM_VERSION: "1.5.0"
+  TF_STATE_BUCKET: "my-terraform-state"
+  GCP_CREDENTIALS: ${GCP_SERVICE_ACCOUNT_KEY}
+
+before_script:
+  - |
+    export GOOGLE_APPLICATION_CREDENTIALS=/tmp/credentials.json
+    echo "$GCP_CREDENTIALS" | base64 -d > $GOOGLE_APPLICATION_CREDENTIALS
+    terraform version
+
+terraform:format:
+  stage: validate
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  script:
+    - terraform fmt -check -recursive
+  allow_failure: false
+
+terraform:validate:
+  stage: validate
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  script:
+    - terraform init -input=false -backend=false
+    - terraform validate
+  allow_failure: false
+
+terraform:scan:
+  stage: scan
+  image: 
+    name: aquasec/tfsec:${TERRAFORM_VERSION}
+    entrypoint: [""]
+  script:
+    - tfsec ./infrastructure --format table --soft-fail
+  allow_failure: true  # Don't block on warnings
+
+checkov:scan:
+  stage: scan
+  image: 
+    name: bridgecrewio/checkov:latest
+    entrypoint: [""]
+  script:
+    - checkov -d ./infrastructure --framework terraform --soft-fail
+  allow_failure: true
+
+terraform:plan:
+  stage: plan
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  script:
+    - terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="prefix=${CI_COMMIT_REF_NAME}"
+    - terraform plan -var-file="${CI_COMMIT_REF_NAME}.tfvars" -out=tfplan -no-color
+  artifacts:
+    paths:
+      - tfplan
+    expire_in: 7 days
+  dependencies:
+    - terraform:validate
+    - terraform:scan
+  allow_failure: false
+
+terraform:apply:
+  stage: apply
+  image: hashicorp/terraform:${TERRAFORM_VERSION}
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" != "main" ]; then
+        echo "Skipping apply for non-main branch"
+        exit 0
+      fi
+      terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="prefix=prod"
+      terraform apply -input=false -auto-approve tfplan
+  dependencies:
+    - terraform:plan
+  allow_failure: false
+  when: manual
+```
+
+## CLI Examples
+
+### GitHub Actions Commands
+
+```bash
+# Terraform setup
+hashicorp/setup-terraform@v3
+with:
+  terraform_version: 1.5.0
+  cli_config_credentials_hostname: app.terraform.io
+  cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+# Terraform init
+terraform init \
+  -input=false \
+  -backend-config="bucket=${TF_STATE_BUCKET}" \
+  -backend-config="prefix=${ENVIRONMENT}" \
+  -backend-config="encryption_key=${ENCRYPTION_KEY}"
+
+# Terraform plan
+terraform plan \
+  -var-file="${ENVIRONMENT}.tfvars" \
+  -out=tfplan \
+  -no-color
+
+# Terraform apply
+terraform apply \
+  -input=false \
+  -auto-approve \
+  tfplan
+```
+
+### Cloud Build Commands
+
+```bash
+# Terraform init
+terraform init \
+  -input=false \
+  -backend-config="bucket=${_STATE_BUCKET}" \
+  -backend-config="prefix=${_ENVIRONMENT}"
+
+# Terraform plan
+terraform plan \
+  -var-file="${_ENVIRONMENT}.tfvars" \
+  -out=tfplan
+
+# Terraform apply
+terraform apply -auto-approve tfplan
+```
+
+### Azure DevOps Commands
+
+```bash
+# Azure Pipeline
+- task: TerraformInstaller@1
+  inputs:
+    terraformVersion: '1.5.0'
+
+- task: TerraformTaskV4@0
+  displayName: 'Terraform Init'
+  inputs:
+    command: 'init'
+    backendServiceArm: 'azure-connection'
+    backendAzureRmResourceGroupName: 'terraform-state'
+    backendAzureRmStorageAccountName: 'tfstateacct'
+    backendAzureRmContainerName: 'tfstate'
+    backendAzureRmKey: 'prod/terraform.tfstate'
+
+- task: TerraformTaskV4@0
+  displayName: 'Terraform Plan'
+  inputs:
+    command: 'plan'
+    environmentServiceNameAzureRM: 'azure-connection'
+    backendAzureRmResourceGroupName: 'terraform-state'
+
+- task: TerraformTaskV4@0
+  displayName: 'Terraform Apply'
+  inputs:
+    command: 'apply'
+    environmentServiceNameAzureRM: 'azure-connection'
+```
+
+## Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `terraform init` | Initialize working directory |
+| `terraform validate` | Validate configuration |
+| `terraform plan -out=tfplan` | Generate execution plan |
+| `terraform apply tfplan` | Apply saved plan |
+| `terraform apply -auto-approve` | Apply without confirmation |
+| `terraform destroy -auto-approve` | Destroy without confirmation |
+| `tflint` | Run linter |
+| `tfsec .` | Run security scan |
+| `checkov -d .` | Run compliance scan |
+
+## Best Practices
+
+### 1. Separate State Per Environment
+
+```hcl
+# environments/prod/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = "prod"  # Separate prefix
+  }
+}
+
+# environments/dev/versions.tf
+terraform {
+  backend "gcs" {
+    bucket = "my-terraform-state"
+    prefix = "dev"  # Separate prefix
+  }
+}
+```
+
+### 2. Require Manual Approval for Production
+
+```yaml
+# GitHub Environment Protection
+environment:
+  name: production
+  url: https://github.com/...
+
+# Or in GitLab
+production:
+  stage: apply
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+```
+
+### 3. Always Generate and Store Plan Files
+
+```bash
+# Store plan for audit
+terraform plan -out=tfplan
+gsutil cp tfplan gs://${TF_STATE_BUCKET}/plans/${ENV}/${BUILD_ID}.tfplan
+
+# Download and review before apply
+gsutil cp gs://${TF_STATE_BUCKET}/plans/${ENV}/${BUILD_ID}.tfplan tfplan
+terraform show tfplan
+```
+
+### 4. Use Short-Lived Credentials
+
+```bash
+# Workload Identity (GCP)
+gcloud iam workload-identity-pools create-cred-config \
+  ${WORKLOAD_IDENTITY_POOL}/${PROVIDER} \
+  --service-account="${SA_EMAIL}" \
+  --output-file=/tmp/credentials.json
+
+# GitHub OIDC
+echo "${{ secrets.GCP_SA_KEY }}" | base64 -d > /tmp/credentials.json
+```
+
+### 5. Lock Provider Versions
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+```
+
+## Monitoring / State Management
+
+### State Lock Monitoring
+
+```bash
+# Check if state is locked
+gsutil cat gs://${TF_STATE_BUCKET}/${PREFIX}/.terraform.lock.info
+
+# Monitor for stale locks
+gsutil ls gs://${TF_STATE_BUCKET}/${PREFIX}/.terraform.lock.info
+state_age=$(date -d "$(gsutil stat gs://${TF_STATE_BUCKET}/${PREFIX}/.terraform.lock.info | grep Creation | awk '{print $3}')" +%s)
+now=$(date +%s)
+age=$((now - state_age))
+if [ $age -gt 3600 ]; then
+  echo "WARNING: State lock is older than 1 hour"
+fi
+```
+
+### Pipeline Metrics
+
+```bash
+# Track plan duration
+start=$(date +%s)
+terraform plan ...
+end=$(date +%s)
+duration=$((end - start))
+echo "Plan duration: ${duration}s"
+
+# Track apply changes
+changes=$(terraform show -json tfplan | jq '.resource_changes | length')
+echo "Resources to change: ${changes}"
+```
+
+### Notification on Failure
+
+```bash
+# Slack notification
+curl -X POST $SLACK_WEBHOOK \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Terraform apply failed for '${ENVIRONMENT}'",
+    "blocks": [
+      {
+        "type": "section",
+        "text": {
+          "type": "mrkdwn",
+          "text": "❌ *Terraform Apply Failed*\n*Environment:* '${ENVIRONMENT}'\n*Pipeline:* '${CI_PIPELINE_URL}'"
+        }
+      }
+    ]
+  }'
+```
+
+## Security
+
+### Use Workload Identity (GCP)
+
+```yaml
+# GitHub OIDC
+- name: Authenticate to Google Cloud
+  id: 'auth'
+  uses: 'google-github-actions/auth@v2'
+  with:
+    workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
+    service_account: '${{ vars.TERRAFORM_SA }}'
+```
+
+### Secrets Management
+
+```bash
+# Store secrets in Secret Manager
+gcloud secrets create terraform-state-key --replication-policy="automatic"
+
+# Grant access to CI service account
+gcloud secrets add-iam-policy-binding terraform-state-key \
+  --member="serviceAccount:ci@project.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Retrieve in pipeline
+gcloud secrets versions access latest --secret="terraform-state-key" > /tmp/key.json
+gcloud secrets versions access latest --secret="gcp-service-account" > /tmp/credentials.json
+```
+
+### State Encryption
+
+```hcl
+# Backend with encryption
+terraform {
+  backend "gcs" {
+    bucket         = "my-terraform-state"
+    prefix         = "prod"
+    encryption_key = "projects/project/locations/global/keyRings/ring/cryptoKeys/key"
+  }
+}
+```
+
+### Principle of Least Privilege
+
+```hcl
+# CI service account IAM
+resource "google_service_account" "ci_sa" {
+  account_id   = "terraform-ci"
+  display_name = "Terraform CI Service Account"
+}
+
+# Development permissions
+resource "google_project_iam_member" "ci_dev" {
+  project = var.project_id
+  role    = "roles/editor"  # Or more restrictive
+  member  = "serviceAccount:${google_service_account.ci_sa.email}"
+}
+
+# Production permissions (separate SA recommended)
+resource "google_service_account" "ci_prod_sa" {
+  account_id   = "terraform-ci-prod"
+  display_name = "Terraform CI Production"
+}
+```
+
+## Cost Optimization
+
+### Reduce Pipeline Costs
+
+```yaml
+# Use smaller runners for validation
+lint:
+  runs-on: ubuntu-latest  # Smallest
+  
+validate:
+  runs-on: ubuntu-latest
+
+plan:
+  runs-on: ubuntu-latest
+
+# Skip unchanged infrastructure
+- name: Get changed files
+  id: changed
+  run: |
+    files=$(git diff --name-only ${{ github.base_ref }}...HEAD | grep -E '\.(tf|tfvars)$' || true)
+    if [ -z "$files" ]; then
+      echo "No Terraform changes"
+    fi
+```
+
+### State File Storage
+
+```hcl
+# Lifecycle for state bucket
+resource "google_storage_bucket" "terraform_state" {
+  name = "my-terraform-state"
+  
+  lifecycle_rule {
+    condition { age = 365 }  # Move to Nearline after 1 year
+    action { type = "SetStorageClass"; storage_class = "NEARLINE" }
+  }
+  
+  lifecycle_rule {
+    condition { age = 730 }  # Delete after 2 years
+    action { type = "Delete" }
+  }
+}
+```
+
+## Troubleshooting
+
+### Common Issues
+
+#### State Lock Timeout
+
+```bash
+# Error: Error acquiring the state lock
+# Solution: Wait or force unlock
+terraform apply  # Wait for lock to be released
+
+# Check lock info
+gsutil cat gs://bucket/prefix/.terraform.lock.info
+
+# Force unlock (USE WITH CAUTION)
+terraform force-unlock <lock-id>
+```
+
+#### Pipeline Fails on Init
+
+```bash
+# Error: Backend reconfiguration required
+# Solution: Reinitialize
+terraform init -reconfigure
+
+# Error: Provider version conflict
+# Solution: Update state
+terraform init -upgrade
+```
+
+#### Plan Differs on Apply
+
+```bash
+# Error: Plan and apply don't match
+# Solution: Re-plan before apply
+terraform plan -out=tfplan
+terraform show tfplan
+
+# Review changes carefully
+terraform apply tfplan
+```
+
+### Debug Pipeline Failures
+
+```bash
+# Enable debug mode
+export TF_LOG=DEBUG
+export TF_LOG_PATH=/tmp/terraform.log
+
+# Run with verbose output
+terraform plan -var-file=prod.tfvars
+
+# Check state
+terraform state list
+terraform show
+```
+
+## Interview Questions
+
+### Q1: How do you structure a Terraform CI/CD pipeline?
+**A:** Stages: Lint (fmt, tflint) → Validate (terraform validate) → Scan (tfsec, checkov) → Plan (terraform plan) → Approval → Apply. Use separate state per environment and require approval for production.
+
+### Q2: How do you secure Terraform credentials in CI/CD?
+**A:** Use Workload Identity for GCP (no long-lived keys), store secrets in Secret Manager, encrypt state backend with CMEK, use short-lived tokens via OIDC.
+
+### Q3: What is the difference between GitOps and CI/CD for Terraform?
+**A:** GitOps uses Git as source of truth; changes are auto-applied on merge. CI/CD requires explicit pipeline execution. Terraform Cloud/HCP Terraform bridges both approaches.
+
+### Q4: How do you handle Terraform state in CI/CD?
+**A:** Use remote backend (GCS, S3) with state locking. Separate state per environment. Store plan files as artifacts. Enable versioning for state recovery.
+
+### Q5: How do you implement approval workflows?
+**A:** Use GitHub Environments, GitLab approval rules, or Terraform Cloud policy sets. Require manual approval for production deployments.
+
+### Q6: What security scans should run in the pipeline?
+**A:** tflint (best practices), tfsec (security), checkov (compliance). Run before plan, block on critical findings.
+
+### Q7: How do you handle drift in CI/CD?
+**A:** Detect via terraform plan showing changes. Use `terraform apply -refresh-only` to update state, or investigate and reconcile external changes.
+
+### Q8: How do you implement rollback in Terraform?
+**A:** Use state versioning (GCS/S3) to restore previous state. For application code, revert Git commit. For infrastructure, use `terraform state push` with previous version.
+
+### Q9: What is Terraform Cloud and when to use it?
+**A:** Managed Terraform service with state management, remote execution, policy as code (Sentinel/OPA), and VCS integration. Use for teams needing collaborative workflows without self-hosting.
+
+### Q10: How do you test Terraform changes safely?
+**A:** Plan in CI/CD and review output before apply. Use `terraform plan -destroy` for deletion review. Run integration tests with Terratest in isolated environment.
+
+## Cheat Sheet
+
+### Pipeline Stage Commands
+
+```bash
+# Stage 1: Format and Lint
+terraform fmt -check -recursive
+tflint --config .tflint.hcl
+
+# Stage 2: Validate
+terraform init -backend=false
+terraform validate
+
+# Stage 3: Security Scan
+tfsec . --soft-fail
+checkov -d . --soft-fail
+
+# Stage 4: Plan
+terraform init \
+  -backend-config="bucket=state-bucket" \
+  -backend-config="prefix=env"
+terraform plan -var-file="env.tfvars" -out=tfplan
+
+# Stage 5: Apply
+terraform apply -auto-approve tfplan
+```
+
+### GitHub Actions Environment Variables
+
+```yaml
+env:
+  TERRAFORM_VERSION: 1.5.0
+  TF_STATE_BUCKET: my-terraform-state
+  GOOGLE_CREDENTIALS: ${{ secrets.GCP_SA_KEY }}
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+```
+
+### Cloud Build Substitutions
+
+```yaml
+substitutions:
+  _STATE_BUCKET: my-terraform-state
+  _ENVIRONMENT: dev
+  _REGION: us-central1
+```
+
+### Environment Protection Rules
+
+```yaml
+# GitHub
+environment:
+  name: production
+  url: https://github.com/...
+
+# Require reviewers
+protection_rules:
+  - required_reviewers: [2]
+
+# GitLab
+production:
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+```
+
+## Related Topics
+
+- [Testing](./testing.mdx) - Testing strategies
+- [GCP Automation](./gcp-automation.mdx) - GCP automation patterns
+- [Backend](./backend.mdx) - State backend configuration
+- [Workspaces](./workspaces.mdx) - Environment management
+- [Security](./secrets.mdx) - Secrets management

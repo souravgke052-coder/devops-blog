@@ -1,0 +1,401 @@
+# Proxy (Forward Proxy)
+
+## Overview
+
+A forward proxy (often just called "proxy") acts on behalf of clients, forwarding requests to external servers. Unlike a reverse proxy (which represents servers), a forward proxy represents the client. Users or applications configure their client to use the proxy, and the proxy makes requests on their behalf.
+
+Forward proxies are used for caching, filtering, authentication, and privacy. Squid is the most common open-source proxy server. Corporate environments use proxies for web filtering and security policies. Understanding forward proxies helps when debugging authentication issues, caching behavior, or traffic inspection.
+
+## When To Use
+
+- **Corporate web filtering**: Block malicious/inappropriate sites, log browsing
+- **Caching**: Cache frequently accessed content to reduce bandwidth
+- **Privacy**: Hide client IP from external servers
+- **Authentication**: Authenticate once at proxy, transparent access
+- **Bandwidth savings**: Cache common content
+
+## When NOT to Use
+
+- **Performance-critical paths**: Proxy adds latency
+- **Internal APIs**: Not needed for service-to-service
+- **When client is aware**: Can cause issues with cert pinning
+
+## Core Concepts
+
+### Forward vs Reverse Proxy
+
+```
+Forward Proxy:
+Client → Proxy → Internet → Server
+Client configures proxy, proxy acts on client's behalf
+Server sees request from proxy IP, not client IP
+
+Reverse Proxy:
+Client → Proxy (Reverse) → Backend Servers
+Client doesn't know about proxy, proxy represents servers
+Server never sees client directly
+```
+
+### Proxy Protocols
+
+**HTTP Proxy**: Standard web proxy. Client sends full HTTP request to proxy.
+
+**HTTPS Proxy (CONNECT tunnel)**: Client sends CONNECT request, proxy establishes TCP tunnel to destination. Proxy cannot inspect encrypted traffic (without MITM).
+
+**SOCKS Proxy**: Protocol-agnostic. Works with any TCP/UDP traffic.
+
+```bash
+# HTTP proxy request
+GET http://example.com/ HTTP/1.1
+Host: example.com
+Proxy-Authorization: Basic <credentials>
+
+# Proxy with full URL (HTTP/1.1)
+# With HTTP/1.0, proxy may require absolute URLs
+
+# CONNECT tunnel (for HTTPS)
+CONNECT example.com:443 HTTP/1.1
+Proxy-Authorization: Basic <credentials>
+
+# After 200 Connection Established, proxy streams bytes
+# Proxy cannot see inside the tunnel
+```
+
+### Squid Configuration
+
+```bash
+# /etc/squid/squid.conf
+
+# Basic configuration
+http_port 3128
+cache_dir ufs /var/spool/squid 1000 16 256
+
+# Access control
+acl localnet src 10.0.0.0/8
+acl localnet src 192.168.0.0/16
+acl SSL_ports port 443
+acl Safe_ports port 80
+acl Safe_ports port 443
+
+# Deny requests to unsafe ports
+http_access deny !Safe_ports
+
+# Allow localnet, deny all else
+http_access allow localnet
+http_access deny all
+
+# Authentication (basic)
+auth_param basic program /usr/lib/squid3/basic_ncsa_auth /etc/squid/passwd
+auth_param basic realm "Corporate Proxy"
+acl authenticated proxy_auth REQUIRED
+http_access allow authenticated
+
+# Caching
+cache_mem 256 MB
+maximum_object_size 4096 KB
+refresh_pattern . 0 20% 4320
+
+# SSL bumping (MITM for inspection - controversial)
+# ssl_bump bump all
+# Requires generating CA and installing on clients
+```
+
+### Transparent Proxying
+
+Transparent proxies intercept traffic without client configuration. Achieved via iptables redirect.
+
+```bash
+# Redirect HTTP traffic to proxy
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 80 \
+  -j REDIRECT --to-port 3128
+
+# For HTTPS, need MITM (ssl_bump in Squid)
+# Or just redirect CONNECT without inspection
+
+# Configure Squid for transparent mode
+http_port 3128 transparent
+```
+
+## Real Production Example
+
+### Corporate Proxy with Authentication
+
+```bash
+# /etc/squid/squid.conf
+http_port 3128
+auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords
+auth_param basic children 10
+auth_param basic realm "Corporate Web Proxy"
+auth_param basic credentialsttl 4 hours
+
+# Define networks
+acl corporate src 10.0.0.0/8
+acl localnet src 192.168.0.0/16
+
+# Define destinations that bypass auth
+acl whitelist dstdomain .example.com
+acl internal_network dst 10.0.0.0/8
+acl internal_network dst 192.168.0.0/16
+
+# Rules
+http_access allow whitelist
+http_access allow authenticated
+http_access deny all
+```
+
+### SOCKS Proxy with SSH
+
+```bash
+# Create SOCKS proxy via SSH
+ssh -D 1080 user@example.com
+# -D 1080: local port 1080 becomes SOCKS proxy
+# All traffic through SSH tunnel to remote server
+
+# Configure applications to use SOCKS proxy
+# curl with SOCKS proxy:
+curl --socks5 localhost:1080 http://example.com/
+
+# Firefox with SOCKS proxy:
+# Settings → Network → Manual proxy → SOCKS Host: localhost, Port: 1080
+
+# SSHuttle (VPN over SSH)
+sshuttle -r user@example.com 0.0.0.0/0
+# Routes all traffic through SSH tunnel
+```
+
+### Proxy Auto-Configuration (PAC)
+
+```bash
+// /var/www/html/proxy.pac
+function FindProxyForURL(url, host) {
+    // Direct connection for internal hosts
+    if (isInNet(host, "10.0.0.0", "255.0.0.0")) {
+        return "DIRECT";
+    }
+    if (isInNet(host, "192.168.0.0", "255.255.0.0")) {
+        return "DIRECT";
+    }
+    
+    // Bypass for localhost
+    if (shExpMatch(host, "localhost")) {
+        return "DIRECT";
+    }
+    
+    // Corporate proxy for everything else
+    if (isInNet(host, "203.0.113.0", "255.255.255.0")) {
+        return "DIRECT";
+    }
+    
+    // Use proxy for all other traffic
+    return "PROXY proxy.corp.example.com:3128; DIRECT";
+}
+```
+
+## CLI Examples
+
+```bash
+# Test proxy with curl
+curl -x http://proxy.example.com:3128 http://example.com/
+
+# With authentication
+curl -x http://user:password@proxy.example.com:3128 http://example.com/
+
+# Using SOCKS proxy
+curl --socks5 localhost:1080 http://example.com/
+
+# Test with authentication header directly
+curl -x http://proxy.example.com:3128 \
+  -H "Proxy-Authorization: Basic $(echo -n user:pass | base64)" \
+  http://example.com/
+
+# Check proxy headers
+curl -x http://proxy.example.com:3128 -v http://example.com/ 2>&1 | grep -i proxy
+
+# Squid management
+squid -k parse  # Check config
+squid -k reconfigure  # Reload config
+tail -f /var/log/squid/access.log
+tail -f /var/log/squid/cache.log
+```
+
+## Common Commands
+
+| Command | Purpose | Example |
+|---------|---------|---------|
+| `curl -x` | HTTP via proxy | `curl -x http://proxy:3128 url` |
+| `wget` | Respect proxy env | `wget url` (uses $http_proxy) |
+| `ssh -D` | SOCKS proxy | `ssh -D 1080 user@host` |
+| `squid -k` | Squid control | `squid -k reconfigure` |
+| `iptables -j REDIRECT` | Transparent redirect | `iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3128` |
+
+## Monitoring
+
+### Proxy Metrics
+
+```bash
+# Squid log analysis
+tail -f /var/log/squid/access.log
+
+# Log format: timestamp elapsed client_address code size method URL rfc931 peer_status/peer_host_type
+# Example:
+# 1623456789.123 45 10.0.0.5 TCP_MISS/200 1234 GET http://example.com/ - DIRECT/original
+
+# Squid statistics
+squidclient mgr:info
+squidclient mgr:count
+squidclient mgr:utilization
+
+# Cache hit ratio
+squidclient mgr:info | grep "Request Hit Ratios"
+# hit ratio = TCP_HIT / total requests
+
+# Top sites
+awk '{print $7}' /var/log/squid/access.log | cut -d'/' -f3 | sort | uniq -c | sort -rn | head
+```
+
+### Prometheus Squid Exporter
+
+```promql
+# If using squid_exporter:
+# squid_client_http_requests_total{hier="DIRECT"}
+# squid_client_http_requests_total{hier="MISS"}
+# squid_client_http_requests_total{hier="HIT"}
+
+# Cache hit ratio
+sum(rate(squid_client_http_requests_total{hier="HIT"}[5m])) /
+sum(rate(squid_client_http_requests_total[5m]))
+```
+
+## Security
+
+### Proxy Security Considerations
+
+```bash
+# Never MITM HTTPS without explicit consent
+# Bumping HTTPS breaks certificate validation
+
+# Restrict proxy to internal networks only
+acl internal_networks src 10.0.0.0/8
+http_access allow internal_networks
+http_access deny all
+
+# Log all requests for audit
+logformat combined %ts.%03tu %6tr %>a %Ss/%03Hs %<st %rm %ru %{X-Forwarded-For}>h %mt
+access_log /var/log/squid/access.log combined
+
+# Rate limiting
+# /etc/squid/squid.conf
+delay_pools 1
+delay_class 1 2
+delay_parameters 1 -1/-1 1000000/1000000
+delay_access 1 allow localnet
+delay_access 1 deny all
+```
+
+### Filtering with Squid
+
+```bash
+# Block specific domains
+acl blocked dstdomain "/etc/squid/blocked.txt"
+http_access deny blocked
+
+# Block file extensions
+acl bad_files url_regex -i \.(exe|zip|pdf|vbs)$
+http_access deny bad_files
+
+# Block keywords
+acl bad_keywords url_regex -i "blockme"
+http_access deny bad_keywords
+
+# Time-based restrictions
+acl working_hours time S TWH 08:00-18:00
+http_access deny bad_sites working_hours
+```
+
+## Troubleshooting
+
+### Common Proxy Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| 407 Proxy Authentication Required | Not authenticated | Add credentials, add to whitelist |
+| Connection refused | Proxy down | Check squid service |
+| 403 Forbidden | ACL denies | Check Squid ACLs |
+| Slow response | Cache miss, slow upstream | Check cache hit ratio |
+| HTTPS not working | CONNECT blocked | Check firewall, auth rules |
+
+```bash
+# Debug Squid
+tail -f /var/log/squid/cache.log
+
+# Check auth
+# Test with nc (netcat):
+echo "GET http://example.com/ HTTP/1.1" | nc proxy.example.com 3128
+
+# Test authentication
+# /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords
+# Enter username:password
+# Should return OK
+
+# Check ACLs
+squidclient mgr:config | grep -E "^acl|^http_access"
+```
+
+## Interview Questions
+
+**Q1: What's the difference between a forward proxy and a reverse proxy?**
+
+A: Forward proxy acts on behalf of clients. Client configures proxy, proxy makes requests to servers. Server sees requests from proxy IP. Used for caching, filtering, privacy. Reverse proxy acts on behalf of servers. Client makes requests to proxy without knowing backend servers exist. Proxy can load balance, cache, SSL terminate. Key insight: who the proxy represents. Forward = clients, Reverse = servers.
+
+**Q2: How does a transparent proxy work, and what are its limitations?**
+
+A: Transparent proxy intercepts traffic at network level (iptables REDIRECT or WCCP) without client configuration. Client thinks it's talking directly to server. For HTTP: proxy can read full request/response. For HTTPS: proxy cannot see content without MITM (SSL bumping). Limitations: (1) Cannot inspect HTTPS without MITM; (2) Some apps don't work (certificate pinning); (3) Requires network-level interception; (4) Privacy/security concerns with MITM. Transparent proxy is useful for caching HTTP in ISPs but problematic for encrypted traffic.
+
+**Q3: What is a SOCKS proxy and when would you use it?**
+
+A: SOCKS (Socket Secure) is a protocol for proxying TCP/UDP connections. Unlike HTTP proxy which only handles HTTP, SOCKS works with any protocol (SSH, FTP, SMTP, etc.). SOCKS5 adds authentication and UDP support. Use cases: (1) Bypassing network restrictions when only specific ports allowed; (2) SSH tunneling for secure access; (3) Applications that don't support HTTP proxy but support SOCKS; (4) UDP applications (DNS, VoIP). Common implementation: `ssh -D 1080` creates local SOCKS proxy tunneling to remote server.
+
+## Cheat Sheet
+
+### Proxy Headers
+
+| Header | Purpose |
+|--------|---------|
+| Proxy-Authorization | Credentials for proxy auth |
+| Proxy-Authenticate | Challenge from proxy |
+| X-Forwarded-For | Original client IP (added by proxy) |
+| X-Forwarded-Proto | Original protocol (HTTP/HTTPS) |
+| Via | Proxy identifier |
+
+### Squid Directives
+
+| Directive | Purpose |
+|-----------|---------|
+| http_port | Listen port |
+| cache_dir | Cache storage location |
+| acl | Access control list |
+| http_access | Allow/deny based on ACL |
+| auth_param | Authentication configuration |
+
+### Proxy Environment Variables
+
+```bash
+# For command-line tools
+export http_proxy=http://proxy.example.com:3128
+export https_proxy=http://proxy.example.com:3128
+export no_proxy=localhost,127.0.0.1,.example.com
+
+# For wget, curl, etc.
+# Some tools respect these directly
+
+# For specific applications
+# Firefox: Network Settings → Manual proxy
+# System: /etc/environment
+```
+
+## Related Topics
+
+- [Reverse Proxy](./reverse-proxy) — NGINX/HAProxy reverse proxy
+- [Load Balancing](./load-balancing) — Load balancing
+- [Firewall](./firewall) — Network filtering
+- [VPC](./vpc) — Cloud networking

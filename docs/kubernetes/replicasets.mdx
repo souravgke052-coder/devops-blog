@@ -1,0 +1,550 @@
+---
+title: "Kubernetes ReplicaSets"
+description: "Complete guide to Kubernetes ReplicaSets - ensuring high availability through pod replication"
+sidebar_position: 4
+---
+
+# Kubernetes ReplicaSets
+
+## Overview
+
+A **ReplicaSet** is a Kubernetes controller that ensures a specified number of pod replicas are running at any given time. It is the foundational mechanism for achieving high availability and self-healing in Kubernetes workloads. While ReplicaSets are rarely used directly (Deployments manage them), understanding them is essential for troubleshooting and advanced configurations.
+
+## When To Use
+
+- **As a building block** for Deployments (rarely used directly)
+- **When you need exact replica count control** without rolling update features
+- **For DaemonSet replacement** in specific scheduling scenarios
+- **In custom controllers** that need declarative replica management
+- **For batch jobs** that need stable replica count
+
+## When NOT To Use
+
+- **For production applications** - use Deployments instead
+- **When you need rolling updates** - ReplicaSets don't support update strategies
+- **When you need rollback capabilities** - use Deployments
+- **When you need automatic label selector updates** - Deployments handle this
+
+## Core Concepts
+
+### ReplicaSet vs Deployment
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Deployment                            │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  Deployment Controller                                   ││
+│  │  - Manages ReplicaSet                                    ││
+│  │  - Handles rolling updates                               ││
+│  │  - Maintains revision history                            ││
+│  │  - Handles rollback                                      ││
+│  └─────────────────────────────────────────────────────────┘│
+│                           │                                  │
+│                           ▼                                  │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │                     ReplicaSet                           ││
+│  │  - Ensures desired replica count                         ││
+│  │  - Pod lifecycle management                              ││
+│  │  - Selector matching                                     ││
+│  └─────────────────────────────────────────────────────────┘│
+│                           │                                  │
+│                           ▼                                  │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │              Pods (managed replicas)                     ││
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐           ││
+│  │  │   Pod 1   │  │   Pod 2   │  │   Pod 3   │           ││
+│  │  └───────────┘  └───────────┘  └───────────┘           ││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Controller Reconciliation Loop
+
+```
+         ┌─────────────────────────────────────────┐
+         │           Reconciliation Loop            │
+         └─────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  1. Get desired state (replicas count from spec)        │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  2. Get current state (pods matching selector)          │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  3. Compare: desired vs current                          │
+│                                                          │
+│  desired = 5, current = 3                                │
+│  → Need to create 2 more pods                            │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  4. Take action: Create/Delete pods to match desired     │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  5. Wait for changes, repeat                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Architecture / How It Works
+
+### Selector Matching
+
+```yaml
+# ReplicaSet selector
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+      tier: frontend
+  
+  # Template pod labels (must include selector labels)
+  template:
+    metadata:
+      labels:
+        app: nginx
+        tier: frontend
+        version: v1
+```
+
+### Pod Management
+
+| Scenario | Action |
+|----------|--------|
+| Pod deleted manually | ReplicaSet creates replacement |
+| Pod crashes | ReplicaSet creates replacement |
+| Node goes down | ReplicaSet waits, then replaces pods |
+| Too many pods | ReplicaSet deletes excess pods |
+| Too few pods | ReplicaSet creates new pods |
+
+## Real Production Example
+
+### ReplicaSet with Complex Configuration
+
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: api-replicaset
+  namespace: production
+  labels:
+    app: api-service
+    version: v2.3.1
+  annotations:
+    description: "API service ReplicaSet for production"
+spec:
+  # Replica count
+  replicas: 5
+  
+  # Selector (immutable after creation)
+  selector:
+    matchLabels:
+      app: api-service
+      version: v2.3.1
+  
+  # Minimum seconds before pod is considered ready
+  minReadySeconds: 10
+  
+  # Pod template
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: v2.3.1
+        team: platform
+    spec:
+      serviceAccountName: api-service-account
+      
+      # Topology spread
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+      
+      # Anti-affinity
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - api-service
+            topologyKey: kubernetes.io/hostname
+      
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.1
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        
+        livenessProbe:
+          httpGet:
+            path: /healthz/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+        
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+```
+
+## YAML Examples
+
+### Basic ReplicaSet
+
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: nginx-replicaset
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+```
+
+### ReplicaSet with Horizontal Pod Autoscaler
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: ReplicaSet
+    name: api-replicaset
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+```
+
+## CLI Examples (kubectl)
+
+### Basic Operations
+
+```bash
+# Create ReplicaSet
+kubectl apply -f replicaset.yaml
+kubectl create -f replicaset.yaml
+
+# List ReplicaSets
+kubectl get replicasets
+kubectl get rs
+kubectl get rs -o wide
+
+# Describe ReplicaSet
+kubectl describe replicaset replicaset-name
+
+# Get ReplicaSet YAML
+kubectl get replicaset replicaset-name -o yaml
+
+# Scale ReplicaSet
+kubectl scale replicaset replicaset-name --replicas=5
+
+# Delete ReplicaSet (deletes managed pods)
+kubectl delete replicaset replicaset-name
+```
+
+### Inspection and Debugging
+
+```bash
+# Check pods managed by ReplicaSet
+kubectl get pods -l app=nginx
+
+# Check ReplicaSet status
+kubectl describe rs replicaset-name | grep -A 10 "Status"
+
+# Check desired vs actual replicas
+kubectl get rs replicaset-name -o jsonpath='{.spec.replicas}{"\n"}{.status.replicas}{"\n"}'
+
+# Check why pod wasn't scheduled
+kubectl describe pod pod-name | grep -A 5 "Events"
+
+# Force recreate pods
+kubectl scale replicaset replicaset-name --replicas=0
+kubectl scale replicaset replicaset-name --replicas=3
+```
+
+## Common Commands
+
+```bash
+# Get all ReplicaSets with pod counts
+kubectl get rs -o wide
+
+# Get ReplicaSets in specific namespace
+kubectl get rs -n production
+
+# Label ReplicaSets
+kubectl label rs replicaset-name environment=production
+
+# Scale multiple ReplicaSets
+kubectl scale rs rs1,rs2,rs3 --replicas=2
+
+# View ReplicaSet events
+kubectl get events --field-selector involvedObject.name=replicaset-name
+
+# Diff against current state
+kubectl diff -f replicaset.yaml
+```
+
+## Monitoring
+
+### Key Metrics
+
+| Metric | Description | Alert Threshold |
+|--------|-------------|-----------------|
+| kube_replicaset_metadata_generation | ReplicaSet generation | Increasing without ready pods |
+| kube_replicaset_status_replicas | Current replica count | != desired |
+| kube_replicaset_status_ready_replicas | Ready replica count | < desired |
+| kube_replicaset_status_observed_generation | Last applied generation | Behind spec generation |
+
+### Prometheus Queries
+
+```promql
+# ReplicaSets not meeting desired count
+kube_replicaset_status_replicas != kube_replicaset_spec_replicas
+
+# ReplicaSets with ready replicas < desired
+kube_replicaset_status_ready_replicas < kube_replicaset_spec_replicas
+
+# All ReplicaSets
+count(kube_replicaset_status_replicas) by (namespace)
+```
+
+## Security
+
+### RBAC for ReplicaSet Management
+
+```yaml
+# Role to manage ReplicaSets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: replicaset-manager
+  namespace: production
+rules:
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: replicaset-manager-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: my-service-account
+  namespace: production
+roleRef:
+  kind: Role
+  name: replicaset-manager
+  apiGroup: rbac.authorization.k8s.io
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Pods not created | Selector mismatch with template | Check labels match |
+| Too many pods | Wrong selector creating unwanted pods | Use unique selector |
+| Pods stuck pending | Node resources exhausted | Scale down or add nodes |
+| Old pods not deleted | ReplicaSet doesn't handle updates | Use Deployment |
+
+### Diagnostic Commands
+
+```bash
+# Check ReplicaSet status
+kubectl get rs replicaset-name
+
+# Check pods created by ReplicaSet
+kubectl get pods -l app=nginx --show-labels
+
+# Check events for ReplicaSet
+kubectl get events --field-selector involvedObject.name=replicaset-name
+
+# Check why pods aren't ready
+kubectl describe rs replicaset-name
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is a ReplicaSet?**
+A: A ReplicaSet is a Kubernetes controller that ensures a specified number of pod replicas are running at all times. It can be used to guarantee high availability and self-healing for workloads.
+
+**Q: What is the difference between ReplicaSet and Deployment?**
+A: A Deployment is a higher-level abstraction that manages ReplicaSets and provides rolling updates, rollback capabilities, and revision history. ReplicaSets are typically created and managed by Deployments, not used directly.
+
+**Q: How does a ReplicaSet ensure desired replica count?**
+A: The ReplicaSet controller continuously monitors the cluster for pods matching its selector. If there are fewer pods than desired, it creates new pods. If there are more, it deletes excess pods.
+
+### Intermediate Questions
+
+**Q: Can you modify a ReplicaSet's selector after creation?**
+A: No, the selector of a ReplicaSet is immutable after creation. This is to prevent confusion about which pods the ReplicaSet is managing.
+
+**Q: What happens if I delete a pod managed by a ReplicaSet?**
+A: The ReplicaSet will immediately create a new pod to replace the deleted one, maintaining the desired replica count.
+
+**Q: How does a ReplicaSet interact with the scheduler?**
+A: The ReplicaSet creates pod specs but doesn't schedule them directly. The scheduler assigns pods to nodes. The ReplicaSet simply ensures the count is maintained.
+
+## Cheat Sheet
+
+### ReplicaSet YAML Template
+
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: my-replicaset
+spec:
+  # Number of replicas
+  replicas: 3
+  
+  # Selector (must match template labels)
+  selector:
+    matchLabels:
+      app: my-app
+  
+  # Minimum time before pod is considered ready
+  minReadySeconds: 10
+  
+  # Pod template
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+```
+
+### Essential Commands
+
+```bash
+# Create
+kubectl apply -f replicaset.yaml
+
+# Scale
+kubectl scale rs my-rs --replicas=5
+
+# Delete (with pods)
+kubectl delete rs my-rs
+
+# Get status
+kubectl get rs
+
+# Describe
+kubectl describe rs my-rs
+```
+
+## Related Topics
+
+- [Deployments](./deployments) - Higher-level abstraction
+- [Pods](./pods) - Pod lifecycle
+- [Services](./services) - Service discovery
+- [Architecture](./architecture) - Controller architecture

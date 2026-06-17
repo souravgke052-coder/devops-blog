@@ -1,0 +1,841 @@
+---
+title: "Kubernetes Overview"
+description: "Complete guide to Kubernetes container orchestration - from basics to production best practices"
+sidebar_position: 1
+---
+
+# Kubernetes Overview
+
+## Overview
+
+Kubernetes (K8s) is an open-source container orchestration platform that automates the deployment, scaling, and management of containerized applications. Originally developed by Google and now maintained by the Cloud Native Computing Foundation (CNCF), Kubernetes has become the industry standard for running production workloads at scale.
+
+## When To Use
+
+- **Microservices architectures** requiring service discovery, load balancing, and automated rollouts/rollbacks
+- **High availability requirements** needing multi-instance deployments with self-healing capabilities
+- **Horizontal scaling** where workloads need to scale based on metrics (CPU, memory, custom metrics)
+- **Multi-environment deployments** requiring consistent behavior across dev, staging, and production
+- **Cloud-native applications** designed to run in distributed environments
+- **Hybrid/multi-cloud strategies** needing workload portability across providers
+
+## When NOT To Use
+
+- **Simple single-container applications** where Kubernetes adds unnecessary complexity
+- **Small teams with limited Kubernetes expertise** - the operational overhead is significant
+- **Batch jobs or periodic workloads** - consider simpler solutions like cron jobs or serverless
+- **Legacy monolithic applications** that would require significant refactoring to containerize
+- **Resource-constrained environments** where Kubernetes control plane overhead is too high (8GB+ RAM for control plane)
+
+## Core Concepts
+
+### Control Plane Components
+
+| Component | Purpose | Runs On |
+|-----------|---------|---------|
+| kube-apiserver | REST API server for all cluster operations | Control plane nodes |
+| etcd | Distributed key-value store for cluster state | Control plane nodes |
+| kube-scheduler | Assigns pods to nodes based on resource availability | Control plane nodes |
+| kube-controller-manager | Runs controller loops (Node, Replication, Endpoint, etc.) | Control plane nodes |
+| cloud-controller-manager | Integrates with cloud provider APIs | Control plane nodes (cloud-specific) |
+
+### Node Components
+
+| Component | Purpose |
+|-----------|---------|
+| kubelet | Agent that ensures containers are running in pods |
+| kube-proxy | Network proxy that maintains network rules on nodes |
+| container runtime | Software for running containers (containerd, CRI-O, Docker) |
+
+### Key Kubernetes Objects
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Kubernetes Objects                        │
+├─────────────┬─────────────┬─────────────┬──────────────────┤
+│   Pods      │  Services   │  Volumes    │  ConfigMaps      │
+│  ReplicaSets│  Ingress    │  Namespaces │  Secrets         │
+│  Deployments│  StatefulSets│ DaemonSets  │  Jobs/CronJobs   │
+│  Services   │  HPA/VPA    │  NetworkPolicy│ RBAC objects   │
+└─────────────┴─────────────┴─────────────┴──────────────────┘
+```
+
+## Architecture / How It Works
+
+### Cluster Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Control Plane                               │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────┐  │
+│  │ kube-apiserver│ │    etcd    │  │  scheduler  │  │controller │  │
+│  │  (HA Setup)  │  │ (HA Setup) │  │             │  │ -manager  │  │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └───────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                │ API
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Worker Nodes                                │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ Node 1           │  │ Node 2           │  │ Node 3           │  │
+│  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │
+│  │ │ kubelet      │ │  │ │ kubelet      │ │  │ │ kubelet      │ │  │
+│  │ │ kube-proxy   │ │  │ │ kube-proxy   │ │  │ │ kube-proxy   │ │  │
+│  │ │ containerd   │ │  │ │ containerd   │ │  │ │ containerd   │ │  │
+│  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │  │
+│  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │
+│  │ │ nginx-pod    │ │  │ │ nginx-pod    │ │  │ │ api-pod      │ │  │
+│  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Pod Lifecycle
+
+```
+Pending → Running → Succeeded/Failed
+              │
+              └── (if restart policy allows) → Running
+```
+
+### Resource Request/Limit Flow
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ User creates │     │  Scheduler   │     │   kubelet    │
+│    Pod       │────▶│  evaluates   │────▶│  on Node     │
+│  manifest    │     │  resources   │     │  starts pod  │
+└──────────────┘     └──────────────┘     └──────────────┘
+                            │
+                            ▼
+                     ┌──────────────┐
+                     │ QoS Classes  │
+                     │ - Guaranteed │
+                     │ - Burstable  │
+                     │ - BestEffort │
+                     └──────────────┘
+```
+
+## Real Production Example
+
+### E-commerce Platform on Kubernetes
+
+A mid-size e-commerce platform running on GKE with the following architecture:
+
+```yaml
+# Production e-commerce architecture
+# Frontend: 3 replicas, 2 CPU, 4Gi memory each
+# API: 5 replicas, 4 CPU, 8Gi memory each
+# Database: StatefulSet with 3 replicas (managed via Cloud SQL)
+# Redis: 3 replicas for session management
+# Monitoring: Prometheus + Grafana stack
+```
+
+**Infrastructure Details:**
+- 3 control plane nodes (n2-standard-4) in multi-zone
+- 10+ worker nodes across 3 zones
+- Vertical Pod Autoscaler for right-sizing
+- Cluster Autoscaler for node scaling
+- Managed SSL certificates via ingress-gce
+- Cloud Armor for DDoS protection at ingress
+
+**Cost Optimization:**
+- Spot instances for non-critical workloads
+- Committed use discounts for baseline capacity
+- Node auto-provisioning for efficient scaling
+
+## YAML Examples
+
+### Minimal Pod Definition
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-pod
+  namespace: default
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25-alpine
+    ports:
+    - containerPort: 80
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "100m"
+      limits:
+        memory: "128Mi"
+        cpu: "200m"
+```
+
+### Production-Grade Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: production-api
+  namespace: production
+  labels:
+    app: api-service
+    version: v2
+    team: platform
+spec:
+  replicas: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: v2
+    spec:
+      serviceAccountName: api-service-account
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: api-service
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+      containers:
+      - name: api
+        image: gcr.io/myproject/api-service:v2.3.1
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: database-url
+        - name: REDIS_HOST
+          value: "redis.production.svc.cluster.local"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /healthz/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 3
+          timeoutSeconds: 3
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          failureThreshold: 30
+          periodSeconds: 10
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Mi
+```
+
+## CLI Examples (kubectl)
+
+### Cluster Information
+
+```bash
+# Get cluster info
+kubectl cluster-info
+kubectl cluster-info --kubeconfig=/path/to/kubeconfig
+
+# Get cluster details
+kubectl get nodes -o wide
+kubectl describe node node-name
+
+# Check API versions available
+kubectl api-resources
+kubectl api-versions
+
+# Get component status
+kubectl get componentstatuses  # deprecated
+kubectl get cs  # shorthand
+```
+
+### Working with Namespaces
+
+```bash
+# List all namespaces
+kubectl get namespaces
+
+# Create namespace
+kubectl create namespace production
+
+# Set default namespace
+kubectl config set-context --current --namespace=production
+
+# Get resources in specific namespace
+kubectl get all -n production
+```
+
+### Pod Operations
+
+```bash
+# List pods
+kubectl get pods
+kubectl get pods -o wide
+kubectl get pods --show-labels
+kubectl get pods -l app=api-service
+
+# Describe pod
+kubectl describe pod pod-name
+
+# Get pod logs
+kubectl logs pod-name
+kubectl logs pod-name -c container-name  # specific container
+kubectl logs pod-name --tail=100 --follow
+
+# Execute command in pod
+kubectl exec pod-name -- ls /app
+kubectl exec -it pod-name -- /bin/sh
+
+# Port forward to pod
+kubectl port-forward pod-name 8080:80
+
+# Copy files to/from pod
+kubectl cp pod-name:/path/to/file ./local-file
+kubectl cp ./local-file pod-name:/path/to/destination
+```
+
+### Deployment Operations
+
+```bash
+# Create deployment
+kubectl create deployment nginx --image=nginx:1.25
+
+# Scale deployment
+kubectl scale deployment nginx --replicas=5
+
+# Rolling update
+kubectl set image deployment/nginx nginx=nginx:1.26
+
+# View rollout status
+kubectl rollout status deployment/nginx
+
+# Rollback
+kubectl rollout undo deployment/nginx
+kubectl rollout history deployment/nginx
+kubectl rollout undo deployment/nginx --to-revision=2
+```
+
+### Service Operations
+
+```bash
+# Create service
+kubectl expose deployment nginx --port=80 --target-port=80 --type=ClusterIP
+
+# List services
+kubectl get services
+kubectl get svc
+
+# Describe service
+kubectl describe service service-name
+```
+
+### YAML Operations
+
+```bash
+# Apply configuration
+kubectl apply -f deployment.yaml
+kubectl apply -f ./manifests/
+
+# Dry-run
+kubectl apply -f deployment.yaml --dry-run=server
+kubectl apply -f deployment.yaml --dry-run=client
+
+# Diff
+kubectl diff -f deployment.yaml
+
+# Delete resources
+kubectl delete -f deployment.yaml
+kubectl delete deployment nginx
+```
+
+## Common Commands
+
+### Debugging Commands
+
+```bash
+# Debug pods
+kubectl debug pod-name -it --image=busybox -- sh
+kubectl debug pod-name --image=busybox --copy-to=debug-pod
+
+# Top resources
+kubectl top pods
+kubectl top nodes
+kubectl top pods -n namespace --sort-by=memory
+
+# Events
+kubectl get events
+kubectl get events --sort-by='.lastTimestamp'
+kubectl get events -n production --field-selector involvedObject.name=pod-name
+```
+
+### Resource Management
+
+```bash
+# Label nodes
+kubectl label nodes node-name disk=ssd
+kubectl label nodes node-name team=api --overwrite
+
+# Cordon/drain nodes
+kubectl cordon node-name
+kubectl drain node-name --ignore-daemonsets --delete-emptydir-data
+
+# Resource quotas
+kubectl create quota production-quota \
+  --hard=cpu=100,memory=200Gi,pods=50 \
+  -n production
+```
+
+### Context and Configuration
+
+```bash
+# List contexts
+kubectl config get-contexts
+
+# Switch context
+kubectl config use-context gke-project-us-central1-prod
+
+# View current config
+kubectl config view
+kubectl config current-context
+
+# Set credentials
+kubectl config set-credentials my-user --username=admin --password=secret
+```
+
+## Monitoring
+
+### Built-in Monitoring
+
+```bash
+# Check node conditions
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+
+# Resource usage
+kubectl top nodes
+kubectl top pods -n monitoring
+```
+
+### Prometheus Metrics
+
+Key metrics to monitor:
+
+| Metric | Description | Alert Threshold |
+|--------|-------------|-----------------|
+| kube_pod_status_phase | Pod phase distribution | pods in Pending > 10 |
+| kube_pod_container_status_restarts | Container restart count | > 5 in 1 hour |
+| kube_node_status_condition | Node conditions | Ready != True |
+| kubelet_volume_stats_capacity_bytes | Persistent volume usage | > 85% |
+| container_cpu_usage_seconds_total | CPU usage | > 80% limit |
+
+### GKE Monitoring
+
+```bash
+# Enable Cloud Monitoring
+gcloud container clusters update my-cluster \
+  --enable-monitoring \
+  --monitoring-service=monitoring.googleapis.com
+
+# View GKE logs
+gcloud logging read "resource.type=k8s_container" --project=my-project
+
+# GKE metrics in Cloud Monitoring
+# - container/cpu/core_usage_time
+# - container/memory/usage_bytes
+# - kubernetes.io/anthos/...
+```
+
+## Security
+
+### Pod Security Standards (PSS)
+
+```yaml
+# Enforce baseline policy via PodSecurity admission
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+### Network Policies
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: database
+    ports:
+    - protocol: TCP
+      port: 5432
+```
+
+### Security Contexts
+
+```yaml
+# Pod-level security context
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10000
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Container-level security context
+  containers:
+  - name: app
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+```
+
+### RBAC Hardening
+
+```bash
+# Create service account with minimal permissions
+kubectl create serviceaccount api-sa -n production
+
+# Create role
+kubectl create role api-pod-reader \
+  --verb=get --verb=list \
+  --resource=pods \
+  -n production
+
+# Create role binding
+kubectl create rolebinding api-pod-reader-binding \
+  --role=api-pod-reader \
+  --serviceaccount=production:api-sa \
+  -n production
+```
+
+## Cost Optimization
+
+### Resource Optimization
+
+```bash
+# Find pods without resource requests
+kubectl get pods -A -o json | jq '.items[] | select(.spec.containers[].resources.requests == null) | .metadata.name'
+
+# Find over-provisioned pods (limits >> requests)
+kubectl top pods -A | awk '{print $2, $3}' | grep -v "cpu"
+```
+
+### Scaling Strategies
+
+```yaml
+# Cluster Autoscaler configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-config
+  namespace: kube-system
+data:
+  # GKE example
+  minimum: "3"
+  maximum: "20"
+```
+
+### Spot Instance Usage
+
+```yaml
+# Node pool with spot instances
+# GKE
+gcloud container node-pools create spot-pool \
+  --cluster=my-cluster \
+  --spot \
+  --num-nodes=2 \
+  --enable-autoscaling \
+  --min-nodes=0 \
+  --max-nodes=10
+```
+
+### Vertical Pod Autoscaler
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api-vpa
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: api
+      minAllowed:
+        cpu: 100m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 4
+        memory: 8Gi
+```
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+| Issue | Diagnosis | Solution |
+|-------|-----------|----------|
+| Pod stuck in Pending | `kubectl describe pod` | Check node resources, affinity rules, PVC binding |
+| Pod stuck in ContainerCreating | `kubectl describe pod`, `kubectl get events` | Check volume mounts, image pull, CNI |
+| Pod crashing (CrashLoopBackOff) | `kubectl logs`, `kubectl describe pod` | Check application startup, health checks |
+| Service unreachable | `kubectl get endpoints`, `kubectl describe svc` | Verify pod selectors, endpoints exist |
+| Node NotReady | `kubectl describe node`, SSH to node | Check kubelet logs, system resources |
+| PersistentVolume stuck | `kubectl get pv`, `kubectl describe pv` | Check storage class, cloud provider |
+
+### Debug Commands
+
+```bash
+# Check pod events
+kubectl get events -n production --field-selector involvedObject.name=pod-name
+
+# Check node resources
+kubectl describe node node-name | grep -A 10 "Allocated resources"
+
+# Check persistent volume claims
+kubectl get pvc -n production
+kubectl describe pvc pvc-name
+
+# Check ingress status
+kubectl describe ingress ingress-name -n production
+
+# Check certificate status
+kubectl get certificate -n production
+kubectl describe certificate certificate-name -n production
+
+# Network debugging
+kubectl run netshoot --image=nicolaka/netshoot:latest -it --rm -- bash
+```
+
+### Log Analysis
+
+```bash
+# Search logs for error
+kubectl logs -n production -l app=api --since=1h | grep -i error
+
+# Tail logs across all pods
+kubectl logs -n production -l app=api --tail=100 -f
+
+# Export logs for analysis
+kubectl logs -n production -l app=api --since=24h > app.log
+
+# GKE log query examples
+gcloud logging read \
+  'resource.type="k8s_container" AND labels."k8s-container/name"="api"' \
+  --project=my-project --format=json
+```
+
+## Interview Questions
+
+### Basic Questions
+
+**Q: What is Kubernetes and why do we use it?**
+A: Kubernetes is a container orchestration platform that automates deployment, scaling, and management of containerized applications. It provides self-healing, load balancing, automated rollouts/rollbacks, and horizontal scaling, making it essential for running production microservices at scale.
+
+**Q: What is the difference between a Pod and a Container?**
+A: A Pod is the smallest deployable unit in Kubernetes and can contain one or more containers that share network and storage. Containers are the actual runtime instances of images. Pods provide a layer of abstraction around containers, allowing them to be scheduled together and share resources.
+
+**Q: What are the main components of the Kubernetes control plane?**
+A: kube-apiserver (REST API), etcd (distributed key-value store), kube-scheduler (pod scheduling), kube-controller-manager (controller loops), and optionally cloud-controller-manager (cloud integrations).
+
+### Intermediate Questions
+
+**Q: How does the Kubernetes scheduler work?**
+A: The scheduler watches for unscheduled pods, evaluates resource requirements, affinity/anti-affinity rules, taints/tolerations, and node selectors. It then ranks suitable nodes using a scoring algorithm and assigns the pod to the highest-ranking node.
+
+**Q: What is the difference between ClusterIP, NodePort, and LoadBalancer services?**
+A: ClusterIP exposes the service on an internal cluster IP (default). NodePort exposes on each node's IP at a static port. LoadBalancer provisions an external load balancer (cloud provider specific).
+
+**Q: How do you handle configuration changes in Kubernetes without restarting pods?**
+A: Use ConfigMaps and Secrets mounted as volumes. Changes to mounted ConfigMaps/Secrets are automatically reflected. For environment variables, use tools like Reloader or implement custom operators that trigger pod restarts on config changes.
+
+### Advanced Questions
+
+**Q: How do you ensure zero-downtime deployments in Kubernetes?**
+A: Use RollingUpdate strategy with maxSurge=1 and maxUnavailable=0. Ensure readiness probes are properly configured. Use PodDisruptionBudgets to protect critical services. Test with production traffic via canary deployments or feature flags.
+
+**Q: How do you handle stateful applications in Kubernetes?**
+A: Use StatefulSets for applications requiring stable network IDs and persistent storage. Implement proper PVC templates. Consider operators for complex stateful applications like databases. Use anti-affinity rules for high availability.
+
+**Q: Explain the difference between liveness, readiness, and startup probes.**
+A: Liveness probe indicates the container is running (restart if failing). Readiness probe indicates the container can serve traffic (remove from Service endpoints if failing). Startup probe indicates the application has started (disabled once successful, allows slow-starting apps).
+
+## Cheat Sheet
+
+### Essential kubectl Commands
+
+```bash
+# Shortcuts
+kubectl get po           # pods
+kubectl get svc          # services
+kubectl get deploy       # deployments
+kubectl get ns           # namespaces
+kubectl get rs           # replicasets
+kubectl get pvc          # persistent volume claims
+kubectl get pv           # persistent volumes
+kubectl get ing          # ingresses
+kubectl get networkpolicy # network policies
+
+# Common flags
+-o wide                  # More details
+-o yaml                  # Export as YAML
+-l key=value             # Label selector
+-n namespace             # Namespace
+--all-namespaces         # All namespaces
+--show-labels            # Show labels
+-w                       # Watch
+```
+
+### YAML Templates
+
+```yaml
+# Basic Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo
+spec:
+  containers:
+  - name: app
+    image: nginx
+
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      containers:
+      - name: app
+        image: nginx
+
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo
+spec:
+  selector:
+    app: demo
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+```
+
+### Quick Reference
+
+| Task | Command |
+|------|---------|
+| Apply manifest | `kubectl apply -f file.yaml` |
+| Delete resources | `kubectl delete -f file.yaml` |
+| View logs | `kubectl logs -f pod-name` |
+| Execute shell | `kubectl exec -it pod-name -- sh` |
+| Port forward | `kubectl port-forward pod-name 8080:80` |
+| Scale | `kubectl scale deploy app --replicas=5` |
+| Restart | `kubectl rollout restart deploy app` |
+| Check status | `kubectl rollout status deploy app` |
+| Get events | `kubectl get events --sort-by=.lastTimestamp` |
+
+## Related Topics
+
+- [Pods](./pods) - Understanding the smallest deployable units
+- [Deployments](./deployments) - Managing application releases
+- [Services](./services) - Network service discovery
+- [Architecture](./architecture) - Deep dive into cluster components
+- [Security](./security) - Kubernetes security best practices
+- [Networking](./networking) - Cluster networking fundamentals
+- [Storage](./volumes) - Persistent storage options
+- [GKE](./gke) - Running Kubernetes on Google Cloud

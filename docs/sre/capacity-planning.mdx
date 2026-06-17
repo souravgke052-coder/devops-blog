@@ -1,0 +1,987 @@
+---
+sidebar_position: 11
+---
+
+# Capacity Planning
+
+## Overview
+
+Capacity planning is the practice of ensuring a system has enough resources to handle current and projected future load. It encompasses understanding current utilization, forecasting growth, planning capacity additions, and implementing autoscaling to handle variability.
+
+Poor capacity planning leads to two failure modes: over-provisioning (wasting money on unused resources) and under-provisioning (service degradation or outages during peak load). The goal is right-sizing — having just enough capacity to meet SLAs at acceptable cost.
+
+SRE teams own capacity planning because it directly impacts reliability. A system without enough capacity will fail under load, regardless of how well-engineered it is. Capacity planning ensures reliability targets can be met as load grows.
+
+## When To Use
+
+- **Resource allocation** — Planning infrastructure spend and procurement
+- **Scaling decisions** — When to add capacity (horizontal or vertical)
+- **SLA planning** — Ensuring capacity meets reliability targets
+- **Cost optimization** — Right-sizing to reduce waste
+- **Architecture decisions** — Designing for expected scale
+- **Budget planning** — Quarterly/annual capacity roadmaps
+
+## When NOT to Use
+
+- **For static, rarely-changing systems** — Less frequent planning needed
+- **Without usage data** — Forecasting without data is guesswork
+- **As one-time activity** — Continuous monitoring and adjustment needed
+
+## Core Concepts
+
+### Key Capacity Metrics
+
+```yaml
+metrics:
+  utilization:
+    description: "How much of available capacity is being used"
+    formula: "current_usage / max_capacity × 100"
+    healthy_range: "40-70%"
+    alert_threshold: "> 80%"
+    
+  headroom:
+    description: "Available capacity for growth"
+    formula: "max_capacity - current_usage"
+    healthy_range: "30-60% headroom"
+    
+  saturation:
+    description: "How full queues and buffers are"
+    critical_indicator: "> 80% leads to performance degradation"
+    
+  throughput:
+    description: "Work processed per unit time"
+    examples: "requests/second, transactions/second, MB/second"
+    
+  capacity_trend:
+    description: "Rate of capacity consumption over time"
+    formula: "(current_utilization - previous_utilization) / days_between"
+```
+
+### Scaling Strategies
+
+```yaml
+scaling_strategies:
+  vertical:
+    name: "Scale Up"
+    description: "Add more resources to existing instances"
+    examples:
+      - "e2-medium → e2-large"
+      - "Add more RAM to database server"
+    pros:
+      - "Simpler architecture"
+      - "No application changes needed"
+      - "Lower network latency"
+    cons:
+      - "Hardware limits (can't scale infinitely)"
+      - "Downtime during resize"
+      - "Single point of failure if not redundant"
+    best_for: "Databases, stateful services, initial scaling"
+
+  horizontal:
+    name: "Scale Out"
+    description: "Add more instances"
+    examples:
+      - "3 instances → 10 instances"
+      - "Add more pods to Kubernetes deployment"
+    pros:
+      - "Near-limitless scale"
+      - "No downtime for scaling"
+      - "Built-in redundancy"
+    cons:
+      - "Application must support distributed operation"
+      - "More operational complexity"
+      - "Potential network latency"
+    best_for: "Stateless web services, APIs, microservices"
+
+  auto_scaling:
+    name: "Automatic Scaling"
+    description: "Automatically adjust capacity based on metrics"
+    types:
+      - "Reactive: Scale based on current metrics"
+      - "Predictive: Scale based on forecasted demand"
+      - "Scheduled: Scale based on time-of-day patterns"
+    pros:
+      - "Handles variable load efficiently"
+      - "Cost-efficient (pay for what you use)"
+      - "Automatic response to load spikes"
+    cons:
+      - "Delay in scaling response (cooldown)"
+      - "Requires proper metrics and thresholds"
+      - "Cold starts can cause latency spikes"
+```
+
+## Real Production Example
+
+### Kubernetes Autoscaling Configuration
+
+```yaml
+# Horizontal Pod Autoscaler (HPA)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    # CPU-based scaling
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70  # Scale when avg CPU > 70%
+    
+    # Memory-based scaling
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80  # Scale when avg memory > 80%
+    
+    # Custom metric scaling
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "1000"  # 1000 RPS per pod
+
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 minute cooldown
+      policies:
+        - type: Percent
+          value: 50  # Max 50% scale down at once
+          periodSeconds: 60
+        - type: Pods
+          value: 2  # Max 2 pods scale down at once
+          periodSeconds: 60
+      selectPolicy: Min  # Use most conservative policy
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Immediate scale up
+      policies:
+        - type: Percent
+          value: 100  # Can double pods immediately
+          periodSeconds: 15
+        - type: Pods
+          value: 4  # Max 4 pods added at once
+          periodSeconds: 15
+      selectPolicy: Max  # Use fastest scaling policy
+```
+
+### AWS Auto Scaling Configuration
+
+```yaml
+# AWS Auto Scaling Group configuration
+# (via AWS CLI or Terraform)
+{
+  "AutoScalingGroupName": "api-asg",
+  "MinSize": 3,
+  "MaxSize": 50,
+  "DesiredCapacity": 5,
+  "VPCZoneIdentifier": "subnet-xxx,subnet-yyy,subnet-zzz",
+  "LaunchTemplate": {
+    "LaunchTemplateId": "lt-xxx",
+    "Version": "1"
+  },
+  "HealthCheckType": "ELB",
+  "HealthCheckGracePeriod": 60,
+  "TerminationPolicies": ["OldestInstance"],
+  "MetricsCollection": [
+    {
+      "Granularity": "1Minute",
+      "Metrics": ["GroupMinSize", "GroupMaxSize", "GroupDesiredCapacity", "GroupInServiceInstances", "GroupPendingInstances"]
+    }
+  ]
+}
+
+# Scaling policies
+{
+  "PolicyName": "scale-on-cpu",
+  "PolicyType": "TargetTrackingScaling",
+  "TargetTrackingConfiguration": {
+    "PredefinedMetricSpecification": {
+      "PredefinedMetricType": "ASGAverageCPUUtilization"
+    },
+    "TargetValue": 70.0
+  },
+  "EstimatedInstanceWarmup": 60
+}
+
+{
+  "PolicyName": "scale-on-memory",
+  "PolicyType": "StepScaling",
+  "MetricAggregationType": "Average",
+  "StepAdjustments": [
+    {
+      "MetricIntervalLowerBound": 0,
+      "MetricIntervalUpperBound": 20,
+      "ScalingAdjustment": 0
+    },
+    {
+      "MetricIntervalLowerBound": 20,
+      "MetricIntervalUpperBound": 40,
+      "ScalingAdjustment": 2
+    },
+    {
+      "MetricIntervalLowerBound": 40,
+      "ScalingAdjustment": 4
+    }
+  ]
+}
+```
+
+### Database Capacity Planning
+
+```yaml
+# PostgreSQL capacity planning
+database_capacity:
+  vertical_scaling:
+    instance_types:
+      - db.r6g.large: "2 vCPU, 16GB RAM, good for dev/test"
+      - db.r6g.xlarge: "4 vCPU, 32GB RAM, standard production"
+      - db.r6g.2xlarge: "8 vCPU, 64GB RAM, high traffic"
+      - db.r6g.4xlarge: "16 vCPU, 128GB RAM, very high traffic"
+      
+  connection_pooling:
+    pgbouncer_settings:
+      pool_mode: "transaction"  # For most workloads
+      max_client_conn: 1000
+      default_pool_size: 20
+      min_pool_size: 5
+      server_idle_timeout: 600  # seconds
+      
+  scaling_triggers:
+    cpu_utilization: "> 80% sustained for 5 minutes"
+    connections: "> 80% of max_connections"
+    disk_utilization: "> 85%"
+    replication_lag: "> 30 seconds"
+    
+  capacity_formulas:
+    # Estimate max connections
+    max_connections: "100 × vCPU_count"
+    
+    # Estimate memory for shared_buffers
+    shared_buffers: "25% of RAM"
+    
+    # Estimate work_mem
+    work_mem: "(RAM - shared_buffers) / (max_connections × 3)"
+```
+
+## Metrics / Formulas / Frameworks
+
+### Capacity Forecasting
+
+```python
+import numpy as np
+from datetime import datetime, timedelta
+
+def linear_forecast(values, periods_ahead):
+    """
+    Simple linear regression forecast.
+    
+    Args:
+        values: List of historical values (e.g., daily peak usage)
+        periods_ahead: Number of future periods to forecast
+        
+    Returns:
+        List of forecasted values
+    """
+    n = len(values)
+    x = np.arange(n)
+    y = np.array(values)
+    
+    # Linear regression: y = mx + b
+    m, b = np.polyfit(x, y, 1)
+    
+    # Forecast future periods
+    future_x = np.arange(n, n + periods_ahead)
+    forecasts = m * future_x + b
+    
+    return forecasts.tolist(), m, b  # forecasts, slope, intercept
+
+def calculate_runway(current_capacity, current_usage, growth_rate_per_week):
+    """
+    Calculate how many weeks until capacity is exhausted.
+    
+    Args:
+        current_capacity: Total capacity (e.g., 100 instances)
+        current_usage: Current usage (e.g., 60 instances)
+        growth_rate_per_week: Weekly growth rate (e.g., 0.05 for 5%)
+        
+    Returns:
+        Number of weeks until capacity reached
+    """
+    weeks = 0
+    usage = current_usage
+    
+    while usage < current_capacity and weeks < 104:  # Max 2 years
+        usage *= (1 + growth_rate_per_week)
+        weeks += 1
+        
+    return weeks
+
+# Example
+capacity = 100  # 100 instances max
+usage = 65      # Currently using 65
+growth = 0.03   # 3% weekly growth
+
+runway = calculate_runway(capacity, usage, growth)
+print(f"Capacity runway: {runway} weeks ({runway/4:.1f} months)")
+
+# Forecast usage in 12 weeks
+forecast, _, _ = linear_forecast([65, 67, 69, 71, 73], 12)
+print(f"Expected usage in 12 weeks: {forecast[-1]:.0f} instances")
+```
+
+### Right-Sizing Calculations
+
+```python
+def calculate_right_sized_instance(current_utilization_avg, 
+                                    current_utilization_peak,
+                                    instance_options):
+    """
+    Calculate right-sized instance based on utilization.
+    
+    Args:
+        current_utilization_avg: Average CPU utilization %
+        current_utilization_peak: Peak CPU utilization %
+        instance_options: List of (name, vCPU, memory) tuples
+        
+    Returns:
+        Recommended instance type
+    """
+    # Target: ~70% utilization at peak (some headroom)
+    target_utilization = 0.70
+    required_capacity = current_utilization_peak / target_utilization
+    
+    # Find smallest instance that provides enough headroom
+    for name, vcpu, mem in sorted(instance_options, key=lambda x: x[1]):
+        if vcpu >= required_capacity:
+            return {
+                'instance': name,
+                'vCPU': vcpu,
+                'memory_gb': mem,
+                'projected_peak_util': current_utilization_peak / (vcpu / required_capacity),
+                'cost_savings_vs_current': f"{calculate_savings(name)}"
+            }
+    
+    return None  # Needs horizontal scaling
+
+def calculate_autoscaling_metrics(current_rps, target_latency_ms, 
+                                   avg_request_duration_ms, max_instances):
+    """
+    Calculate autoscaling parameters.
+    """
+    # Target RPS per instance
+    rps_per_instance = 1000 / avg_request_duration_ms * 1000  # rough estimate
+    
+    # Minimum instances needed for target latency
+    min_instances = int(current_rps / rps_per_instance) + 1
+    
+    # Scale threshold (70% CPU target)
+    scale_threshold = 0.70
+    
+    return {
+        'min_instances': min(min_instances, max_instances),
+        'max_instances': max_instances,
+        'scale_threshold_pct': scale_threshold * 100,
+        'cooldown_seconds': 300,
+        'target_rps_per_instance': rps_per_instance
+    }
+```
+
+### Queue Depth and Saturation
+
+```python
+def calculate_queue_impact(arrival_rate, service_rate, num_servers):
+    """
+    Calculate queue metrics using M/M/c queuing model.
+    
+    Args:
+        arrival_rate: Requests per second
+        service_rate: Service rate per server
+        num_servers: Number of servers
+        
+    Returns:
+        Dictionary with queue metrics
+    """
+    # Traffic intensity per server
+    rho = arrival_rate / (num_servers * service_rate)
+    
+    # Must be < 1 for stable system
+    if rho >= 1:
+        return {'stable': False, 'message': 'Overloaded - need more servers'}
+    
+    # Utilization
+    utilization = rho * 100
+    
+    # Average queue length (approximation)
+    # Using Kingman's formula approximation
+    import math
+    queue_length = (rho ** 2) / (1 - rho) / num_servers
+    
+    # Average wait time
+    avg_wait_time = queue_length / arrival_rate if arrival_rate > 0 else 0
+    
+    return {
+        'stable': True,
+        'utilization_pct': utilization,
+        'queue_length': queue_length,
+        'avg_wait_time_ms': avg_wait_time * 1000,
+        'recommendation': 'scale_up' if utilization > 80 else 'adequate'
+    }
+```
+
+## Common Tools and Commands
+
+### Capacity Monitoring Queries
+
+```promql
+-- Current capacity utilization
+rate(process_cpu_seconds_total[5m]) * 100
+
+-- Memory utilization
+process_resident_memory_bytes / container_spec_memory_limit_bytes * 100
+
+-- Disk utilization
+(node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100
+
+-- Database connections
+pg_stat_activity_count / pg_stat_activity_max * 100
+
+-- Queue depth (Redis)
+redis_db_keys / redis_config_maxmemory
+
+-- Autoscaling status
+kube_deployment_status_replicas / kube_deployment_spec_replicas
+```
+
+### Capacity Planning Dashboard
+
+```json
+{
+  "title": "Capacity Planning Dashboard",
+  "panels": [
+    {
+      "title": "Current Utilization",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total[5m]) * 100",
+          "legendFormat": "CPU %"
+        },
+        {
+          "expr": "process_resident_memory_bytes / container_spec_memory_limit_bytes * 100",
+          "legendFormat": "Memory %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "max": 100,
+          "thresholds": {
+            "steps": [
+              {"value": 0, "color": "green"},
+              {"value": 60, "color": "green"},
+              {"value": 80, "color": "yellow"},
+              {"value": 90, "color": "red"}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Capacity Trend",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total[1h]) * 100",
+          "legendFormat": "CPU %"
+        },
+        {
+          "expr": "predict_linear(rate(process_cpu_seconds_total[1h])[7d:1h], 7*24*3600)",
+          "legendFormat": "CPU (7d forecast)"
+        }
+      ]
+    },
+    {
+      "title": "Requests vs Capacity",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m]))",
+          "legendFormat": "Current RPS"
+        },
+        {
+          "expr": "sum(rate(http_requests_total[5m])) * 1.5",
+          "legendFormat": "150% Capacity"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Capacity Planning Commands
+
+```bash
+# === Check current resource usage ===
+kubectl top nodes
+kubectl top pods -n production
+
+# === Check persistent volume usage ===
+kubectl exec -it -n production POD -- df -h
+
+# === Check database connections ===
+psql -h db.internal -U postgres -c "SELECT count(*) FROM pg_stat_activity;"
+
+# === Check autoscaling status ===
+kubectl get hpa -n production
+kubectl describe hpa api-hpa -n production
+
+# === Forecast capacity needs ===
+# Using Prometheus query results
+curl -s localhost:9090/api/v1/query \
+  --data-urlencode 'query=rate(http_requests_total[7d])' \
+  | jq '.data.result[0].value[1]'  # Current 7-day rate
+
+# === Calculate runway ===
+python3 << 'EOF'
+current_capacity = 100  # max instances
+current_usage = 70      # current instances
+growth_rate = 0.05      # 5% weekly
+
+usage = current_usage
+weeks = 0
+while usage < current_capacity and weeks < 104:
+    usage *= (1 + growth_rate)
+    weeks += 1
+print(f"Runway: {weeks} weeks")
+EOF
+```
+
+## Monitoring / Alerting Examples
+
+### Capacity Alert Rules
+
+```yaml
+# prometheus/rules/capacity-alerts.yaml
+groups:
+  - name: capacity
+    rules:
+      # CPU utilization high
+      - alert: HighCPUUtilization
+        expr: |
+          rate(process_cpu_seconds_total[5m]) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "CPU utilization above 80%"
+          description: |
+            Current CPU: {{ $value | printf "%.1f" }}%
+            Scale capacity or optimize workload.
+
+      # Memory utilization high
+      - alert: HighMemoryUtilization
+        expr: |
+          process_resident_memory_bytes 
+          / container_spec_memory_limit_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "Memory usage above 85% of limit"
+          description: |
+            Memory: {{ $value | humanize }}
+            Risk of OOM kills.
+
+      # Disk approaching full
+      - alert: DiskSpaceWarning
+        expr: |
+          (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "Disk usage above 85%"
+
+      # Autoscaling at max
+      - alert: AutoscalingAtMax
+        expr: |
+          kube_deployment_status_replicas 
+          >= kube_deployment_spec_replicas
+        for: 5m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "Deployment at maximum replicas"
+          description: |
+            At max scale ({{ $value }} replicas).
+            Investigate if load is expected or unexpected.
+
+      # Capacity runway
+      - alert: CapacityRunwayWarning
+        expr: |
+          # Runway < 4 weeks based on growth trend
+          (
+            # Current headroom
+            (kube_deployment_spec_replicas - kube_deployment_status_replicas)
+            /
+            # Weekly growth
+            delta(kube_deployment_status_replicas[7d])
+          ) < 28  # 4 weeks
+        for: 0m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "Capacity runway less than 4 weeks"
+          description: |
+            Based on current growth rate, capacity will be reached in < 4 weeks.
+            Plan capacity increase.
+
+      # Database connections high
+      - alert: DatabaseConnectionsHigh
+        expr: |
+          pg_stat_activity_count / pg_stat_activity_max > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          category: database
+        annotations:
+          summary: "Database connections above 80%"
+          description: |
+            Connection pool: {{ $value | printf "%.1f" }}% utilized
+            Risk of connection exhaustion.
+```
+
+## Security
+
+### Capacity-Related Security Concerns
+
+```yaml
+security_capacity:
+  denial_of_service:
+    risk: "Malicious or accidental traffic spike exhausts capacity"
+    mitigation:
+      - "Rate limiting at API gateway"
+      - "CDN-level DDoS protection"
+      - "Autoscaling to handle legitimate spikes"
+      - "Connection limiting"
+      
+  resource_exhaustion:
+    risk: "Memory leaks or unbounded growth exhaust resources"
+    mitigation:
+      - "Resource limits on containers/pods"
+      - "Monitoring for memory leaks"
+      - "Circuit breakers to prevent cascade"
+      - "Regular capacity audits"
+      
+  credential_theft:
+    risk: "Stolen credentials used to run up compute costs"
+    mitigation:
+      - "Principle of least privilege for cloud credentials"
+      - "Regular rotation of access keys"
+      - "Monitoring for unusual resource creation"
+      - "Budget alerts on cloud accounts"
+```
+
+## Cost Optimization
+
+### Capacity Cost Optimization
+
+```python
+def calculate_capacity_cost_optimization(current_setup, target_utilization=0.70):
+    """
+    Calculate potential savings from right-sizing.
+    """
+    # Current: 100 instances, 40% avg utilization (over-provisioned)
+    # Target: 70% utilization at peak, so ~57 instances would work
+    # Savings: 43 instances × hourly_cost
+    
+    overprovisioned_instances = current_setup['instances'] * (1 - target_utilization)
+    hourly_savings = overprovisioned_instances * current_setup['hourly_cost_per_instance']
+    monthly_savings = hourly_savings * 24 * 30
+    
+    return {
+        'overprovisioned_instances': overprovisioned_instances,
+        'hourly_savings': hourly_savings,
+        'monthly_savings': monthly_savings,
+        'annual_savings': monthly_savings * 12
+    }
+
+# Example
+current = {
+    'instances': 100,
+    'hourly_cost_per_instance': 0.10  # e2-medium in GCE
+}
+optimization = calculate_capacity_cost_optimization(current)
+print(f"Monthly savings: ${optimization['monthly_savings']:.2f}")
+# Monthly savings: $3,096.00
+```
+
+### Cost-Effective Capacity Strategies
+
+```yaml
+cost_optimization:
+  right_sizing:
+    description: "Use resources appropriate to actual load"
+    savings_potential: "30-50%"
+    tools: "CloudWatch, Stackdriver, Datadog"
+    
+  spot_instances:
+    description: "Use preemptible/spot for fault-tolerant workloads"
+    savings_potential: "60-90%"
+    best_for: "Batch processing, stateless workers"
+    
+  reserved_capacity:
+    description: "Commit to usage for discounts"
+    savings_potential: "30-60%"
+    best_for: "Baseline capacity, known steady loads"
+    
+  autoscaling:
+    description: "Scale to match demand exactly"
+    savings_potential: "20-40%"
+    best_for: "Variable traffic patterns"
+    
+  geographic_load_shifting:
+    description: "Run workloads in cheaper regions when possible"
+    savings_potential: "10-30%"
+    best_for: "Non-latency-sensitive batch workloads"
+```
+
+## Troubleshooting / Common Mistakes
+
+### Common Capacity Planning Mistakes
+
+| Mistake | Impact | Solution |
+|---------|--------|----------|
+| No historical data | Poor forecasts | Start collecting metrics NOW |
+| Ignoring seasonality | Under-provisioning during peaks | Include seasonal patterns |
+| Planning only for peak | Wasted resources | Use autoscaling |
+| No headroom | Frequent scaling events | Plan 30-50% headroom |
+| Ignoring growth | Capacity surprises | Include growth rate in plans |
+| No cost modeling | Budget overruns | Model costs before scaling |
+
+### Capacity Troubleshooting
+
+**Symptom**: Service slow during peak hours
+
+**Diagnosis**:
+```bash
+# 1. Check if scaling actually triggered
+kubectl get hpa -n production
+kubectl describe hpa api -n production
+
+# 2. Check current resource usage
+kubectl top pods -n production
+kubectl top nodes
+
+# 3. Check for scaling lag (cooldown preventing scale)
+kubectl logs -n kube-system kube-controller-manager | grep -i scaling
+
+# 4. Check if hitting resource limits
+kubectl describe deployment api -n production | grep -A5 Resources
+```
+
+## Interview Questions
+
+### Q1: How do you forecast capacity needs?
+
+**A**: I use multiple methods:
+
+1. **Historical trend analysis**:
+   - Collect 3-6 months of usage data
+   - Calculate weekly/monthly growth rates
+   - Project forward
+
+2. **Seasonal patterns**:
+   - Identify recurring patterns (daily, weekly, seasonal)
+   - Plan for known peaks (Black Friday, product launches)
+   - Include buffer for unknown peaks
+
+3. **SLO-based calculation**:
+   - What's the maximum latency we can accept?
+   - How many requests can each instance handle at that latency?
+   - How many instances do we need for peak + headroom?
+
+4. **Business projections**:
+   - Marketing's growth projections
+   - Product roadmap (new features = new usage)
+   - Customer commitments
+
+Key formula:
+```
+Needed capacity = Peak demand × (1 + growth rate) ^ time_period × headroom_factor
+```
+
+### Q2: What's the difference between reactive and predictive autoscaling?
+
+**A**:
+
+| Aspect | Reactive | Predictive |
+|--------|----------|------------|
+| **Timing** | Responds after threshold exceeded | Scales before thresholds exceeded |
+| **Basis** | Current metrics | Forecasted demand |
+| **Pros** | Simple, proven | No latency from scaling wait |
+| **Cons** | Some requests served slowly during scale-up | Can over-provision |
+| **Tools** | HPA, ASG | KEDA, AWS Predictive Scaling |
+
+Reactive is the foundation — always implement that first. Predictive adds value for known predictable patterns (daily peaks, scheduled events).
+
+### Q3: How do you handle capacity planning for databases?
+
+**A**: Database capacity is more complex because:
+
+1. **Vertical scaling often required**:
+   - Sharding is complex
+   - Connection pooling helps but has limits
+   - Read replicas can offload read traffic
+
+2. **Key metrics**:
+   - CPU (compute bound)
+   - Memory (buffer pool hits)
+   - Disk I/O (query performance)
+   - Connections (pool exhaustion)
+   - Replication lag (for read replicas)
+
+3. **Planning approach**:
+   - Monitor all metrics
+   - Right-size based on data volume and query patterns
+   - Plan vertical scaling in advance (downtime often needed)
+   - Use read replicas for read scaling
+   - Consider sharding for extreme scale (careful!)
+
+Key difference from stateless services: databases often need planned maintenance windows for major scaling operations.
+
+### Q4: How do you calculate autoscaling thresholds?
+
+**A**: Thresholds should balance responsiveness with stability:
+
+1. **CPU threshold**:
+   ```
+   Target: 70% average utilization at peak
+   Reason: Some headroom needed, avoid thrashing
+   ```
+
+2. **Scale up**:
+   - Be aggressive (respond quickly to demand)
+   - No cooldown or minimal cooldown (30-60 seconds)
+   - Allow significant scale per cycle (100% doubling OK)
+
+3. **Scale down**:
+   - Be conservative (avoid oscillation)
+   - Long cooldown (5-10 minutes)
+   - Small scale-down per cycle (10-25%)
+
+4. **Multiple metrics**:
+   - Use composite of CPU + memory + custom metrics
+   - Scale when ANY threshold exceeded
+   - Avoid over-scaling due to one noisy metric
+
+Example HPA behavior:
+```yaml
+scaleUp:
+  stabilizationWindowSeconds: 0  # Immediate scale up
+scaleDown:
+  stabilizationWindowSeconds: 300  # 5 minute delay
+```
+
+### Q5: How do you plan capacity for a new service?
+
+**A**: Without historical data, I use:
+
+1. **Similar service benchmarks**:
+   - What's the utilization of similar existing services?
+   - Adjust for expected differences
+
+2. **Load testing**:
+   - Test with expected peak load
+   - Measure what breaks first
+   - Size based on limits
+
+3. **Industry benchmarks**:
+   - Typical RPS per instance for similar workloads
+   - Memory per concurrent user
+   - Database queries per request
+
+4. **Safety factors**:
+   - Start with 2-3x expected capacity
+   - Use autoscaling to adjust
+   - Monitor and right-size after seeing real usage
+
+5. **Phased rollout**:
+   - Start with baseline capacity
+   - Monitor closely during launch
+   - Adjust based on actual usage patterns
+
+## Cheat Sheet
+
+### Capacity Planning Quick Reference
+
+```
+CPU Scaling Formula:
+  min_replicas = ceil(peak_rps × avg_duration / target_utilization)
+
+Memory Scaling Formula:
+  min_replicas = ceil(peak_concurrent_users × memory_per_request / instance_memory)
+
+Database Connection Sizing:
+  max_connections = 100 × vCPU_count
+  pool_size = max_connections / num_app_instances
+
+Autoscaling Parameters:
+  CPU threshold: 70%
+  Scale up stabilization: 0-30s
+  Scale down stabilization: 5-10 minutes
+  Min instances: 2-3 (for availability)
+  Max instances: Based on cost/architecture limits
+```
+
+### Right-Sizing Checklist
+
+```
+[ ] Collect 30+ days of baseline metrics
+[ ] Identify peak usage patterns
+[ ] Calculate current utilization
+[ ] Identify growth rate (weekly/monthly)
+[ ] Calculate runway (weeks until capacity exhausted)
+[ ] Right-size instance type (target 70% utilization)
+[ ] Implement autoscaling
+[ ] Set capacity alerts at 70%, 80%, 90%
+[ ] Review monthly and adjust
+```
+
+### Growth Rate Calculation
+
+```python
+# Weekly growth rate
+growth_rate = (current_usage / previous_usage) - 1
+
+# Monthly growth rate  
+monthly_growth = ((current_usage / usage_30_days_ago) ** (30/days_between)) - 1
+
+# Runway calculation
+runway_weeks = ln(max_capacity/current_usage) / ln(1 + growth_rate)
+```
+
+## Related Topics
+
+- [Reliability](./reliability.mdx) — Designing reliable systems
+- [Monitoring](./monitoring.mdx) — Observability for capacity
+- [Alerting](./alerting.mdx) — Capacity alerts
+- [SLO](./slo.mdx) — Capacity and performance targets

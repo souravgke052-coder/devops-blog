@@ -1,0 +1,676 @@
+---
+sidebar_position: 5
+title: Role-Based Paths
+description: Specialized DevOps career paths
+---
+
+# Role-Based DevOps Career Paths
+
+## Overview
+
+Choose a specialized path aligned with your career goals. Each path builds the specific skills needed for that role, from foundational to advanced levels.
+
+## Available Paths
+
+| Role | Focus Areas | Target Audience |
+|------|-------------|-----------------|
+| [Cloud / Platform Engineer](#cloud-engineer--platform-engineer) | Cloud infrastructure, Developer platforms, IaC | Infrastructure-focused engineers |
+| [SRE / DevOps Engineer](#sre--devops-engineer) | Reliability, Observability, Incidents | Operations-minded engineers |
+| [Security Engineer](#security-engineer) | Security, Compliance, Zero Trust | Security-interested engineers |
+| [Data Engineer (Infra)](#data-engineer-infrastructure-focus) | Data pipelines, ML infrastructure, Analytics | Data-infrastructure engineers |
+
+---
+
+## Cloud Engineer / Platform Engineer
+
+### Role Description
+
+Build and maintain cloud infrastructure and developer platforms. Create self-service tools that enable product teams to deploy safely and efficiently.
+
+### Responsibilities
+- Design and manage cloud infrastructure
+- Build Internal Developer Platforms (IDPs)
+- Create infrastructure templates and golden paths
+- Implement security and compliance controls
+- Optimize costs and performance
+
+### Time Estimates
+
+| Level | Duration |
+|-------|----------|
+| Foundational (Junior) | 4-6 months |
+| Mid-level | 8-12 months |
+| Senior | 12-18 months |
+
+### Phase 1: Cloud Foundations
+**Goal**: Master core cloud services and infrastructure patterns
+
+#### Read
+- [Cloud Computing Basics](/docs/cloud/basics)
+- [GCP Fundamentals](/docs/gcp/fundamentals)
+- [GCP Compute Engine](/docs/gcp/compute)
+- [GCP Networking](/docs/gcp/networking)
+- [GCP Storage](/docs/gcp/storage)
+
+#### Practice
+- Complete [GCP Labs 1-2](/labs/gcp-labs) (Compute Engine, Storage)
+- Complete [GCP Labs 3](/labs/gcp-labs) (VPC Networking)
+- Deploy a multi-tier architecture (web + database)
+- Implement VPC with public and private subnets
+- Set up Cloud NAT for private instance internet access
+
+#### Validate
+```bash
+# Can you:
+gcloud compute instances create production-vm --machine-type=e2-standard-2
+gcloud compute networks subnets create private-subnet --network=my-vpc
+gcloud compute firewall-rules create allow-internal --network=my-vpc
+# Deploy 3-tier architecture with load balancer
+```
+
+**Time Estimate**: 4-6 weeks
+
+### Phase 2: Infrastructure as Code
+**Goal**: Manage all infrastructure through code
+
+#### Read
+- [Terraform Basics](/docs/terraform/basics)
+- [Terraform State Management](/docs/terraform/state)
+- [Terraform Modules](/docs/terraform/modules)
+- [Terraform Best Practices](/docs/terraform/best-practices)
+
+#### Practice
+- Complete [Terraform Labs 1-2](/labs/terraform-labs) (Basic Resources, Variables)
+- Complete [Terraform Labs 3-4](/labs/terraform-labs) (Remote Backend, Modules)
+- Create reusable Terraform modules for common patterns
+- Set up workspace-based multi-environment deployments
+- Implement automated testing for Terraform
+
+#### Validate
+```bash
+# Can you:
+terraform init -backend=true  # With GCS backend
+# Create module structure for VPC, compute, databases
+terraform workspace new prod && terraform workspace select prod
+# Write and run Terratest or terraform-compliance tests
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 3: Platform Engineering
+**Goal**: Build Internal Developer Platforms
+
+#### Read
+- [Platform Engineering](/docs/platform/overview)
+- [Internal Developer Platform](/docs/platform/idp)
+- [Developer Experience](/docs/platform/developer-experience)
+- [Backstage Overview](https://backstage.io/docs/overview/what-is-backstage)
+
+#### Practice
+- Install and configure Backstage
+- Create service catalog with automatic discovery
+- Build templated scaffolding for new services
+- Integrate ArgoCD for GitOps deployments
+- Implement policy enforcement (OPA/Gatekeeper)
+
+#### Validate
+```bash
+# Can you:
+backstage-cli create-app  # Bootstrap Backstage
+# Create template for new service deployment
+# Integrate Kubernetes cluster with Backstage
+# Configure permission policies
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 4: Production Operations
+**Goal**: Ensure production reliability and optimization
+
+#### Read
+- [Cloud Cost Optimization](/docs/cloud/cost-optimization)
+- [Monitoring Best Practices](/docs/monitoring/best-practices)
+- [Incident Management](/docs/sre/incident-response)
+
+#### Practice
+- Set up comprehensive monitoring and alerting
+- Implement cost optimization (reserved instances, committed use)
+- Create runbooks and documentation
+- Implement backup and disaster recovery
+- Conduct regular infrastructure audits
+
+#### Validate
+- Design and document DR strategy
+- Implement cost allocation by team/project
+- Create automated health checks and recovery
+
+**Time Estimate**: 4-6 weeks
+
+### Certifications
+- [GCP Professional Cloud Architect](https://cloud.google.com/certification/cloud-architect)
+- [HashiCorp Terraform Associate](https://www.hashicorp.com/certification/terraform-associate)
+- [GCP Associate Cloud Engineer](https://cloud.google.com/certification/cloud-engineer)
+
+### Common Interview Topics
+- How do you design a VPC with multiple environments?
+- Describe your experience with infrastructure automation
+- How do you implement cost optimization at scale?
+- Walk me through designing an IDP
+
+---
+
+## SRE / DevOps Engineer
+
+### Role Description
+
+Ensure system reliability, performance, and availability. Balance feature velocity with system stability. Own incident response and continuous improvement.
+
+### Responsibilities
+- Define and track SLOs
+- Build observability infrastructure
+- Lead incident response
+- Conduct chaos engineering
+- Drive reliability improvements
+- Manage on-call rotations
+
+### Time Estimates
+
+| Level | Duration |
+|-------|----------|
+| Foundational (Junior) | 4-6 months |
+| Mid-level | 8-12 months |
+| Senior | 12-18 months |
+
+### Phase 1: Observability Foundations
+**Goal**: Build comprehensive observability
+
+#### Read
+- [Observability Fundamentals](/docs/monitoring/observability)
+- [Prometheus](/docs/monitoring/prometheus)
+- [Grafana](/docs/monitoring/grafana)
+- [Logging Best Practices](/docs/logging/overview)
+
+#### Practice
+- Deploy Prometheus and Grafana
+- Complete [SRE Labs 3](/labs/sre-labs) (Prometheus and Grafana)
+- Instrument applications with custom metrics
+- Create SLO-based dashboards
+- Set up distributed tracing (Jaeger or Tempo)
+- Configure log aggregation (Loki or ELK)
+
+#### Validate
+```bash
+# Can you:
+# Write PromQL queries for:
+#   - Request rate
+#   - Error rate
+#   - Latency percentiles
+#   - SLO burn rate
+# Create comprehensive Grafana dashboard
+# Configure alerting rules
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 2: SLOs and Error Budgets
+**Goal**: Implement reliability measurement
+
+#### Read
+- [SLOs and Error Budgets](/docs/sre/slos)
+- [SRE Fundamentals](/docs/sre/fundamentals)
+- [Error Budget Policy](/docs/sre/error-budget)
+
+#### Practice
+- Complete [SRE Labs 1](/labs/sre-labs) (SLO and Error Budget)
+- Define SLIs for key services
+- Create SLO documents with stakeholders
+- Implement error budget alerts
+- Design error budget consumption policies
+
+#### Validate
+```bash
+# Can you:
+# Define complete SLI for a service
+# Calculate error budget
+# Create burn rate alerts
+# Present SLO to stakeholders
+```
+
+**Time Estimate**: 4-6 weeks
+
+### Phase 3: Incident Management
+**Goal**: Master production incident response
+
+#### Read
+- [Incident Management](/docs/sre/incident-response)
+- [On-Call Best Practices](/docs/sre/on-call)
+- [Postmortem Culture](/docs/sre/postmortem)
+
+#### Practice
+- Complete [SRE Labs 2](/labs/sre-labs) (Alerting and Incident Management)
+- Create incident response playbooks
+- Establish on-call rotation and procedures
+- Write blameless postmortems
+- Implement PagerDuty or similar tools
+
+#### Validate
+```bash
+# Can you:
+# Lead incident call
+# Communicate status to stakeholders
+# Write effective postmortem
+# Implement on-call tooling
+# Drive action items to completion
+```
+
+**Time Estimate**: 4-6 weeks
+
+### Phase 4: Chaos Engineering
+**Goal**: Proactively find weaknesses
+
+#### Read
+- [Chaos Engineering](/docs/chaos/overview)
+- [Litmus](https://litmuschaos.io/docs/)
+- [Chaos Mesh](https://chaos-mesh.org/docs/)
+
+#### Practice
+- Complete [SRE Labs 5](/labs/sre-labs) (Chaos Engineering)
+- Define steady-state hypothesis
+- Create experiment library (pod kill, network latency, etc.)
+- Run game days with team
+- Integrate chaos into CI/CD
+
+#### Validate
+```bash
+# Can you:
+# Install and configure chaos tool
+# Define steady-state hypothesis
+# Run chaos experiments safely
+# Document and share results
+```
+
+**Time Estimate**: 4-6 weeks
+
+### Phase 5: Production Readiness
+**Goal**: Ensure systems are production-ready
+
+#### Read
+- [Production Readiness](/docs/sre/production-readiness)
+- [Release Engineering](/docs/sre/release)
+- [Deployment Best Practices](/docs/cicd/deployment)
+
+#### Practice
+- Create production readiness checklists
+- Implement deployment best practices
+- Set up feature flags for gradual rollouts
+- Configure canary deployments
+- Build deployment automation
+
+#### Validate
+- Conduct production readiness review
+- Implement blue-green or canary deployment
+- Design feature flag system
+
+**Time Estimate**: 4-6 weeks
+
+### Certifications
+- [GCP Professional Cloud Architect](https://cloud.google.com/certification/cloud-architect) (broad knowledge)
+- [Prometheus Certified Observer](https://www.cncf.io/training/exams/)
+- [Datadog Observability](https://www.datadoghq.com/certification/)
+
+### Common Interview Topics
+- How do you define SLOs for a new service?
+- Walk me through your incident response process
+- What is error budget and how do you use it?
+- How do you build a culture of reliability?
+
+---
+
+## Security Engineer
+
+### Role Description
+
+Implement security controls across infrastructure and applications. Build secure-by-default platforms and ensure compliance with security requirements.
+
+### Responsibilities
+- Implement security scanning and prevention
+- Manage secrets and access controls
+- Ensure container and Kubernetes security
+- Drive compliance (SOC2, HIPAA, PCI)
+- Respond to security incidents
+- Build security automation
+
+### Time Estimates
+
+| Level | Duration |
+|-------|----------|
+| Foundational (Junior) | 5-7 months |
+| Mid-level | 10-14 months |
+| Senior | 14-20 months |
+
+### Phase 1: Security Foundations
+**Goal**: Build security fundamentals
+
+#### Read
+- [DevOps Security](/docs/security/overview)
+- [Container Security](/docs/security/container)
+- [Kubernetes Security](/docs/kubernetes/security)
+- [Identity and Access Management](/docs/security/iam)
+
+#### Practice
+- Complete security sections of [Linux Labs](/labs/linux-labs)
+- Implement container image scanning
+- Configure Kubernetes security contexts
+- Set up Pod Security Policies/PSA
+- Implement network policies
+
+#### Validate
+```bash
+# Can you:
+trivy image myapp:latest  # Scan for vulnerabilities
+kubectl apply -f network-policy.yaml
+# Configure PodSecurityContext
+# Implement RBAC in Kubernetes
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 2: Secrets Management
+**Goal**: Secure credential and secret handling
+
+#### Read
+- [Secrets Management](/docs/security/secrets)
+- [HashiCorp Vault](/docs/security/vault)
+- [GCP Secret Manager](/docs/gcp/secret-manager)
+
+#### Practice
+- Install and configure HashiCorp Vault
+- Implement dynamic secrets for databases
+- Set up Vault authentication methods
+- Integrate secrets into Kubernetes
+- Implement secret rotation
+
+#### Validate
+```bash
+# Can you:
+vault server -dev  # Start dev server
+vault kv put secret/myapp api_key=xxx
+# Configure Kubernetes auth
+# Implement dynamic database credentials
+# Set up secret rotation
+```
+
+**Time Estimate**: 4-6 weeks
+
+### Phase 3: Compliance and Policy
+**Goal**: Implement compliance automation
+
+#### Read
+- [Compliance as Code](/docs/security/compliance)
+- [OPA/Gatekeeper](/docs/security/policy)
+- [SOC2 Compliance](/docs/security/soc2)
+
+#### Practice
+- Implement OPA/Gatekeeper policies
+- Set up compliance scanning in CI/CD
+- Create policy library for common requirements
+- Configure audit logging
+- Implement data classification
+
+#### Validate
+```bash
+# Can you:
+kubectl apply -f GatekeeperPolicy.yaml
+# Configure OPA Rego policies
+# Implement CIS benchmark scanning
+# Create compliance reports
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 4: Supply Chain Security
+**Goal**: Secure software supply chain
+
+#### Read
+- [Supply Chain Security](/docs/security/supply-chain)
+- [Sigstore/Cosign](/docs/security/sigstore)
+- [SBOM](/docs/security/sbom)
+
+#### Practice
+- Implement container image signing
+- Generate and verify SBOMs
+- Set up SLSA compliance
+- Implement dependency scanning
+- Configure准入 validation
+
+#### Validate
+```bash
+# Can you:
+cosign sign myreg.io/myimage:v1
+cosign verify myreg.io/myimage:v1
+# Generate SPDX/ CycloneDX SBOM
+# Configure admission controller
+# Implement SLSA Level 3
+```
+
+**Time Estimate**: 4-6 weeks
+
+### Phase 5: Security Operations
+**Goal**: Monitor and respond to threats
+
+#### Read
+- [Security Monitoring](/docs/security/monitoring)
+- [SIEM](/docs/security/siem)
+- [Threat Detection](/docs/security/threat-detection)
+
+#### Practice
+- Configure audit logging (Cloud Audit Logs)
+- Set up SIEM aggregation
+- Implement threat detection rules
+- Create security playbooks
+- Conduct security assessments
+
+#### Validate
+- Design security monitoring architecture
+- Create threat detection rules
+- Run tabletop security exercises
+
+**Time Estimate**: 4-6 weeks
+
+### Certifications
+- [GCP Professional Security Engineer](https://cloud.google.com/certification/professional-security-engineer)
+- [CKS (Kubernetes Security)](https://www.cncf.io/certification/cks/)
+- [CISSP](https://www.isc2.org/certifications/cissp) (for senior roles)
+
+### Common Interview Topics
+- How do you secure a Kubernetes cluster?
+- Walk me through implementing zero trust
+- How do you handle secrets in CI/CD?
+- What is your approach to container security?
+
+---
+
+## Data Engineer (Infrastructure Focus)
+
+### Role Description
+
+Build and maintain data infrastructure including pipelines, ML platforms, and analytics systems. Focus on infrastructure that supports data processing at scale.
+
+### Responsibilities
+- Design and manage data pipelines
+- Build ML infrastructure
+- Ensure data reliability and quality
+- Optimize data infrastructure costs
+- Manage data warehouse and lake
+
+### Time Estimates
+
+| Level | Duration |
+|-------|----------|
+| Foundational (Junior) | 4-6 months |
+| Mid-level | 8-12 months |
+| Senior | 12-18 months |
+
+### Phase 1: Data Infrastructure Foundations
+**Goal**: Understand data infrastructure basics
+
+#### Read
+- [Data Pipeline Basics](/docs/data/pipelines)
+- [Data Lake Architecture](/docs/data/lake)
+- [GCP BigQuery](/docs/gcp/bigquery)
+- [GCP Dataflow](/docs/gcp/dataflow)
+
+#### Practice
+- Deploy a data warehouse (BigQuery)
+- Create data pipelines with Dataflow
+- Set up data ingestion from multiple sources
+- Configure data partitioning and clustering
+- Implement data retention policies
+
+#### Validate
+```bash
+# Can you:
+bq query --use_legacy_sql=false "SELECT * FROM dataset.table"
+gcloud dataflow jobs run my-pipeline --gcs-location=gs://...
+# Design partitioned table schema
+# Set up Data Studio dashboards
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 2: Data Pipeline Development
+**Goal**: Build robust data pipelines
+
+#### Read
+- [ETL vs ELT](/docs/data/etl-vs-elt)
+- [Data Quality](/docs/data/quality)
+- [Apache Airflow](/docs/data/airflow)
+
+#### Practice
+- Deploy Apache Airflow
+- Create DAGs for data pipelines
+- Implement data quality checks
+- Set up incremental data loads
+- Configure alerting for pipeline failures
+
+#### Validate
+```bash
+# Can you:
+airflow dags list && airflow tasks list dag_id
+# Create DAG with multiple tasks
+# Implement sensor for external data
+# Configure SLA monitoring
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 3: ML Infrastructure
+**Goal**: Build infrastructure for ML workloads
+
+#### Read
+- [MLOps](/docs/mlops/overview)
+- [Kubeflow](/docs/mlops/kubeflow)
+- [Feature Store](/docs/mlops/feature-store)
+
+#### Practice
+- Deploy Kubeflow on Kubernetes
+- Set up training infrastructure
+- Create feature pipeline
+- Implement model deployment
+- Configure model monitoring
+
+#### Validate
+```bash
+# Can you:
+kubectl apply -f TrainingJob.yaml
+# Deploy Kubeflow pipelines
+# Create feature store
+# Configure model serving
+```
+
+**Time Estimate**: 6-8 weeks
+
+### Phase 4: Data Reliability
+**Goal**: Ensure data system reliability
+
+#### Read
+- [Data Reliability Engineering](/docs/data/reliability)
+- [Data Observability](/docs/data/observability)
+- [Data Contracts](/docs/data/contracts)
+
+#### Practice
+- Implement data SLAs
+- Create data quality monitoring
+- Set up lineage tracking
+- Build data testing framework
+- Document data systems
+
+#### Validate
+- Define SLAs for data pipelines
+- Create data quality dashboard
+- Implement data lineage tracking
+
+**Time Estimate**: 4-6 weeks
+
+### Certifications
+- [GCP Professional Data Engineer](https://cloud.google.com/certification/data-engineer)
+- [Databricks Data Engineer Associate](https://www.databricks.com/learn/certification/data-engineer-associate)
+
+### Common Interview Topics
+- How do you ensure data quality?
+- Walk me through designing a data pipeline
+- How do you handle data backfills?
+- What is your approach to data modeling?
+
+---
+
+## Cross-Cutting Topics
+
+These topics apply to all roles:
+
+| Topic | Importance | Resource |
+|-------|------------|----------|
+| [Documentation](/docs/documentation/overview) | All roles | Write clear runbooks and ADRs |
+| [Communication](/docs/soft-skills/communication) | All roles | Present to stakeholders |
+| [Cost Awareness](/docs/cloud/cost-optimization) | All roles | Optimize cloud spend |
+| [Career Growth](/docs/career/overview) | All roles | Navigate DevOps career |
+
+---
+
+## Path Selection Guide
+
+### Choose Cloud/Platform Engineer if:
+- You enjoy building infrastructure
+- You like creating developer tools
+- You want to enable other teams
+- You prefer architecture and design work
+
+### Choose SRE/DevOps if:
+- You enjoy operational work
+- You like solving complex incidents
+- You care deeply about reliability
+- You want to balance development and operations
+
+### Choose Security if:
+- You have security background or interest
+- You enjoy security architecture
+- You want to be a specialist
+- You want to protect systems and data
+
+### Choose Data Infrastructure if:
+- You enjoy data and analytics
+- You want to support ML/AI workloads
+- You prefer data-focused work
+- You want to work with data pipelines
+
+---
+
+## Getting Started
+
+1. **Assess your current level** using the assessment in [Overview](/learning-paths/overview)
+2. **Choose your path** based on role description
+3. **Set schedule** based on target completion
+4. **Join community** for support and accountability
+5. **Track progress** through labs and projects
+
+Ready to begin? Start with the Phase 1 for your chosen path.

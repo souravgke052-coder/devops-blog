@@ -1,0 +1,1175 @@
+---
+sidebar_position: 10
+title: "Scenario-Based Interview Questions"
+description: "Real-world production scenarios testing multi-technology troubleshooting and design skills"
+---
+
+# Scenario-Based Interview Questions
+
+## Overview
+
+Scenario questions are the closest approximation to real work you'll face in an interview. Unlike conceptual questions where you can provide a theoretical answer, scenarios require you to apply your knowledge under pressure, think through multiple technologies, and communicate your reasoning clearly.
+
+Each scenario below represents a real production situation. Study the model answers not for the exact steps (every situation is different), but for the methodology and thinking process.
+
+## Scenario Questions
+
+### Scenario 1: The Production Outage
+
+**Q: "At 2:47 AM, you receive an alert: Error rate on your payment service spiked from 0.1% to 45%. PagerDuty is screaming. Walk me through your response."**
+
+A: **Immediate Response (0-5 minutes)**:
+
+**Step 1: Acknowledge and assess**
+```bash
+# Acknowledge the alert first (stops escalation)
+# Then start investigation without making changes yet
+
+# Quick health checks
+kubectl get pods -n payment -o wide
+kubectl top pods -n payment  # Check CPU/memory
+kubectl get events -n payment --sort-by=.lastTimestamp
+```
+
+**Step 2: Check monitoring and traces**
+```bash
+# What's the error pattern?
+# In Grafana/Jaeger: filter by error=true, check stack traces
+# Are specific endpoints failing or all?
+```
+
+**Step 3: Identify symptoms**
+```bash
+# Likely culprits at 2 AM:
+# 1. Recent deployment (check: git log, ArgoCD, Helm)
+# 2. Downstream dependency (database, auth service)
+# 3. Traffic spike (DDoS, viral content)
+# 4. Resource exhaustion (OOM, connection pool)
+
+# Check recent deployments
+kubectl rollout history deployment/payment-service -n payment
+argocd app history payment-service
+
+# Check downstream services
+kubectl get pods -n dependencies
+for svc in auth-db payment-gateway redis; do
+  kubectl exec -it payment-0 -n payment -- curl -s $svc:8080/health
+done
+```
+
+**Step 4: Initial mitigation**
+```bash
+# If recent deployment: rollback immediately
+kubectl rollout undo deployment/payment-service -n payment
+
+# If database issue: check connection pool
+kubectl exec -it payment-db-0 -n payment -- psql -c "SELECT count(*) FROM pg_stat_activity"
+
+# If resource exhaustion: scale up (temporarily)
+kubectl scale deployment/payment-service --replicas=10 -n payment
+```
+
+**Investigation Phase (5-20 minutes)**:
+```bash
+# Capture evidence while you fix
+kubectl logs -n payment -l app=payment --since=30m > /tmp/payment-logs.txt
+tcpdump -i any 'port 5432' -w /tmp/db-traffic.pcap &
+
+# Look for patterns in errors
+kubectl logs -n payment -l app=payment | grep -E "ERROR|Exception" | head -100
+```
+
+**Root cause identification**:
+```bash
+# Was it a slow query?
+# Check: did a new index get dropped? Did data grow unexpectedly?
+# Check: explain analyze on slow queries
+psql -c "SELECT query, calls, mean_time FROM pg_stat_statements ORDER BY mean_time DESC LIMIT 10;"
+
+# Was it network?
+# Check: mtr to payment service, check DNS resolution times
+```
+
+**Post-incident (after recovery)**:
+1. Document timeline and actions taken
+2. Write blameless postmortem
+3. Create follow-up tickets for permanent fixes
+4. Review alerting to catch faster next time
+
+**Key insight**: The methodology matters more than the steps. Acknowledge → Assess → Mitigate → Investigate → Fix → Document.
+
+---
+
+### Scenario 2: The Kubernetes Latency Issue
+
+**Q: "Users are complaining about slow API responses. You check your monitoring and see p99 latency has increased from 200ms to 2s over the past week. The Kubernetes cluster looks healthy. How do you investigate?"**
+
+A: **Layered investigation approach**:
+
+**Layer 1: Application metrics**
+```bash
+# Where specifically is latency coming from?
+# Check: is it database, external APIs, or application logic?
+
+# If using APM (Jaeger/DataDog):
+# - Find slow traces
+# - What operation is taking time?
+# - Is it a specific service in the call chain?
+```
+
+**Layer 2: Database**
+```bash
+# Check for slow queries
+kubectl exec -it postgres-0 -n database -- psql -c \
+  "SELECT query, calls, total_time, mean_time, rows 
+   FROM pg_stat_statements 
+   ORDER BY mean_time DESC 
+   LIMIT 10;"
+
+# Check for connection pool exhaustion
+kubectl exec -it payment-api-0 -n payment -- curl localhost:9090/metrics | \
+  grep database_connections
+
+# Check replication lag (if using read replicas)
+kubectl exec -it postgres-replica-0 -n database -- psql -c \
+  "SELECT now() - pg_last_xact_replay_timestamp();"
+```
+
+**Layer 3: Memory pressure (causes GC pauses)**
+```bash
+# For Java: check GC metrics
+kubectl exec -it java-service-0 -n production -- jstat -gc 1
+# Look for: FGC (Full GC) count increasing, long GC times
+
+# For Go: check goroutine count and memory
+kubectl exec -it go-service-0 -n production -- curl localhost:9090/debug/pprof/heap
+```
+
+**Layer 4: Network issues**
+```bash
+# Check for packet loss or latency between services
+# Install kubectl-debug or use existing metrics
+
+# Check DNS resolution times (can cause latency)
+kubectl exec -it api-service-0 -n production -- time nslookup payment-service
+
+# Check iptables rules (excessive rules can slow packet processing)
+iptables -L -n | wc -l  # Should be < 1000
+ipvs -L -n | wc -l      # If using ipvs
+```
+
+**Layer 5: Resource saturation**
+```bash
+# CPU throttling (especially in containers)
+kubectl top pods -n production --containers | grep throttled
+
+# Memory limits causing OOM
+dmesg | grep -i oom | tail -50
+
+# Disk I/O wait (if using local storage)
+kubectl exec -it api-service-0 -n production -- cat /proc/stat | grep iowait
+```
+
+**Common causes for gradual latency increase**:
+1. **Data growth**: Indexes no longer fitting in memory, table scans
+2. **Connection pool leaks**: Connections not being released properly
+3. **Memory leaks**: Gradually consuming more heap, more GC pauses
+4. **Dependency drift**: Upstream services getting slower
+5. **Network packet loss**: Gradual network degradation
+
+**Fixes**:
+```bash
+# For slow queries: add/verify indexes, optimize query plans
+psql -c "EXPLAIN ANALYZE SELECT ..."  # Test query plan
+
+# For GC pauses: tune JVM or switch to Go/Rust
+java -XX:+UseG1GC -XX:MaxGCPauseMillis=100  # Tune GC
+
+# For memory leaks: profile, find leak, fix
+
+# For network: check CNI plugin logs, consider switching CNI
+kubectl logs -n kube-system -l k8s-app=cilium | tail -100
+```
+
+---
+
+### Scenario 3: The Database Migration
+
+**Q: "We need to migrate our PostgreSQL database from version 12 to version 15 with zero downtime. The database is 5TB. Walk me through your approach."**
+
+A: **Migration strategy for zero downtime**:
+
+**Phase 1: Assessment**
+```bash
+# What's different between PG12 and PG15?
+# Breaking changes, deprecated features, index changes
+
+# Run pg_upgrade check first
+pg_upgrade --old-datadir=/data/old --new-datadir=/data/new \
+  --old-bindir=/usr/lib/postgresql/12/bin \
+  --new-bindir=/usr/lib/postgresql/15/bin \
+  --check  # Dry run, doesn't modify anything
+
+# Check for deprecated features in use
+SELECT proname, prosrc FROM pg_proc WHERE prosrc LIKE '%old_feature%';
+```
+
+**Phase 2: Pre-migration validation**
+```bash
+# Applications handle both versions during transition
+# Test query plans (optimizer differences)
+# Verify extensions compatible (PostGIS, pg_partman, etc.)
+```
+
+**Phase 3: Data migration (zero-downtime approach)**
+```python
+# Use logical replication for initial copy + continuous sync
+
+# 1. Create publication on source (PG12)
+psql -h source -c "CREATE PUBLICATION db_migration FOR ALL TABLES;"
+
+# 2. Create subscription on target (PG15)
+psql -h target -c "CREATE SUBSCRIPTION db_sub CONNECTION 
+  'host=source dbname=mydb user=replica' PUBLICATION db_migration;"
+
+# 3. Monitor replication
+psql -h target -c "SELECT * FROM pg_stat_subscription;"
+
+# 4. Wait for initial sync to complete
+# Check: subscription shows "streaming" not "starting"
+```
+
+**Phase 4: Cutover planning**
+```bash
+# During low-traffic window:
+
+# 1. Disable writes to source (maintenance mode)
+kubectl scale deployment payment-service --replicas=0 -n production
+
+# Or: Use load balancer to route to new version
+
+# 2. Wait for replication to catch up
+psql -h target -c "
+SELECT 
+  pg_wal_lsn_diff(pg_last_wal_replay_lsn(), confirmed_flush_lsn) 
+  AS replication_lag 
+FROM pg_stat_subscription 
+WHERE subname = 'db_sub';"
+
+# 3. Verify data integrity
+pg_checksums --data-checksums /data/new
+
+# 4. Point application to new database
+# Update connection strings, secrets
+
+# 5. Enable writes on new DB
+```
+
+**Phase 5: Rollback plan**
+```bash
+# If something goes wrong:
+# 1. Keep old database running (don't delete)
+# 2. Point application back to old database
+# 3. Investigate issue
+# 4. Fix and retry (or accept downtime)
+
+# After successful migration:
+# Keep old database in read-only mode for 24 hours
+# Just in case
+```
+
+**Alternative: Blue-green database**:
+```yaml
+# Maintain parallel database, switchover when ready
+# More resource intensive but cleaner switchover
+
+databases:
+  blue:  # Current
+    version: "12"
+    active: true
+  green:  # New
+    version: "15"
+    active: false
+
+# Cutover: switch active, old becomes standby for rollback
+```
+
+**Key insight**: True zero-downtime for large DB migrations is complex. Often the answer is accepting brief read-only window or using database that supports live migration (like Aurora).
+
+---
+
+### Scenario 4: The Cost Spike
+
+**Q: "Your GCP bill increased 40% this month. The CFO is asking questions. How do you investigate and what will you report back?"**
+
+A: **Cost investigation methodology**:
+
+**Step 1: Gather data**
+```bash
+# Export billing data to BigQuery
+# Enable billing export to GCS
+
+# Query by service
+bq query --use_legacy_sql=false "
+SELECT 
+  service.description,
+  SUM(cost) as total_cost,
+  SUM(usage.amount) as total_usage,
+  ROUND(AVG(CAST(usage.amount*cost/SUM(usage.amount) OVER() AS FLOAT64)), 4) as avg_cost_per_unit
+FROM `billing-data.gcp_billing_export`
+WHERE usage_start_time >= '2024-05-01' AND usage_start_time < '2024-06-01'
+GROUP BY service.description
+ORDER BY total_cost DESC
+LIMIT 20;"
+```
+
+**Step 2: Identify anomalies**
+```bash
+# Compare month over month
+# What increased significantly?
+
+# Common culprits:
+# 1. Egress: data transfer out
+# 2. Compute: more/larger VMs than expected
+# 3. Storage: more data stored than expected
+# 4. Cross-region: traffic between regions
+
+# Check egress specifically
+SELECT 
+  destination_region,
+  SUM(cost) as egress_cost
+FROM `billing-data.gcp_billing_export`
+WHERE service.description = 'Network'
+GROUP BY destination_region
+ORDER BY egress_cost DESC;
+```
+
+**Step 3: Identify culprits**
+```bash
+# Is it a specific project?
+SELECT 
+  project.id,
+  SUM(cost) as total_cost
+FROM `billing-data.gcp_billing_export`
+WHERE usage_start_time >= '2024-05-01'
+GROUP BY project.id
+ORDER BY total_cost DESC;
+
+# Is it a specific resource?
+SELECT 
+  resource.name,
+  SUM(cost) as total_cost
+FROM `billing-data.gcp_billing_export`
+WHERE service.description = 'Compute Engine'
+GROUP BY resource.name
+ORDER BY total_cost DESC
+LIMIT 20;
+
+# Is it new resources?
+SELECT 
+  DATE(usage_start_time) as date,
+  SUM(cost) as daily_cost
+FROM `billing-data.gcp_billing_export`
+WHERE DATE(usage_start_time) >= '2024-05-01'
+GROUP BY date
+ORDER BY date;
+```
+
+**Step 4: Common causes and fixes**
+
+| Cause | Fix |
+|-------|-----|
+| Unused VMs | Right-sizing, auto-shutdown schedules |
+| Oversized databases | Right-sizing, autoscale |
+| Data egress | Move to same region, use Cloud CDN |
+| Old snapshots | Lifecycle policies to delete old snapshots |
+| Load balancer with many backends | Minimize backend count |
+| Cloud SQL with high connections | Connection pooling, reduce max_connections |
+
+**Step 5: Report structure**
+```markdown
+# Cost Analysis Report: June 2024
+
+## Summary
+- Total spend: $47,000 (+40% vs May)
+- Primary driver: Compute Engine (+$12,000)
+- Secondary driver: Network Egress (+$4,000)
+
+## Root Causes
+1. Production autoscaling triggered by traffic spike (May 15)
+2. Three dev VMs left running over weekend (cost: $800)
+3. New data pipeline copying to BigQuery ($2,000)
+
+## Action Items
+| Item | Owner | Expected Savings |
+|------|-------|------------------|
+| Right-size GKE nodes | Platform | $3,000/mo |
+| Auto-shutdown dev VMs | DevOps | $500/mo |
+| Optimize data pipeline | Data | $1,500/mo |
+| Reserved instances (1yr) | Finance | $8,000/yr |
+
+## Recommendations
+1. Set budget alerts at 80% threshold
+2. Implement VM shutdown schedules
+3. Review all new services before deployment
+```
+
+---
+
+### Scenario 5: The Security Incident
+
+**Q: "Your security team detected unusual API calls from a service account in your production GKE cluster. The calls are accessing storage buckets outside of normal patterns. Walk me through your response."**
+
+A: **Security incident response**:
+
+**Phase 1: Containment (immediate)**
+```bash
+# Don't wait for full investigation - contain first
+
+# 1. Revoke the service account key immediately
+gcloud iam service-accounts keys list \
+  --iam-account=SuspiciousSA@project.iam.gserviceaccount.com
+
+gcloud iam service-accounts keys delete KEY_ID \
+  --iam-account=SuspiciousSA@project.iam.gserviceaccount.com
+
+# 2. Disable the service account
+gcloud iam service-accounts disable \
+  SuspiciousSA@project.iam.gserviceaccount.com
+
+# 3. Identify which pods are using this SA
+kubectl get pods -A -o json | jq -r \
+  '.items[] | select(.spec.serviceAccountName=="SuspiciousSA") | "\(.metadata.namespace)/\(.metadata.name)"'
+
+# 4. If pods are compromised, delete them
+kubectl delete pod <pod-name> -n <namespace>
+```
+
+**Phase 2: Evidence collection**
+```bash
+# Preserve logs before they rotate
+gcloud logging read \
+  'resource.type="gke_cluster" AND "SuspiciousSA"' \
+  --project=my-project > suspicious-sa-logs.txt
+
+# Export audit logs
+gcloud logging read \
+  'resource.type="service_account" AND resource.labels.email_id="SuspiciousSA@project.iam.gserviceaccount.com"' \
+  --project=my-project --format=json > audit-logs.json
+
+# Check CloudTrail for API calls (AWS equivalent)
+# Check VPC Flow Logs for unusual network activity
+gcloud logging read \
+  'resource.type="gce_subnetwork" AND jsonPayload.instance.project_id="my-project"' \
+  --order-by=timestamp | head -1000
+
+# Capture current state
+gcloud projects get-iam-policy my-project > iam-policy.json
+kubectl get all -A -o yaml > cluster-state.yaml
+```
+
+**Phase 3: Investigation**
+```bash
+# What accessed what?
+gcloud audit logs list --filter="principalEmail:SuspiciousSA"
+
+# Check for data exfiltration
+# How much data was accessed?
+gsutil ls -l gs://suspicious-bucket/
+
+# Check for command injection (if pod was compromised)
+kubectl logs <pod-name> -n <namespace> --previous  # Previous container logs
+
+# Look for reverse shells or cron jobs
+kubectl exec -it <pod-name> -n <namespace> -- cat /var/spool/cron/crontabs/root
+```
+
+**Phase 4: Determine scope**
+```bash
+# Was this a compromised service account key?
+# Or was it a compromised container?
+
+# Check if the service account key was leaked (in code, secrets, etc.)
+grep -r "SuspiciousSA" --include="*.yaml" --include="*.tf" .
+
+# Check for other suspicious activity
+gcloud logging read \
+  'resource.type="service_account" AND NOT principalEmail:"@project.iam.gserviceaccount.com"' \
+  --project=my-project
+
+# Check other service accounts
+gcloud iam service-accounts list
+```
+
+**Phase 5: Remediation**
+```yaml
+# 1. Rotate all potentially exposed credentials
+# Not just this SA, but any it had access to
+
+# 2. Review and tighten IAM
+# Least privilege - remove unnecessary permissions
+
+# 3. Implement Workload Identity (no more key files)
+# Use Workload Identity Federation instead
+
+# 4. Add additional monitoring/guardrails
+# Enable VPC Service Controls
+# Add Cloud Armor rules for exfiltration
+
+# 5. Forensics
+# Capture pod for analysis (if needed before deletion)
+kubectl debug <pod-name> -n <namespace> --image=busybox \
+  --share-processes --copy-to=debug-pod
+```
+
+**Phase 6: Post-incident**
+```markdown
+# Security Incident Report: Unauthorized Access via Service Account
+
+## Timeline
+- May 15, 14:32 - First suspicious API call detected
+- May 15, 14:35 - Security alert triggered
+- May 15, 14:40 - SA key revoked, pods terminated
+- May 15, 15:00 - Scope assessment complete
+
+## Root Cause
+Service account key was committed to GitHub repo in April.
+Repo was public, key was quickly scraped.
+
+## Impact
+- 3 storage buckets were listed
+- No data exfiltrated (access was detected in time)
+- 2 buckets were world-readable (now fixed)
+
+## Recommendations
+1. Enable secret scanning on GitHub
+2. Implement Workload Identity for all GKE workloads
+3. Rotate all service account keys monthly
+4. Enable VPC Service Controls perimeter
+5. Review public bucket access policies
+```
+
+---
+
+### Scenario 6: The Multi-Region Deployment
+
+**Q: "Design a multi-region active-active deployment strategy for a stateless API service. What are the key design decisions?"**
+
+A: **Key design decisions**:
+
+**1. Data layer strategy**:
+```yaml
+# Option A: Synchronous replication (Spanner, CockroachDB)
+# Pros: Strong consistency, simple writes
+# Cons: Latency, cost (cross-region writes are slow)
+# Best for: Financial transactions, inventory
+
+# Option B: Asynchronous replication (PostgreSQL with BDR)
+# Pros: Lower write latency
+# Cons: Eventual consistency, conflict resolution needed
+# Best for: User profiles, preferences
+
+# Option C: Event-driven (Kafka, EventStore)
+# Pros: High availability, can replay
+# Cons: More complex, eventual consistency
+# Best for: Event sourcing, audit logs
+
+# Recommendation: Start with Option C or B
+# Spanner if on GCP and budget allows
+```
+
+**2. Traffic routing**:
+```yaml
+# Cloud Load Balancer (Global)
+# Features:
+# - Anycast IP (same IP worldwide, routes to nearest)
+# - Cloud CDN in front
+# - Health checks per region
+# - Geolocation-based routing
+
+# DNS-based (secondary)
+# - Route53 with latency routing
+# - Health checks via Route53
+# - Fallback to secondary region on failure
+
+# Global HTTP(S) Load Balancer
+backend_config:
+  us-central:
+    health_check: /health
+    failure_threshold: 3
+  europe-west:
+    health_check: /health
+    failure_threshold: 3
+
+routing:
+  type: "geolocation"  # or "latency", "weighted"
+  rules:
+    - match: "Europe"
+      action: "route to europe-west"
+    - match: "default"
+      action: "route to us-central"
+```
+
+**3. Session/state management**:
+```yaml
+# Since service is stateless:
+# 1. All session state in Redis (global)
+# 2. Or JWT tokens with user state in them
+
+# For Redis (global cluster):
+# - Regional Redis clusters
+# - Cross-region replication (Redis Enterprise)
+# - Or: Use Memorystore with read replicas
+
+# Session strategy:
+sessions:
+  store: "Redis"
+  ttl: 3600
+  replication: "async"  # Accept eventual consistency
+  
+# Or: JWT
+JWT:
+  issuer: "https://auth.example.com"
+  audience: "api.example.com"
+  expiration: 3600
+  # All state in token, no session storage needed
+```
+
+**4. Database per region**:
+```yaml
+# Each region has its own database
+# Async sync between regions
+# Eventual consistency
+
+database:
+  us-central:
+    primary: true
+    read_replicas: 2
+  europe-west:
+    primary: false
+    read_replicas: 2
+  asia-east:
+    primary: false
+    read_replicas: 2
+
+replication:
+  type: "async"
+  conflict_resolution: "last_write_wins"  # Or application-level
+```
+
+**5. Deployment strategy**:
+```yaml
+# ArgoCD with multi-cluster support
+# Or: GitOps with separate environments per region
+
+# Rollout strategy:
+# 1. Deploy to staging
+# 2. Deploy to us-central (10% traffic)
+# 3. Deploy to europe-west (10% traffic)
+# 4. Deploy to asia-east (10% traffic)
+# 5. Full rollout to all regions
+
+# Monitor for:
+# - Error rates by region
+# - Latency by region
+# - Replicated data consistency
+```
+
+**6. Disaster recovery**:
+```yaml
+RTO: "15 minutes"  # Time to recover
+RPO: "5 minutes"   # Data loss acceptable
+
+# DR testing: quarterly
+# Failover procedure:
+# 1. Promote secondary region to primary
+# 2. Update DNS
+# 3. Verify data integrity
+# 4. Resume traffic
+
+# Monitoring:
+# - Replication lag per region
+# - Error rates
+# - Data checksum validation
+```
+
+---
+
+### Scenario 7: The CI/CD Pipeline Failure
+
+**Q: "Your CI/CD pipeline has been failing intermittently for the past 3 days. The failures are in the 'build' stage but the error messages are inconsistent (sometimes 'out of memory', sometimes 'connection timeout'). How do you debug this?"**
+
+A: **Debugging intermittent CI failures**:
+
+**Step 1: Gather evidence**
+```bash
+# Collect all recent failures
+# Look for patterns
+
+# Common patterns for intermittent failures:
+# 1. Resource exhaustion (memory, CPU)
+# 2. Flaky tests
+# 3. Network issues (timeouts)
+# 4. Race conditions
+# 5. Dependency issues (network packages)
+
+# In GitHub Actions:
+# Go to Actions tab → Find failed runs → Download logs
+
+# Look for:
+# - What time do failures occur?
+# - Which branches?
+# - Which runners (hosted vs self-hosted)?
+```
+
+**Step 2: Reproduce locally if possible**
+```bash
+# Run the exact same commands locally
+docker build -t my-app --progress=plain .
+# If it works locally but not in CI: CI environment issue
+
+# For self-hosted runners:
+# Check runner logs
+systemctl status actions.runner.*
+journalctl -u actions.runner.* -n 100
+
+# Check resource usage on runner
+free -h
+df -h
+```
+
+**Step 3: Check for resource exhaustion**
+```yaml
+# If "out of memory":
+# - Build is using too much RAM
+# - Check: swap usage, container memory limits
+
+# Fix options:
+# - Split build into stages (multi-stage Dockerfile)
+# - Add more RAM to runner
+# - Use buildx with smaller images
+# - Reduce parallelism (make -j 2 instead of -j 8)
+
+# In GitLab CI:
+variables:
+  DOCKER_BUILDKIT_INLINE_CACHE: 1
+  NODE_OPTIONS: "--max-old-space-size=4096"
+
+# In GitHub Actions:
+- name: Build
+  run: npm ci && npm run build
+  env:
+    NODE_OPTIONS: "--max-old-space-size=4096"
+```
+
+**Step 4: Check for network issues**
+```yaml
+# If "connection timeout":
+# - Package registry slow/unreachable
+# - Registry rate limiting (npm, Docker Hub)
+
+# Solutions:
+# - Cache dependencies
+# - Use private registry mirrors
+# - Add retry logic
+# - Use authentication to avoid rate limits
+
+# GitHub Actions caching:
+- name: Cache npm
+  uses: actions/cache@v3
+  with:
+    path: ~/.npm
+    key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+- name: Cache Docker layers
+  uses: actions/cache@v3
+  with:
+    path: /tmp/.buildx-cache
+    key: ${{ runner.os }}-buildx-${{ hashFiles('**/Dockerfile') }}
+```
+
+**Step 5: Check for flaky tests**
+```bash
+# Run tests multiple times locally
+for i in {1..10}; do
+  npm test || echo "Run $i failed"
+done
+
+# If flaky:
+# - Use test retries (most test frameworks support)
+# - Isolate flaky tests
+# - Fix timing issues (add waits, use test timeouts)
+
+# In CI:
+- name: Test
+  uses: cypress-io/github-action@v5
+  with:
+    spec: cypress/e2e/**/*.cy.js
+    browser: electron
+  continue-on-error: true  # But still report results
+```
+
+**Step 6: Common fixes**:
+```yaml
+# For npm/Docker network timeouts:
+# Increase timeout
+timeout: 60m
+
+# Use faster package mirrors
+# npm: Use npmjs.org
+# Docker: Use regional mirrors
+
+# For memory:
+# Multi-stage builds
+# Smaller base images
+# Alpinelinux variants
+
+# For flakiness:
+# Test retries
+# Parallel test splitting
+# Better test isolation
+```
+
+---
+
+### Scenario 8: The Kubernetes Upgrade
+
+**Q: "We need to upgrade our production Kubernetes cluster from 1.26 to 1.28. We have 50 nodes, 200 pods. Walk me through your approach."**
+
+A: **Kubernetes upgrade strategy**:
+
+**Phase 1: Pre-upgrade assessment**
+```bash
+# 1. Check deprecated APIs (1.27 removed some)
+# Kubernetes 1.28 removes: ...
+# Check: https://kubernetes.io/docs/reference/using-api/deprecation-guide/
+
+# Run in test environment first
+# Check all workloads for compatibility
+
+# Check node images compatibility
+gcloud container images list | grep "1.26"
+
+# Check addons (CNI, CSI, monitoring)
+# Upgrade them first
+
+# Backup etcd
+#快照etcd data
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-snap.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+```
+
+**Phase 2: Control plane upgrade**
+```bash
+# Upgrade control plane first (1.26 -> 1.27 -> 1.28)
+# One minor version at a time
+
+# If using GKE:
+gcloud container clusters upgrade my-cluster \
+  --master-version=1.27.10 \
+  --region=us-central1 \
+  --node-pool=default-pool
+
+# Or managed control plane (GKE Autopilot)
+# GKE handles control plane automatically
+
+# For self-managed:
+# 1. Upgrade etcd
+# 2. Upgrade kube-apiserver
+# 3. Upgrade controller-manager, scheduler
+# 4. Upgrade kubelet on control plane nodes
+# 5. Upgrade kube-proxy
+```
+
+**Phase 3: Node upgrade (zero-downtime approach)**
+```bash
+# Use node pool surge upgrade (GKE)
+gcloud container node-pools update default-pool \
+  --cluster=my-cluster \
+  --region=us-central1 \
+  --node-pool-soak-duration=1h  # Wait between node upgrades
+
+# Or manual process:
+# 1. Cordon node (mark as unschedulable)
+kubectl cordon node-1
+
+# 2. Drain node (evict pods)
+kubectl drain node-1 --ignore-daemonsets --delete-emptydir-data
+
+# 3. Upgrade kubelet on node
+apt-get install kubelet=1.28.0-* && systemctl restart kubelet
+
+# 4. Uncordon node
+kubectl uncordon node-1
+
+# 5. Repeat for next node
+```
+
+**Phase 4: Validation**
+```bash
+# After each node upgrade:
+kubectl get nodes  # Should show new version
+kubectl get pods -A | grep -v Running  # Should be empty
+
+# Run smoke tests
+kubectl run test-pod --image=my-app:latest --restart=Never
+kubectl exec test-pod -- curl localhost:8080/health
+kubectl delete pod test-pod
+
+# Check metrics
+# Verify no increase in error rates
+```
+
+**Phase 5: Rollback plan**
+```bash
+# If critical issue found:
+# 1. Stop further upgrades
+# 2. If control plane issue: restore etcd backup
+# 3. If node issue: rollback node (cordon, drain, reinstall old kubelet)
+
+# Node rollback:
+kubectl cordon node-1
+kubectl drain node-1 --ignore-daemonsets
+apt-get install kubelet=1.26.0-* && systemctl restart kubelet
+kubectl uncordon node-1
+```
+
+**Timeline estimate**:
+```yaml
+# 50 nodes, 200 pods
+# Control plane: 1-2 hours (or managed by GKE)
+# Node upgrade: ~15-20 min per node (3 nodes at a time)
+# Total: ~4-6 hours for node pool upgrade
+# Can do rolling upgrade with 0 downtime if:
+# - Enough nodes to handle capacity
+# - PodDisruptionBudgets in place
+# - Readiness probes working
+```
+
+---
+
+### Scenario 9: The On-Call Wake-Up
+
+**Q: "At 3 AM, you get paged: 'API latency increasing, p99 > 5s'. You're half-asleep and have 5 minutes before the next on-call engineer escalates to you. What do you do in those 5 minutes?"**
+
+A: **5-minute response protocol**:
+
+**Minute 1: Acknowledge and assess (30 seconds)**
+```bash
+# Acknowledge the alert (stops escalation timer)
+# Check the dashboard quickly
+# Don't touch anything yet - understand the situation
+
+# Quick checks:
+kubectl top pods -n api 2>/dev/null || echo "metrics unavailable"
+kubectl get pods -n api -o wide | head -20
+```
+
+**Minute 2: Identify the scope (60 seconds)**
+```bash
+# Is it affecting all endpoints or specific ones?
+# Check monitoring (Jaeger, APM)
+# Is it one service or multiple?
+
+# Quick diagnosis:
+# In Grafana: look at error rate vs latency
+# If error rate high: investigate errors
+# If latency high but no errors: investigate performance
+
+# Check if it's deployment related
+kubectl rollout history deployment/api -n api
+```
+
+**Minute 3: Take immediate action (90 seconds)**
+```bash
+# If deployment-related: rollback
+kubectl rollout undo deployment/api -n api
+
+# If resource exhaustion: scale up (temporary)
+kubectl scale deployment/api --replicas=10 -n api
+
+# If you don't know: just scale up
+# More instances often helps, rarely hurts
+```
+
+**Minute 4: Communicate status (60 seconds)**
+```bash
+# Update PagerDuty: "Investigating, scaling up as immediate mitigation"
+# Post in #incidents: "Investigating latency spike, initial mitigation applied"
+
+# If it's clearly bad: declare incident
+# Better to over-communicate than under
+```
+
+**Minute 5: Call for help (30 seconds)**
+```bash
+# If not resolved:
+# - Loop in second on-call
+# - Or escalate to team lead
+# Don't try to solo this at 3 AM
+```
+
+**The key insight**: The goal in those 5 minutes is not to fix the problem — it's to prevent it from getting worse and to buy time for proper investigation. Immediate mitigation (rollback, scale) is better than diagnosis.
+
+**Post-incident (after sleep)**:
+- Write detailed postmortem
+- Add automated remediation (autoscaling rules, better health checks)
+- Add better alerting (catch earlier next time)
+
+---
+
+### Scenario 10: The Design Interview
+
+**Q: "Design a system that processes 1 million images per day for a computer vision application. Images come from mobile apps, need processing (object detection, classification), and results need to be stored and queryable. Walk me through your design."**
+
+A: **System design approach**:
+
+**Step 1: Clarify requirements**
+```yaml
+# Functional:
+# - Ingest 1M images/day = ~12 images/second average, ~100/second peak
+# - Process each image (object detection + classification)
+# - Store results
+# - Query results by image metadata, time, detected objects
+
+# Non-functional:
+# - Latency: < 30 seconds from upload to result available
+# - Availability: 99.9%
+# - Cost: Minimize
+
+# Constraints:
+# - Mobile apps (unreliable connections)
+# - Image processing is CPU-intensive
+```
+
+**Step 2: High-level architecture**
+```
+┌──────────┐    ┌──────────────┐    ┌────────────────┐    ┌────────────┐
+│ Mobile   │───▶│ Load Balancer│───▶│ Upload Service │───▶│    S3      │
+│ App      │    │              │    │ (pre-signed URL)│    │  (raw imgs)│
+└──────────┘    └──────────────┘    └────────────────┘    └─────┬──────┘
+                                                                   │
+                                                                   ▼
+┌──────────┐    ┌──────────────┐    ┌────────────────┐    ┌────────────┐
+│  Query   │◀───│   Results    │◀───│    Process     │◀───│   Queue    │
+│  API     │    │   Store      │    │    Workers     │    │  (SQS/    │
+│          │    │              │    │  (GPU servers) │    │   Kafka)   │
+└──────────┘    └──────────────┘    └────────────────┘    └────────────┘
+                      │
+                      ▼
+              ┌──────────────┐
+              │ Elasticsearch│
+              │ (for search) │
+              └──────────────┘
+```
+
+**Step 3: Data flow**
+```python
+# 1. Upload flow
+def upload_request(user_id):
+    # Generate pre-signed S3 URL
+    presigned_url = s3.generate_presigned_url(
+        'put_object',
+        Params={'Bucket': 'raw-images', 'Key': f'{user_id}/{uuid4()}.jpg'}
+    )
+    return presigned_url
+
+# After upload, S3 triggers Lambda (or EventBridge)
+# Lambda enqueues job to processing queue
+
+# 2. Processing flow (workers)
+def process_image(job):
+    s3.download(job.image_key)
+    
+    # Run ML inference
+    results = ml_model.detect_and_classify(image)
+    
+    # Store results
+    store.save_results(job.image_id, results)
+    
+    # Index in Elasticsearch
+    es.index(index='image-results', body={
+        'image_id': job.image_id,
+        'timestamp': job.timestamp,
+        'objects_detected': results.objects,
+        'classifications': results.classes,
+        'confidence': results.confidence
+    })
+```
+
+**Step 4: Scaling considerations**
+```yaml
+# Image upload: 
+# - Pre-signed URLs = serverless upload
+# - S3 auto-scales
+# - 12 RPS average, design for 100 RPS peak
+
+# Processing:
+# - GPU workers (expensive)
+# - Use spot instances for cost savings
+# - Auto-scale based on queue depth
+# - If queue > 1000: scale up workers
+# - If queue < 10: scale down workers
+
+# Storage:
+# - Raw images: S3 Standard
+# - Processed results: PostgreSQL or DynamoDB
+# - Search index: Elasticsearch
+
+# Cost optimization:
+# - S3 Intelligent Tiering for raw images
+# - Spot instances for workers (60-70% cheaper)
+# - Results stored in compressed format
+# - Batch processing for non-urgent images
+```
+
+**Step 5: Query patterns**
+```python
+# Search by detected object:
+es.search(index='image-results', body={
+    'query': {
+        'bool': {
+            'must': [
+                {'range': {'timestamp': {'gte': '2024-01-01'}}},
+                {'match': {'objects_detected': 'car'}}
+            ]
+        }
+    },
+    'aggs': {
+        'object_counts': {'terms': {'field': 'objects_detected'}}
+    }
+})
+```
+
+**Step 6: Reliability**
+```yaml
+# - Workers: multiple AZs
+# - SQS: message retry with DLQ
+# - S3: replicated automatically
+# - Elasticsearch: cluster with replicas
+# - Database: read replicas
+
+# Failure modes:
+# - Worker fails: SQS will redeliver
+# - Image upload fails: client retries
+# - Processing timeout: job gets requeued
+
+# Monitoring:
+# - Queue depth (scale workers)
+# - Processing time (optimize ML)
+# - Error rate (monitor failures)
+# - Cost per image (optimize)
+```
+
+---
+
+## Related Topics
+
+- [SRE Questions](./sre-questions.mdx)
+- [Architecture Questions](./architecture-questions.mdx)
+- [Linux Questions](./linux-questions.mdx)
+- [Kubernetes Questions](./kubernetes-questions.mdx)
+- [CI/CD Questions](./cicd-questions.mdx)

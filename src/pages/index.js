@@ -13,14 +13,22 @@ function HomepageHeader() {
     <header className={clsx('hero hero--primary', styles.heroBanner)}>
       <div className="container">
         <Heading as="h1" className="hero__title">
-          {siteConfig.title}
+          DevOps Documentation Platform
         </Heading>
-        <p className="hero__subtitle">{siteConfig.tagline}</p>
+        <p className="hero__subtitle">
+          A comprehensive documentation, learning, and interview prep platform covering Linux, Networking, Google Cloud, Kubernetes, Terraform, CI/CD, Containers, SRE, Architecture, Troubleshooting, and hands-on Labs.
+        </p>
         <div className={styles.buttons}>
           <Link
             className="button button--secondary button--lg"
             to="/docs/intro">
-            Docusaurus Tutorial - 5min ⏱️
+            Explore the Knowledge Base
+          </Link>
+          <Link
+            className="button button--outline button--lg"
+            to="/blog"
+            style={{marginLeft: '0.75rem'}}>
+            Read Engineering Blog
           </Link>
         </div>
       </div>
@@ -32,8 +40,8 @@ export default function Home() {
   const {siteConfig} = useDocusaurusContext();
   return (
     <Layout
-      title={`Hello from ${siteConfig.title}`}
-      description="Description will go into a meta tag in <head />">
+      title={siteConfig.title}
+      description="Production-grade cloud engineering, DevOps automation, and SRE — built from real infrastructure experience.">
       <HomepageHeader />
       <main>
         <HomepageFeatures />
